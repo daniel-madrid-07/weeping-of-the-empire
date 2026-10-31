@@ -193,7 +193,7 @@ PC_VROW(ABILITY,  "reset_rotation",PCVK(2), B_ZL, "Q")            // D2: ZL "Res
 PC_ROW(ABILITY,  "raise",         'M', PCOP_NONE, MAC_RAISE,     0,          "Space")
 PC_ROW(ABILITY,  "lower",         'M', PCOP_NONE, MAC_LOWER,     0,          "Ctrl")
 PC_ROW(ABILITY,  "unstick",       'M', PCOP_NONE, MAC_UNSTICK,   0,          "X")  // X
-                                                                // Backspace was out of its reach
+                                                                // Backspace was out of its reach)
 PC_NOLAYOUT(ABILITY)
 
 // ---- horse (3.6)
@@ -234,7 +234,7 @@ PC_ROW(VEHICLE,  "bow_toggle",    'M', PCOP_NONE, MAC_BOW_DRAW,  B_ZR,       "F"
 PC_VROW(VEHICLE,  "jump",          PCVK(0) | PCVK(26), B_X, "Space")   // stick: jump off; construct: it jumps (26);
                                                                           // telescope: leaves (26); sled: nothing
 // (Mineru's construct, RideRobot 25: no other VEHICLE executor (Manipulate, RideSled, RideTelescopeBase)
-// reads VK 2 / 6 / 12
+// reads VK 2 / 6 / 12)
 PC_NOLAYOUT(VEHICLE)
 
 // ---- Mineru's construct (RideRobot 25: "the controls overlap", G attached and attacked at once, no key to get off, G

@@ -27,8 +27,17 @@ const pc_setting k_lang[] = {
      "settings' own texts (English or Spanish). Automatic: Windows' display language if the game has it, else English.",
      "", V_LANG, N_LANG, 0, 0, 0, PC_SET_RESTART, "TOTK_LANG", nullptr, nullptr, nullptr},
 };
+// The row, once: from this TU's static initializer, or from pc_lang_code when another TU's static initializer asks for the
+// language first (the order across TUs is the linker's). Registered after pc_settings' boot, the row takes settings.ini's
+// value and puts it in TOTK_LANG (start_value), which pc_lang_code reads: before 10-31 a first call ahead of this TU's
+// initializer read TOTK_LANG unset and kept Windows' language for the run: "[lang] es (Windows' display language es-ES)"
+// with game.language = en-US).
+void add_lang_rows() {
+    static const bool added = (pc_settings_add(k_lang, (int)(sizeof k_lang / sizeof k_lang[0])), true);
+    (void)added;
+}
 struct AddLangRows {
-    AddLangRows() { pc_settings_add(k_lang, (int)(sizeof k_lang / sizeof k_lang[0])); }
+    AddLangRows() { add_lang_rows(); }
 } g_add_lang_rows;
 
 // A BCP-47 tag ("es-ES", "es-MX", "en-GB", "zh-TW") -> the game's code; English (US) when it has no such language
@@ -94,6 +103,7 @@ static const char *with_fonts(const char *c) {
 
 extern "C" const char *pc_lang_code(void) {
     static const char *code = [] {
+        add_lang_rows();
         const char *e = getenv("TOTK_LANG");
         for (int i = 1; e && *e && V_LANG[i]; i++)
             if (!strcmp(e, V_LANG[i])) {

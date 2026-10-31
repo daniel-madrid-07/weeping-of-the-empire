@@ -29,7 +29,7 @@
 #include "../shim/las.h"
 #include "vk.h"
 #include "shaders.h"      // (vk_glsl_to_spirv / vk_module: undeclared, the build's -Wno-everything let C take them as int, and
-#include "latch_math.h"  // the truncated SPIR-V pointer crashed the first warp in the driver
+#include "latch_math.h"  // the truncated SPIR-V pointer crashed the first warp in the driver)
 
 extern void *totk_data_page_current(void);
 uint64_t renderer_present_count(void);

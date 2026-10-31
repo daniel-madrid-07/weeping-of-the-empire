@@ -320,6 +320,63 @@ bool renderer_texture_apply_promotion(NvnTexture *t) {
     return true;
 }
 
+// A scaled depth drawn with a colour target's level of the same guest size but a larger host extent (2026-10-31: fs 6b2da6dd
+// draws level 1 of the 400x225 colour target with a standalone 200x112 depth; on the host that level is floor(450 / 2) = 225
+// rows, the depth 2 x 112 = 224, so the render area cut the level's last row, never written in that pass, and the bloom
+// chain pulled the stale row in as a cyan band at the bottom; at 1.333 the same pass was the ALLOC_CEIL case). exec.c
+// begin_pass records the colour level's host extent here; the depth is then allocated at least that large (its own ratio
+// follows the allocation, as every scaled image's). LARECOMP_DEPTH_GROW=0: off.
+#define GROW_MAX 64
+static struct { uint64_t addr; uint32_t w, h, fmt, hw, hh; } g_grow[GROW_MAX];
+static int g_ngrow;
+static bool tex_grown(const NvnTexture *t, uint32_t *hw, uint32_t *hh) {
+    int n = __atomic_load_n(&g_ngrow, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++)
+        if (g_grow[i].addr == t->addr && g_grow[i].w == t->width && g_grow[i].h == t->height && g_grow[i].fmt == t->format) { *hw = g_grow[i].hw; *hh = g_grow[i].hh; return true; }
+    return false;
+}
+bool renderer_texture_grow(NvnTexture *t, uint32_t hw, uint32_t hh) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("LARECOMP_DEPTH_GROW"); off = e && !strcmp(e, "0"); }
+    TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+    if (off || !b || !b->scalable || !b->image || b->samples > 1 || b->blk || b->pending_rgba || t->target != 1) return false;
+    if (b->width >= hw && b->height >= hh) return false;
+    uint32_t ow, oh;
+    if (!tex_grown(t, &ow, &oh)) {
+        if (g_ngrow >= GROW_MAX) return false;
+        g_grow[g_ngrow].addr = t->addr; g_grow[g_ngrow].w = t->width; g_grow[g_ngrow].h = t->height; g_grow[g_ngrow].fmt = t->format;
+        g_grow[g_ngrow].hw = hw; g_grow[g_ngrow].hh = hh;
+        __atomic_store_n(&g_ngrow, g_ngrow + 1, __ATOMIC_RELEASE);
+    } else {   // (a larger level seen later: the table keeps the largest)
+        for (int i = 0; i < g_ngrow; i++)
+            if (g_grow[i].addr == t->addr && g_grow[i].w == t->width && g_grow[i].h == t->height && g_grow[i].fmt == t->format) {
+                if (hw > g_grow[i].hw) g_grow[i].hw = hw;
+                if (hh > g_grow[i].hh) g_grow[i].hh = hh;
+            }
+    }
+    const uint32_t bw = b->width, bh = b->height;
+    extern uint32_t vk_view_gen;
+    destroy_image(b);
+    create_image(t, b);
+    vk_view_gen++;
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkImageSubresourceRange rg = {b->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    if (b->aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
+        VkClearColorValue z = {{0}};
+        vkCmdClearColorImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
+    } else {
+        VkClearDepthStencilValue z = {0};
+        vkCmdClearDepthStencilImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
+    }
+    vk_full_barrier(cb);
+    static int nlog;
+    if (nlog++ < 32)
+        LOG("[tex] depth grown to its colour level: %p addr %llx %ux%u f%#x %ux%u -> %ux%u\n", (void *)t, (unsigned long long)t->addr,
+            t->width, t->height, t->format, bw, bh, b->width, b->height);
+    return true;
+}
+
 // 0 = rendered at the game's size, 1 = 16:9 colour/depth target (output scale), 2 = shadow map
 static int tex_scale_kind(const NvnTexture *t) {
     // (cached: a getenv per call - per sampled texture per draw - was 0.24 ms a frame of the render thread in ucrtbase,
@@ -490,6 +547,8 @@ static void create_image_(NvnTexture *t, TexBackend *b) {
         else { tw = (uint32_t)lroundf(tw * b->sx); th = (uint32_t)lroundf(th * b->sy); }
         if (tw < 1) tw = 1;
         if (th < 1) th = 1;
+        uint32_t gw, gh;   // (renderer_texture_grow: at least its colour level's extent)
+        if (g_ngrow && tex_grown(t, &gw, &gh)) { if (gw > tw) tw = gw; if (gh > th) th = gh; }
     }
     VkImageType type = VK_IMAGE_TYPE_2D;
     uint32_t layers = 1, depth = 1;
@@ -1108,6 +1167,9 @@ static bool recycle_put(NvnTexture *t, TexBackend *b) {
 }
 static bool g_recycle_same;   // (debug log: the last recycle_get kept the same storage's image)
 static bool recycle_shape(const Recycled *r, const NvnTexture *t, bool sc) {
+    uint32_t gw, gh;   // (a grown depth, renderer_texture_grow: never handed an image of the size before it grew; the
+                       // game re-creates the object every frame and the pool kept giving it the short one)
+    if (sc && g_ngrow && tex_grown(t, &gw, &gh) && (r->b->width < gw || r->b->height < gh)) return false;
     return r->format == t->format && r->target == t->target && r->w == t->width && r->h == t->height && r->d == t->depth &&
            r->levels == t->levels && r->samples == t->samples && r->scalable == sc &&
            (!sc || (r->sx == kind_sx(tex_scale_kind(t)) && r->sy == kind_sy(tex_scale_kind(t))));

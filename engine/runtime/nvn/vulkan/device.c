@@ -1541,7 +1541,7 @@ void backend_present(NvnTexture *t) {
     extern char g_hold_kinds[8];
     extern int g_hold_nkeys;
     static uint64_t run_keys[8];   // (the keys as of the run's last held frame: the shown frame that ends the run executes
-    static char run_kinds[8];  // before this decision, and its own skips held nothing
+    static char run_kinds[8];  // before this decision, and its own skips held nothing)
     static int run_nkeys;
     if (held) {
         if (!held_run++) { held_from = total_frames; held_sk[0] = held_sk[1] = held_sk[2] = 0; }

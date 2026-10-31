@@ -62,7 +62,7 @@ extern "C" void totk_count_in_game_time(Ctx *__restrict c, void (*orig)(Ctx *__r
     if (now != t.left) t.elapsed = (float)now;    // reset or written outside the hook
     const float e = t.elapsed + r;               // ready frames including this one, if it is ready
     g_lock.clear(std::memory_order_release);     // (not held across the original: it calls into the actor / terrain
-                                                 // managers, which take their own locks
+                                                 // managers, which take their own locks)
     st32(n + off, e >= 1.0f ? (u32)floorf(e - 1.0f + 1e-4f) : 0);
     orig(c);
     const u32 after = ld32(n + off);

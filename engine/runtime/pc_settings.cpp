@@ -167,16 +167,19 @@ const char *fps_cap_for_hz(long top) {   // (59.94 / 89.91 Hz modes report 59 / 
     return top >= 59 && top <= 61 ? "60" : top >= 89 && top <= 91 ? "90" : top >= 125 ? "unlocked" : nullptr;
 }
 // The first start's monitor, the primary (pc_display_caps.cpp). NXR_FIRST_RUN_HZ (test_pc_settings.py) stands in for
-// it: its fastest Hz, with NXR_FIRST_RUN_VRR (PCD_VRR_*) and NXR_FIRST_RUN_PEAK (nits, Windows HDR on).
+// it: its fastest Hz, with NXR_FIRST_RUN_VRR (PCD_VRR_*) and NXR_FIRST_RUN_PEAK (nits, Windows HDR on), and is
+// described the same way (pcd_caps_text's pc_tr: the language's first use, test_pc_settings.py's game.language case).
 bool first_run_display(pcd_caps *c) {
     *c = {};
     if (const char *t = getenv("NXR_FIRST_RUN_HZ")) {
         c->hz = c->top_hz = atoi(t);
         if (const char *v = getenv("NXR_FIRST_RUN_VRR")) c->vrr = atoi(v);
         if (const char *p = getenv("NXR_FIRST_RUN_PEAK")) c->hdr_on = (c->peak_nits = atoi(p)) > 0;
-        return true;
+        snprintf(c->name, sizeof c->name, "NXR_FIRST_RUN_HZ");
+        c->vrr_kind = c->vrr ? "G-SYNC" : nullptr;
+    } else if (!pcd_caps_of(nullptr, c)) {
+        return false;
     }
-    if (!pcd_caps_of(nullptr, c)) return false;
     char line[384];
     pcd_caps_text(*c, line, sizeof line);
     printf("[pc-settings] first start: primary monitor %s (NVAPI VRR bits %d)\n", line, c->nv_bits);
@@ -389,6 +392,10 @@ void boot() {
     //    HDR output itself stays off: it expands the picture's highlights (present.c).
     // The Welcome screen then sets pc.welcome_done, so the player's own choices are never touched. No file: left alone.
     // Scripted boots (TOTK_PRESS / TOTK_CTL) get the frame rate only: their measurements must not follow the host's VRR.
+    // The file's values are in g_kv before anything below can translate a text (first_run_display's monitor line,
+    // pc_tr): the language's first use registers game.language (pc_lang.cpp), whose start value comes from g_kv. Until
+    // 10-31 they came after: "[lang] es (Windows' display language es-ES)" with game.language = en-US).
+    g_kv = kv;
     {
         bool welcomed = false, has_vrr = false, has_peak = false;
         int cap = -1;   // (an index: the pushes below may move kv)

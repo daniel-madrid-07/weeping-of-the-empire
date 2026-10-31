@@ -191,7 +191,7 @@ typedef struct {
     int npools, cur_pool;
     // (LARECOMP_VKQ_SETS: the record thread allocates from pools[]; the render thread's own allocations (vk_alloc_set:
     // post / present, sets not deferred) take these, so they no longer drain the ring first: 0.07-0.08 ms a frame of
-    // vkq_drain under vk_alloc_set
+    // vkq_drain under vk_alloc_set)
     VkDescriptorPool dpools[16];
     int ndpools, cur_dpool;
 } Sub;
@@ -2765,6 +2765,21 @@ static void begin_pass(void) {
             NvnTexture *t = i < st.rt.ncolor ? st.rt.color[i] : st.rt.depth;
             if (t && t->backend) renderer_texture_apply_promotion(t);
             if (t) renderer_texture_target_kind(t, i < st.rt.ncolor);   // (also before its first image: made in the right kind)
+        }
+        // (textures.c renderer_texture_grow) a scaled level-0 depth of the colour level's guest size but 1-2 host rows /
+        // columns smaller than that level (its mip chain rounds an odd size up: 450 / 2 = 225 against 2 x 112): grown to
+        // the level, so the render area covers all of it
+        extern bool renderer_texture_grow(NvnTexture *t, uint32_t hw, uint32_t hh);
+        NvnTexture *dt = st.rt.depth, *ct = st.rt.ncolor ? st.rt.color[0] : NULL;
+        const uint32_t dlv = st.rt.has_dview && (st.rt.dview.setmask & 1) ? st.rt.dview.base_level : 0;
+        const uint32_t clv = st.rt.ncolor && st.rt.has_cview[0] && (st.rt.cview[0].setmask & 1) ? st.rt.cview[0].base_level : 0;
+        if (dt && ct && dt->backend && ct->backend && !dlv && clv) {
+            const TexBackend *db = dt->backend, *cb2 = ct->backend;
+            const uint32_t cw = level_extent(cb2->width, clv), ch = level_extent(cb2->height, clv);
+            const uint32_t gw = level_extent(ct->width, clv), gh = level_extent(ct->height, clv);
+            if (db->scalable && cb2->scalable && dt->width == gw && dt->height == gh && (db->width < cw || db->height < ch) &&
+                cw <= db->width + 2 && ch <= db->height + 2)
+                renderer_texture_grow(dt, cw > db->width ? cw : db->width, ch > db->height ? ch : db->height);
         }
     }
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
@@ -6411,7 +6426,7 @@ static void resolve_feedback(Prog *pr) {
                 selfw_note(pr, i, t, rk);   // (i: the program's texture index, as the GLSL names it)
             }
             static int selfcopy = -1;
-            if (selfcopy < 0) {  // (was getenv() != NULL: =0 turned it on too
+            if (selfcopy < 0) {  // (was getenv() != NULL: =0 turned it on too)
                 const char *e = getenv("LARECOMP_FEEDBACK_SELFCOPY");
                 // (default 2 since the controlled Fire Temple repro; =0: live same-draw reads, the old default)
                 selfcopy = !e || !*e ? 2 : *e == '0' ? 0 : *e == '2' ? 2 : 1;
@@ -6697,15 +6712,15 @@ static inline uint64_t ubo_size(const ShaderInfo *si, int k, Range r) {
 // LARECOMP_C1_PERSIST (present, cut (b); default 1 (Kakariko at a 120 cap: 614-735 MB a stats window not copied, render
 // CPU 3.96 against 4.00 ms/frame, c1p4_k1a / k0b); =0 off, the per-list copies; =2 check: binds the per-list copy as
 // before and compares the guest bytes with the persistent copy at every hit, "[c1p] changed" lines): compiler constants
-// the heap mirror refuses (dbh_A2_kakariko: 697k binds / 736 MB per stats window, all "past the mirror", i.e. code in
-// the alias window) were re-copied into the transient ring by every command list. They are part of the shader blob, and
-// programs are keyed by code address already (prog_tab, get_program_slow; both reset only by vk_exec_reset), so one copy
-// per (address, size), written once into a grow-only arena that is never recycled, serves every list: the GPU reads the
-// same bytes, with no per-list copy, no ring space and a stable offset (more stage_set memo / set_tab hits).
+// the heap mirror refuses were re-copied into the transient ring by every command list. They are part of the shader
+// blob, and programs are keyed by code address already (prog_tab, get_program_slow; both reset only by vk_exec_reset),
+// so one copy per (address, size), written once into a grow-only arena that is never recycled, serves every list: the
+// GPU reads the same bytes, with no per-list copy, no ring space and a stable offset (more stage_set memo / set_tab
+// hits).
 #define C1P_TAB 16384
 #define C1P_MAX (16ull << 20)   // (arena cap: past it, misses go back to the per-list copies. Host-visible: without resizable
                                 // BAR it can land in the 256 MB BAR heap with the ring, so it is no bigger than the table's
-                                // 3/4 load (~12k entries of ~1.3 KB aligned, dbh_A2: 736 MB / 697k binds)
+                                // 3/4 load (~12k entries of ~1.3 KB aligned: 736 MB / 697k binds))
 static struct { uint64_t addr, size, hash; VkSpan span; void *shadow; } c1p_tab[C1P_TAB];   // (hash: of the bytes copied)
 static struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t used; } c1p_blk[C1P_MAX / C1P_BLOCK];
 static int c1_persist_mode(void) {

@@ -179,12 +179,14 @@ static std::atomic<int> g_pads_scanned{0};   // bit 0: pad_read's first XInput s
 // for a device whose interface comes up after the notification).
 static std::atomic<unsigned> g_dev_gen{0};
 #ifdef _WIN32
-static HANDLE dev_event() { static HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr); return e; }
-extern "C" void hid_devices_changed(void) {
+static HANDLE dev_event() { static HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr); return e; }   // raw HID's scan
+static HANDLE xscan_event() { static HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr); return e; }  // XInput's scan
+extern "C" void hid_devices_changed(void) {   // (the window's thread: only wakes the two scan threads)
     static std::atomic<int> logs{0};
     if (logs++ < 20) printf("[hid] device change: looking for pads now\n");
     g_dev_gen++;
     SetEvent(dev_event());
+    SetEvent(xscan_event());
 }
 #else
 extern "C" void hid_devices_changed(void) { g_dev_gen++; }
@@ -209,27 +211,39 @@ static DWORD xget(XInputGetState_t get, DWORD i, XState* st) {
     }
     return get(i, st);
 }
+// The empty slots are looked at on a thread of their own: XInputGetState on an empty slot costs ~1 ms, and while USB /
+// HID devices change it can take seconds. Inline in pad_read (host_input: a guest thread, holding the mutex every npad
+// poll waits on) that stopped the game, 0.5-3.6 s each after "[hid] device change". The scan runs once a second while no
+// pad is in use, at once on a device change (at most one scan per 250 ms: a hub or a USB drive sends a burst of them);
+// pad_read reads only the slot in use and takes the one the scan found.
+static std::atomic<int> g_xfound{-1};   // a slot the scan found a pad on, for pad_read to take
+static void xinput_scan_thread(XInputGetState_t get) {
+    for (;;) {
+        if (g_xslot.load() < 0 && g_xfound.load() < 0) {
+            XState st;
+            for (int i = 0; i < 4; i++)
+                if (xget(get, i, &st) == ERROR_SUCCESS) { g_xfound = i; break; }
+        }
+        g_pads_scanned |= 1;
+        Sleep(250);
+        WaitForSingleObject(xscan_event(), 750);
+    }
+}
 static void pad_read(HostInput* in) {
     static XInputGetState_t get = xinput_load();
     static const bool labels = getenv("TOTK_PAD_LABELS") != nullptr;
     static int slot = -1;
-    static u64 next_scan, last_scan;
-    static unsigned seen_gen;
     if (!get) { g_pads_scanned |= 1; return; }  // (no XInput DLL: nothing to wait for)
+    static const bool scanning = (std::thread(xinput_scan_thread, get).detach(), true);
+    (void)scanning;
     XState st;
-    if (slot < 0) {   // XInputGetState on an empty slot is slow (~ms): look for a new pad once a second, or on a device change
-        u64 now = GetTickCount64();
-        const unsigned gen = g_dev_gen.load();
-        // (a device change counts once the last scan is 250 ms old: a hub or a USB drive sends a burst of them, and each
-        // scan of the empty slots costs the pad-read thread ~1 ms a slot)
-        if (now < next_scan && (gen == seen_gen || now - last_scan < 250)) return;
-        seen_gen = gen;
-        next_scan = now + 1000;
-        last_scan = now;
-        for (int i = 0; i < 4 && slot < 0; i++) if (xget(get, i, &st) == ERROR_SUCCESS) { slot = i; printf("[hid] pad connected (XInput slot %d)\n", i); }
-        g_pads_scanned |= 1;
-        if (slot < 0) return;
-        g_xslot = slot;
+    if (slot < 0) {
+        const int found = g_xfound.load();
+        if (found < 0) return;
+        slot = found;
+        g_xslot = slot;     // (before g_xfound clears: the scan thread never sees both at -1 with a pad being taken)
+        g_xfound = -1;
+        printf("[hid] pad connected (XInput slot %d)\n", slot);
     }
     if (xget(get, slot, &st) != ERROR_SUCCESS) {
         printf("[hid] pad on XInput slot %d disconnected\n", slot);

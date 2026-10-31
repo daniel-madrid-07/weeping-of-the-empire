@@ -337,7 +337,7 @@ static int window_monitor_hz();
 static std::atomic<bool> g_load_fast{false};
 static std::atomic<unsigned> g_pace_epoch{0};   // (+1 when the loading pace starts or ends: the speed fix restarts its mean)
 static std::atomic<int64_t> g_paced_ns{0};       // paced_period's last period, and how many it has set (the seed after a
-static std::atomic<unsigned> g_paced_seq{0};  // loading-pace change: the new pace's
+static std::atomic<unsigned> g_paced_seq{0};  // loading-pace change: the new pace's)
 extern "C" unsigned long long hle_fs_read_bytes(void);   // hle_fs.cpp
 extern "C" unsigned long long renderer_video_frames(void);   // nvn/vulkan/textures.c: decoded video frames so far
 // TOTK_CAP30 (tools/engine/build.py, another game version whose build lost its frame-time hooks): nothing paces

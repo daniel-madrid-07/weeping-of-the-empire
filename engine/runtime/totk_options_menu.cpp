@@ -778,6 +778,66 @@ void add(s32 type, u32 index, const void *layout) {
 }
 }  // namespace cull
 
+// ---------------------------------------------------------------- the layout's unused row parts SystemOption_00.bflyt
+// has one part of each row kind: Pa_ToggleBtn_00, Pa_SelectBtn_00, Pa_AmiiboBtn_00 and Pa_Separator_00. The screen's
+// creation takes it for the kind's first entry and clones it for the others. The game's one list has every kind, so
+// each is used; a section (zones) may have none of a kind, and its part then stays where the layout put it, never
+// bound; no section has a separator, and Display, Graphics, Audio and Keys no toggle or amiibo either). Hidden at the
+// rows' bind: the part of each kind the shown section has no entry of (shown or conditional: the creation takes it for
+// either). A section change opens a new screen, whose parts start shown.
+namespace orphans {
+constexpr u64 kPaneName = 0xb0;  // nn::ui2d::Pane's name (totk_menu_cursor.cpp's kPaneName)
+const char *const kPart[4] = {"Pa_ToggleBtn_00", "Pa_SelectBtn_00", "Pa_AmiiboBtn_00", "Pa_Separator_00"};  // by buttonType
+
+// list's children (cull::member_try's walk) named for a kind not in has: hidden. False on any fault or bad link
+bool hide_try(u64 list, const bool *has, s32 zone) {
+#ifdef _WIN32
+    __try {
+#endif
+        const u64 head = list + 0x20;
+        u64 node = cull::rd<u64>(head + 8);
+        for (int n = 0; n < 512 && node != head; n++) {
+            if (!cull::ok(node)) return false;
+            const u64 pane = node - 8;
+            const char *const name = reinterpret_cast<const char *>(pane + kPaneName);
+            for (int k = 0; k < 4; k++) {
+                if (has[k] || strncmp(name, kPart[k], 24) != 0) continue;
+                const u8 f = cull::rd<u8>(pane + cull::kFlag);
+                if (!(f & 1)) continue;
+                cull::wr<u8>(pane + cull::kFlag, static_cast<u8>(f & ~1));
+                printf("[options-menu] section %d: %s unused (no entry of its kind), hidden\n", static_cast<int>(zone),
+                       kPart[k]);
+            }
+            node = cull::rd<u64>(node + 8);
+        }
+        return true;
+#ifdef _WIN32
+    } __except (GetExceptionCode() == 0xC0000005 /* access violation */ ? 1 : 0) {
+        return false;
+    }
+#endif
+}
+
+// A row of the open screen was bound (layout: its part's LayoutEx; its root pane's parent is the rows' list)
+void hide(const void *layout) {
+    if (!zones::on() || !zones::g_ok || !layout) return;
+    const s32 z = zones::g_zone.load();
+    const OptionsMgr &v = zones::g_view[z >= 0 && z < Z_COUNT ? z : Z_GENERAL];
+    if (!v.entries) return;
+    bool has[4] = {};
+    for (u32 i = 0; i < v.count; i++)  // (buttonType is signed: a stray negative one must not index has)
+        if (const u32 k = static_cast<u32>(v.entries[i].buttonType); k < 4) has[k] = true;
+    if (has[0] && has[1] && has[2] && has[3]) return;
+    const u64 root = cull::rd<u64>(reinterpret_cast<u64>(layout) + cull::kRoot);
+    if (!cull::ok(root)) return;
+    const u64 list = cull::rd<u64>(root + cull::kParent);
+    if (!cull::ok(list)) return;
+    pc_fault_guard(1);
+    hide_try(list, has, z);
+    pc_fault_guard(0);
+}
+}  // namespace orphans
+
 void append_rows(OptionsMgr *mgr, u64 heap) {
     cbdiag::start();
     struct Add {
@@ -1609,6 +1669,7 @@ OPTIONS_HOOK(1a862e4, {   // a toggle row's bind (x0 the controller, x1 its entr
     guest_bridge::Enter e(c);
     if (!ctl::game_row(row_type)) ctl::toggle_bind(self, entry);
     cull::add(self->type, zones::shown_index(entry), self->layout);
+    orphans::hide(self->layout);
 })
 OPTIONS_HOOK(1a86420, {   // a toggle row's button changed state (x1 the button)
     OptionToggle *const self = reinterpret_cast<OptionToggle *>(c->x[0]);
@@ -1625,6 +1686,7 @@ OPTIONS_HOOK(1a85b3c, {   // a selection row's bind
     guest_bridge::Enter e(c);
     if (!ctl::game_row(row_type)) ctl::select_bind(self, entry);
     cull::add(self->type, zones::shown_index(entry), self->layout);
+    orphans::hide(self->layout);
     sels::add(self);
     if (!pc_rows::owns(self->type)) return;
     note_bound(self);
@@ -1714,7 +1776,7 @@ bool totk_options_section_step(int dir) {
     // (on eui's thread, as the section row's own step: reopen::request reads the opener's focus there)
     return totk_ui_post([](void *arg, bool ran) {
         // (no section row in this list, zones::g_ok, written on eui's thread: view() shows the one list, so nothing to
-        // step to; closing and reopening Options would be for nothing
+        // step to; closing and reopening Options would be for nothing)
         if (!ran || !zones::g_ok) return;
         const s32 d = static_cast<s32>(reinterpret_cast<intptr_t>(arg));
         reopen::request((zones::g_zone.load() + d + Z_COUNT) % Z_COUNT);

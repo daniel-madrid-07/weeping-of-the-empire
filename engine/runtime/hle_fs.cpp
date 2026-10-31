@@ -996,7 +996,7 @@ static void glyph_live_start() {
     std::thread([] {
         unsigned seen = 0;
         for (;;) {   // (every 20 ms: a change applies after two equal looks, 20-40 ms; it was 50 ms, ~100-150 ms of the old
-                     // prompts at a menu / mount switch with the reset; 250 ms before that
+                     // prompts at a menu / mount switch with the reset; 250 ms before that)
             bool kicked;
             {
                 std::unique_lock<std::mutex> l(g_kick_mu);
@@ -1270,7 +1270,7 @@ static std::string rstb_merged(const std::string& base) {
 #else
     const unsigned long pid = (unsigned long)getpid();
 #endif
-    // (increment(ec), not a range-for: its operator++ throws on an iteration error, here inside call_once
+    // (increment(ec), not a range-for: its operator++ throws on an iteration error, here inside call_once)
     for (fsys::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         const std::string n = it->path().filename().string();
         std::error_code e2;

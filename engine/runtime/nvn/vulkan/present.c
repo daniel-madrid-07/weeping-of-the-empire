@@ -378,6 +378,7 @@ static Pend g_pend[PEND];
 static uint64_t g_pend_head, g_pend_tail;   // [tail, head) waiting to be seen on screen
 static VkSwapchainKHR g_pw_busy;            // swapchain the waiter is inside vkWaitForPresentKHR on
 static uint64_t g_last_id, g_shown_id;      // last present id given; highest one on screen (or given up on)
+static uint64_t g_seen_ns, g_lim_off_ns;    // last present reported on screen; the queued-frame limit off since (0: on)
 static SRWLOCK g_pw_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_pw_cv = CONDITION_VARIABLE_INIT;
 
@@ -456,6 +457,16 @@ static DWORD WINAPI pw_thread(void *arg) {
         ReleaseSRWLockExclusive(&g_pw_lock);
         VkResult r = pw_wait(e.sc, e.id);
         uint64_t t = SDL_GetTicksNS();
+        {   // LARECOMP_PW_DROP=<start s>,<seconds> (test): no present is reported on screen in that window of the run, as
+            static uint64_t d0 = 1, d1;
+            if (d0 == 1) {
+                const char *v = getenv("LARECOMP_PW_DROP");
+                double a = 0, b = 0;
+                d0 = v && sscanf(v, "%lf,%lf", &a, &b) == 2 && b > 0 ? SDL_GetTicksNS() + (uint64_t)(a * 1e9) : 0;
+                d1 = d0 ? d0 + (uint64_t)(b * 1e9) : 0;
+            }
+            if (d0 && t >= d0 && t < d1 && r != VK_TIMEOUT) { r = VK_TIMEOUT; wait_half_ms(NULL); }
+        }
         bool seen = false;
         AcquireSRWLockExclusive(&g_pw_lock);
         g_pw_busy = VK_NULL_HANDLE;
@@ -464,6 +475,7 @@ static DWORD WINAPI pw_thread(void *arg) {
             g_pend_tail++;
             if (e.id > g_shown_id) g_shown_id = e.id;
             seen = r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
+            if (seen) g_seen_ns = t;
         }
         WakeAllConditionVariable(&g_pw_cv);
         ReleaseSRWLockExclusive(&g_pw_lock);
@@ -550,11 +562,25 @@ static void present_limits(uint64_t id, uint64_t seq, int extra) {
         // in ids)
         const int sc = atomic_load(&g_ll_scale);
         if (mq > 0) mq = sc > 1 && vk_present_latency_id() ? mq * sc : mq + extra;
+        // Off after a timeout until the display reports a present again, and for 5 s at least. The presents queued
+        // meanwhile count as seen. LARECOMP_QLIMIT_BACKOFF=0: the old wait every frame.
+        static int backoff = -1;
+        if (backoff < 0) { const char *e = getenv("LARECOMP_QLIMIT_BACKOFF"); backoff = !e || strcmp(e, "0"); }
+        if (mq > 0 && g_lim_off_ns) {
+            const uint64_t now = SDL_GetTicksNS();
+            if (now - g_lim_off_ns >= 5000000000ull && g_seen_ns > g_lim_off_ns) {
+                LOG("[present] queued-frame limit on again: presents reported on screen again after %.1f s\n", (now - g_lim_off_ns) / 1e9);
+                g_lim_off_ns = 0;
+            } else mq = 0;
+        }
         for (uint64_t t0 = SDL_GetTicksNS(); mq > 0 && g_last_id - g_shown_id >= (uint64_t)mq;) {
             uint64_t el = SDL_GetTicksNS() - t0;
             if (el >= 100000000ull) {   // (minimised, occluded: never block a frame for long)
                 static int warned;
-                if (warned++ < 10) LOG("[present] queued-frame limit: present %llu not on screen after 100 ms\n", (unsigned long long)g_shown_id + 1);
+                if (warned++ < 10)
+                    LOG("[present] queued-frame limit: present %llu not on screen after 100 ms%s\n", (unsigned long long)g_shown_id + 1,
+                        backoff ? ": off until the display reports presents again (5 s at least)" : "");
+                if (backoff) { g_lim_off_ns = SDL_GetTicksNS(); g_shown_id = g_last_id; }
                 break;
             }
             SleepConditionVariableSRW(&g_pw_cv, &g_pw_lock, (DWORD)((100000000ull - el) / 1000000ull) + 1, 0);

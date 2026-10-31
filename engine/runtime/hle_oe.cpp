@@ -53,7 +53,7 @@ extern "C" bool oe_host_paused(void);
 // game is told it has focus again.
 extern "C" void oe_settings_reload(void) {
     pause_from_env();   // (here, on the settings thread that set the variable: never a getenv on the audio / vsync
-    hold_update();  // threads while it _putenv's another row
+    hold_update();  // threads while it _putenv's another row)
     if (!pause_unfocused() && !g_focused.exchange(1)) oe_push_message(15);
 }
 static void oe_push_message(u32 m) {

@@ -1021,7 +1021,7 @@ extern "C" int pc_glyph_vk_in(int set, int bit) {
 // The HUD bar's set: the riding / gliding / swimming / vehicle / ability / bow-aim mode in force, else on foot's (a
 // jump's AIR, CLIMB), and a mode whose keys are on foot's own is on foot's set (no rewrite for nothing: the records
 // key on the set). ("its own keys": every button the mode keys (a nonzero entry) keyed as on foot; a button it has
-// no row for draws no prompt there, so SWIM / VEHICLE, which only lack rows, stay on foot's
+// no row for draws no prompt there, so SWIM / VEHICLE, which only lack rows, stay on foot's)
 extern "C" int pc_glyph_game_set(void) {
     std::lock_guard<std::mutex> l(g_glyph_mu);
     const int i = intent_locked();   // (a gameplay context named by a press: its set at once; else the context in force)

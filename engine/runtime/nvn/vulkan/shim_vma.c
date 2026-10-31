@@ -63,7 +63,7 @@ VkResult vmaCreateAllocator(const VmaAllocatorCreateInfo *ci, VmaAllocator *out)
 // reached 3,951 live allocations in a 30-min drive, against the ~4096 the Windows driver allows, before heap imports.
 // First fit over an offset-sorted free list, neighbours merged on free; an empty block is freed unless it is the last of
 // its type and kind. Host-visible blocks stay mapped. On by default since 2026-10-25 (LARECOMP_VMA_SUB=0: one allocation
-// per resource), a 12-min Kakariko soak 95-129 live, ~2,100-2,250 resources in blocks, no growth, no errors (gc_soak_kak).
+// per resource), a 12-min Kakariko soak 95-129 live, ~2,100-2,250 resources in blocks, no growth, no errors.
 enum { SUB_BLOCK = 32 << 20, SUB_MAX = 4 << 20 };
 struct SubBlock {
     SubBlock *next;

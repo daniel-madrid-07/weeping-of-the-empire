@@ -819,7 +819,7 @@ void glyph_textbox(u64 tb, GlyphPass& gp) {
         set = totk_controls_page_set(ride, kind, pc_glyph_game_set(), totk_player_state());
     }
     // (debounced: a context held under 100 ms, ~3 frames, is not drawn, so a 1-frame GLIDE at a jump or an AIM edge
-    // does not rewrite and re-register the bar's boxes at that rate
+    // does not rewrite and re-register the bar's boxes at that rate)
     if (gp.gi == 0) {
         static int shown = -1, cand = -1;
         static ULONGLONG since;
@@ -911,7 +911,7 @@ void glyph_relayout(u64 tb) {
     // cached it (mc_glyph7's blank callouts). From state 2 only (never 1), the box goes back to 0 and its next
     // Calculate registers the new codes. TOTK_MC_GLYPH_REREG=0: not. (2 -> 0 as one compare-exchange: a Calculate
     // of the box on another thread that pushed it (state 1) between a read and a write would otherwise be undone,
-    // and the box pushed twice
+    // and the box pushed twice)
     static const bool rereg = !(getenv("TOTK_MC_GLYPH_REREG") && !strcmp(getenv("TOTK_MC_GLYPH_REREG"), "0"));
     u8 two = 2;
     if (rereg && rd<u64>(tb) == kVtTextBox &&
@@ -1900,7 +1900,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
         if (rd<u8>(ab_scr + 0x264)) return pending = 0;   // (the info panel takes the input, as the game's own)
         // (the notches wait for the list: updateImpl_ takes input only once its born animation is at frame 0,
         // *(f32*)(*(screen + 0x1b8) + 0x20); unreadable, 10 UI updates. A gate that never clears (a frame that never
-        // reads 0) gives way after 30 UI updates, so the list never stops answering
+        // reads 0) gives way after 30 UI updates, so the list never stops answering)
         const u64 born = rd<u64>(ab_scr + 0x1b8);
         if (ptr_ok(born) ? rd<float>(born + 0x20) != 0.f : ab_age < 10) {
             if (ab_age < 30) return 0;
