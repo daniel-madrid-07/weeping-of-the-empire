@@ -39,6 +39,7 @@ typedef struct {
     VkShaderStageFlags sg32_stages;  // stages whose warp-op shaders require 32-wide subgroups (device.c; exec.c sg_pin)
     uint32_t max_wg_subgroups;       // maxComputeWorkgroupSubgroups: a pinned compute workgroup holds at most this many subgroups
     bool maint5;  // VK_KHR_maintenance5 enabled (device.c: unwritten point sizes are 1.0)
+    bool maint8;  // VK_KHR_maintenance8 enabled: vkCmdCopyImage between depth and matching colour formats (textures.c)
     bool astc_ldr;   // textureCompressionASTC_LDR enabled: ASTC images are created natively (textures.c), else decoded to RGBA8
     bool fill_nonsolid, dual_src_blend, depth_clamp;  // core features the device has (device.c; exec.c falls back without)
     bool feedback_loop;  // attachment feedback loops declared to the driver (device.c: EXT layout + dynamic state, unified layouts)

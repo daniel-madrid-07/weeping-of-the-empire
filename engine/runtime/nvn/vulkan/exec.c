@@ -116,7 +116,7 @@ static uint64_t stat_up_kind[8];  // upload bytes per kind in the stats window (
 static int prof = -1;
 static uint64_t prof_set_alloc, prof_set_cbuf, prof_set_fill, prof_set_update, prof_set_writes;  // (stage_set zones)
 static uint64_t prof_set_calls[6], prof_set_same[6], prof_set_samedyn[6];  // (VK_PROF) stage_set calls per stage, same set / + same dynamic offsets as the previous call of that stage
-extern uint64_t prof_memo_hit[6], prof_memo_bad[6], prof_memo_why[6][10];
+extern uint64_t prof_memo_hit[6], prof_memo_bad[6], prof_memo_why[6][10], prof_memo_other[6][8];
 // (VK_PROF) where the shader constants (c1) come from: zero-copy, heap mirror, or copies and why; guest_copy outcomes
 static int hm_why;   // (VK_PROF) why heap_mirror_bind refused: 1 shader-written page, 2 past the mirror, 3 straddles, 4 no block, 5 off, 6 cold (LARECOMP_MIRROR_HOT)
 static uint64_t prof_hmw[7], prof_c1[8], prof_c1_b[8], prof_gc_hit, prof_gc_new, prof_gc_new_b, prof_gc_evict, prof_gc_evict_b;   // (stage_set inputs memo, defined before stage_set)
@@ -1825,6 +1825,13 @@ const char *renderer_stats(void) {
                 sg ? "fs" : "vs", (unsigned long long)y[0], (unsigned long long)y[1], (unsigned long long)y[2], (unsigned long long)y[3], (unsigned long long)y[4],
                 (unsigned long long)y[5], (unsigned long long)y[6], (unsigned long long)y[7], (unsigned long long)y[8], (unsigned long long)y[9]);
         }
+        for (int sg = 0; sg < 2; sg++) {
+            const uint64_t *o = prof_memo_other[sg];
+            LOG("[prof] stage_set 'other' misses, %s: feedback %llu, pause substitution %llu, rscale row 0 %llu, tint %llu, info / set %llu, groups %llu, pre-resolved %llu, bind / storage generations %llu\n",
+                sg ? "fs" : "vs", (unsigned long long)o[0], (unsigned long long)o[1], (unsigned long long)o[2], (unsigned long long)o[3],
+                (unsigned long long)o[4], (unsigned long long)o[5], (unsigned long long)o[6], (unsigned long long)o[7]);
+        }
+        memset(prof_memo_other, 0, sizeof prof_memo_other);
         memset(prof_memo_why, 0, sizeof prof_memo_why);
         memset(prof_memo_hit, 0, sizeof prof_memo_hit); memset(prof_memo_bad, 0, sizeof prof_memo_bad);
         memset(prof_set_calls, 0, sizeof prof_set_calls); memset(prof_set_same, 0, sizeof prof_set_same); memset(prof_set_samedyn, 0, sizeof prof_set_samedyn);
@@ -8799,6 +8806,7 @@ static int memo_gmem(void) {
     return on;
 }
 uint64_t prof_memo_why[6][MW_N];
+uint64_t prof_memo_other[6][8];   // (MW_OTHER split: feedback, pause substitution, rscale row 0, tint, info / set, groups, pre-resolved textures, bind / storage generations)
 static StageMemo g_smemo[6];
 // LARECOMP_SET_UBOFAST=2: the fast path's set and offsets against the ones the full build chose (a different set with the
 // same writes is fine only if set_tab missed: the check compares offsets, and the set when set_tab reused one) (=2) Each
@@ -8899,7 +8907,14 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     int npre = pre_ii ? (si->ntex < 64 ? si->ntex : 64) : 0;
     extern uint32_t g_pool_gen;
     uint32_t m_pool_gen = __atomic_load_n(&g_pool_gen, __ATOMIC_RELAXED);
-    bool memo_hit = m && !nfeedback && !pk_subst_tex && (!si->uses_gmem || memo_gmem()) && m->ds && m->pool_gen == m_pool_gen && m->gen == g_set_gen && m->q == m_q && m->epoch == m_epoch &&
+    // (LARECOMP_SET_MEMO_FB, default on, =0 off: a draw with feedback reads (nfeedback) may hit too when all of its textures
+    // came in pre-resolved (the fragment stage's pre_ii, compared below by bytes: fstc refills its version for such draws), so
+    // the feedback views (live, snapshot) are part of the key; the vertex stage, resolving its own textures, still misses.
+    // t3_fight_t8b: ~43-55k fragment calls per 2-s window missed with the same set for "other", all feedback in full2)
+    static int memo_fb = -1;
+    if (memo_fb < 0) { const char *e = getenv("LARECOMP_SET_MEMO_FB"); memo_fb = !(e && *e == '0'); }
+    const bool fb_ok = !nfeedback || (memo_fb && npre && npre == si->ntex);
+    bool memo_hit = m && fb_ok && !pk_subst_tex && (!si->uses_gmem || memo_gmem()) && m->ds && m->pool_gen == m_pool_gen && m->gen == g_set_gen && m->q == m_q && m->epoch == m_epoch &&
                     m->frame == m_frame && m->view_gen == memo_gen() && m->p == p && m->layout == layout && m->set == set && m->si == si &&
                     m->gxyz[0] == gx && m->gxyz[1] == gy && m->gxyz[2] == gz && !memcmp(m->rs0, rs[0], 16) &&
                     m->has_tint == (tint != NULL) && (!tint || !memcmp(m->tint, tint, 32)) && m->npre == npre &&
@@ -9111,6 +9126,10 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                           memcmp(m->tex, st.tex[stage], sizeof m->tex) ? MW_TEX : memcmp(m->ubuf, st.ubuf[stage], sizeof m->ubuf) ? MW_UBUF :
                           memcmp(m->sbuf, st.sbuf[stage], sizeof m->sbuf) ? MW_SBUF : (m->npre != npre || (npre && memcmp(m->pre, pre_ii, (size_t)npre * sizeof *pre_ii))) ? MW_PRE : MW_OTHER;
                 prof_memo_why[stage][why]++;
+                if (why == MW_OTHER)
+                    prof_memo_other[stage][nfeedback ? 0 : pk_subst_tex ? 1 : memcmp(m->rs0, rs[0], 16) ? 2 :
+                                           m->has_tint != (tint != NULL) || (tint && memcmp(m->tint, tint, 32)) ? 3 : m->si != si || m->set != set ? 4 :
+                                           m->gxyz[0] != gx || m->gxyz[1] != gy || m->gxyz[2] != gz ? 5 : !memo_pre_same(m, pre_ii, npre, stage) ? 6 : 7]++;
             }
             m->gen = g_set_gen; m->q = m_q; m->epoch = m_epoch; m->frame = m_frame; m->h = h; m->view_gen = memo_gen(); m->pool_gen = m_pool_gen;
             m->gxyz[0] = gx; m->gxyz[1] = gy; m->gxyz[2] = gz; m->nd = nd; memcpy(m->d, d, nd * 4);

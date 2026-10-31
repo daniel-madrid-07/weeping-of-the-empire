@@ -138,8 +138,14 @@ static void cover_monitor(HWND h, HMONITOR mon) {
     if (!GetMonitorInfoW(mon, &mi)) return;
     LONG style = GetWindowLongW(h, GWL_STYLE);
     SetWindowLongW(h, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+    // (SWP_NOACTIVATE: covering the monitor never takes the foreground; and only the window in front is raised: a display
+    // change or a recovery while the player is in another window, keeps its place in the z-order instead of a
+    // monitor-sized popup over his windows. The in-game paths, a mode switch from the options and exclusive's way back on
+    // activation, are in front: HWND_TOP)
+    const bool front = GetForegroundWindow() == h;
     SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
-                 mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+                 mi.rcMonitor.bottom - mi.rcMonitor.top,
+                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE | (front ? 0 : SWP_NOZORDER));
 }
 
 static bool g_applying;   // (window thread) apply_mode is moving / restyling the window: no recovery meanwhile

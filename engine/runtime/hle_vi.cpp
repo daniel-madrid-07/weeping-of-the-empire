@@ -372,6 +372,25 @@ static int load_fps(void) {   // the loading screen's rate, 0: off
 static std::atomic<bool> g_load_screen{false};
 extern "C" int vi_loading_screen(void) { return g_load_screen.load(std::memory_order_relaxed); }
 static std::atomic<int> g_unlock_ceil{120};
+// No pacing above this many frames a second, whatever the cap (TOTK_AUDIO_FPS_MAX=<fps>, default 180; 0: none). Each game
+// frame the game hands its audio commands to the audio thread as one CommandList in a ring of 16 (aal
+// AudioRendererController::calc, main+0x9c2ef0), and the audio thread takes one list per audio frame, 200 a second. Above
+// 200 game frames a second the ring fills; the game then drops the full list (its commands lost, the list leaked), and
+// within seconds the 16 lists are gone, the stream read requests with them: the new game's OpeningText narration stopped
+// after 14.6 s and the opening's event waited ~275 s at 240 fps (8 of 8 boots; 120, 60 and 30: 0 of 5, follow-up 4). 180:
+// a tenth under 200, so pacing jitter cannot creep the ring up. A stopgap until a hook on main+0x9c2ef0 keeps the list
+// when the ring is full. Only the game frames are held (vi_pace_wait's last step); DLSS-G's real frames are game frames
+// and under it anyway. A value below 30 counts as 30, one that is not a number as the default.
+static int audio_fps_max() {
+    static const int m = [] {
+        const char *e = getenv("TOTK_AUDIO_FPS_MAX");
+        char *end = nullptr;
+        const long v = e ? strtol(e, &end, 10) : 0;
+        if (!e || end == e) return 180;
+        return v <= 0 ? 0 : (int)std::min(std::max(v, 30L), 1000L);
+    }();
+    return m;
+}
 // The frame-rate setting, live. The environment at start (TOTK_FPS, TOTK_UNLOCK_FPS, TOTK_UNLOCK_STEADY, which
 // pc_settings.cpp fps_env writes from display.fps_cap) gives the first values; the row sets them again as it changes
 // (fps_apply -> vi_set_frame_rate), and every reader below takes them per frame. -1: not read yet (a set before the first
@@ -577,7 +596,13 @@ static void load_track(void) {
             const bool first = checked.time_since_epoch().count() == 0;
             checked = now;
             int hz = window_monitor_hz(), c = fixed ? fixed : hz ? std::min(std::max(hz, 60), 240) : 120;
-            if (first || c != g_unlock_ceil.load()) printf("[pace] unlocked: up to %d fps in gameplay (%s)\n", c, fixed ? "TOTK_UNLOCK_CEIL" : hz ? "the monitor's refresh" : "monitor refresh unknown");
+            // (the ceiling stays the monitor's: DLSS-G halves it and VRR steady starts from its margin; vi_pace_wait holds
+            // the game frames under audio_fps_max after those)
+            if (first || c != g_unlock_ceil.load()) {
+                char held[64] = "";
+                if (audio_fps_max() && c > audio_fps_max()) snprintf(held, sizeof held, "; game frames held at %d: TOTK_AUDIO_FPS_MAX", audio_fps_max());
+                printf("[pace] unlocked: up to %d fps in gameplay (%s%s)\n", c, fixed ? "TOTK_UNLOCK_CEIL" : hz ? "the monitor's refresh" : "monitor refresh unknown", held);
+            }
             g_unlock_ceil.store(c);
         }
         if (!rule) { g_gameplay.store(true); return; }
@@ -851,6 +876,7 @@ static void vi_pace_wait(int interval) {
         }
         if (on) fps = title_fps;
     }
+    if (audio_fps_max() && fps > audio_fps_max()) fps = audio_fps_max();   // (a TOTK_FPS or title rate above it; see audio_fps_max)
     // TOTK_WARMUP=1 (shader warm-up only, tools/linux/warmup.sh, 2026-10-17): the game is paced at 10 fps so its own threads
     // (and their share of the Steam Deck's power budget) go to the shader compile workers; only the title screen runs.
     // ("play now" on the warm-up screen ends this pacing: exec.c vk_precompile_play_now)

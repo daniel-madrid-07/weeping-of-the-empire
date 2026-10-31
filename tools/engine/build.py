@@ -90,10 +90,11 @@ GEN_CODEGEN = ['--simd', '--nanrun', '--vdirect', '--lso-abi', 'auto']
 # followers' ring sampled at 30 Hz of game time. 212b740 SelectorPouchPlayer's update: the inventory Link's tab debounce in game time. 1f61d6c QueryControllerGetStick's worker: the UI stick scaled to 30 Hz of game time for the AI
 # programs. 2833b60 ExecuteBlackboardSetToBase::updateImpl_: listed AI-program integrators step per 30 Hz of AI time. 200f61c 200f8b0 20147f4 27dcb98 the ChaseF32 / ChaseVec3f / LerpF32 / AddF32 calcs: listed easers / adders of
 # drawn values scaled by the step. 27b6e64 SeqOneShotPrintLoadLapTimeForPatrol's oneShot: the game's load lap labels logged with TOTK_LOAD_LAPS=1. 11276cc ares::System::initializeThreads: the resource loader thread count,
-# TOTK_LOADER_THREADS=<n> for the A/B. --vlocal: V registers in locals in these functions (stages 1-2; verified only on top of --vdirect; not `all`: the giant functions grow 20-60% in x86)
+# TOTK_LOADER_THREADS=<n> for the A/B. 9c2ef0 aal's per-frame command-list flush: a full game -> audio ring keeps the frame's commands instead of dropping them above 200 fps. --vlocal: V registers in locals in these functions
+# (stages 1-2; verified only on top of --vdirect; not `all`: the giant functions grow 20-60% in x86)
 GEN_MAIN = ['--hook', '7a83e4,f6092c,1a862e4,1a86420,1a85b3c,1a8604c,1a85e4c,83e3f8,1ccf894,'
             'b6afc8,75718c,18fb7d0,18fbf18,18fbf68,18fc0ac,279a77c,2798a1c,f15364,16e4728,8f689c,1cd0260,16e4610,f0fdec,1aa3e44,16e4b80,1d23614,a5f010,1d97648,1c17fb0,120ec94,9d8d00,212b740,1b7ba58,1aa6a94,1f61d6c,2833b60,200f61c,200f8b0,20147f4,27dcb98,1b3ebac,1a4f0ac,1c73fbc,1dbdcf0,'
-            '1a06840,1a068cc,704b7c,27b6e64,11276cc', *GEN_CODEGEN,
+            '1a06840,1a068cc,704b7c,27b6e64,11276cc,9c2ef0', *GEN_CODEGEN,
             '--vlocal', '260a970,317040,704b7c,10cfecc']
 GEN_SDK = ['--base', '0x7180000000', '--prefix', 's', '--plt-all', *GEN_CODEGEN]
 GEN_EXTRA = []         # --gen-args: gen.py flags added for both modules (e.g. --fz); join the key, game-var/

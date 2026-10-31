@@ -757,6 +757,19 @@ void vk_depth_twin_copy(VkCommandBuffer cb, TexBackend *b) {
     }
     VkBufferImageCopy rg[16];
     uint32_t nlv = b->levels < 16 ? b->levels : 16;
+    if (g_vk.maint8) {   // (VK_KHR_maintenance8: R32F -> D32 / R16 -> D16 in one image copy, no buffer round trip)
+        VkImageCopy ic[16];
+        for (uint32_t l = 0; l < nlv; l++)
+            ic[l] = (VkImageCopy){.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, b->layers}, .dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, l, 0, b->layers},
+                                  .extent = {level_w(b, l), level_h(b, l), 1}};
+        vk_full_barrier(cb);
+        vkCmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, nlv, ic);
+        vk_full_barrier(cb);
+        b->twin_valid = true;
+        if (++vk_twin_copies <= 4) LOG("[tex] depth twin copy #%llu: %ux%u fmt %d (image copy, maintenance8)\n", (unsigned long long)vk_twin_copies,
+                                       b->width, b->height, b->format);
+        return;
+    }
     for (uint32_t l = 0; l < nlv; l++)
         rg[l] = (VkBufferImageCopy){.bufferOffset = off[l], .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, b->layers},
                                     .imageExtent = {level_w(b, l), level_h(b, l), 1}};
@@ -902,6 +915,17 @@ bool renderer_texture_target_kind(NvnTexture *t, bool colour) {
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &dac_buf, &dac_buf_mem, NULL) != VK_SUCCESS) dac_buf = VK_NULL_HANDLE, n = dac_buf_size = 0;
         else dac_buf_size = n;
+    }
+    if (g_vk.maint8) {   // (VK_KHR_maintenance8: depth <-> matching colour in one image copy)
+        VkImageCopy ic[16];
+        for (uint32_t l = 0; l < lv; l++)
+            ic[l] = (VkImageCopy){.srcSubresource = {cur.aspect, l, 0, ly}, .dstSubresource = {b->aspect, l, 0, ly},
+                                  .extent = {w >> l ? w >> l : 1, h >> l ? h >> l : 1, 1}};
+        VkCommandBuffer cb = vk_cmd();
+        vk_full_barrier(cb);
+        vkCmdCopyImage(cb, cur.image, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, lv, ic);
+        vk_full_barrier(cb);
+        n = 0;
     }
     if (n) {
         VkBufferImageCopy rg[16];

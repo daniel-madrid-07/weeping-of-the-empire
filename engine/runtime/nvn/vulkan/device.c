@@ -550,6 +550,10 @@ static void create_device(void) {
     // (maxwell_vs_pointsize). Its feature bit is checked with the others below.
     g_vk.maint5 = has_ext(ep, ne, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     if (g_vk.maint5) ext[n_ext++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+    // VK_KHR_maintenance8: depth <-> matching colour copies in one vkCmdCopyImage (textures.c's depth twins and
+    // depth-format colour targets: one copy instead of image -> buffer -> image). LARECOMP_NO_MAINT8=1: off.
+    g_vk.maint8 = has_ext(ep, ne, VK_KHR_MAINTENANCE_8_EXTENSION_NAME) && !getenv("LARECOMP_NO_MAINT8");
+    if (g_vk.maint8) ext[n_ext++] = VK_KHR_MAINTENANCE_8_EXTENSION_NAME;
     vk_present_device_exts(ep, ne, ext, &n_ext);   // present.c: present id / wait, HDR metadata (when used)
     vk_ngx_device_exts(ep, ne, ext, &n_ext, 40);   // ngx.c: what DLSS asks for on this GPU (TOTK_DLSS only)
     free(ep);
@@ -572,8 +576,11 @@ static void create_device(void) {
     if (g_vk.gpl) { have_gpl.pNext = have13.pNext; have13.pNext = &have_gpl; }
     VkPhysicalDeviceMaintenance5FeaturesKHR have_m5 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
     if (g_vk.maint5) { have_m5.pNext = have13.pNext; have13.pNext = &have_m5; }
+    VkPhysicalDeviceMaintenance8FeaturesKHR have_m8 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+    if (g_vk.maint8) { have_m8.pNext = have13.pNext; have13.pNext = &have_m8; }
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
     if (g_vk.maint5 && !have_m5.maintenance5) { g_vk.maint5 = false; drop_ext(ext, &n_ext, VK_KHR_MAINTENANCE_5_EXTENSION_NAME); }
+    if (g_vk.maint8 && !have_m8.maintenance8) { g_vk.maint8 = false; drop_ext(ext, &n_ext, VK_KHR_MAINTENANCE_8_EXTENSION_NAME); }
     extern bool maxwell_vs_pointsize;
     maxwell_vs_pointsize = !g_vk.maint5;
     LOG("[vk] maintenance5: %s\n", g_vk.maint5 ? "on (unwritten point sizes are 1.0)" : "off: vertex shaders write gl_PointSize 1.0");
@@ -655,6 +662,8 @@ static void create_device(void) {
     if (vk_dyn_clamp) { eds3f.pNext = f13.pNext; f13.pNext = &eds3f; }
     VkPhysicalDeviceMaintenance5FeaturesKHR m5f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, .maintenance5 = VK_TRUE};
     if (g_vk.maint5) { m5f.pNext = f13.pNext; f13.pNext = &m5f; }
+    VkPhysicalDeviceMaintenance8FeaturesKHR m8f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR, .maintenance8 = VK_TRUE};
+    if (g_vk.maint8) { m8f.pNext = f13.pNext; f13.pNext = &m8f; }
     f13.pNext = vk_present_features(f13.pNext);
     // vendor binary = the driver's own GPU crash dump (NVIDIA 617: supported), saved by vk_device_fault_report
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,

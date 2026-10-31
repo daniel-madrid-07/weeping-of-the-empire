@@ -37,7 +37,8 @@ Experimental: the same PC settings as rows at the end of the game's own Options 
 sections and the keys: add the line env.TOTK_OPTIONS_MENU=1 at the end of player.txt.
 
 The frame rate starts at 120 (the original runs at 30). In F10 > Graphics you can choose 30, 60, 90, 120 or
-"Unlocked": no limit, up to your monitor's refresh rate (at most 240), with the game running at its right speed.
+"Unlocked": no limit, up to your monitor's refresh rate but at most 180 fps for now (above about 200 the game's own
+audio breaks), with the game running at its right speed.
 
 DLSS frame generation (NVIDIA RTX 40 series or newer, off by default, experimental) does not make the game itself
 faster: use it only when the game runs under 60 fps without it, on a monitor of 120 Hz or more, with the frame limit
