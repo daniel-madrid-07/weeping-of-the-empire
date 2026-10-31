@@ -113,6 +113,9 @@ RunLog g_drop_log{"dropped by the game on a full queue A (TOTK_AAL_CMD_HOLD=0)"}
 }  // namespace
 
 extern "C" u64 totk_aal_cmd_held(void) { return g_held.load(std::memory_order_relaxed); }
+// The hook ran (this key has gen.py --hook 9c2ef0) with its hold on: hle_vi.cpp's 180 fps hold is then not needed
+static std::atomic<bool> g_hook_seen{false};
+extern "C" bool totk_aal_cmd_hold_active(void) { return g_hook_seen.load(std::memory_order_relaxed) && hold_on(); }
 extern "C" u64 totk_aal_cmd_dropped(void) { return g_dropped.load(std::memory_order_relaxed); }
 
 #ifdef _WIN32
@@ -124,6 +127,7 @@ __attribute__((weak)) void f_9c2ef0_orig(Ctx *__restrict c);
 #endif
 
 void hook_f_9c2ef0(Ctx *__restrict c) {   // flush the frame's command list (x0: a pointer to the controller pointer)
+    if (!g_hook_seen.load(std::memory_order_relaxed)) g_hook_seen.store(true, std::memory_order_relaxed);
     const bool fast = game_fast();
     if (totk_ptr_ok(c->x[0])) {
         const u64 ctl = ld64(c->x[0]);

@@ -45,6 +45,8 @@ typedef struct {
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
     uint8_t a2c_dither;  // fragment (GLSL): alpha-to-coverage with dithering emulated, 1 sample; in what was padding:
                             // sizeof and the bytes of every key without it are unchanged (precompile records stay valid)
+    uint8_t snap_mark;      // fragment (GLSL): marks the 32x32 tile of every fragment it writes in the SMark buffer (exec.c
+                            // LARECOMP_SNAP_MARK: feedback snapshots copy only marked tiles); padding as a2c_dither
 } ShaderKey;
 
 typedef struct {
@@ -69,6 +71,7 @@ typedef struct {
     bool writes_gmem;       // STG / RED / ATOM present (its storage buffers go to the device window)
     bool uses_subgroup;     // warp ops (LANEID / lane masks, VOTE, SHFL, min-pc): exec.c requires 32-wide subgroups where it can
     bool uses_tint;         // fragment: reads the per-draw tint (buffer 19, float4[2]) applied to color target 0
+    bool uses_smark;        // fragment: ShaderKey.snap_mark's tile marks (buffer SMARK_BUFFER_INDEX)
     bool uses_rscale;       // reads the resolution-scale table (fragment/compute buffer 18): float4 [0] = render
                             // target scale, [1 + i] = allocation scale of texture i
     bool brx_blind;         // a BRX jump table could not be read (no compiler constants: precompile record without
@@ -103,6 +106,8 @@ extern bool maxwell_nvidia;  // NVIDIA's proprietary driver (device.c): per-prog
 // GDEV_BUFFER_INDEX, VRAM copies of the storage buffers shaders write (exec.c gdev_*: RED atomics into the
 // host-imported heap cost 77 of a 113 ms GPU frame).
 #define GDEV_BUFFER_INDEX 20
+// ShaderKey.snap_mark's tile marks: uint per 32x32 tile, 256 tiles a row (exec.c SMARK_*)
+#define SMARK_BUFFER_INDEX 24
 extern MAXWELL_TLS uint64_t maxwell_gdev_size;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).

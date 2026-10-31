@@ -100,7 +100,7 @@ static uint64_t stat_hazard_barriers;     // LARECOMP_BARRIERS=tracked: barriers
 static uint64_t stat_pass_barriers, stat_pass_nobarrier, stat_game_barriers, stat_game_barrier_breaks;
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies, stat_feedback_live, stat_depth_war, stat_fb_selfw, stat_fb_alias;
 static uint64_t stat_fb_selfreuse;
-static uint64_t stat_snap_delta, stat_snap_delta_px, stat_snap_delta_full_px;   // (LARECOMP_SNAP_DELTA: copies, their pixels, the whole images' pixels)
+static uint64_t stat_snap_delta, stat_snap_delta_px, stat_snap_delta_full_px, stat_snap_tiles_n;   // (LARECOMP_SNAP_DELTA: copies, their pixels, the whole images' pixels)
 static uint64_t stat_fbl_moves;   // (g_vk.fbl_layout: attachments moved to the feedback-loop layout for a pass)
 static uint64_t stat_oq_reports, stat_oq_hidden, stat_oq_visible_fallback;   // (occlusion queries: see oq_report)   // (LARECOMP_FEEDBACK_SELFCOPY=2: same-draw read + write copies not retaken, see resolve_feedback)
 static uint64_t stat_upload_bytes;
@@ -1049,9 +1049,10 @@ static VkDescriptorSet alloc_set_from(VkDescriptorPool *pools, int *npools, int 
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nsb},
                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
                                             {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024},
                                             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 32768}};
             VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8192,
-                                             .poolSizeCount = 6, .pPoolSizes = sizes};
+                                             .poolSizeCount = (uint32_t)(sizeof sizes / sizeof *sizes), .pPoolSizes = sizes};
             VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &pools[(*npools)++]));
         }
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1732,6 +1733,11 @@ const char *renderer_stats(void) {
         snprintf(stats_text + n, sizeof stats_text - n, ", snapshot deltas %llu (%.1f %% of their pixels copied)", (unsigned long long)stat_snap_delta,
                  stat_snap_delta_full_px ? 100.0 * (double)stat_snap_delta_px / (double)stat_snap_delta_full_px : 0.0);
         stat_snap_delta = stat_snap_delta_px = stat_snap_delta_full_px = 0;
+        if (stat_snap_tiles_n) {
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, ", by marked tiles %llu", (unsigned long long)stat_snap_tiles_n);
+            stat_snap_tiles_n = 0;
+        }
     }
     if (stat_fb_selfreuse) {
         size_t n = strlen(stats_text);
@@ -2411,6 +2417,124 @@ static int snap_delta_on(void) {
     if (on < 0) { const char *e = getenv("LARECOMP_SNAP_DELTA"); on = !e || strcmp(e, "0"); }
     return on;
 }
+// LARECOMP_SNAP_MARK=1 (with LARECOMP_SNAP_DELTA; off by default for now): the fragment shaders that read a target they write (the
+// self-write draws that need snapshots: G-buffer decals) get a variant marking the 32x32 tile of every fragment they write
+// (ShaderKey.snap_mark, SMark buffer: one uint per tile, cleared once a frame). A mirror whose every write since its copy was such
+// a draw takes a compute copy of the marked tiles instead of the scissor box: the decals cover a few % of the target, so the
+// retaken snapshots move a few % of their bytes. The marks of the whole frame are shared (every marked draw, every target): more
+// tiles than needed, never fewer. A variant not built yet, or any other draw into the image, falls back to the box.
+static int smark_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_SNAP_MARK"); on = snap_delta_on() && e && *e == '1'; if (on) LOG("[vk] feedback snapshots: marked tiles only (LARECOMP_SNAP_MARK)\n"); }
+    return on;
+}
+static uint64_t smark_fs[256];   // (fragment code addresses that wrote a mirrored image: the self-write draws and their neighbours)
+static int smark_nfs;
+static bool smark_fs_has(uint64_t code) {
+    for (int i = 0; i < smark_nfs; i++) if (smark_fs[i] == code) return true;
+    return false;
+}
+#define SMARK_ROWS 256
+#define SMARK_BYTES (256u * SMARK_ROWS * 4u)
+static VkBuffer smark_buf;
+static VmaAllocation smark_mem;
+static uint64_t smark_frame = ~0ull;
+static VkDescriptorBufferInfo smark_info(void) {
+    if (!smark_buf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = SMARK_BYTES,
+                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &smark_buf, &smark_mem, NULL));
+    }
+    return (VkDescriptorBufferInfo){smark_buf, 0, SMARK_BYTES};
+}
+// (begin_pass, outside the pass: the frame's first pass clears the marks, between full barriers)
+static void smark_frame_start(VkCommandBuffer cb) {
+    if (!smark_on() || smark_frame == vk_frame_counter()) return;
+    smark_frame = vk_frame_counter();
+    smark_info();
+    vk_full_barrier(cb);
+    vkCmdFillBuffer(cb, smark_buf, 0, SMARK_BYTES, 0);
+    vk_full_barrier(cb);
+}
+static VkPipeline smark_pipe[3];   // (texel 4, 8, 16 bytes)
+static VkPipelineLayout smark_pl;
+static VkDescriptorSetLayout smark_dsl;
+static VkPipeline smark_pipeline(int k) {
+    if (smark_pipe[k]) return smark_pipe[k];
+    if (!smark_dsl) {
+        VkDescriptorSetLayoutBinding b[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                             {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                             {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = b};
+        VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &smark_dsl));
+        VkPushConstantRange pc = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+        VkPipelineLayoutCreateInfo pl = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &smark_dsl,
+                                         .pushConstantRangeCount = 1, .pPushConstantRanges = &pc};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &pl, NULL, &smark_pl));
+    }
+    static const char *fmt[3] = {"r32ui", "rg32ui", "rgba32ui"};
+    char src[1024];
+    snprintf(src, sizeof src,
+             "#version 450\n"
+             "layout(local_size_x = 8, local_size_y = 8) in;\n"
+             "layout(set = 0, binding = 0) uniform usampler2D src_;\n"
+             "layout(set = 0, binding = 1, %s) uniform writeonly uimage2D dst_;\n"
+             "layout(std430, set = 0, binding = 2) readonly buffer M { uint m[]; } mk_;\n"
+             "layout(push_constant) uniform P { uint w, h; } pc_;\n"
+             "void main() {\n"
+             "  uvec2 t = gl_WorkGroupID.xy;\n"
+             "  if (mk_.m[min(t.y, 255u) * 256u + min(t.x, 255u)] == 0u) return;\n"
+             "  for (uint dy = 0u; dy < 4u; dy++)\n"
+             "    for (uint dx = 0u; dx < 4u; dx++) {\n"
+             "      uvec2 p = t * 32u + gl_LocalInvocationID.xy * 4u + uvec2(dx, dy);\n"
+             "      if (p.x < pc_.w && p.y < pc_.h) imageStore(dst_, ivec2(p), texelFetch(src_, ivec2(p), 0));\n"
+             "    }\n"
+             "}\n", fmt[k]);
+    size_t nw;
+    uint32_t *spv = vk_glsl_to_spirv(src, STAGE_COMPUTE, "snap_tiles", &nw);
+    if (!spv) return VK_NULL_HANDLE;
+    VkShaderModule m = vk_module(spv, nw);
+    free(spv);
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                                                .module = m, .pName = "main"},
+                                      .layout = smark_pl};
+    if (vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &smark_pipe[k]) != VK_SUCCESS) smark_pipe[k] = VK_NULL_HANDLE;
+    vkDestroyShaderModule(g_vk.dev, m, NULL);
+    return smark_pipe[k];
+}
+static int smark_kind(VkFormat f) {   // (the uint view a texel of f copies through; -1: not by tiles)
+    extern uint32_t vk_host_texel_bytes(VkFormat f);
+    uint32_t n = vk_host_texel_bytes(f);
+    return n == 4 ? 0 : n == 8 ? 1 : n == 16 ? 2 : -1;
+}
+// the marked tiles of src into dst (both GENERAL; after the caller's full barrier); false: not possible, copy otherwise
+static bool smark_copy(VkCommandBuffer cb, TexBackend *src, TexBackend *dst) {
+    static const VkFormat uf[3] = {VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32B32A32_UINT};
+    int k = smark_kind(src->format);
+    if (k < 0 || !(dst->usage & VK_IMAGE_USAGE_STORAGE_BIT)) return false;
+    VkPipeline pipe = smark_pipeline(k);
+    if (!pipe) return false;
+    static const VkComponentMapping id = {0};
+    VkImageView sv = vk_image_view(src, VK_IMAGE_VIEW_TYPE_2D, uf[k], 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageView dv = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, uf[k], 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!sv || !dv) return false;
+    VkDescriptorSet ds = vk_alloc_set(smark_dsl);
+    VkDescriptorImageInfo si = {vk_default_sampler(false), sv, VK_IMAGE_LAYOUT_GENERAL}, di = {VK_NULL_HANDLE, dv, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorBufferInfo bi = smark_info();
+    VkWriteDescriptorSet w[3] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &si},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &di},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 2, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi}};
+    vkUpdateDescriptorSets(g_vk.dev, 3, w, 0, NULL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, smark_pl, 0, 1, &ds, 0, NULL);
+    uint32_t pc[2] = {src->width, src->height};
+    vkCmdPushConstants(cb, smark_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, pc);
+    vkCmdDispatch(cb, (src->width + 31) / 32, (src->height + 31) / 32, 1);
+    return true;
+}
 static void snap_box_add(TexBackend *b, VkRect2D r) {
     if (!r.extent.width || !r.extent.height) return;
     int32_t x0 = r.offset.x, y0 = r.offset.y, x1 = x0 + (int32_t)r.extent.width, y1 = y0 + (int32_t)r.extent.height;
@@ -2920,6 +3044,7 @@ static void begin_pass(void) {
             }
     }
     pass_w = minw; pass_h = minh;
+    smark_frame_start(cb);   // (LARECOMP_SNAP_MARK)
     pd_n = 0;   // (LARECOMP_SNAP_DELTA: draw_ adds its scissor to these images' boxes)
     for (int i = 0; i <= st.rt.ncolor; i++) {
         NvnTexture *t = i < st.rt.ncolor ? st.rt.color[i] : st.rt.depth;
@@ -3969,14 +4094,14 @@ static uint32_t g_memo_gen;
 static Prog *get_program_slow(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey);
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
-    static struct { NvnProgram *np; uint64_t code[2]; uint32_t mask, gen; ShaderKey vkey; uint8_t rt[8], a2cd; Prog *p; } memo;
+    static struct { NvnProgram *np; uint64_t code[2]; uint32_t mask, gen; ShaderKey vkey; uint8_t rt[8], a2cd, smk; Prog *p; } memo;
     if (memo.p && memo.gen == g_memo_gen && memo.np == np && memo.code[0] == np->stages[0].code_addr &&
         memo.code[1] == np->stages[1].code_addr && memo.mask == np->stage_mask && !memcmp(&memo.vkey, vkey, sizeof *vkey) &&
-        !memcmp(memo.rt, fkey->rt_kind, 8) && memo.a2cd == fkey->a2c_dither)
+        !memcmp(memo.rt, fkey->rt_kind, 8) && memo.a2cd == fkey->a2c_dither && memo.smk == fkey->snap_mark)
         return memo.p;
     Prog *res = get_program_slow(np, vkey, fkey);
     memo.np = np; memo.code[0] = np->stages[0].code_addr; memo.code[1] = np->stages[1].code_addr; memo.mask = np->stage_mask;
-    memo.gen = g_memo_gen; memo.vkey = *vkey; memcpy(memo.rt, fkey->rt_kind, 8); memo.a2cd = fkey->a2c_dither; memo.p = res;
+    memo.gen = g_memo_gen; memo.vkey = *vkey; memcpy(memo.rt, fkey->rt_kind, 8); memo.a2cd = fkey->a2c_dither; memo.smk = fkey->snap_mark; memo.p = res;
     return res;
 }
 static Prog *get_program_slow(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
@@ -3986,6 +4111,7 @@ static Prog *get_program_slow(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) 
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
     if (fkey->a2c_dither) { h ^= 0xA2C0u; h *= 0x100000001B3ull; }
+    if (fkey->snap_mark) { h ^= 0x5A4Bu; h *= 0x100000001B3ull; }    // (LARECOMP_SNAP_MARK, likewise)
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
@@ -3995,7 +4121,7 @@ static Prog *get_program_slow(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) 
 #define GPS_ZONE(i) do { if (PROFD) { uint64_t n_ = prof_now(); gps_ns[i] += n_ - gz; gz = n_; } } while (0)
     // same code + keys under another address, or built ahead by the shader precompile: share that program
     uint64_t chash[2], cmax[2], ck = 0;
-    if (pc_on()) { pc_start(); ck = pc_prog_key(np, vkey, fkey, chash, cmax); }
+    if (pc_on() && !fkey->snap_mark) { pc_start(); ck = pc_prog_key(np, vkey, fkey, chash, cmax); }   // (pc_ckey has no snap_mark)
     GPS_ZONE(0);
     Prog *p = calloc(1, sizeof *p);
     for (int i = 0; i < 2; i++) {
@@ -5984,6 +6110,8 @@ static uint32_t snap_levels(TexBackend *src) {
 
 // Host texel bytes of the uncompressed colour formats an alias snapshot can be viewed in; 0 = not handled (resolve_feedback
 // then keeps the live read: a view of another texel size of the copy is invalid)
+static uint32_t host_texel_bytes(VkFormat f);
+uint32_t vk_host_texel_bytes(VkFormat f) { return host_texel_bytes(f); }
 static uint32_t host_texel_bytes(VkFormat f) {
     switch (f) {
     case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8_SRGB:
@@ -6027,9 +6155,9 @@ static TexBackend *snapshot_image(NvnTexture *t, TexBackend *src, bool mut) {
     if (!s) {
         // A new key takes the least recently used slot whose image already has the source's size / format / levels /
         // samples, so the image is reused, not reallocated: TotK re-creates its targets every frame (a new object each
-        // time), and the round robin below handed each one a slot of another size: full2.cap, 71 dedicated
-        // vkAllocateMemory + vkFreeMemory of 6.5 MB snapshots in 56 frames (render thread, NtGdiDdDDI*Allocation).
-        // Never a slot this draw already uses. LARECOMP_SNAP_REUSE=0: round robin only (old).
+        // time), and the round robin below handed each one a slot of another size, 71 dedicated vkAllocateMemory +
+        // vkFreeMemory of 6.5 MB snapshots in 56 frames (render thread, NtGdiDdDDI*Allocation). Never a slot this draw
+        // already uses. LARECOMP_SNAP_REUSE=0: round robin only (old).
         static int reuse = -1;
         if (reuse < 0) { const char *e = getenv("LARECOMP_SNAP_REUSE"); reuse = !e || strcmp(e, "0"); }
         // (LARECOMP_SNAP_DELTA: a slot that mirrored an image this frame goes last: taking it ends that mirror; a new slot first)
@@ -6055,8 +6183,11 @@ static TexBackend *snapshot_image(NvnTexture *t, TexBackend *src, bool mut) {
     }
     s->used = ++snap_clock; s->draw = snap_draw;
     TexBackend *d = &s->copy;
+    const bool smk = smark_on() && nlv == 1 && src->samples == 1 && smark_kind(src->format) >= 0 &&
+                     !(src->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
     if (d->image && (d->width != src->width || d->height != src->height || d->format != src->format || d->levels != nlv ||
-                     d->samples != src->samples || d->aspect != src->aspect || (mut && !s->mut))) {
+                     d->samples != src->samples || d->aspect != src->aspect || (mut && !s->mut) ||
+                     (smk && !(d->usage & VK_IMAGE_USAGE_STORAGE_BIT)))) {
         vk_views_forget(d);  // (resolution change, or a mutable image now needed)
         s->tag = 0;
         vk_defer_image(d->image, d->mem);
@@ -6069,9 +6200,14 @@ static TexBackend *snapshot_image(NvnTexture *t, TexBackend *src, bool mut) {
                                 .samples = (VkSampleCountFlagBits)src->samples, .tiling = VK_IMAGE_TILING_OPTIMAL,
                                 .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                 .flags = mut ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0};
+        if (smk) {   // (LARECOMP_SNAP_MARK: written through an r32ui / rg32ui / rgba32ui storage view by the tile copy)
+            ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+        }
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
-        s->mut = mut;
+        s->mut = mut || smk;
+        d->usage = ci.usage; d->cflags = ci.flags;
         d->format = src->format; d->width = src->width; d->height = src->height; d->depth = 1; d->layers = 1; d->levels = nlv;
         d->samples = src->samples; d->aspect = src->aspect; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
         vk_image_init_layout(vk_cmd(), d->image, d->aspect);
@@ -6418,6 +6554,7 @@ static void resolve_feedback(Prog *pr) {
             for (int k = 0; k < st.rt.ncolor; k++)
                 if (st.rt.color[k] == t && ((pr->fi->out_mask & st.channel_mask) >> (k * 4) & 0xF)) self_write_c = true;
             stat_fb_selfw += self_write_c;
+            if (self_write_c && smark_nfs < 256 && smark_on() && !smark_fs_has(pr->code[1])) smark_fs[smark_nfs++] = pr->code[1];   // (LARECOMP_SNAP_MARK)
             static int selfw_stats = -1;
             if (selfw_stats < 0) selfw_stats = getenv("LARECOMP_SELFW_STATS") && *getenv("LARECOMP_SELFW_STATS") == '1';
             if (self_write_c && selfw_stats) {
@@ -6584,8 +6721,10 @@ static void resolve_feedback(Prog *pr) {
                     src->snap_box[0], src->snap_box[1], src->snap_box[2], src->snap_box[3],
                     !delta && dshape && sn->tag && sn->tag == src->snap_tag && sn->mfrm == vk_frame_counter() ? " cause " : "",
                     !delta && dshape && sn->tag && sn->tag == src->snap_tag && sn->mfrm == vk_frame_counter() ? snap_nd_why : "");
+            const bool tiles = delta && drg.extent.width && smark_on() && src->smark_ok;   // (LARECOMP_SNAP_MARK)
             if (dshape) { sn->tag = src->snap_tag = ++snap_tagc; sn->mimg = src->image; sn->nd = snap_ndgen; sn->mfrm = vk_frame_counter(); }
             else sn->tag = 0;
+            src->smark_ok = true;
             src->snap_box[0] = src->snap_box[1] = src->snap_box[2] = src->snap_box[3] = 0;
             VkCommandBuffer cb = vk_cmd();
             // (one barrier for all of this draw's copies: between them only copies into other snapshot images were recorded,
@@ -6601,7 +6740,8 @@ static void resolve_feedback(Prog *pr) {
                 rg[l] = (VkImageCopy){.srcSubresource = {src->aspect, l, 0, 1}, .dstSubresource = {src->aspect, l, 0, 1},
                                       .extent = {w ? w : 1, h ? h : 1, 1}};
             }
-            if (delta) { if (drg.extent.width) vkCmdCopyImage(cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &drg); }
+            if (tiles && smark_copy(cb, src, dst)) stat_snap_tiles_n++;
+            else if (delta) { if (drg.extent.width) vkCmdCopyImage(cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &drg); }
             else vkCmdCopyImage(cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, nlv, rg);
             if (g_debug_frame && (src->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) {
                 static int nd;
@@ -8925,7 +9065,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     // (LARECOMP_SET_MEMO_FB, default on, =0 off: a draw with feedback reads (nfeedback) may hit too when all of its textures
     // came in pre-resolved (the fragment stage's pre_ii, compared below by bytes: fstc refills its version for such draws), so
     // the feedback views (live, snapshot) are part of the key; the vertex stage, resolving its own textures, still misses.
-    // t3_fight_t8b: ~43-55k fragment calls per 2-s window missed with the same set for "other", all feedback in full2)
+    // t3_fight_t8b: ~43-55k fragment calls per 2-s window missed with the same set for "other")
     static int memo_fb = -1;
     if (memo_fb < 0) { const char *e = getenv("LARECOMP_SET_MEMO_FB"); memo_fb = !(e && *e == '0'); }
     const bool fb_ok = !nfeedback || (memo_fb && npre && npre == si->ntex);
@@ -9032,7 +9172,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             if (PROFD) zc += prof_now() - c0;
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-            bi[n] = b->binding == GDEV_BUFFER_INDEX ? gdev_info()
+            bi[n] = b->binding == SMARK_BUFFER_INDEX ? smark_info() : b->binding == GDEV_BUFFER_INDEX ? gdev_info()
                   : b->binding >= GMEM_WIN_BUFFER_INDEX && b->binding < GMEM_WIN_BUFFER_INDEX + GMEM_WIN_MAX - 1
                   ? gmem_win_info((int)b->binding - GMEM_WIN_BUFFER_INDEX + 1) : gmem_info();
             w[n].pBufferInfo = &bi[n];
@@ -9539,6 +9679,7 @@ static void draw_(CmdRec *r, bool indexed) {
         for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i] && st.rt.color[i]->samples > 1) msaa = true;
         if (!msaa) a2c_dither = fkey.a2c_dither = 1;
     }
+    if (smark_nfs && smark_on() && smark_fs_has(st.program->stages[1].code_addr)) fkey.snap_mark = 1;   // (LARECOMP_SNAP_MARK)
     // One-shot bakes (3D volumes, BC volumes the game encodes on the GPU at load, and nothing redraws them) never skip:
     // program and pipeline are built / waited for (<= 3 s). Screen passes keep the async skip + held frame.
     // LARECOMP_BAKE_ASYNC=1: bakes skip like the rest (old).
@@ -9562,6 +9703,18 @@ static void draw_(CmdRec *r, bool indexed) {
     g_bake_sync = g_draw_bake || g_hold_force;
     g_prog_full_draw = r->x[2] <= 6;
     Prog *pr = get_program(st.program, &vkey, &fkey);
+    // (LARECOMP_SNAP_MARK: the program without the marks, asked for only when the variant or its pipeline is not ready,
+    // so a ready variant keeps get_program's one-entry memo)
+    bool smark_variant = false;
+    ShaderKey smark_fk0;
+    if (fkey.snap_mark) {
+        smark_fk0 = fkey;
+        smark_fk0.snap_mark = 0;
+        if (pr && atomic_load(&pr->state) == 2)   // (the variant failed: not asked for again)
+            for (int i = 0; i < smark_nfs; i++) if (smark_fs[i] == st.program->stages[1].code_addr) smark_fs[i] = smark_fs[--smark_nfs];
+        if (!pr || atomic_load(&pr->state) != 1) pr = get_program(st.program, &vkey, &smark_fk0);   // (built aside; drawn as before)
+        else smark_variant = true;
+    }
     if (ind_log() && pr && pr->vi && pr->fi && (pr->vi->writes_gmem || pr->fi->writes_gmem)) { ind_wdraw++; ind_note_writes(0); ind_note_writes(1); }
     g_prog_full_draw = false;
     g_bake_sync = false;
@@ -9970,6 +10123,7 @@ static void draw_(CmdRec *r, bool indexed) {
     // blend / colour / multisample / polygon / depth-clamp / target state. exec_list bumps g_pk_gen only when one of those commands changes its bytes
     // (TotK re-issues identical binds per draw), so a draw with the same program, class, pass and generation as the last one reuses its pipeline
     // without building, comparing and hashing the ~700-byte key. =2 builds the key anyway and counts draws where the fast path would have been wrong.
+smark_reselect:;
     static int pk_fast = -1;
     if (pk_fast < 0) { const char *e = getenv("LARECOMP_PK_FAST"); pk_fast = e ? atoi(e) : 1; if (pk_fast) LOG("[vk] pipeline-key fast path %d\n", pk_fast); }
     static struct { Pipe *pp; Prog *pr; uint64_t gen; uint32_t mgen, ncolor, samples; uint8_t cls; VkFormat color[8], depth, stencil; VkImageAspectFlags fbl; } pkf;
@@ -10126,6 +10280,11 @@ pipe_known:;
     // "[pipeskip]" (first 300): why a skipped pipeline was not fast-linked, then how long its draws were missing. Frames with
     // <= LARECOMP_HOLD_MIN such skips are shown (user's free play 2026-10-20 07:31: 39 shown frames, "buildings disappear").
     static int ps_log;
+    if (atomic_load(&pp->state) != 1 && smark_variant) {   // (LARECOMP_SNAP_MARK: no skip for it)
+        smark_variant = false;
+        Prog *p0 = get_program(st.program, &vkey, &smark_fk0);
+        if (p0 && atomic_load(&p0->state) == 1) { pr = p0; goto smark_reselect; }
+    }
     if (atomic_load(&pp->state) != 1) {
         stat_skipped++; stat_skip_why[4]++;
         if (atomic_load(&pp->state) == 0) {
@@ -10475,6 +10634,15 @@ pipe_known:;
     apply_scissor();
     VkRect2D pe_sc = scissor_rect();   // (vp_exact split: the game's scissor, which every part is clipped to)
     for (int k = 0; k < pd_n; k++) if (pd_b[k]->snap_tag) snap_box_add(pd_b[k], pe_sc);   // (LARECOMP_SNAP_DELTA)
+    if (!pr->fi->uses_smark && pd_n) {   // (LARECOMP_SNAP_MARK: a write it did not mark; its variant from the next sight on)
+        for (int k = 0; k < pd_n; k++) pd_b[k]->smark_ok = false;
+        // (LARECOMP_SNAP_MARK_LEARN=1: every writer of a mirrored image gets the variant too: snapshots 1.25 -> 2.3-3.6 ms and the
+        // draws +1-6 ms (storage stores in the G-buffer fill shaders, the frame's marks near full), so off: only the self-write shaders
+        // mark, 1.25 -> 0.83 ms)
+        static int learn = -1;
+        if (learn < 0) { const char *e = getenv("LARECOMP_SNAP_MARK_LEARN"); learn = e && *e == '1'; }
+        if (learn && smark_on() && smark_nfs < 256 && !smark_fs_has(pr->code[1])) smark_fs[smark_nfs++] = pr->code[1];
+    }
     {   // (a draw with image stores writes images outside its pass: no mirror holds after it)
         static Prog *ilast;
         static bool iimg;
@@ -11936,8 +12104,8 @@ static void ind_note_writes(int stage) {   // (a writing draw / dispatch: every 
         if (st.sbuf[stage][i].addr && st.sbuf[stage][i].size) { ind_w[ind_nw].lo = st.sbuf[stage][i].addr; ind_w[ind_nw++].hi = st.sbuf[stage][i].addr + st.sbuf[stage][i].size; }
 }
 static void ind_note_indirect(int kind, uint64_t addr) {   // (0 DrawElementsIndirect, 1 DrawArraysIndirect, 2 DispatchComputeIndirect)
-    // (always: the first of each kind is logged, as the stubs are; full2 and drs1 hold none, so they are dropped, not
-    // executed, until a scene shows one)
+    // (always: the first of each kind is logged, as the stubs are, so they are dropped, not executed, until a scene shows
+    // one)
     static bool told[3];
     if (!told[kind]) { told[kind] = true; LOG("[nvn] %s at %llx: not executed\n", kind == 0 ? "DrawElementsIndirect" : kind == 1 ? "DrawArraysIndirect" : "DispatchComputeIndirect", (unsigned long long)addr); }
     if (!ind_log()) return;

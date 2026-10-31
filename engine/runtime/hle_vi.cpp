@@ -372,24 +372,32 @@ static int load_fps(void) {   // the loading screen's rate, 0: off
 static std::atomic<bool> g_load_screen{false};
 extern "C" int vi_loading_screen(void) { return g_load_screen.load(std::memory_order_relaxed); }
 static std::atomic<int> g_unlock_ceil{120};
-// No pacing above this many frames a second, whatever the cap (TOTK_AUDIO_FPS_MAX=<fps>, default 180; 0: none). Each game
-// frame the game hands its audio commands to the audio thread as one CommandList in a ring of 16 (aal
-// AudioRendererController::calc, main+0x9c2ef0), and the audio thread takes one list per audio frame, 200 a second. Above
-// 200 game frames a second the ring fills; the game then drops the full list (its commands lost, the list leaked), and
-// within seconds the 16 lists are gone, the stream read requests with them: the new game's OpeningText narration stopped
-// after 14.6 s and the opening's event waited ~275 s at 240 fps (8 of 8 boots; 120, 60 and 30: 0 of 5, follow-up 4). 180:
-// a tenth under 200, so pacing jitter cannot creep the ring up. A stopgap until a hook on main+0x9c2ef0 keeps the list
-// when the ring is full. Only the game frames are held (vi_pace_wait's last step); DLSS-G's real frames are game frames
-// and under it anyway. A value below 30 counts as 30, one that is not a number as the default.
+// No pacing above this many frames a second, whatever the cap (TOTK_AUDIO_FPS_MAX=<fps>; 0: none), on a key without the
+// aal hold. Each game frame the game hands its audio commands to aal's AudioRenderer thread as a CommandList, taking a
+// fresh one from a pool of 16; the audio thread returns one per 5 ms audio frame. Above 200 game frames a second the game
+// takes every returned list first, the pool sits empty, and aal's jam watchdog (main+0x21ef964, from
+// AudioRendererController::calc once a game frame) counts the starved frames: 300 in a row (10 s at the Switch's 30, 1.25
+// s at 240) switch the stream request pool off for good. The stream reads stop; the new game's OpeningText narration
+// stopped and its opening held the fade ~275 s. The fix is the hold in totk_aal_commands.cpp (hook 9c2ef0: the game's
+// flush waits while the audio thread is short of lists), so once that hook has run with its hold on the default here is
+// off (240 at 240 Hz again). Without it (a key without --hook 9c2ef0, TOTK_AAL_CMD_HOLD=0) the default is 180, a tenth
+// under 200 (main 9e9a97e2). An explicit TOTK_AUDIO_FPS_MAX applies either way. Only the game frames are held
+// (vi_pace_wait's last step); DLSS-G's real frames are game frames and under it anyway. A value below 30 counts as 30,
+// one that is not a number as the default.
+extern "C" bool totk_aal_cmd_hold_active(void);   // totk_aal_commands.cpp
 static int audio_fps_max() {
     static const int m = [] {
         const char *e = getenv("TOTK_AUDIO_FPS_MAX");
         char *end = nullptr;
         const long v = e ? strtol(e, &end, 10) : 0;
-        if (!e || end == e) return 180;
+        if (!e || end == e) return -180;   // (the default: negative, so the aal hold can lift it)
         return v <= 0 ? 0 : (int)std::min(std::max(v, 30L), 1000L);
     }();
-    return m;
+    if (m >= 0) return m;
+    if (!totk_aal_cmd_hold_active()) return -m;
+    static bool told;   // (the unlocked line may have said "held at 180" before the hook's first call, at the title)
+    if (!told) { told = true; printf("[pace] the aal hold is on (hook 9c2ef0): game frames no longer held at %d\n", -m); }
+    return 0;
 }
 // The frame-rate setting, live. The environment at start (TOTK_FPS, TOTK_UNLOCK_FPS, TOTK_UNLOCK_STEADY, which
 // pc_settings.cpp fps_env writes from display.fps_cap) gives the first values; the row sets them again as it changes

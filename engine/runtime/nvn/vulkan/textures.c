@@ -2442,6 +2442,11 @@ VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uin
     prof_views_created++;
     VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = b->image, .viewType = type,
                                 .format = fmt, .components = sw, .subresourceRange = {aspect, lv0, nlv, ly0, nly}};
+    // (an EXTENDED_USAGE image with storage, exec.c's snapshot copies: a view in a format without storage is sampled only)
+    VkImageViewUsageCreateInfo vu = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = b->usage & ~VK_IMAGE_USAGE_STORAGE_BIT};
+    if ((b->cflags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) && (b->usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+        fmt != VK_FORMAT_R32_UINT && fmt != VK_FORMAT_R32G32_UINT && fmt != VK_FORMAT_R32G32B32A32_UINT)
+        vi.pNext = &vu;
     VkImageView v;
     uint64_t v0 = __rdtsc();
     VkResult vr = vkCreateImageView(g_vk.dev, &vi, NULL, &v);

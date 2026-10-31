@@ -33,10 +33,11 @@ keys. [Read LEGAL.md](LEGAL.md).
    administrator rights needed).
 2. **Drop in your files:** your dump of the game, version 1.0.0 (`.nsp` or `.xci`), and your `prod.keys`. Pick a
    folder on an NTFS drive with about 75 GB free and press **Install**.
-3. **Wait, then play.** Setup downloads the tools it needs, decrypts and recompiles the game on your PC, and puts a
-   shortcut on your desktop. Our full install took about 33 minutes on a 16-thread CPU with 62 GB of RAM while
-   other work was running, and its folder peaked at about 39 GB (Setup asks for 75 GB to be safe); other PCs will
-   vary. If it stops, press Install again and it continues where it stopped.
+3. **Wait, then play.** Setup downloads the tools it needs and our optimisation profile (made by running the game on
+   our PC: function names and how often their branches ran; see [LEGAL.md](LEGAL.md)), decrypts and recompiles the
+   game on your PC, and puts a shortcut on your desktop. Our full install took about 33 minutes on a 16-thread CPU with
+   62 GB of RAM while other work was running, and its folder peaked at about 39 GB (Setup asks for 75 GB to be safe);
+   other PCs will vary. If it stops, press Install again and it continues where it stopped.
 
 Optional: your console's firmware, for its own Korean and Chinese fonts. Without it, Korean and Chinese text uses a
 Windows font for that language, or English on a Windows that has none.
@@ -57,9 +58,6 @@ rates. A developer build from October 2026, the developer's everyday settings.
 | Castle area, rain | 3840x2160 | 119.2 / 107 | 151.0 / 94 |
 | Field camp fight | 3840x2160 | 114.1 / 83 (a second run: 100.1 / 67) | 97.4 / 64 |
 
-The unlocked runs were measured before the 180 fps limit below; today unlocked is held at 180, so the Depths'
-198.6 is not reachable.
-
 - **Video memory:** peak 5.07 GB at 2560x1440 and 6.17 GB at 3840x2160 (castle rain, unlocked). This was measured
   with another program holding 7.9 GB of the 16 GB card to stand in for an 8 GB card; the frame rate there was
   114.6 fps, 1 % low 37 (2560x1440) and 96.8 fps, 1 % low 26 (3840x2160); the lows come from a partly warm shader
@@ -69,17 +67,17 @@ The unlocked runs were measured before the 180 fps limit below; today unlocked i
 - **Stutter:** the first visit to a place or a fight can hitch while its shaders are built (from an empty cache: 17
   hitches, median 96 ms, worst 997 ms). Built shaders stay in the cache on disk for later visits.
 
-**Not measured yet:** builds made by Setup from this public tree (they lack some of the developer build's
-optimisations: a profile-guided compile and a shader cache seed, so expect the same or lower numbers); dedicated AMD
-and Intel graphics cards (AMD so far: one integrated GPU, see the FAQ); any CPU other than the one above; a real 8 GB
-card; laptops. Your numbers are welcome: use the
+**Not measured yet:** builds made by Setup from this public tree (they use the same optimisation profile but lack
+the developer build's shader cache seed, so expect the same or lower numbers); dedicated AMD and Intel graphics cards
+(AMD so far: one integrated GPU, see the FAQ); any CPU other than the one above; a real 8 GB card; laptops. Your
+numbers are welcome: use the
 [performance report](https://github.com/daniel-madrid-07/weeping-of-the-empire/issues/new?template=performance.yml).
 
 ## Features
 
 | | |
 |---|---|
-| **Frame rate** | 30, 60, 90, 120 or unlocked (at most 180 fps for now, see below), with the game running at its real speed |
+| **Frame rate** | 30, 60, 90, 120 or unlocked (up to your monitor's refresh rate, 240 fps at most), with the game running at its real speed |
 | **Display** | Any window size and render resolution, ultrawide, borderless or exclusive fullscreen, VRR, HDR |
 | **Upscaling** | NVIDIA DLSS super resolution and frame generation on RTX cards (optional), FSR 1, SMAA |
 | **Controls** | Keyboard and mouse made for a PC, with keyboard and mouse glyphs in the game's prompts; Xbox, PlayStation and Switch controllers |
@@ -94,9 +92,6 @@ generation) are options.
 
 - Only version **1.0.0** of the game is supported.
 - **Windows 10 / 11** only. Linux and Steam Deck are not supported or tested.
-- **Unlocked runs at most 180 fps for now.** Above about 200 frames a second the game's own audio breaks (its audio
-  commands overflow and get lost, which also caused a long black screen on a new game), so every frame above 180 is
-  held back. The F10 window still describes "Unlocked" as up to your monitor's refresh rate; 180 is the real ceiling.
 - First visits can stutter while shaders are built (above).
 - Some visual differences from the Switch remain, among them lighting in parts of the Depths. Known problems are in
   [Issues](https://github.com/daniel-madrid-07/weeping-of-the-empire/issues).

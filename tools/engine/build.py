@@ -182,7 +182,7 @@ VARIANT = {}  # --opt / --march / --pgo / --lto: game-object compile variants; j
 # --package: the play package's variant. PGO with the profile of training boots pgo_main_world + pgo_main_newgame
 # (2026-10-25, key 9405618d instrumented on main 7967437; quiet pairs on 6d99968: -11.9% game+render vs -O2; before:
 # 8f530723, 2bae7916), stored in <work>/engine/pgo/; portable x86-64-v3 kept (znver5 did not win)
-PACKAGE = {'pgo': '5489cce62deb7b93'}
+PACKAGE = {'pgo': '855fd396bdf75b97'}
 NOLINES = False        # --no-line-tables: game objects without -gline-tables-only (80% of an object's bytes, 11% of its
                        # compile time; the same code: tu_050's disassembly, relocations and symbols are identical)
 GEN_SHARES = {'main': 5, 'sdk': 1}  # with --split: gen.py processes per module (6 at once

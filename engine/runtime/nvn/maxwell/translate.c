@@ -2751,6 +2751,12 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     if (c->uses_d16q)   // (rscale[1 + i].z: texture i is D16, exec.c stage_set)
         sp(&s, "float d16q(float r, int i) { return rscale[1 + i].z != 0.0f ? floor(clamp(r, 0.0f, 1.0f) * 65535.0f + 0.5f) / 65535.0f : r; }\n");
+    // exec.c LARECOMP_SNAP_MARK: the variant of a fragment shader that also marks the tiles it writes (feedback snapshots)
+    const bool smark = stage == STAGE_FRAGMENT && !dbg && key && key->snap_mark && c->glsl;
+    if (smark) {
+        sp(&s, "layout(std430, set = %d, binding = %d) writeonly buffer SMark { uint m[]; } smark_;\n", set, SMARK_BUFFER_INDEX);
+        info->uses_smark = true;
+    }
     bool tint = stage == STAGE_FRAGMENT && !dbg && (c->omap_target & 0x7) == 0x7 && (!key || key->rt_kind[0] == 0);
     if (tint) {
         sp(&s, "layout(std140, set = %d, binding = 19) uniform Tint { vec4 ltint[2]; };\n", set);
@@ -2922,6 +2928,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                    "    if (((0xfbb99110u >> ((q_ << 2) | xy_)) & 1u) == 0u) discard; }\n");
             c->info->uses_discard = true;
         }
+        // (after every discard: a fragment that reaches here writes its targets; a later depth / stencil failure only
+        // over-marks, which copies more, never less)
+        if (smark) sp(&s, "  smark_.m[min(uint(gl_FragCoord.y) >> 5u, 255u) * 256u + min(uint(gl_FragCoord.x) >> 5u, 255u)] = 1u;\n");
         if (any_branch && getenv("LARECOMP_GUARD_VIS"))
             for (int rt = 0; rt < 8; rt++)
                 if (((c->omap_target >> (rt * 4)) & 0xF) && !(key && key->rt_kind[rt])) {

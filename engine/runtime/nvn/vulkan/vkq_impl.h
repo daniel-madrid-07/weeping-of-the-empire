@@ -12,7 +12,7 @@ enum {
     QOP_VIEWPORT, QOP_SCISSOR, QOP_BLENDC, QOP_DBIAS, QOP_DBIAS_EN, QOP_DTEST, QOP_DWRITE, QOP_DCMP, QOP_STEST, QOP_SOP, QOP_SCMASK,
     QOP_SWMASK, QOP_SREF, QOP_CULL, QOP_FRONT, QOP_TOPO, QOP_RESTART, QOP_BEGINR, QOP_ENDR, QOP_BARRIER, QOP_CPBUF, QOP_CPIMG,
     QOP_CPB2I, QOP_CPI2B, QOP_BLIT, QOP_RESOLVE, QOP_CLRCOL, QOP_CLRDS, QOP_CLRATT, QOP_QRESET, QOP_TS, QOP_FBL, QOP_SUBMIT,
-    QOP_SETW, QOP_QBEGIN, QOP_QEND, QOP_MARK
+    QOP_SETW, QOP_QBEGIN, QOP_QEND, QOP_MARK, QOP_FILL
 };
 typedef struct { uint32_t op, size; VkCommandBuffer cb; } QHdr;   // size: whole record, header included
 static uint8_t *q_buf;
@@ -302,6 +302,11 @@ void q_vkCmdCopyBuffer(VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n, c
     if (!vkq_enabled()) { (vkCmdCopyBuffer)(cb, s, d, n, r); return; }
     QEXTRA(QOP_CPBUF, cb, QCopy, n * sizeof *r + 8); a->src = (uint64_t)s; a->dst = (uint64_t)d; a->n = n; QCOPY(a->r, r, n * sizeof *r); q_commit();
 }
+typedef struct { VkBuffer b; VkDeviceSize off, size; uint32_t v; } QFill;
+void q_vkCmdFillBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, VkDeviceSize size, uint32_t v) {
+    if (!vkq_enabled()) { (vkCmdFillBuffer)(cb, b, off, size, v); return; }
+    QREC(QOP_FILL, cb, QFill); a->b = b; a->off = off; a->size = size; a->v = v; q_commit();
+}
 void q_vkCmdCopyImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageCopy *r) {
     if (!vkq_enabled()) { (vkCmdCopyImage)(cb, s, sl, d, dl, n, r); return; }
     QEXTRA(QOP_CPIMG, cb, QCopy, n * sizeof *r + 8);
@@ -547,6 +552,7 @@ static void q_exec(const QHdr *h) {
     case QOP_MARK: { const QMark *a = p; a->fn(cb, a->st, a->buf, a->off, a->v); break; }
     case QOP_SUBMIT: q_submit((const QSub *)p); break;
     case QOP_SETW: q_setw((const QSetW *)p); break;
+    case QOP_FILL: { const QFill *a = p; (vkCmdFillBuffer)(cb, a->b, a->off, a->size, a->v); break; }
     default: FATAL("[vkq] bad record op %u\n", h->op);
     }
 }

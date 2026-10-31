@@ -41,6 +41,7 @@ void q_vkCmdBeginRendering(VkCommandBuffer, const VkRenderingInfo *);
 void q_vkCmdEndRendering(VkCommandBuffer);
 void q_vkCmdPipelineBarrier2(VkCommandBuffer, const VkDependencyInfo *);
 void q_vkCmdCopyBuffer(VkCommandBuffer, VkBuffer, VkBuffer, uint32_t, const VkBufferCopy *);
+void q_vkCmdFillBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, uint32_t);
 void q_vkCmdCopyImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, uint32_t, const VkImageCopy *);
 void q_vkCmdCopyBufferToImage(VkCommandBuffer, VkBuffer, VkImage, VkImageLayout, uint32_t, const VkBufferImageCopy *);
 void q_vkCmdCopyImageToBuffer(VkCommandBuffer, VkImage, VkImageLayout, VkBuffer, uint32_t, const VkBufferImageCopy *);
@@ -90,6 +91,7 @@ void q_mark(PFN_vkCmdWriteBufferMarkerAMD fn, VkCommandBuffer cb, VkPipelineStag
 #define vkCmdEndRendering(...) q_vkCmdEndRendering(__VA_ARGS__)
 #define vkCmdPipelineBarrier2(...) q_vkCmdPipelineBarrier2(__VA_ARGS__)
 #define vkCmdCopyBuffer(...) q_vkCmdCopyBuffer(__VA_ARGS__)
+#define vkCmdFillBuffer(...) q_vkCmdFillBuffer(__VA_ARGS__)
 #define vkCmdCopyImage(...) q_vkCmdCopyImage(__VA_ARGS__)
 #define vkCmdCopyBufferToImage(...) q_vkCmdCopyBufferToImage(__VA_ARGS__)
 #define vkCmdCopyImageToBuffer(...) q_vkCmdCopyImageToBuffer(__VA_ARGS__)

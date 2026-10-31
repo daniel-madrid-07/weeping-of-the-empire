@@ -354,6 +354,48 @@ def mark(marker, inputs):
         json.dump(inputs, f, indent=1)
 
 
+# The release's profile (PGO): made on the release PC by playing the game (tools/engine/pgo_train.py), a release asset,
+# never in the repository. The compile uses it (-fprofile-use) where the code still matches the training; without it
+# (--no-pgo, no network, a bad checksum) the build is the plain -O2 one. Pinned per source version: the profile belongs
+# to the code it was trained on. None: this source has no published profile (no download, no log line): -O2.
+PGO = dict(tag='v0.1.5', name='855fd396bdf75b97.profdata', size=56037960,
+           sha256='855fd396bdf75b9724a00c30786069f43b1efcd26be50348dda31a594eb3a6c8')
+# its training record: the hashes of the parts it was trained on (build.py's log says how many have changed since) and
+# "runtime": true, which makes build.py compile the runtime with the profile too (pgo_rt: it joins the key). Without
+# the record the game objects still get the profile, the runtime does not
+PGO_RECORD = dict(tag='v0.1.5', name='855fd396bdf75b97.json', size=889,
+                  sha256='3f98fcde299a65f789a18abed30f2bcf2d4268bff15ed705c96080b0382a28c8')
+PGO_URL = 'https://github.com/daniel-madrid-07/weeping-of-the-empire/releases/download/{tag}/{name}'
+
+
+def pgo_args(work, off, dry):
+    """['--pgo', <the profile>] for build.py game / key, [] to build without one (said in the log)"""
+    if not PGO:
+        return []
+    if off:
+        say('profile (PGO): off (--no-pgo): plain -O2')
+        return []
+    dest = os.path.join(work, 'engine', 'pgo', PGO['name'])   # (build.py's own name for it: <sha16>.profdata)
+    if dry:
+        return ['--pgo', dest]
+    import toolchain
+    try:
+        toolchain.download('the release\'s profile (PGO)', PGO_URL.format(**PGO), dest, PGO['sha256'], PGO['size'])
+    except Exception as e:   # (any failure: a network error, a full disk... never stops the build)
+        say(f'profile (PGO): not used ({e}); the build goes on without it, plain -O2 (a little slower in play)')
+        return []
+    if not PGO_RECORD:
+        return ['--pgo', dest]
+    try:
+        toolchain.download('the profile\'s training record', PGO_URL.format(**PGO_RECORD),
+                           os.path.join(os.path.dirname(dest), PGO_RECORD['name']), PGO_RECORD['sha256'],
+                           PGO_RECORD['size'])
+    except Exception as e:
+        say(f'profile (PGO): no training record ({e}): the game code gets the profile, the runtime does not (it '
+            'builds at plain -O2)')
+    return ['--pgo', dest]
+
+
 def newest_package(out):
     folders = sorted((d for d in glob.glob(os.path.join(out, 'TotK-PC-*')) if os.path.isdir(d) and not d.endswith('.tmp')),
                      key=os.path.getmtime)
@@ -390,6 +432,8 @@ def main(argv=None):
     ap.add_argument('--until', choices=('tools', 'extract', 'romfs'),
                     help=f'stop after this step (romfs: only the game files, about {EXTRACT_GB} GB)')
     ap.add_argument('--dry-run', action='store_true', help='check the inputs and print the steps, build nothing')
+    ap.add_argument('--no-pgo', action='store_true',
+                    help='build without the release\'s profile (PGO): plain -O2, a little slower in play')
     ap.add_argument('--cpu', choices=['auto', 'v3', 'v2'], default='auto',
                     help='the processor level to build for: auto = this PC (v3 with AVX2, else v2); v2 also runs on '
                          'processors without AVX2, slower')
@@ -506,9 +550,10 @@ def main(argv=None):
     march = ['--march', 'x86-64-v2'] if cpu == 'v2' else []   # (the same flag to game and key: it joins the key)
     say(f'processor level: {cpu}' + (' (no AVX2 here: the build runs on this processor, slower than an AVX2 one)'
                                     if cpu == 'v2' and a.cpu == 'auto' else ''))
-    run(f'5/{n} build', [py, build, 'game', '--patches', patches, '--jobs', str(game_jobs), '--jobs-rt', str(rt_jobs)] + march,
-        env, a.dry_run)
-    k = run(f'5/{n} build', [py, build, 'key', '--patches', patches] + march, env, a.dry_run, quiet=True)
+    variant = march + pgo_args(work, a.no_pgo, a.dry_run)   # (both join the key: game and key get the same)
+    run(f'5/{n} build', [py, build, 'game', '--patches', patches, '--jobs', str(game_jobs), '--jobs-rt', str(rt_jobs)]
+        + variant, env, a.dry_run)
+    k = run(f'5/{n} build', [py, build, 'key', '--patches', patches] + variant, env, a.dry_run, quiet=True)
     key = '<key>' if a.dry_run else result(k)['key']
     # 6. the game-patch sets the Options menu switches between (grass / shadow / fog distance, texture cache, output
     #    and aspect sizes, fast travel): every value its sliders offer, as on the release PC

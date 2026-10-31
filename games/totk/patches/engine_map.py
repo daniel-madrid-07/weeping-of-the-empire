@@ -69,7 +69,9 @@ HOOK_GROUPS = (
      (0xb6afc8, 0x75718c, 0x18fb7d0, 0x18fbf18, 0x18fbf68, 0x18fc0ac, 0x279a77c, 0x2798a1c)),
 )
 HOOK_FREE = {0x704b7c: 'submesh cull (speed)', 0x27b6e64: 'load lap labels (diagnostic)',
-             0x11276cc: 'loader thread count (A/B)'}
+             0x11276cc: 'loader thread count (A/B)',
+             0x9c2ef0: 'aal flush hold: without it the runtime keeps its 180 fps hold (hle_vi audio_fps_max), under the '
+                       '200 where the jam watchdog cuts audio'}
 
 
 def hook_policy(kept, hooks):

@@ -124,6 +124,7 @@ typedef struct TexBackend {
     uint64_t snap_tag;       // exec.c LARECOMP_SNAP_DELTA: the feedback snapshot that mirrors this image (0: none), and the box
     int32_t snap_box[4];     // draws wrote in it since (level 0, x0 y0 x1 y1; empty when x1 <= x0)
     bool preuploaded;        // preupload.c: uploaded on the loading screen; its first real use checks it (upload_texture_)
+    bool smark_ok;           // exec.c LARECOMP_SNAP_MARK: every draw into it since that copy marked its tiles
 } TexBackend;
 VkImageView vk_depth_twin_view(TexBackend *b, const NvnTextureView *v, bool has_view, int textype);  // textures.c: twin view once filled
 bool vk_depth_twin_stale(TexBackend *b);  // textures.c: b is compare-sampled through a twin that needs a copy now (outside a pass)
