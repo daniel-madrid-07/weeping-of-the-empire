@@ -1,0 +1,47 @@
+name: Bug report
+description: Something is wrong in the game or in the build.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One problem per issue. Never attach or link game files, keys, firmware, saves with personal data, or a built game folder: such issues are closed and the attachment deleted.
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where does it happen?
+      options:
+        - Build (Setup / Builder)
+        - Start-up (before the title screen)
+        - In game
+        - Settings (F10) / controls
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens, and what did you expect?
+      description: Steps to see it, where in the game, and how often. A screenshot helps.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release or commit you built (the launcher's README.txt and `git log -1` show it).
+    validations:
+      required: true
+  - type: textarea
+    id: pc
+    attributes:
+      label: PC
+      description: CPU, GPU and driver version, RAM, Windows version, display resolution.
+      placeholder: "Ryzen 7 5800X, RTX 3070 (driver 566.36), 32 GB, Windows 11 24H2, 2560x1440"
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Attach the log file from the game folder (it has no keys in it). For a build problem, the last 50 lines of the Builder's output.
+      render: text

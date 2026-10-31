@@ -1,0 +1,520 @@
+#version 450
+// ASTC LDR 2D -> RGBA8 on the GPU. Bit-exact port of engine/runtime/nvn/astc.c (astc_decode_block, itself bit-exact
+// with ARM astcenc decode_unorm8): endpoints expand to 16 bits (linear v * 257, sRGB v << 8 | 0x80), texel =
+// (e0 * (64 - w) + e1 * w + 32) >> 6, top 8 bits kept. Error blocks -> magenta; HDR endpoint modes -> magenta endpoints
+// for that partition. 32-bit integer ops only (no int64 on the device): the block is a uvec4, x = bits 0..31.
+// One invocation per 128-bit block; texels outside width x height are not written.
+// Tested against astc.c by engine/tools/astcgpu (every block size, sRGB / linear, pitch and block-linear sources).
+
+layout(local_size_x = 64) in;
+
+// Raw guest bytes of one mip level of one layer, from a 16-byte-aligned offset (src_off, in uints).
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint src[]; };
+// RGBA8 (R in the low byte), one uint per texel, row-major width x height, from dst_off (in uints).
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint dst[]; };
+
+layout(push_constant) uniform PC {
+    uint src_off, dst_off;   // in uints
+    uint width, height;      // level size in texels
+    uint bw, bh;             // ASTC footprint
+    uint srgb;               // 1: sRGB endpoint expansion
+    uint linear;             // 1: pitch-linear source (block (i,j) at j*stride + i*16); 0: Tegra block-linear
+    uint stride;             // pitch-linear row stride in bytes
+    uint wb, hb;             // blocks per row / column
+    uint bh_log2, bd_log2;   // block-linear: GOBs per block in height / depth (log2)
+} pc;
+
+// ---- tables (astc.c) ----
+// Quantization levels QUANT_2 .. QUANT_256 (index 0..20): bits / trits / quints per level.
+// wunq_*: weight unquantization (QUANT_2..QUANT_32 -> 0..64), cunq_*: colour (QUANT_6..QUANT_128 -> 0..255),
+// both indexed by the raw ISE value (trit/quint << bits | bits).
+const uint q_bits[21] = uint[](
+    1,0,2,0,1,3,1,2,4,2,3,5,3,4,6,4,5,7,5,6,8);
+const uint q_trits[21] = uint[](
+    0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0);
+const uint q_quints[21] = uint[](
+    0,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0);
+const uint wunq_data[142] = uint[](
+    0,64,0,32,64,0,21,43,64,0,16,32,48,64,0,64,12,52,25,39,0,9,18,27,
+    37,46,55,64,0,64,7,57,14,50,21,43,28,36,0,64,17,47,5,59,23,41,11,53,
+    28,36,0,4,8,12,17,21,25,29,35,39,43,47,52,56,60,64,0,64,16,48,3,61,
+    19,45,6,58,23,41,9,55,26,38,13,51,29,35,0,64,8,56,16,48,24,40,2,62,
+    11,53,19,45,27,37,5,59,13,51,22,42,30,34,0,2,4,6,8,10,12,14,16,18,
+    20,22,24,26,28,30,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,64);
+const uint wunq_off[12] = uint[](
+    0,2,5,9,14,20,28,38,50,66,86,110);
+const uint cunq_data[936] = uint[](
+    0,255,51,204,102,153,0,36,73,109,146,182,219,255,0,255,28,227,56,199,84,171,113,142,
+    0,255,69,186,23,232,92,163,46,209,116,139,0,17,34,51,68,85,102,119,136,153,170,187,
+    204,221,238,255,0,255,67,188,13,242,80,175,27,228,94,161,40,215,107,148,54,201,121,134,
+    0,255,33,222,66,189,99,156,11,244,44,211,77,178,110,145,22,233,55,200,88,167,121,134,
+    0,8,16,24,33,41,49,57,66,74,82,90,99,107,115,123,132,140,148,156,165,173,181,189,
+    198,206,214,222,231,239,247,255,0,255,32,223,65,190,97,158,6,249,39,216,71,184,104,151,
+    13,242,45,210,78,177,110,145,19,236,52,203,84,171,117,138,26,229,58,197,91,164,123,132,
+    0,255,16,239,32,223,48,207,65,190,81,174,97,158,113,142,5,250,21,234,38,217,54,201,
+    70,185,86,169,103,152,119,136,11,244,27,228,43,212,59,196,76,179,92,163,108,147,124,131,
+    0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,65,69,73,77,81,85,89,93,
+    97,101,105,109,113,117,121,125,130,134,138,142,146,150,154,158,162,166,170,174,178,182,186,190,
+    195,199,203,207,211,215,219,223,227,231,235,239,243,247,251,255,0,255,16,239,32,223,48,207,
+    64,191,80,175,96,159,112,143,3,252,19,236,35,220,51,204,67,188,83,172,100,155,116,139,
+    6,249,22,233,38,217,54,201,71,184,87,168,103,152,119,136,9,246,25,230,42,213,58,197,
+    74,181,90,165,106,149,122,133,13,242,29,226,45,210,61,194,77,178,93,162,109,146,125,130,
+    0,255,8,247,16,239,24,231,32,223,40,215,48,207,56,199,64,191,72,183,80,175,88,167,
+    96,159,104,151,112,143,120,135,2,253,10,245,18,237,26,229,35,220,43,212,51,204,59,196,
+    67,188,75,180,83,172,91,164,99,156,107,148,115,140,123,132,5,250,13,242,21,234,29,226,
+    37,218,45,210,53,202,61,194,70,185,78,177,86,169,94,161,102,153,110,145,118,137,126,129,
+    0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,
+    48,50,52,54,56,58,60,62,64,66,68,70,72,74,76,78,80,82,84,86,88,90,92,94,
+    96,98,100,102,104,106,108,110,112,114,116,118,120,122,124,126,129,131,133,135,137,139,141,143,
+    145,147,149,151,153,155,157,159,161,163,165,167,169,171,173,175,177,179,181,183,185,187,189,191,
+    193,195,197,199,201,203,205,207,209,211,213,215,217,219,221,223,225,227,229,231,233,235,237,239,
+    241,243,245,247,249,251,253,255,0,255,8,247,16,239,24,231,32,223,40,215,48,207,56,199,
+    64,191,72,183,80,175,88,167,96,159,104,151,112,143,120,135,1,254,9,246,17,238,25,230,
+    33,222,41,214,49,206,57,198,65,190,73,182,81,174,89,166,97,158,105,150,113,142,121,134,
+    3,252,11,244,19,236,27,228,35,220,43,212,51,204,59,196,67,188,75,180,83,172,91,164,
+    99,156,107,148,115,140,123,132,4,251,12,243,20,235,28,227,36,219,44,211,52,203,60,195,
+    68,187,76,179,84,171,92,163,100,155,108,147,116,139,124,131,6,249,14,241,22,233,30,225,
+    38,217,46,209,54,201,62,193,70,185,78,177,86,169,94,161,102,153,110,145,118,137,126,129,
+    0,255,4,251,8,247,12,243,16,239,20,235,24,231,28,227,32,223,36,219,40,215,44,211,
+    48,207,52,203,56,199,60,195,64,191,68,187,72,183,76,179,80,175,84,171,88,167,92,163,
+    96,159,100,155,104,151,108,147,112,143,116,139,120,135,124,131,1,254,5,250,9,246,13,242,
+    17,238,21,234,25,230,29,226,33,222,37,218,41,214,45,210,49,206,53,202,57,198,61,194,
+    65,190,69,186,73,182,77,178,81,174,85,170,89,166,93,162,97,158,101,154,105,150,109,146,
+    113,142,117,138,121,134,125,130,2,253,6,249,10,245,14,241,18,237,22,233,26,229,30,225,
+    34,221,38,217,42,213,46,209,50,205,54,201,58,197,62,193,66,189,70,185,74,181,78,177,
+    82,173,86,169,90,165,94,161,98,157,102,153,106,149,110,145,114,141,118,137,122,133,126,129);
+const uint cunq_off[16] = uint[](
+    0,6,14,24,36,52,72,96,128,168,216,280,360,456,584,744);
+const uint QUANT_6 = 4u, QUANT_256 = 20u;
+
+// ---- block-linear addressing: tegra.c gob_offset() ----
+// Byte offset of (xb bytes, y rows, z slices) in a block-linear surface. 32-bit: the level must be under 4 GiB.
+uint gob_offset(uint xb, uint y, uint z, uint width_gobs, uint bh_log2, uint bd_log2, uint slice_blocks_rows) {
+    uint gob_x = xb >> 6, gob_y = y >> 3;
+    uint block_y = gob_y >> bh_log2, gob_in_block_y = gob_y & ((1u << bh_log2) - 1u);
+    uint block_z = z >> bd_log2, z_in_block = z & ((1u << bd_log2) - 1u);
+    uint block_size = 512u << (bh_log2 + bd_log2);
+    uint off = (block_z * slice_blocks_rows + block_y) * width_gobs * block_size;
+    off += gob_x * block_size;
+    off += ((z_in_block << bh_log2) | gob_in_block_y) * 512u;
+    // within the GOB: 64x8 bytes arranged in 16-byte sectors
+    uint xi = xb & 63u, yi = y & 7u;
+    off += ((xi >> 5) << 8) | ((yi >> 1) << 6) | (((xi >> 4) & 1u) << 5) | ((yi & 1u) << 4) | (xi & 0x0Fu);
+    return off;
+}
+
+// ---- bits: rbits / bitrev64 ----
+
+// n (<= 32) bits at pos; bits past 127 read as zero.
+uint rbits(uvec4 b, int pos, int n) {
+    if (n == 0 || pos >= 128) return 0u;
+    int wi = pos >> 5, sh = pos & 31;
+    uint v = b[wi] >> sh;
+    if (sh != 0 && wi < 3) v |= b[wi + 1] << (32 - sh);
+    return n >= 32 ? v : v & ((1u << n) - 1u);
+}
+
+// The block with its 128 bits reversed (astc.c: {bitrev64(hi), bitrev64(lo)}).
+uvec4 bitrev128(uvec4 b) {
+    return uvec4(bitfieldReverse(b.w), bitfieldReverse(b.z), bitfieldReverse(b.y), bitfieldReverse(b.x));
+}
+
+// Byte array of up to 64 ISE results (astc.c raw[64] / cv[18]), 4 per uint. Cleared before each ise_decode.
+uint pv[16];
+void pv_put(int i, uint v) { pv[i >> 2] |= v << ((i & 3) * 8); }
+uint pv_get(int i) { return pv[i >> 2] >> ((i & 3) * 8) & 0xFFu; }
+
+// ---- integer sequence encoding: ise_bitcount / trits_of / quints_of / ise_decode ----
+
+int ise_bitcount(int count, int q) {
+    int n = count * int(q_bits[q]);
+    if (q_trits[q] != 0u) n += (8 * count + 4) / 5;
+    if (q_quints[q] != 0u) n += (7 * count + 2) / 3;
+    return n;
+}
+
+void trits_of(uint T, out uint t[5]) {
+    uint C;
+    if ((T >> 2 & 7u) == 7u) {
+        C = (T >> 5 & 7u) << 2 | (T & 3u);
+        t[4] = 2u; t[3] = 2u;
+    } else {
+        C = T & 0x1Fu;
+        if ((T >> 5 & 3u) == 3u) { t[4] = 2u; t[3] = T >> 7 & 1u; }
+        else { t[4] = T >> 7 & 1u; t[3] = T >> 5 & 3u; }
+    }
+    if ((C & 3u) == 3u) {
+        t[2] = 2u; t[1] = C >> 4 & 1u;
+        t[0] = (C >> 3 & 1u) << 1 | ((C >> 2 & 1u) & ~(C >> 3) & 1u);
+    } else if ((C >> 2 & 3u) == 3u) {
+        t[2] = 2u; t[1] = 2u; t[0] = C & 3u;
+    } else {
+        t[2] = C >> 4 & 1u; t[1] = C >> 2 & 3u;
+        t[0] = (C >> 1 & 1u) << 1 | ((C & 1u) & ~(C >> 1) & 1u);
+    }
+}
+
+void quints_of(uint Q, out uint q[3]) {
+    if ((Q >> 1 & 3u) == 3u && (Q >> 5 & 3u) == 0u) {
+        uint q0 = Q & 1u;
+        q[2] = q0 << 2 | ((Q >> 4 & 1u) & ~q0 & 1u) << 1 | ((Q >> 3 & 1u) & ~q0 & 1u);
+        q[1] = 4u; q[0] = 4u;
+        return;
+    }
+    uint C;
+    if ((Q >> 1 & 3u) == 3u) { q[2] = 4u; C = (Q >> 3 & 3u) << 3 | (~(Q >> 5) & 3u) << 1 | (Q & 1u); }
+    else { q[2] = Q >> 5 & 3u; C = Q & 0x1Fu; }
+    if ((C & 7u) == 5u) { q[1] = 4u; q[0] = C >> 3 & 3u; }
+    else { q[1] = C >> 3 & 3u; q[0] = C & 7u; }
+}
+
+// Decodes count raw ISE values (tq << bits | bits) from bit pos into pv[0..count).
+void ise_decode(uvec4 b, int pos, int count, int q) {
+    for (int i = 0; i < 16; i++) pv[i] = 0u;
+    int nb = int(q_bits[q]);
+    if (q_trits[q] != 0u) {
+        const int tb[5] = int[](2, 2, 1, 2, 1), ts[5] = int[](0, 2, 4, 5, 7);
+        for (int i = 0; i < count; i += 5) {
+            uint m[5] = uint[](0u, 0u, 0u, 0u, 0u), t[5];
+            uint T = 0u;
+            int k = 0;
+            for (; k < 5 && i + k < count; k++) {
+                m[k] = rbits(b, pos, nb); pos += nb;
+                T |= rbits(b, pos, tb[k]) << ts[k]; pos += tb[k];
+            }
+            trits_of(T, t);
+            for (int j = 0; j < k; j++) pv_put(i + j, t[j] << nb | m[j]);
+        }
+    } else if (q_quints[q] != 0u) {
+        const int qb[3] = int[](3, 2, 2), qs[3] = int[](0, 3, 5);
+        for (int i = 0; i < count; i += 3) {
+            uint m[3] = uint[](0u, 0u, 0u), v[3];
+            uint Q = 0u;
+            int k = 0;
+            for (; k < 3 && i + k < count; k++) {
+                m[k] = rbits(b, pos, nb); pos += nb;
+                Q |= rbits(b, pos, qb[k]) << qs[k]; pos += qb[k];
+            }
+            quints_of(Q, v);
+            for (int j = 0; j < k; j++) pv_put(i + j, v[j] << nb | m[j]);
+        }
+    } else {
+        for (int i = 0; i < count; i++, pos += nb) pv_put(i, rbits(b, pos, nb));
+    }
+}
+
+// ---- block mode: block_mode_2d ----
+
+int bm_wx, bm_wy, bm_dual, bm_quant, bm_wbits;
+
+bool block_mode_2d(uint m, uint bw, uint bh) {
+    uint r = m >> 4 & 1u, h = m >> 9 & 1u, d = m >> 10 & 1u, a = m >> 5 & 3u;
+    uint wx, wy;
+    if ((m & 3u) != 0u) {
+        r |= (m & 3u) << 1;
+        uint b = m >> 7 & 3u;
+        uint sel = m >> 2 & 3u;
+        if (sel == 0u) { wx = b + 4u; wy = a + 2u; }
+        else if (sel == 1u) { wx = b + 8u; wy = a + 2u; }
+        else if (sel == 2u) { wx = a + 2u; wy = b + 8u; }
+        else {
+            b &= 1u;
+            if ((m & 0x100u) != 0u) { wx = b + 2u; wy = a + 2u; }
+            else { wx = a + 2u; wy = b + 6u; }
+        }
+    } else {
+        r |= (m >> 2 & 3u) << 1;
+        if ((m >> 2 & 3u) == 0u) return false;
+        uint b = m >> 9 & 3u;
+        uint sel = m >> 7 & 3u;
+        if (sel == 0u) { wx = 12u; wy = a + 2u; }
+        else if (sel == 1u) { wx = a + 2u; wy = 12u; }
+        else if (sel == 2u) { wx = a + 6u; wy = b + 6u; d = 0u; h = 0u; }
+        else {
+            if (a == 0u) { wx = 6u; wy = 10u; }
+            else if (a == 1u) { wx = 10u; wy = 6u; }
+            else return false;
+        }
+    }
+    int count = int(wx * wy * (d + 1u));
+    bm_wx = int(wx); bm_wy = int(wy); bm_dual = int(d);
+    bm_quant = int(r) - 2 + 6 * int(h);
+    bm_wbits = ise_bitcount(count, bm_quant);
+    return count <= 64 && bm_wbits >= 24 && bm_wbits <= 96 && wx <= bw && wy <= bh;
+}
+
+// ---- partitions: hash52 / part_init / part_of ----
+
+uint hash52(uint p) {
+    p ^= p >> 15; p -= p << 17; p += p << 7; p += p << 4;
+    p ^= p >> 5;  p += p << 16; p ^= p >> 7; p ^= p >> 3;
+    p ^= p << 6;  p ^= p >> 17;
+    return p;
+}
+
+uvec4 ps_sa, ps_sb, ps_r;   // PartSel s[0..3], s[4..7], r[0..3]
+int ps_count;
+
+void part_init(int seed, int count) {
+    seed += (count - 1) * 1024;
+    uint rnum = hash52(uint(seed));
+    int sh1, sh2;
+    if ((seed & 1) != 0) { sh1 = (seed & 2) != 0 ? 4 : 5; sh2 = count == 3 ? 6 : 5; }
+    else { sh1 = count == 3 ? 6 : 5; sh2 = (seed & 2) != 0 ? 4 : 5; }
+    uint s[8];
+    for (int i = 0; i < 8; i++) {
+        uint v = rnum >> (4 * i) & 0xFu;
+        s[i] = (v * v) >> ((i & 1) != 0 ? sh2 : sh1);
+    }
+    ps_sa = uvec4(s[0], s[1], s[2], s[3]);
+    ps_sb = uvec4(s[4], s[5], s[6], s[7]);
+    ps_r = uvec4(rnum >> 14, rnum >> 10, rnum >> 6, rnum >> 2);
+    ps_count = count;
+}
+
+int part_of(uint x, uint y) {
+    // z = 0 for 2D, so seeds 9..12 drop out
+    uint a = (ps_sa.x * x + ps_sa.y * y + ps_r.x) & 0x3Fu;
+    uint b = (ps_sa.z * x + ps_sa.w * y + ps_r.y) & 0x3Fu;
+    uint c = ps_count >= 3 ? (ps_sb.x * x + ps_sb.y * y + ps_r.z) & 0x3Fu : 0u;
+    uint d = ps_count >= 4 ? (ps_sb.z * x + ps_sb.w * y + ps_r.w) & 0x3Fu : 0u;
+    if (a >= b && a >= c && a >= d) return 0;
+    if (b >= c && b >= d) return 1;
+    if (c >= d) return 2;
+    return 3;
+}
+
+// ---- colour endpoints: unpack_endpoints ----
+
+int cq_level;   // colour quant level; colour values are pv[] unquantized on read
+int cval(int i) {
+    uint raw = pv_get(i);
+    return int(cq_level == int(QUANT_256) ? raw : cunq_data[cunq_off[cq_level - int(QUANT_6)] + raw]);
+}
+
+int clamp255(int v) { return clamp(v, 0, 255); }
+
+// Endpoints of a partition from colour values k.., 8-bit. Returns false for an HDR mode.
+bool unpack_endpoints(int cem, int k, out ivec4 e0, out ivec4 e1) {
+    e0 = ivec4(0); e1 = ivec4(0);
+    if (cem == 0) {   // L direct
+        int l0 = cval(k), l1 = cval(k + 1);
+        e0 = ivec4(l0, l0, l0, 255); e1 = ivec4(l1, l1, l1, 255);
+        return true;
+    }
+    if (cem == 1) {   // L delta
+        int v0 = cval(k), v1 = cval(k + 1);
+        int l0 = v0 >> 2 | (v1 & 0xC0);
+        int l1 = min(l0 + (v1 & 0x3F), 255);
+        e0 = ivec4(l0, l0, l0, 255); e1 = ivec4(l1, l1, l1, 255);
+        return true;
+    }
+    if (cem == 4) {   // LA direct
+        int l0 = cval(k), l1 = cval(k + 1);
+        e0 = ivec4(l0, l0, l0, cval(k + 2)); e1 = ivec4(l1, l1, l1, cval(k + 3));
+        return true;
+    }
+    if (cem == 5) {   // LA delta
+        int l0 = cval(k), l1 = cval(k + 1), a0 = cval(k + 2), a1 = cval(k + 3);
+        l0 |= (l1 & 0x80) << 1; a0 |= (a1 & 0x80) << 1;
+        l1 &= 0x7F; a1 &= 0x7F;
+        if ((l1 & 0x40) != 0) l1 -= 0x80;
+        if ((a1 & 0x40) != 0) a1 -= 0x80;
+        l0 >>= 1; a0 >>= 1; l1 >>= 1; a1 >>= 1;   // arithmetic shift of the signed deltas
+        l1 = clamp255(l1 + l0); a1 = clamp255(a1 + a0);
+        e0 = ivec4(l0, l0, l0, a0); e1 = ivec4(l1, l1, l1, a1);
+        return true;
+    }
+    if (cem == 6 || cem == 10) {   // RGB scale (+ two alphas)
+        int s = cval(k + 3);
+        for (int c = 0; c < 3; c++) { int v = cval(k + c); e1[c] = v; e0[c] = v * s >> 8; }
+        if (cem == 6) { e0.w = 255; e1.w = 255; }
+        else { e0.w = cval(k + 4); e1.w = cval(k + 5); }
+        return true;
+    }
+    if (cem == 8 || cem == 12) {   // RGB(A) direct
+        ivec4 a = ivec4(cval(k), cval(k + 2), cval(k + 4), cem == 12 ? cval(k + 6) : 0);
+        ivec4 b = ivec4(cval(k + 1), cval(k + 3), cval(k + 5), cem == 12 ? cval(k + 7) : 0);
+        if (a.x + a.y + a.z > b.x + b.y + b.z) {   // blue contraction: swap + uncontract
+            e0 = b; e1 = a;
+            e0.x = (e0.x + e0.z) >> 1; e0.y = (e0.y + e0.z) >> 1;
+            e1.x = (e1.x + e1.z) >> 1; e1.y = (e1.y + e1.z) >> 1;
+        } else {
+            e0 = a; e1 = b;
+        }
+        if (cem == 8) { e0.w = 255; e1.w = 255; }
+        return true;
+    }
+    if (cem == 9 || cem == 13) {   // RGB(A) base + delta
+        int n = cem == 13 ? 4 : 3;
+        ivec4 a = ivec4(0), b = ivec4(0);
+        for (int c = 0; c < n; c++) {
+            int base = cval(k + 2 * c), delta = cval(k + 2 * c + 1);
+            a[c] = base >> 1 | (delta & 0x80);
+            b[c] = delta >> 1 & 0x3F;
+            if ((b[c] & 0x20) != 0) b[c] -= 0x40;
+        }
+        int sum = b.x + b.y + b.z;
+        b += a;
+        if (sum < 0) {   // swap + uncontract
+            e0 = b; e1 = a;
+            e0.x = (e0.x + e0.z) >> 1; e0.y = (e0.y + e0.z) >> 1;
+            e1.x = (e1.x + e1.z) >> 1; e1.y = (e1.y + e1.z) >> 1;
+        } else {
+            e0 = a; e1 = b;
+        }
+        e0 = clamp(e0, 0, 255); e1 = clamp(e1, 0, 255);
+        if (cem == 9) { e0.w = 255; e1.w = 255; }
+        return true;
+    }
+    return false;   // 2, 3, 7, 11, 14, 15: HDR
+}
+
+// ---- block: astc_decode_block ----
+
+uint g[40];   // weight grid, bytes: plane 0 at 0..79, plane 1 at 80..159 (astc.c grid[2][80]), zero padded
+uint g_get(int i) { return g[i >> 2] >> ((i & 3) * 8) & 0xFFu; }
+
+ivec4 ep0[4], ep1[4];   // per-partition endpoints, expanded to 16 bits
+
+void write_texel(uint x0, uint y0, uint x, uint y, uint rgba) {
+    uint tx = x0 + x, ty = y0 + y;
+    if (tx < pc.width && ty < pc.height) dst[pc.dst_off + ty * pc.width + tx] = rgba;
+}
+
+void fill_block(uint x0, uint y0, uint rgba) {
+    for (uint y = 0u; y < pc.bh; y++)
+        for (uint x = 0u; x < pc.bw; x++) write_texel(x0, y0, x, y, rgba);
+}
+
+const uint MAGENTA = 0xFFFF00FFu;   // FF 00 FF FF
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.wb * pc.hb) return;
+    uint bi = idx % pc.wb, bj = idx / pc.wb;
+    uint bw = pc.bw, bh = pc.bh;
+    uint x0 = bi * bw, y0 = bj * bh;
+    if (bw < 4u || bh < 4u || bw > 12u || bh > 12u) return;   // not an ASTC 2D footprint
+
+    uint off;   // byte offset of the block in the level
+    if (pc.linear != 0u) {
+        off = bj * pc.stride + bi * 16u;
+    } else {
+        uint width_gobs = (pc.wb * 16u + 63u) / 64u;
+        uint gob_rows = 8u << pc.bh_log2;
+        uint blocks_rows = (pc.hb + gob_rows - 1u) / gob_rows;
+        off = gob_offset(bi * 16u, bj, 0u, width_gobs, pc.bh_log2, pc.bd_log2, blocks_rows);
+    }
+    uint s = pc.src_off + (off >> 2);
+    uvec4 b = uvec4(src[s], src[s + 1u], src[s + 2u], src[s + 3u]);
+    int texels = int(bw * bh);
+    uint mode = b.x & 0x7FFu;
+
+    if ((mode & 0x1FFu) == 0x1FCu) {   // void extent
+        if ((mode & 0x200u) != 0u) { fill_block(x0, y0, MAGENTA); return; }       // HDR (fp16) constant
+        if ((b.x >> 10 & 3u) != 3u) { fill_block(x0, y0, MAGENTA); return; }     // reserved bits
+        uint s0 = rbits(b, 12, 13), s1 = rbits(b, 25, 13);
+        uint t0 = rbits(b, 38, 13), t1 = rbits(b, 51, 13);
+        bool all_ones = s0 == 0x1FFFu && s1 == 0x1FFFu && t0 == 0x1FFFu && t1 == 0x1FFFu;
+        if ((s0 >= s1 || t0 >= t1) && !all_ones) { fill_block(x0, y0, MAGENTA); return; }
+        // bytes 9, 11, 13, 15: top 8 bits of the UNORM16s
+        uint c = (b.z >> 8 & 0xFFu) | (b.z >> 24) << 8 | (b.w >> 8 & 0xFFu) << 16 | (b.w >> 24) << 24;
+        fill_block(x0, y0, c);
+        return;
+    }
+
+    if (!block_mode_2d(mode, bw, bh)) { fill_block(x0, y0, MAGENTA); return; }
+    int pcount = int(b.x >> 11 & 3u) + 1;
+    int wx = bm_wx, wy = bm_wy, dual = bm_dual;
+    int wcount = wx * wy;
+
+    // Weights, read backwards from the top of the block.
+    ise_decode(bitrev128(b), 0, wcount << dual, bm_quant);
+    if (dual != 0 && pcount == 4) { fill_block(x0, y0, MAGENTA); return; }
+
+    int wt = int(wunq_off[bm_quant]);
+    for (int i = 0; i < 40; i++) g[i] = 0u;
+    for (int i = 0; i < wcount; i++) {
+        uint w0 = wunq_data[wt + int(pv_get(dual != 0 ? 2 * i : i))];
+        g[i >> 2] |= w0 << ((i & 3) * 8);
+        if (dual != 0) {
+            int i1 = 80 + i;
+            g[i1 >> 2] |= wunq_data[wt + int(pv_get(2 * i + 1))] << ((i1 & 3) * 8);
+        }
+    }
+
+    // Colour endpoint modes.
+    int cem[4] = int[](0, 0, 0, 0);
+    int below = 128 - bm_wbits, high = 0;
+    if (pcount == 1) {
+        cem[0] = int(b.x >> 13 & 0xFu);
+    } else {
+        high = 3 * pcount - 4;
+        below -= high;
+        uint enc = (b.x >> 23 & 0x3Fu) | rbits(b, below, high) << 6;
+        uint base = enc & 3u;
+        if (base == 0u) {
+            for (int i = 0; i < pcount; i++) cem[i] = int(enc >> 2 & 0xFu);
+            below += high;
+            high = 0;
+        } else {
+            base--;
+            for (int i = 0; i < pcount; i++) cem[i] = int(((enc >> (2 + i) & 1u) + base) << 2);
+            for (int i = 0; i < pcount; i++) cem[i] |= int(enc >> (2 + pcount + 2 * i) & 3u);
+        }
+    }
+    int ccount = 0;
+    for (int i = 0; i < pcount; i++) ccount += ((cem[i] >> 2) + 1) * 2;
+    if (ccount > 18) { fill_block(x0, y0, MAGENTA); return; }
+    int cbits = max((pcount == 1 ? 111 : 99) - bm_wbits - high - (dual != 0 ? 2 : 0), 0);
+    int cq = -1;
+    for (int q = 20; q >= 0; q--) {
+        if (ise_bitcount(ccount, q) <= cbits) { cq = q; break; }
+    }
+    if (cq < int(QUANT_6)) { fill_block(x0, y0, MAGENTA); return; }
+    // ccs read before ise_decode reuses pv (it reads the block, not pv; order is irrelevant)
+    int ccs = dual != 0 ? int(rbits(b, below - 2, 2)) : -1;
+    ise_decode(b, pcount == 1 ? 17 : 29, ccount, cq);
+    cq_level = cq;
+
+    // Endpoints, expanded to 16 bits.
+    for (int p = 0, k = 0; p < pcount; p++) {
+        ivec4 e0, e1;
+        if (!unpack_endpoints(cem[p], k, e0, e1)) { e0 = ivec4(0xFF, 0x00, 0xFF, 0xFF); e1 = e0; }
+        k += ((cem[p] >> 2) + 1) * 2;
+        if (pc.srgb != 0u) { ep0[p] = e0 << 8 | 0x80; ep1[p] = e1 << 8 | 0x80; }
+        else { ep0[p] = e0 * 257; ep1[p] = e1 * 257; }
+    }
+
+    if (pcount > 1) part_init(int(b.x >> 13 & 0x3FFu), pcount);
+    bool small = texels < 32;
+    // Weight grid -> texel weights (bilinear infill), per axis
+    uint xstep = (1024u + bw / 2u) / (bw - 1u), ystep = (1024u + bh / 2u) / (bh - 1u);
+
+    for (uint y = 0u; y < bh; y++) {
+        int vy = int(ystep * y * uint(wy - 1) + 32u) >> 6;
+        int yi = (vy >> 4) * wx, ft = vy & 0xF;
+        for (uint x = 0u; x < bw; x++) {
+            int vx = int(xstep * x * uint(wx - 1) + 32u) >> 6;
+            int xi = vx >> 4, fs = vx & 0xF;
+            int w11 = (fs * ft + 8) >> 4, w10 = fs - w11, w01 = ft - w11, w00 = 16 - fs - ft + w11;
+            int i0 = yi + xi;
+            int w[2] = int[](0, 0);
+            for (int pl = 0; pl <= dual; pl++) {
+                int gi = i0 + 80 * pl;
+                w[pl] = (int(g_get(gi)) * w00 + int(g_get(gi + 1)) * w10 + int(g_get(gi + wx)) * w01 +
+                         int(g_get(gi + wx + 1)) * w11 + 8) >> 4;
+            }
+            int p = pcount > 1 ? part_of(small ? x << 1 : x, small ? y << 1 : y) : 0;
+            ivec4 e0 = ep0[p], e1 = ep1[p];
+            uint rgba = 0u;
+            for (int c = 0; c < 4; c++) {
+                int wc = c == ccs ? w[1] : w[0];
+                uint o = uint((e0[c] * (64 - wc) + e1[c] * wc + 32) >> 14);   // >> 6, then top 8 bits
+                rgba |= o << (8 * c);
+            }
+            write_texel(x0, y0, x, y, rgba);
+        }
+    }
+}

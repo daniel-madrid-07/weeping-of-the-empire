@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and help with the build
+    url: https://github.com/daniel-madrid-07/weeping-of-the-empire/discussions
+    about: Ask in Discussions. Requests for game files, keys, firmware or builds are closed without reply.

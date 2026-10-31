@@ -1,0 +1,53 @@
+# Reference clones (read-only, re-cloned on demand)
+/refs/
+
+# Nothing game-derived is ever committed
+*.nsp
+*.nsz
+*.xci
+*.xcz
+*.nca
+*.nso
+*.nro
+*.npdm
+*.keys
+*.bfttf
+*.bntx
+*.bfres
+*.zs
+*.sarc
+*.pack
+*.bin
+*.msbt
+*.byml
+*.bgyml
+*.bfsha
+*.bnsh
+*.sav
+/generated/
+/work/
+
+# Builds and tooling
+/build/
+/out/
+/cmake-build-*/
+/vcpkg_installed/
+*.obj
+*.o
+*.lib
+*.pdb
+*.exe
+*.dll
+*.ilk
+*.exp
+__pycache__/
+*.pyc
+.venv/
+bin/
+obj/
+*.gpr
+*.rep/
+*.log
+
+# Tracked on purpose
+!/engine/third_party/opus/lib/opus.lib

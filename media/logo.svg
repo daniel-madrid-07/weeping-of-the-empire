@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64" role="img" aria-label="Weeping of the Empire logo">
+  <defs>
+    <linearGradient id="drop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7fe3d4"/>
+      <stop offset="1" stop-color="#2a6fdb"/>
+    </linearGradient>
+  </defs>
+  <g stroke="#7fe3d4" stroke-width="2" stroke-linecap="round" opacity="0.85">
+    <path d="M6 36h7M5 42h7M6 48h8M51 36h7M52 42h7M50 48h8"/>
+  </g>
+  <path d="M32 4C32 4 13 27 13 41a19 19 0 0 0 38 0C51 27 32 4 32 4Z" fill="url(#drop)"/>
+  <path d="M22 35l5 13 5-9 5 9 5-13" fill="none" stroke="#0b1320" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

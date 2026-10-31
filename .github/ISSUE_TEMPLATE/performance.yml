@@ -1,0 +1,35 @@
+name: Performance report
+description: Frame rate, stutter or load times on your PC (good results are welcome too).
+labels: [performance]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Measured numbers help most: the fps overlay value, where you stood, and your settings. Never attach game files, keys or builds.
+  - type: textarea
+    id: pc
+    attributes:
+      label: PC
+      description: CPU, GPU and driver version, RAM, Windows version.
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings
+      description: Window / render resolution, fps cap, upscaler (none, DLSS, FSR), anything you changed in F10.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Result
+      description: Place in the game, fps (average and lows if you have them), stutters, load times.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+    validations:
+      required: true
