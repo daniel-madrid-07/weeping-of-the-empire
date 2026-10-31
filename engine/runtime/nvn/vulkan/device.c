@@ -2155,6 +2155,11 @@ void backend_present(NvnTexture *t) {
                 static uint64_t l_tw;
                 if (vk_twin_copies != l_tw) LOG("[tex] depth twin copies: %llu since the last line\n", (unsigned long long)(vk_twin_copies - l_tw));
                 l_tw = vk_twin_copies;
+                extern uint64_t vk_dac_moves;   // (textures.c: depth-format targets re-made for a colour / depth binding)
+                static uint64_t l_dm;
+                if (vk_dac_moves != l_dm) LOG("[tex] depth-format targets re-made for their binding: %llu since the last line\n",
+                                              (unsigned long long)(vk_dac_moves - l_dm));
+                l_dm = vk_dac_moves;
             }
             extern uint64_t cum_img_n, cum_img_reused, cum_img_unpooled;   // (textures.c)
             static uint64_t l_n, l_r, l_u;

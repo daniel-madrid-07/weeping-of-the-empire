@@ -119,6 +119,7 @@ typedef struct {
     uint32_t dag_why;     // (no DAG guard) the pc of the first backward branch / loop / call op + 1 (GLSL comment)
     bool gmem_coherent;   // LARECOMP_GMEM_COHERENT=1 and a cache-bypassing LDG / STG or a MEMBAR.GL / .SYS: gmem_ / gdev_ coherent volatile
     bool soft_f64;        // F64 ops emitted as soft_f64.h calls on uint64_t (maxwell_soft_f64): the library goes in the header
+    bool uses_d16q;       // depth-compare references rounded to D16 where the texture is D16 (d16q(), d16_ref_on)
 } Ctx;
 
 // Global memory windows (exec.c gmem_import): where one buffer cannot hold the heap, [k * W, (k + 1) * W) is buffer
@@ -311,6 +312,24 @@ bool maxwell_vs_pointsize;
 // 32 KiB; a larger declaration fails the pipeline, so every compute program using STS / LDS was dropped there). The
 // program's own size is not known here (it is in the QMD); accesses past the declared size are dropped / read 0.
 uint32_t maxwell_smem_bytes = 49152;
+// Fragment output components the program does not write (SPH omap) of a render target it does write: undefined in
+// Vulkan. NVIDIA's driver leaves them 0; AMD writes whatever the register held. Written as 0 off NVIDIA (NVIDIA's
+// GLSL unchanged); LARECOMP_FS_ZERO_UNWRITTEN=1 everywhere, =0 never. Depth compare against a D16 texture: Maxwell
+// (and NVIDIA's driver) converts the reference to the texture's 16-bit precision before comparing; AMD compares the
+// full float, so a surface at exactly its own stored depth reads as shadowed. Off NVIDIA the reference is rounded to
+// the D16 grid when the bound texture is D16 (exec.c: rscale[1 + slot].z = 1); LARECOMP_D16_REF=1 everywhere, =0
+// never.
+extern bool maxwell_nvidia;
+static int d16_ref_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("LARECOMP_D16_REF"); v = e ? *e == '1' : !maxwell_nvidia; }
+    return v;
+}
+static int fs_zero_unwritten(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("LARECOMP_FS_ZERO_UNWRITTEN"); v = e ? *e == '1' : !maxwell_nvidia; }
+    return v;
+}
 static const char *dreg(Ctx *c, int r, char *buf) {
     if (maxwell_soft_f64) c->soft_f64 = true;
     if (r == RZ) return c->soft_f64 ? "0ul" : "packDouble2x32(uint2(0u, 0u))";
@@ -885,6 +904,12 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
     bool cube = type == TEXTYPE_CUBE || type == TEXTYPE_CUBE_ARRAY;
     int n = (type == TEXTYPE_1D || type == TEXTYPE_1D_ARRAY) ? 1 : (type == TEXTYPE_2D || type == TEXTYPE_2D_ARRAY) ? 2 : 3;
     if (lod_kind == 3 && (n == 1 || type == TEXTYPE_3D)) { fail(c, "gather on a 1d/3d texture"); strcpy(out, "vec4(0.0f)"); return; }
+    char dq[400];
+    if (t->shadow && dref && slot < 64 && d16_ref_on()) {   // (the reference on the D16 grid where the texture is D16)
+        snprintf(dq, sizeof dq, "d16q(%s, %d)", dref, slot);
+        dref = dq;
+        c->uses_rscale = c->uses_d16q = true;
+    }
     if (lod_kind == 4) {   // textureQueryLod: only fragment shaders have derivatives
         if (c->stage != STAGE_FRAGMENT) { strcpy(out, "vec4(0.0f)"); return; }
         char q[400];
@@ -2724,6 +2749,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "layout(std140, set = %d, binding = 18) uniform RScale { vec4 rscale[65]; };\n", set);
         info->uses_rscale = true;
     }
+    if (c->uses_d16q)   // (rscale[1 + i].z: texture i is D16, exec.c stage_set)
+        sp(&s, "float d16q(float r, int i) { return rscale[1 + i].z != 0.0f ? floor(clamp(r, 0.0f, 1.0f) * 65535.0f + 0.5f) / 65535.0f : r; }\n");
     bool tint = stage == STAGE_FRAGMENT && !dbg && (c->omap_target & 0x7) == 0x7 && (!key || key->rt_kind[0] == 0);
     if (tint) {
         sp(&s, "layout(std140, set = %d, binding = 19) uniform Tint { vec4 ltint[2]; };\n", set);
@@ -2865,7 +2892,10 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             int kind = key ? key->rt_kind[rt] : 0;
             const char *cv = kind == 1 ? "int" : kind == 2 ? "uint" : "";
             for (int comp = 0; comp < 4; comp++) {
-                if (!(m & (1u << comp))) continue;
+                if (!(m & (1u << comp))) {   // (a component the program does not output: 0, as NVIDIA's driver leaves it;
+                    if (fs_zero_unwritten()) sp(&s, "  c%d[%d] = 0;\n", rt, comp);   // undefined in Vulkan: AMD writes garbage)
+                    continue;
+                }
                 if (dbg) {
                     if (comp == 3) sp(&s, "  c%d[%d] = %s(1.0f);\n", rt, comp, cv);
                     else sp(&s, "  c%d[%d] = %s(dbgv);\n", rt, comp, cv);

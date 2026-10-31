@@ -449,6 +449,21 @@ void vk_collect_dead(void) {
 uint64_t prof_img_n, prof_img_ns;  // (exec.c LARECOMP_VK_PROF) images created and the time spent creating them
 uint64_t cum_img_n, cum_img_ns;    // the same, never reset (exec.c hitch log)
 static void create_image_(NvnTexture *t, TexBackend *b);
+// CUBE_COMPATIBLE on square 2D arrays of 6+ layers that are no cube textures. kak.cap on the RDNA2 iGPU: 12+ such arrays
+// (the terrain material arrays, 1024x1024 x121, 128x128 x118, 512x512 x12...) and no cube view of any 2D array. Off
+// NVIDIA only cube / cube-array textures get the flag (a cube view of a flagless array gets the dummy view, logged);
+// LARECOMP_CUBE_COMPAT=all / =cube forces either rule.
+static int cube_compat_all(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern bool maxwell_nvidia;
+        const char *e = getenv("LARECOMP_CUBE_COMPAT");
+        v = e ? !strcmp(e, "all") : maxwell_nvidia;
+    }
+    return v;
+}
+static bool dac_listed(const NvnTexture *t);
+static VkFormat dac_colour(VkFormat f);
 static void create_image(NvnTexture *t, TexBackend *b) {
     extern uint64_t prof_up_ns;   // (~0: profiling off)
     uint64_t t0 = SDL_GetTicksNS();
@@ -540,6 +555,9 @@ static void create_image_(NvnTexture *t, TexBackend *b) {
             vf = VK_FORMAT_R8G8B8A8_UNORM;
         }
     }
+    if (depthfmt && dac_listed(t) && dac_colour(vf) &&   // (a depth-format texture this storage renders colour into: below)
+        format_supports(dac_colour(vf), VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+        vf = dac_colour(vf), depthfmt = false;
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (depthfmt) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     else if (format_supports(vf, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -548,7 +566,8 @@ static void create_image_(NvnTexture *t, TexBackend *b) {
         usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     VkImageCreateFlags flags = 0;
     if (!depthfmt) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // format views (NVN texture views, raw sRGB views)
-    if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1 && (cube_compat_all() || t->target == 8 || t->target == 9))
+        flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     // 3D render targets (TotK renders mips / slices of 3D volumes): slices are drawn through 2D views
     if (type == VK_IMAGE_TYPE_3D && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = vf,
@@ -618,6 +637,8 @@ static void destroy_image(TexBackend *b) {
     if (b->blk) { destroy_image(b->blk); free(b->blk); b->blk = NULL; }
     if (b->twin) { destroy_image(b->twin); free(b->twin); b->twin = NULL; }
     b->twin_valid = false;
+    if (b->alt.image || b->alt.mem) defer((Dead){.img = b->alt.image, .mem = b->alt.mem});
+    memset(&b->alt, 0, sizeof b->alt);
 }
 
 // ---- depth twins: TotK renders depth into R32F colour targets (1600x900 f0xa) and samples them with depth compare. A
@@ -770,12 +791,152 @@ void vk_depth_twin_copy(VkCommandBuffer cb, TexBackend *b) {
     if (++vk_twin_copies <= 4) LOG("[tex] depth twin copy #%llu: %ux%u fmt %d\n", (unsigned long long)vk_twin_copies, b->width, b->height, b->format);
 }
 
+// ---- depth-format colour targets (AMD VVL on kak.cap: VUIDs 06582, 06087, 04727, 06062): TotK renders colour into textures of
+// NVN depth formats (DEPTH32F 1600x900 / 800x450 / 320x180 / 200x112 / 100x56 and D16 800x450 / 1600x900 / 800x800, mostly as the
+// only attachment of the pass: a depth pyramid / linear-depth chain). A depth image cannot be a colour attachment (NVIDIA renders
+// it anyway; elsewhere the writes are undefined). Such a texture's image moves to the colour format with the same bits (D32_SFLOAT
+// -> R32_SFLOAT, D16_UNORM -> R16_UNORM) when it is bound as a colour target, and back when it is bound as the depth attachment
+// (renderer_texture_target_kind, exec.c begin_pass): the other kind's image is kept (TexBackend.alt), so a move is a swap and a
+// copy of the contents, made once per role change. Its storage is listed while its last role is colour, so the objects TotK
+// re-creates there every frame start in the colour format (a texture only ever drawn as colour costs no copy). A compare sample of
+// the colour image takes the depth twin path. Default on except on NVIDIA's driver (it renders depth images as colour: no copies
+// there); LARECOMP_DEPTH_AS_COLOUR=1 on, =0 off (the depth image as the colour attachment, as before).
+#define DAC_MAX 128
+static struct { uint64_t addr; uint32_t w, h, f; } g_dac[DAC_MAX];
+static int g_ndac;
+static pthread_mutex_t g_dac_lock = PTHREAD_MUTEX_INITIALIZER;
+static int dac_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern bool maxwell_nvidia;
+        const char *e = getenv("LARECOMP_DEPTH_AS_COLOUR");
+        on = e ? *e == '1' : !maxwell_nvidia;
+        LOG("[tex] depth-format colour targets: %s\n", on ? "the colour format (copies on a role change)" :
+            e ? "the depth image (LARECOMP_DEPTH_AS_COLOUR=0)" : "the depth image (NVIDIA renders depth images as colour)");
+    }
+    return on;
+}
+static VkFormat dac_colour(VkFormat f) {
+    return f == VK_FORMAT_D32_SFLOAT ? VK_FORMAT_R32_SFLOAT : f == VK_FORMAT_D16_UNORM ? VK_FORMAT_R16_UNORM : VK_FORMAT_UNDEFINED;
+}
+static VkFormat dac_depth(VkFormat f) {
+    return f == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : f == VK_FORMAT_R16_UNORM ? VK_FORMAT_D16_UNORM : VK_FORMAT_UNDEFINED;
+}
+static int dac_find(const NvnTexture *t) {   // (under g_dac_lock)
+    for (int i = 0; i < g_ndac; i++)
+        if (g_dac[i].addr == t->addr && g_dac[i].w == t->width && g_dac[i].h == t->height && g_dac[i].f == t->format) return i;
+    return -1;
+}
+static bool dac_listed(const NvnTexture *t) {
+    if (!g_ndac || !t->addr || !renderer_format_is_depth(t->format)) return false;
+    pthread_mutex_lock(&g_dac_lock);
+    bool r = dac_find(t) >= 0;
+    pthread_mutex_unlock(&g_dac_lock);
+    return r;
+}
+static void dac_list(const NvnTexture *t, bool add) {
+    if (!t->addr) return;
+    pthread_mutex_lock(&g_dac_lock);
+    int i = dac_find(t);
+    if (add && i < 0 && g_ndac < DAC_MAX) g_dac[g_ndac++] = (typeof(g_dac[0])){t->addr, t->width, t->height, t->format};
+    if (!add && i >= 0) g_dac[i] = g_dac[--g_ndac];
+    pthread_mutex_unlock(&g_dac_lock);
+}
+static VkBuffer dac_buf;
+static VmaAllocation dac_buf_mem;
+static uint64_t dac_buf_size;
+uint64_t vk_dac_moves;   // (device.c stats window)
+// t is bound as a colour target (colour) or as the depth attachment (!colour) of the pass begin_pass opens next: an image
+// of a depth NVN format moves to the kind that attachment needs. Outside a render pass. True: moved.
+bool renderer_texture_target_kind(NvnTexture *t, bool colour) {
+    if (!t || !renderer_format_is_depth(t->format) || !dac_on()) return false;
+    if (t->samples > 1) return false;
+    dac_list(t, colour);   // (an image made now follows the listing: its storage's last role)
+    // the image the pass will use, made or taken from the recycle pool now (a pooled image of this storage may be of the
+    // other kind: it is moved below, a swap once it has both)
+    TexBackend *b = vk_tex(t, true);
+    if (!b || !b->image) return false;
+    if (b->samples > 1 || b->blk || b->pending_rgba || b->base_type == VK_IMAGE_VIEW_TYPE_3D) return false;
+    bool is_colour = b->aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+    if (is_colour == colour || (!is_colour && b->aspect != VK_IMAGE_ASPECT_DEPTH_BIT)) return false;   // (stencil formats stay)
+    VkFormat nf = colour ? dac_colour(b->format) : dac_depth(b->format);
+    if (!nf || !format_supports(nf, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                        (colour ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT : VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)))
+        return false;
+    dac_list(t, colour);
+    views_forget(b);
+    if (b->twin) { destroy_image(b->twin); free(b->twin); b->twin = NULL; }
+    b->twin_valid = false;
+    typeof(b->alt) cur = {b->image, b->mem, b->format, b->aspect, b->usage, b->cflags};
+    bool made = false;
+    if (b->alt.image && b->alt.format == nf) {   // swap in the kept image of the other kind
+        b->image = b->alt.image, b->mem = b->alt.mem, b->format = b->alt.format, b->aspect = b->alt.aspect;
+        b->usage = b->alt.usage, b->cflags = b->alt.cflags;
+    } else {   // first move of this backend: make the other kind (create_image follows the listing above)
+        if (b->alt.image || b->alt.mem) defer((Dead){.img = b->alt.image, .mem = b->alt.mem});
+        b->image = VK_NULL_HANDLE, b->mem = VK_NULL_HANDLE;
+        create_image(t, b);
+        if (!b->image || b->format != nf) {   // (refused after all: back to the old image)
+            if (b->image || b->mem) defer((Dead){.img = b->image, .mem = b->mem});
+            b->image = cur.image, b->mem = cur.mem, b->format = cur.format, b->aspect = cur.aspect, b->usage = cur.usage, b->cflags = cur.cflags;
+            memset(&b->alt, 0, sizeof b->alt);
+            dac_list(t, !colour);
+            return false;
+        }
+        made = true;
+    }
+    b->alt = cur;
+    extern uint32_t vk_view_gen;
+    vk_view_gen++;   // (exec.c's per-frame view memo is keyed by the texture object)
+    // the contents: old image -> a buffer -> new image (the same bits: 4 / 2 bytes per texel, each level and layer)
+    uint32_t w = b->width, h = b->height, lv = b->levels < 16 ? b->levels : 16, ly = b->layers;
+    uint64_t tb = nf == VK_FORMAT_R32_SFLOAT || nf == VK_FORMAT_D32_SFLOAT ? 4 : 2, off[16], n = 0;
+    for (uint32_t l = 0; l < lv; l++) {
+        off[l] = n;
+        n += ((uint64_t)(w >> l ? w >> l : 1) * (h >> l ? h >> l : 1) * ly * tb + 3) & ~3ull;
+    }
+    if (n > dac_buf_size) {
+        if (dac_buf) defer((Dead){.buf = dac_buf, .mem = dac_buf_mem});
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n,
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &dac_buf, &dac_buf_mem, NULL) != VK_SUCCESS) dac_buf = VK_NULL_HANDLE, n = dac_buf_size = 0;
+        else dac_buf_size = n;
+    }
+    if (n) {
+        VkBufferImageCopy rg[16];
+        for (uint32_t l = 0; l < lv; l++)
+            rg[l] = (VkBufferImageCopy){.bufferOffset = off[l], .imageSubresource = {cur.aspect, l, 0, ly},
+                                        .imageExtent = {w >> l ? w >> l : 1, h >> l ? h >> l : 1, 1}};
+        VkCommandBuffer cb = vk_cmd();
+        vk_full_barrier(cb);
+        vkCmdCopyImageToBuffer(cb, cur.image, VK_IMAGE_LAYOUT_GENERAL, dac_buf, lv, rg);
+        vk_full_barrier(cb);
+        for (uint32_t l = 0; l < lv; l++) rg[l].imageSubresource.aspectMask = b->aspect;
+        vkCmdCopyBufferToImage(cb, dac_buf, b->image, VK_IMAGE_LAYOUT_GENERAL, lv, rg);
+        vk_full_barrier(cb);
+    }
+    vk_dac_moves++;
+    static int nlog;
+    if (nlog++ < 24)
+        LOG("[tex] depth-format target bound as %s: %p addr %llx %ux%u nvn f%#x -> vk %d (%s)\n", colour ? "colour" : "depth again",
+            (void *)t, (unsigned long long)t->addr, t->width, t->height, t->format, nf, made ? "made" : "swapped");
+    return true;
+}
+
 // ---- block-compressed render targets. Vulkan cannot render to a BC image, so the pass draws into an uncompressed "block
 // shadow" image (w/4 x h/4 x depth, the view's format) and exec.c copies each rendered level/slice into the BC image
 // after the pass (vkCmdCopyImage between size-compatible formats). LARECOMP_NO_BC_RT=1: dropped (not rendered).
 static bool is_bc(VkFormat f) { return f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK; }
 static uint32_t bc_block_bytes(VkFormat f) {
     return f <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK || f == VK_FORMAT_BC4_UNORM_BLOCK || f == VK_FORMAT_BC4_SNORM_BLOCK ? 8 : 16;
+}
+// BC compatibility class (Vulkan: BC1_RGB, BC1_RGBA, BC2 .. BC7 are each their own class; UNORM / SRGB / SNORM share one)
+static int bc_class(VkFormat f) { return (int)(f - VK_FORMAT_BC1_RGB_UNORM_BLOCK) / 2; }
+static int bc_class_views(void) {   // (vk_view: views across BC kinds read in the image's format; LARECOMP_BC_CLASS_VIEW=0 off)
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_BC_CLASS_VIEW"); on = !(e && *e == '0'); }
+    return on;
 }
 static uint32_t texel_bytes(VkFormat f) {
     switch (f) {
@@ -2299,6 +2460,23 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
             }
         }
     }
+    if (fmt != b->format && is_bc(fmt) && is_bc(b->format) && bc_class(fmt) != bc_class(b->format) && bc_class_views()) {
+        // A BC view of a BC image of another kind (kak.cap: BC5 views of BC1 images and back): no Vulkan image can be
+        // viewed across BC kinds (VUID-VkImageViewCreateInfo-image-01761; NVIDIA accepts it, AMD need not). The texels are
+        // the image's own: they are read in its format. LARECOMP_BC_CLASS_VIEW=0: the view's format (old).
+        static uint32_t seen[32];
+        static int nseen;
+        uint32_t key = (uint32_t)fmt << 16 | (uint32_t)b->format, i = 0;
+        while (i < (uint32_t)nseen && seen[i] != key) i++;
+        if (i == (uint32_t)nseen && nseen < 32) {
+            seen[nseen++] = key;
+            LOG("[tex] a view in BC format %d of a BC image in format %d (another BC kind, nvn fmt %#x): read in the image's format\n",
+                fmt, b->format, t->format);
+        }
+        fmt = b->format;
+    }
+    if (color && fmt >= VK_FORMAT_D16_UNORM && fmt <= VK_FORMAT_D32_SFLOAT_S8_UINT)   // (a depth reading of a colour image: a depth-format
+        fmt = dac_colour(fmt) ? dac_colour(fmt) : b->format;                         // target made colour, renderer_texture_target_kind)
     uint32_t lv0 = v && (v->setmask & 1) ? v->base_level : 0;
     uint32_t nlv = v && (v->setmask & 1) && v->num_levels ? v->num_levels : b->levels - (lv0 < b->levels ? lv0 : 0);
     uint32_t ly0 = v && (v->setmask & 2) ? v->min_layer : 0;
@@ -2397,8 +2575,15 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
         return vk_image_view(b, want, fmt, lv0, nlv, ly0, 1, sw, aspect);
     if (want == VK_IMAGE_VIEW_TYPE_2D_ARRAY && (have == VK_IMAGE_VIEW_TYPE_2D || have == VK_IMAGE_VIEW_TYPE_CUBE))
         return vk_image_view(b, want, fmt, lv0, nlv, ly0, have == VK_IMAGE_VIEW_TYPE_CUBE ? nly : 1, sw, aspect);
-    if (want == VK_IMAGE_VIEW_TYPE_CUBE && have == VK_IMAGE_VIEW_TYPE_2D_ARRAY && b->layers >= 6 && b->width == b->height)
+    if (want == VK_IMAGE_VIEW_TYPE_CUBE && have == VK_IMAGE_VIEW_TYPE_2D_ARRAY && b->layers >= 6 && b->width == b->height) {
+        if (!(b->cflags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)) {   // (cube_compat_all off: no flag on non-cube arrays)
+            static int nlog;
+            if (nlog++ < 16) LOG("[tex] cube view of a 2D array without CUBE_COMPATIBLE (%ux%u x%u fmt %#x addr %llx): dummy view "
+                                 "(LARECOMP_CUBE_COMPAT=all keeps the flag)\n", t->width, t->height, b->layers, t->format, (unsigned long long)t->addr);
+            return vk_dummy_view(want_textype);
+        }
         return vk_image_view(b, want, fmt, lv0, nlv, ly0 + 6 <= b->layers ? ly0 : 0, 6, sw, aspect);
+    }
     if (want == VK_IMAGE_VIEW_TYPE_1D_ARRAY && have == VK_IMAGE_VIEW_TYPE_1D)
         return vk_image_view(b, want, fmt, lv0, nlv, 0, 1, sw, aspect);
     static int nlog;

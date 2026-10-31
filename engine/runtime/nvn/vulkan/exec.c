@@ -2003,7 +2003,7 @@ uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 static float pass_sx = 1, pass_sy = 1;
 static float vp_sx = 1, vp_sy = 1, vp_ox = 0, vp_oy = 0;
-static float tex_sc[2][64][2];
+static float tex_sc[2][64][3];   // [2]: 1 = a D16 image sampled with depth compare (translate.c d16q)
 static uint32_t tex_wh[2][64][2];
 
 // ================================================================== render passes
@@ -2708,9 +2708,11 @@ static void begin_pass(void) {
     }
     {   // (textures.c) a promoted target that kept its unscaled backend: reallocated at the scene's scale before use
         extern bool renderer_texture_apply_promotion(NvnTexture *t);
+        extern bool renderer_texture_target_kind(NvnTexture *t, bool colour);   // (a depth-format texture as a colour target)
         for (int i = 0; i <= st.rt.ncolor; i++) {
             NvnTexture *t = i < st.rt.ncolor ? st.rt.color[i] : st.rt.depth;
             if (t && t->backend) renderer_texture_apply_promotion(t);
+            if (t) renderer_texture_target_kind(t, i < st.rt.ncolor);   // (also before its first image: made in the right kind)
         }
     }
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
@@ -8516,10 +8518,10 @@ void vk_exec_reset(void) {
     st_defaults();
 }
 
-static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]);
+static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[3], uint32_t wh[2]);
 // Feedback / pause-capture substitutions bypass it.
 uint64_t prof_tic_hit, prof_tic_miss, prof_tic_wmiss;   // (VK_PROF "[prof] G5 caches" line; wmiss: dropped by a writer change)
-static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
+static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[3], uint32_t wh[2]) {
     static int mode = -1;
     if (mode < 0) { const char *e = getenv("LARECOMP_TEXINFO_CACHE"); mode = e ? atoi(e) : 1; if (mode != 1) LOG("[vk] texture_info cache %d\n", mode); }
     ShaderTexture *st_ = &si->tex[i];
@@ -8533,7 +8535,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     // re-checked against it when vk_alias_gen moved. No list epoch: texture_info_'s view memo and upload check are per frame.)
     extern uint32_t vk_view_gen, vk_alias_gen;
     extern NvnTexture *renderer_texture_alias_writer(NvnTexture *t);
-    static struct { uint64_t h, frame; void *tp, *sp; NvnTexture *tex, *w; uint32_t gen, agen, pool_gen; uint8_t type, valid; VkDescriptorImageInfo ii; float sc[2]; uint32_t wh[2]; } c[4096];
+    static struct { uint64_t h, frame; void *tp, *sp; NvnTexture *tex, *w; uint32_t gen, agen, pool_gen; uint8_t type, valid; VkDescriptorImageInfo ii; float sc[3]; uint32_t wh[2]; } c[4096];
     uint64_t frame = vk_frame_counter();
     uint32_t gen = vk_view_gen, pg = __atomic_load_n(&g_pool_gen, __ATOMIC_RELAXED), tic = (uint32_t)(h & 0xFFFFF);
     uint64_t k = (h * 0x9E3779B97F4A7C15ull) ^ ((uintptr_t)st.tpool >> 4) ^ ((uintptr_t)st.spool << 7) ^ st_->type;
@@ -8546,7 +8548,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
         else e->agen = vk_alias_gen;
     }
     if (hit && mode == 1) {
-        *out = e->ii; sc[0] = e->sc[0]; sc[1] = e->sc[1]; wh[0] = e->wh[0]; wh[1] = e->wh[1];
+        *out = e->ii; sc[0] = e->sc[0]; sc[1] = e->sc[1]; sc[2] = e->sc[2]; wh[0] = e->wh[0]; wh[1] = e->wh[1];
         prof_tic_hit++;
         return;
     }
@@ -8554,7 +8556,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     if (hit) {   // (check mode)
         static uint64_t n, bad;
         n++;
-        if (memcmp(&e->ii, out, sizeof *out) || e->sc[0] != sc[0] || e->sc[1] != sc[1] || e->wh[0] != wh[0] || e->wh[1] != wh[1]) {
+        if (memcmp(&e->ii, out, sizeof *out) || e->sc[0] != sc[0] || e->sc[1] != sc[1] || e->sc[2] != sc[2] || e->wh[0] != wh[0] || e->wh[1] != wh[1]) {
             if (bad++ < 20) LOG("[vk] texture_info cache would have been wrong: handle %llx type %u (%llu of %llu)\n",
                                 (unsigned long long)h, (unsigned)st_->type, (unsigned long long)bad, (unsigned long long)n);
         }
@@ -8566,12 +8568,13 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     NvnTexture *tex = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
     e->h = h; e->type = (uint8_t)st_->type; e->tp = (void *)st.tpool; e->sp = (void *)st.spool; e->frame = frame;
     e->tex = tex; e->w = tex ? renderer_texture_alias_writer(tex) : NULL; e->agen = vk_alias_gen;
-    e->gen = gen; e->pool_gen = pg; e->ii = *out; e->sc[0] = sc[0]; e->sc[1] = sc[1]; e->wh[0] = wh[0]; e->wh[1] = wh[1]; e->valid = 1;
+    e->gen = gen; e->pool_gen = pg; e->ii = *out; e->sc[0] = sc[0]; e->sc[1] = sc[1]; e->sc[2] = sc[2]; e->wh[0] = wh[0]; e->wh[1] = wh[1]; e->valid = 1;
 }
-static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
+static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[3], uint32_t wh[2]) {
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+    sc[2] = 0;   // (1: a D16 image compare-sampled here, below: translate.c rounds the reference to the D16 grid)
     VkImageView view = VK_NULL_HANDLE;
     VkSampler smp = VK_NULL_HANDLE;
     // (g_vk.fbl_layout: the descriptor says the layout the viewed guest image is in, FEEDBACK_LOOP_OPTIMAL while a pass holds it
@@ -8643,6 +8646,7 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
                 TexBackend *sb = (w ? w : tex)->backend;
                 VkImageView tv = sb && !subst ? vk_depth_twin_view(sb, &e->view, e->has_view, st_->type) : VK_NULL_HANDLE;
                 if (tv) view = tv, vb = NULL;
+                if (sb && (sb->format == VK_FORMAT_D16_UNORM || (tv && sb->format == VK_FORMAT_R16_UNORM))) sc[2] = 1;   // (a D16 image / twin)
             }
         }
     }
@@ -8937,12 +8941,12 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->binding >= 32) {
             int ti = (int)b->binding - 32;
-            float sc[2]; uint32_t wh[2];
-            if (ti < si->ntex && pre_ii && ti < 64) { ii[n] = pre_ii[ti]; sc[0] = tex_sc[sg][ti][0]; sc[1] = tex_sc[sg][ti][1]; wh[0] = tex_wh[sg][ti][0]; wh[1] = tex_wh[sg][ti][1]; }
+            float sc[3] = {1, 1, 0}; uint32_t wh[2];
+            if (ti < si->ntex && pre_ii && ti < 64) { ii[n] = pre_ii[ti]; sc[0] = tex_sc[sg][ti][0]; sc[1] = tex_sc[sg][ti][1]; sc[2] = tex_sc[sg][ti][2]; wh[0] = tex_wh[sg][ti][0]; wh[1] = tex_wh[sg][ti][1]; }
             else if (ti < si->ntex) texture_info(stage, si, ti, &ii[n], sc, wh);
             else { ii[n] = (VkDescriptorImageInfo){vk_default_sampler(true), vk_dummy_view(TEXTYPE_2D), VK_IMAGE_LAYOUT_GENERAL}; sc[0] = sc[1] = 1; wh[0] = wh[1] = 0; }
             if (ti < 64) {
-                tex_sc[sg][ti][0] = sc[0]; tex_sc[sg][ti][1] = sc[1];
+                tex_sc[sg][ti][0] = sc[0]; tex_sc[sg][ti][1] = sc[1]; tex_sc[sg][ti][2] = sc[2];
                 tex_wh[sg][ti][0] = wh[0]; tex_wh[sg][ti][1] = wh[1];
             }
             w[n].pImageInfo = &ii[n];
@@ -8969,7 +8973,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->binding == 18) {
             int nt = si->ntex < 64 ? si->ntex : 64;
-            for (int t = 0; t < nt; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; rs[1 + t][2] = rs[1 + t][3] = 0; }
+            for (int t = 0; t < nt; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; rs[1 + t][2] = tex_sc[sg][t][2]; rs[1 + t][3] = 0; }
             uint64_t rsz = (uint64_t)(1 + nt) * 16;
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, rsz, 256), rsz);
         } else {
@@ -10220,7 +10224,7 @@ pipe_known:;
     static int fs_tc = -1;
     if (fs_tc < 0) { const char *e = getenv("LARECOMP_FS_TEXCACHE"); fs_tc = e ? atoi(e) : 1; if (fs_tc) LOG("[vk] fragment-texture cache %d\n", fs_tc); }
     static struct { ShaderInfo *fi; uint64_t bgen, frame, epoch; uint32_t view_gen, pool_gen; int n; bool valid;
-                    VkDescriptorImageInfo ii[64]; float sc[64][2]; uint32_t wh[64][2]; } fstc;
+                    VkDescriptorImageInfo ii[64]; float sc[64][3]; uint32_t wh[64][2]; } fstc;
     static uint64_t fstc_hits, fstc_bad, fstc_ver = 1;   // (ver: bumped at every refill of fstc.ii, never 0)
     extern uint32_t vk_view_gen, g_pool_gen;
     extern uint64_t vk_frame_counter(void);
@@ -10230,20 +10234,20 @@ pipe_known:;
                    fstc.epoch == (in_execute ? alias_epoch : 0);
     if (fs_same && fs_tc == 1) {
         memcpy(fii, fstc.ii, (size_t)fs_n * sizeof *fii);
-        for (int i = 0; i < fs_n; i++) { tex_sc[1][i][0] = fstc.sc[i][0]; tex_sc[1][i][1] = fstc.sc[i][1]; tex_wh[1][i][0] = fstc.wh[i][0]; tex_wh[1][i][1] = fstc.wh[i][1]; }
+        for (int i = 0; i < fs_n; i++) { tex_sc[1][i][0] = fstc.sc[i][0]; tex_sc[1][i][1] = fstc.sc[i][1]; tex_sc[1][i][2] = fstc.sc[i][2]; tex_wh[1][i][0] = fstc.wh[i][0]; tex_wh[1][i][1] = fstc.wh[i][1]; }
         fstc_hits++;
     } else {
         for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
-            float sc[2]; uint32_t wh[2];
+            float sc[3] = {1, 1, 0}; uint32_t wh[2];
             texture_info(1, pr->fi, i, &fii[i], sc, wh);
-            tex_sc[1][i][0] = sc[0]; tex_sc[1][i][1] = sc[1]; tex_wh[1][i][0] = wh[0]; tex_wh[1][i][1] = wh[1];
+            tex_sc[1][i][0] = sc[0]; tex_sc[1][i][1] = sc[1]; tex_sc[1][i][2] = sc[2]; tex_wh[1][i][0] = wh[0]; tex_wh[1][i][1] = wh[1];
         }
         if (fs_tc) {
             bool bad = false;
             if (fs_same) {
                 bad = memcmp(fii, fstc.ii, (size_t)fs_n * sizeof *fii) != 0;
                 for (int i = 0; i < fs_n && !bad; i++)
-                    bad = tex_sc[1][i][0] != fstc.sc[i][0] || tex_sc[1][i][1] != fstc.sc[i][1] || tex_wh[1][i][0] != fstc.wh[i][0] || tex_wh[1][i][1] != fstc.wh[i][1];
+                    bad = tex_sc[1][i][0] != fstc.sc[i][0] || tex_sc[1][i][1] != fstc.sc[i][1] || tex_sc[1][i][2] != fstc.sc[i][2] || tex_wh[1][i][0] != fstc.wh[i][0] || tex_wh[1][i][1] != fstc.wh[i][1];
                 fstc_hits++;
                 if (bad && fstc_bad++ < 16) LOG("[vk] fragment-texture cache would have been wrong (%llu so far)\n", (unsigned long long)fstc_bad);
             }
@@ -10252,7 +10256,7 @@ pipe_known:;
             fstc.pool_gen = __atomic_load_n(&g_pool_gen, __ATOMIC_RELAXED); fstc.epoch = in_execute ? alias_epoch : 0;
             memcpy(fstc.ii, fii, (size_t)fs_n * sizeof *fii);
             fstc_ver++;
-            for (int i = 0; i < fs_n; i++) { fstc.sc[i][0] = tex_sc[1][i][0]; fstc.sc[i][1] = tex_sc[1][i][1]; fstc.wh[i][0] = tex_wh[1][i][0]; fstc.wh[i][1] = tex_wh[1][i][1]; }
+            for (int i = 0; i < fs_n; i++) { fstc.sc[i][0] = tex_sc[1][i][0]; fstc.sc[i][1] = tex_sc[1][i][1]; fstc.sc[i][2] = tex_sc[1][i][2]; fstc.wh[i][0] = tex_wh[1][i][0]; fstc.wh[i][1] = tex_wh[1][i][1]; }
         }
     }
     g_fs_pre_ver = fs_tc ? fstc_ver : 0;   // (with the cache on, fii[0..fs_n) is fstc.ii at this version: stage_set's pre_ii below)

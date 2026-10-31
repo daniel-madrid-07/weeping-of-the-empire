@@ -50,7 +50,7 @@ int g_bancs;                    // (changes started so far; the hook runs on the
 bool banc_on() {
     static const bool on = [] {
         const char *e = getenv("TOTK_LOAD_BANC");
-        return e && strcmp(e, "0") != 0;   // (opt-in)
+        return !e || strcmp(e, "0") != 0;
     }();
     return on;
 }

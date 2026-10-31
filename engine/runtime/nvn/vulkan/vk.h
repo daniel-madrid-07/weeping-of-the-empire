@@ -115,6 +115,9 @@ typedef struct TexBackend {
     bool fbl_in;             // exec.c g_vk.fbl_layout: in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL for the open pass (else GENERAL)
     struct TexBackend *twin; // a colour target sampled with depth compare: its depth-format copy (textures.c vk_depth_twin)
     bool twin_valid;         // the twin holds this image's latest rendering (copied after each pass that drew into it)
+    struct { VkImage image; VmaAllocation mem; VkFormat format; VkImageAspectFlags aspect; VkImageUsageFlags usage;
+             VkImageCreateFlags cflags; } alt;   // a depth-format texture's other kind (colour / depth): textures.c
+                                                // renderer_texture_target_kind swaps it in, contents copied
     uint32_t rd_epoch;       // exec.c LARECOMP_PASS_ELIDE=2: barrier epoch in which a draw last sampled it
     uint64_t snap_tag;       // exec.c LARECOMP_SNAP_DELTA: the feedback snapshot that mirrors this image (0: none), and the box
     int32_t snap_box[4];     // draws wrote in it since (level 0, x0 y0 x1 y1; empty when x1 <= x0)
