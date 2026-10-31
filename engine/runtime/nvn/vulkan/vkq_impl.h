@@ -12,7 +12,7 @@ enum {
     QOP_VIEWPORT, QOP_SCISSOR, QOP_BLENDC, QOP_DBIAS, QOP_DBIAS_EN, QOP_DTEST, QOP_DWRITE, QOP_DCMP, QOP_STEST, QOP_SOP, QOP_SCMASK,
     QOP_SWMASK, QOP_SREF, QOP_CULL, QOP_FRONT, QOP_TOPO, QOP_RESTART, QOP_BEGINR, QOP_ENDR, QOP_BARRIER, QOP_CPBUF, QOP_CPIMG,
     QOP_CPB2I, QOP_CPI2B, QOP_BLIT, QOP_RESOLVE, QOP_CLRCOL, QOP_CLRDS, QOP_CLRATT, QOP_QRESET, QOP_TS, QOP_FBL, QOP_SUBMIT,
-    QOP_SETW, QOP_QBEGIN, QOP_QEND
+    QOP_SETW, QOP_QBEGIN, QOP_QEND, QOP_MARK
 };
 typedef struct { uint32_t op, size; VkCommandBuffer cb; } QHdr;   // size: whole record, header included
 static uint8_t *q_buf;
@@ -270,6 +270,11 @@ typedef struct { PFN_vkCmdSetAttachmentFeedbackLoopEnableEXT fn; VkImageAspectFl
 void q_set_fbl(PFN_vkCmdSetAttachmentFeedbackLoopEnableEXT fn, VkCommandBuffer cb, VkImageAspectFlags m) {
     if (!vkq_enabled()) { fn(cb, m); return; }
     QREC(QOP_FBL, cb, QFbl); a->fn = fn; a->m = m; q_commit();
+}
+typedef struct { PFN_vkCmdWriteBufferMarkerAMD fn; VkBuffer buf; VkDeviceSize off; VkPipelineStageFlagBits st; uint32_t v; } QMark;
+void q_mark(PFN_vkCmdWriteBufferMarkerAMD fn, VkCommandBuffer cb, VkPipelineStageFlagBits st, VkBuffer buf, VkDeviceSize off, uint32_t v) {
+    if (!vkq_enabled()) { fn(cb, st, buf, off, v); return; }
+    QREC(QOP_MARK, cb, QMark); a->fn = fn; a->buf = buf; a->off = off; a->st = st; a->v = v; q_commit();
 }
 void q_vkCmdEndRendering(VkCommandBuffer cb) {
     if (!vkq_enabled()) { (vkCmdEndRendering)(cb); return; }
@@ -539,6 +544,7 @@ static void q_exec(const QHdr *h) {
     case QOP_QBEGIN: { const QQuery *a = p; (vkCmdBeginQuery)(cb, a->p, a->a, a->b); break; }
     case QOP_QEND: { const QQuery *a = p; (vkCmdEndQuery)(cb, a->p, a->a); break; }
     case QOP_FBL: { const QFbl *a = p; a->fn(cb, a->m); break; }
+    case QOP_MARK: { const QMark *a = p; a->fn(cb, a->st, a->buf, a->off, a->v); break; }
     case QOP_SUBMIT: q_submit((const QSub *)p); break;
     case QOP_SETW: q_setw((const QSetW *)p); break;
     default: FATAL("[vkq] bad record op %u\n", h->op);

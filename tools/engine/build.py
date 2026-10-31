@@ -47,7 +47,7 @@ Layout under <work>/engine/ (game-derived, never in git):
   overlay/romfs/                TOTK_OVERLAY for boots
   glyphs/engine+glyphs/         the glyph bank (TOTK_GLYPHS_DIR default: <overlay>/../../glyphs)
 """
-import argparse, functools, hashlib, io, json, os, re, shutil, subprocess, sys, tarfile, time
+import argparse, functools, glob, hashlib, io, json, os, re, shutil, subprocess, sys, tarfile, time
 from concurrent.futures import ThreadPoolExecutor
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -235,8 +235,7 @@ def clang_version() -> str:
 # ---------------------------------------------------------------- images and patches
 def stale_features(pset: dict) -> list:
     """Each feature whose words in an exported patch set differ from games/totk/patches/v100.toml now (what an export
-    today would write: the rows whose new word differs from the original).
-    from older exports under the same feature name; a stale export is a build error, not a fight crash."""
+    today would write: the rows whose new word differs from the original)."""
     import tomllib
     with open(PATCH_TABLE, 'rb') as f:
         table = tomllib.load(f)
@@ -526,6 +525,8 @@ def key_of(img: str, root: str):
         parts['objs'] = 'no line tables'
     if VARIANT:
         parts['variant'] = json.dumps(VARIANT, sort_keys=True)
+    if no_avx(VARIANT.get('march')):   # (force-included into those keys' game objects)
+        parts['rt_x86v2.h'] = fsha(os.path.join(root, 'runtime', 'rt_x86v2.h'))
     if REF:   # (the exe's runtime comes from the ref too, and two refs can share gen.py and rt.h)
         parts['ref'] = os.path.basename(os.path.dirname(root))
     if SPLIT:
@@ -651,8 +652,8 @@ def sync_tree(new, cur):
 
 
 def with_veneers(fj, pset):
-    """Game patches' veneers: `fde_add` = functions to add, `ext` = code outside a function's
-    FDE that belongs to it (gen_ext.py decodes it as part of the function)."""
+    """Game patches' veneers (the doc): `fde_add` = functions to add, `ext` = code outside a function's FDE that
+    belongs to it (gen_ext.py decodes it as part of the function)."""
     funcs = json.load(open(fj))
     for s, n in pset.get('fde_add', {}).items():
         funcs['fde'][hex(int(s, 16))] = n
@@ -721,6 +722,25 @@ def rt_include(root):
     return d
 
 
+# --march levels without AVX (the Builder's --cpu v2, processors without AVX2): their game objects and runtime get
+# engine/runtime/rt_x86v2.h force-included (rt.h's AVX-only compare; FMA and F16C fall back to exact calls by themselves)
+NO_AVX_MARCH = ('x86-64', 'x86-64-v2')
+
+
+def no_avx(march) -> bool:
+    return march in NO_AVX_MARCH
+
+
+def x86v2_include(root):
+    """rt_x86v2.h at a path that depends only on its content (as rt_include), forward slashes for the ninja rules"""
+    src = os.path.join(root, 'runtime', 'rt_x86v2.h')
+    d = os.path.join(SIG, 'rth', 'x86v2-' + fsha(src)[:12])
+    if not os.path.exists(os.path.join(d, 'rt_x86v2.h')):
+        os.makedirs(d, exist_ok=True)
+        shutil.copy2(src, os.path.join(d, 'rt_x86v2.h'))
+    return os.path.join(d, 'rt_x86v2.h').replace('\\', '/')
+
+
 def toolset() -> str:
     """the C/C++ headers rt.h pulls in come from the MSVC toolset and the Windows SDK, not from clang: their include
     paths name both versions (msvc_env exports no version variables)"""
@@ -771,8 +791,8 @@ def pgo_record(sha):
 
 
 def variant_rule(rule, hot):
-    """the game rule with VARIANT's compile flags: --opt (hot TUs only; cold ones keep
-    COLD_OPT), --march, --pgo gen (IR instrumentation) / --pgo <profdata> (use), --lto thin"""
+    """the game rule with VARIANT's compile flags: --opt (hot TUs only; cold ones keep COLD_OPT), --march,
+    --pgo gen (IR instrumentation) / --pgo <profdata> (use), --lto thin"""
     if not VARIANT:
         return rule
     if VARIANT.get('opt') and hot:
@@ -782,6 +802,8 @@ def variant_rule(rule, hot):
             sys.exit('`rule gen` has no -march=x86-64-v3 to replace')
         rule = rule.replace('-march=x86-64-v3', f"-march={VARIANT['march']}")
     extra = []
+    if no_avx(VARIANT.get('march')):
+        extra.append(f'-include {x86v2_include(TOOLS)}')
     if VARIANT.get('pgo') == 'gen':
         extra.append('-fprofile-generate')
     elif VARIANT.get('pgo'):
@@ -952,7 +974,7 @@ def prune_cache(days=7):
 
 def key_dir(key):
     """<work>/engine/game/<key>, or game-var/<key> for a build variant (--opt/--march/--pgo/--lto/--ref/--gen-args):
-    boot.py's default exe and allon.py take the newest key under game/, and a variant must never be picked as the
+    boot.py's default exe and allon.py take the newest key under game/: a default boot ran the -O3 experiment).
     `runtime --key` finds a key in either."""
     if VARIANT or gen_variant() or REF:
         return os.path.join(SIG, 'game-var', key)
@@ -1008,7 +1030,7 @@ def cmd_game(a):
                     run([sys.executable, HEAVY, '--prio', a.prio, '--', sys.executable, os.path.abspath(__file__), '_gen',
                          img, kdir, TOOLS, str(SPLIT), HOT or '', ' '.join(GEN_EXTRA)])
                 man.update(key=key, parts=parts, img=img, patches=a.patches, src=TOOLS, gen_done=True)
-                json.dump(man, open(mpath, 'w', newline='\n'), indent=1)
+                write_json(mpath, man)
             run([PY, '-I', os.path.join(TOOLS, 'tools', 'recomp', 'mkninja_win.py'), '--game-only', '--root', TOOLS,
                  '--rt-include', rt_include(TOOLS),
                  '--gen', os.path.join(kdir, 'gen', 'main'), '--obj', os.path.join(kdir, 'obj'), '--out', kdir,
@@ -1021,10 +1043,14 @@ def cmd_game(a):
             else:
                 run([sys.executable, HEAVY, '--prio', a.prio, '--', sys.executable, os.path.abspath(__file__), '_ninja', kdir, str(a.jobs)])
             man.update(objs_done=True, objs_built=time.strftime('%Y-%m-%d %H:%M'), objs_minutes=round((time.time() - t0) / 60, 1))
-            json.dump(man, open(mpath, 'w', newline='\n'), indent=1)
+            write_json(mpath, man)
         log('game objects ready')
     if not a.no_exe:
-        runtime_build(TOOLS, os.path.join(kdir, 'exe'), kdir, a.jobs_rt, *debug_files(a))
+        src = runtime_build(TOOLS, os.path.join(kdir, 'exe'), kdir, a.jobs_rt, *debug_files(a))
+        with Lock(kdir):   # the key's own exe: its runtime's commit beside the objects' src (that one stays)
+            man = json.load(open(mpath))
+            man.update(exe_commit=src['commit'], exe_src=TOOLS)
+            write_json(mpath, man)
     print(json.dumps({'key': key, 'dir': kdir, 'img': img, 'exe': None if a.no_exe else os.path.join(kdir, 'exe', 'totk.exe'),
                       'commit': COMMIT}))
 
@@ -1060,8 +1086,8 @@ def cmd_ninja(kdir, jobs, file='build.ninja', stop=None):
 
 
 # ---------------------------------------------------------------- runtime-only
-def small_link(out, pdb, mapfile, variant={}, rt_lto=False):
-    """the link rule of <out>/build.ninja without the PDB (821 MB) and the .map (47 MB) unless asked for: a relink
+def small_link(out, pdb, mapfile, variant={}, rt_lto=False, root=None):
+    """the link rule of <out>/build.ninja without the PDB (821 MB) and the.map (47 MB) unless asked for: a relink
     dir holds the 263 MB exe and nothing else big (2026-10-23: 29 relink dirs took C: under the 40 GB line).
     Without /DEBUG lld-link turns /OPT:REF and /OPT:ICF on, and ICF would fold identical guest functions into one
     address (ftab, the sampler's guest_fn_of); /OPT:NOREF,NOICF keeps the code what it was with /DEBUG."""
@@ -1109,6 +1135,22 @@ def small_link(out, pdb, mapfile, variant={}, rt_lto=False):
             text = text[:mv.end()] + f" -DTOTK_GAME_VERSION={VERSION_DIR[1:]}" + (
                 ' -DTOTK_CAP30' if 'cap30' in SAFE_MODE else '') + text[mv.end():]   # (hle_vi.cpp: nothing above 30)
         m = re.search(r'^rule link\n  command = .*$', text, re.M)
+    if variant.get('march'):   # the runtime at the key's level too: a v2 exe must not carry v3 runtime code
+        for name in ('cxxflags', 'cflags'):
+            mv = re.search(rf'^{name} = .*$', text, re.M)
+            if not mv or '-march=x86-64-v3' not in mv.group(0):
+                sys.exit(f'{p}: no {name} line with -march=x86-64-v3 for --march')
+            line = mv.group(0).replace('-march=x86-64-v3', f"-march={variant['march']}")
+            if no_avx(variant['march']):
+                line += ' -include ' + os.path.join(root or ENGINE, 'runtime', 'rt_x86v2.h').replace('\\', '/')
+            text = text[:mv.start()] + line + text[mv.end():]
+        m = re.search(r'^rule link\n  command = .*$', text, re.M)
+        if no_avx(variant['march']):   # without F16C, _Float16 conversions call __extendhfsf2 / __truncsfhf2 (compiler-rt)
+            lib = sorted(glob.glob(os.path.join(LLVM, '..', 'lib', 'clang', '*', 'lib', 'windows',
+                                                'clang_rt.builtins-x86_64.lib')))
+            if not lib:
+                sys.exit(f'no clang_rt.builtins-x86_64.lib under {LLVM}\\..\\lib\\clang: an x86-64-v2 key needs it')
+            rule = rule.replace(' -fuse-ld=lld', ' -fuse-ld=lld "' + os.path.normpath(lib[-1]).replace('\\', '/') + '"', 1)
     if variant.get('lto') or rt_lto:
         rule = rule.replace(' -fuse-ld=lld', f" -fuse-ld=lld -flto={variant.get('lto') or 'thin'} -Wl,/opt:lldltojobs=6 "
                             f"-Wl,/lldltocache:{os.path.join(SIG, 'ltocache')}")
@@ -1119,6 +1161,31 @@ def small_link(out, pdb, mapfile, variant={}, rt_lto=False):
     for fn, keep in (('totk.pdb', pdb), ('totk.exe.map', mapfile)):
         if not keep and os.path.exists(os.path.join(out, fn)):
             os.remove(os.path.join(out, fn))
+
+
+def write_json(path: str, obj) -> None:
+    """path written whole or not at all: a.tmp, then os.replace (a killed build or a full disk mid-write left a
+    truncated key manifest)"""
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w', newline='\n') as f:
+        json.dump(obj, f, indent=1)
+    os.replace(tmp, path)
+
+
+def source_of(root: str) -> dict:
+    """the commit a runtime build's sources are: a snapshot (<SIG>/src/<commit12>/engine) names it (the full hash when
+    this run exported it, COMMIT), a worktree's --root its HEAD, marked dirty when engine/ has uncommitted edits;
+    commit None outside git"""
+    r = os.path.abspath(root)
+    snap = os.path.dirname(r)
+    if os.path.normcase(os.path.dirname(snap)) == os.path.normcase(os.path.join(SIG, 'src')):
+        c12 = os.path.basename(snap)
+        return {'commit': COMMIT if COMMIT and COMMIT.startswith(c12) else c12, 'dirty': False}
+    head = subprocess.run(['git', '-C', r, 'rev-parse', 'HEAD'], capture_output=True, text=True)
+    if head.returncode:
+        return {'commit': None, 'dirty': None}
+    st = subprocess.run(['git', '-C', r, 'status', '--porcelain', '--', '.'], capture_output=True, text=True)
+    return {'commit': head.stdout.strip(), 'dirty': bool(st.stdout.strip())}
 
 
 def runtime_build(root, out, kdir, jobs, pdb=False, mapfile=False, rt_lto=False):
@@ -1140,12 +1207,18 @@ def runtime_build(root, out, kdir, jobs, pdb=False, mapfile=False, rt_lto=False)
     os.makedirs(out, exist_ok=True)
     run([PY, '-I', os.path.join(root, 'tools', 'recomp', 'mkninja_win.py'), '--prebuilt-gen', '--root', root,
          '--gen', os.path.join(kdir, 'gen', 'main'), '--obj', os.path.join(kdir, 'obj'), '--out', out, '--vcpkg', VCPKG])
-    small_link(out, pdb, mapfile, json.loads(man['parts'].get('variant', '{}')), rt_lto)
+    small_link(out, pdb, mapfile, json.loads(man['parts'].get('variant', '{}')), rt_lto, root)
     t0 = time.time()
     # through heavy.py: 6 runtime compiles (~0.6 GB each) and lld (~1.2 GB)
     run([sys.executable, HEAVY, '--prio', os.environ.get('NXR_HEAVY_PRIO', 'normal'), '--', sys.executable,
          os.path.abspath(__file__), '_ninja', out, str(jobs), 'build.ninja', 'stop'])
     log(f'runtime + link: {time.time() - t0:.0f} s -> {os.path.join(out, "totk.exe")}')
+    # what this exe was built from, next to it: the key manifest's src is the snapshot its game objects were generated
+    # from and stays so (canary_engine.py reads that rt.h); a runtime-only relink from a newer tree would otherwise be
+    # named after the key's first commit
+    src = dict(source_of(root), root=os.path.abspath(root), key=man.get('key'), built=time.strftime('%Y-%m-%d %H:%M'))
+    write_json(os.path.join(out, 'source.json'), src)
+    return src
 
 
 def debug_files(a):
@@ -1220,11 +1293,11 @@ def cmd_overlay(a):
 
 
 def aspect_overlay(romfs, size):
-    """graphics.aspect_ratio: the overlay again with the UI layouts for a
-    <size> canvas, romfs-aspect-<size> beside romfs (totk_engine_boot points TOTK_OVERLAY at it for a window of that shape).
-    From the aspect set in <work>/overlays (python -m games.totk.overlays); one not built there is skipped, and that shape
-    keeps the game's 16:9. Not fatal. When it is not rebuilt, the last build goes too (with its glyph bank): it holds an
-    older engine overlay (Options rows, sets), which a window of that shape would otherwise still get."""
+    """graphics.aspect_ratio: the overlay again with the UI layouts for a <size> canvas, romfs-aspect-<size> beside romfs
+    (totk_engine_boot points TOTK_OVERLAY at it for a window of that shape). From the aspect set in <work>/overlays (python
+    -m games.totk.overlays); one not built there is skipped, and that shape keeps the game's 16:9. Not fatal. When it is not
+    rebuilt, the last build goes too (with its glyph bank): it holds an older engine overlay (Options rows, sets), which a
+    window of that shape would otherwise still get."""
     name, sets = f'aspect-{size}', os.path.join(WORK, 'overlays')
     dst = f'{romfs}-{name}'
     if not os.path.isdir(os.path.join(sets, name)):
@@ -1265,11 +1338,11 @@ def drop_aspect_overlay(dst, size):
 
 
 def glyph_bank(overlay, name='engine+glyphs'):
-    """The glyph bank on this overlay's Common archive and resource size table:
-    the engine skips a bank whose base.fnv names another overlay, and every button prompt goes back to the game's own,
-    so it is rebuilt with the overlay. An aspect overlay (romfs-aspect-<size>, graphics.aspect_ratio) has its own Common
-    archive, so its own bank, engine+glyphs@aspect-<size>, which hle_fs.cpp picks for that overlay. Not fatal: without it
-    the game shows its own prompts."""
+    """The glyph bank on this overlay's Common archive and resource size table: the engine skips a bank whose base.fnv names
+    another overlay, and every button prompt goes back to the game's own, so it is rebuilt with the overlay. An aspect
+    overlay (romfs-aspect-<size>, graphics.aspect_ratio) has its own Common archive, so its own bank,
+    engine+glyphs@aspect-<size>, which hle_fs.cpp picks for that overlay. Not fatal: without it the game shows its own
+    prompts."""
     bank = os.path.join(SIG, 'glyphs', name)
     py = glyph_python()
     if not py:
@@ -1347,7 +1420,8 @@ def main():
                        help='re-cut the TUs at ~N guest instructions with stable boundaries (tusplit.py); 0 = off')
         p.add_argument('--hot', help='with --split: hot function names (f_<hex>/s_<hex>); the others compile at ' + COLD_OPT)
         p.add_argument('--opt', choices=['-O3'], help='game objects at -O3 instead of -O2')
-        p.add_argument('--march', help='instead of x86-64-v3 (e.g. znver5: this PC only, never a shipped package)')
+        p.add_argument('--march', help='instead of x86-64-v3: x86-64-v2 for processors without AVX2 (the Builder\'s '
+                       '--cpu v2, rt_x86v2.h force-included), or e.g. znver5 (this PC only, never a shipped package)')
         p.add_argument('--pgo', metavar='gen|FILE.profdata',
                        help='gen: an instrumented key (boots write profiles with TOTK_PGO_DUMP); a .profdata: use it')
         p.add_argument('--lto', choices=['thin'], help='ThinLTO across the game objects (the backends run at link)')

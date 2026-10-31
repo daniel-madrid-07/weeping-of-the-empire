@@ -420,8 +420,8 @@ def build_base(romfs, zstd, out_root, aspect=None, hud='corner', capture_frame=0
 
 
 def build_skip_opening(romfs, zstd, out_root):
-    """skip_opening/: the opening flow that starts a new game at the Great Sky Island wake-up. The engine serves it
-    before the RomFS while "Skip the opening" is on: TOTK_SKIP_OPENING=1 and TOTK_SKIP_DIR=<out_root>/skip_opening (its
+    """skip_opening/: the opening flow that starts a new game at the Great Sky Island wake-up. The engine serves it before
+    the RomFS while "Skip the opening" is on: TOTK_SKIP_OPENING=1 and TOTK_SKIP_DIR=<out_root>/skip_opening (its
     default is C:/totk/overlay/skip_opening/romfs). Same decompressed size, so the RSTB entry stands."""
     raw = romfs.read(OPENING_FLOW)
     flow, dict_id = zstd.decompress(raw)

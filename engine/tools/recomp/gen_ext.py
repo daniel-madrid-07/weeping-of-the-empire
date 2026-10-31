@@ -8,14 +8,27 @@ A wrapper, not an edit of gen.py: gen.py is part of every shared game-object key
 patched keys that need this pay for it. Functions without `ext` go through gen.py's own code (byte-identical output,
 checked on 303 functions); the extended copy of Emitter.function below is refused when gen.py's function / tail
 change, so it cannot drift silently."""
-import hashlib, inspect, json, os, re, sys
+import ast, hashlib, inspect, json, os, re, sys, textwrap
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gen as G   # noqa: E402
 
-UPSTREAM = {'function': '002a1464061d806f', 'tail': '58cb5091eaf5fad8'}   # sha256[:16] of the methods this copies
+
+def shape(fn):
+    """sha256[:16] of a method's code, not its text: comments, blank lines, layout and docstrings do not count
+    (tools/release/export_public.py rewrites comments inside gen.py; a hash of the text refused every public build)."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body and \
+                isinstance(node.body[0], ast.Expr) and isinstance(getattr(node.body[0], 'value', None), ast.Constant) \
+                and isinstance(node.body[0].value.value, str):
+            node.body = node.body[1:] or [ast.Pass()]
+    return hashlib.sha256(ast.dump(tree).encode()).hexdigest()[:16]
+
+
+UPSTREAM = {'function': '1e3da005df9a5e0f', 'tail': 'b06f536b1ecf4910'}   # shape() of the gen.py methods this copies
 for name, want in UPSTREAM.items():
-    have = hashlib.sha256(inspect.getsource(getattr(G.Emitter, name)).encode()).hexdigest()[:16]
+    have = shape(getattr(G.Emitter, name))
     if have != want:
         sys.exit(f'gen_ext.py: gen.py Emitter.{name} changed ({have}, expected {want}): port the change into gen_ext.py')
 
@@ -105,7 +118,9 @@ class ExtEmitter(G.Emitter):
         # --alias, as in gen.py (another game version: the 1.0.0 name f_<old> forwards here)
         old = self.alias.get(start)
         names = ('',) if start in self.hooks else ('', '_orig')
-        fwd = ''.join(f'void {ALIAS_FN}{old:x}{sfx}(Ctx* __restrict c) {{ {FN}{start:x}(c); }}\n'
+        # each forwarder is a block of its own (a blank line, then up to a `}` line), as tools/engine/tusplit.py
+        # parses a TU
+        fwd = ''.join(f'\nvoid {ALIAS_FN}{old:x}{sfx}(Ctx* __restrict c) {{\n{FN}{start:x}(c);\n}}\n'
                       for sfx in names) if old is not None else ''
         hname = f'{ALIAS_FN}{old:x}' if old is not None else f'{FN}{start:x}'
         if start in self.hooks:

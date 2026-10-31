@@ -432,7 +432,9 @@ class Emitter:
         # answers to that name too.
         old = self.alias.get(start)
         names = ('',) if start in self.hooks else ('', '_orig')
-        fwd = ''.join(f'void {ALIAS_FN}{old:x}{sfx}(Ctx* __restrict c) {{ {FN}{start:x}(c); }}\n'
+        # each forwarder is a block of its own (a blank line, then up to a `}` line), as tools/engine/tusplit.py
+        # parses a TU
+        fwd = ''.join(f'\nvoid {ALIAS_FN}{old:x}{sfx}(Ctx* __restrict c) {{\n{FN}{start:x}(c);\n}}\n'
                       for sfx in names) if old is not None else ''
         hname = f'{ALIAS_FN}{old:x}' if old is not None else f'{FN}{start:x}'
         if start in self.hooks:  # runtime wrapper (e.g. TotK's frame-delta setter): it calls <name>_orig itself
@@ -525,8 +527,8 @@ class Emitter:
     def abi_dead_ok(self, a, part):
         """part = the code after an LSO at the instruction at a: a call (to a function, an import or through a register),
         a return or a tail call to a function start / import, and neither the site nor a direct callee listed. A
-        function a listed site calls directly keeps D at its returns and tail calls (it may produce what that caller
-        reads."""
+        function a listed site calls directly keeps D at its returns and tail calls. gen_ext.py's functions with
+        extension ranges keep D everywhere (the scan reads FDEs only)."""
         if self.fstart in getattr(self, 'ext', {}):
             return False
         ret = self.ABI_RET.match(part)
@@ -1391,9 +1393,9 @@ class Emitter:
         v = (~self._movi_val(ops, esz)) & ((1 << esz) - 1)
         return f'c->v[{d}] = {self.vimm(f"vdup({esz // 8}, {cnt * esz // 8}, {v:#x}ull)")};'
     def vimm(self, e):
-        """a V register immediate: opaque under --fz, else clang folds x * 1.0, x - 0.0 ... (f_86e2fc; IEEE-exact, but
-        ARM gives a denormal 0 under FZ). rt.h's opq on the register as a vector: rt.h itself is unchanged (its hash is part
-        of the game key, and a074fe0's opqv there stopped runtime builds against the existing keys)."""
+        """a V register immediate: opaque under --fz, else clang folds x * 1.0, x - 0.0... (f_86e2fc; IEEE-exact, but ARM gives
+        a denormal 0 under FZ). rt.h's opq on the register as a vector: rt.h itself is unchanged (its hash is part of the
+        game key, and a074fe0's opqv there stopped runtime builds against the existing keys)."""
         return f'__builtin_bit_cast(V128, opq(__builtin_bit_cast(vf64x2, {e})))' if self.fz else e
 
     # ---------------- floating point (scalar + vector)

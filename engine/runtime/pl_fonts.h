@@ -34,8 +34,9 @@ inline bytes read_file(const std::string& path) {
 inline std::string bfttf_path(const std::string& dir, int type) {
     const std::string prefix = std::to_string(type) + "-";
     std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator(dir, ec))
-        if (e.path().filename().string().rfind(prefix, 0) == 0 && e.path().extension() == ".bfttf") return e.path().string();
+    // (increment(ec), not a range-for: its operator++ throws on an iteration error)
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+        if (it->path().filename().string().rfind(prefix, 0) == 0 && it->path().extension() == ".bfttf") return it->path().string();
     return "";
 }
 

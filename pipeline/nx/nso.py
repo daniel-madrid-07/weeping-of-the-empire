@@ -127,8 +127,8 @@ class Module:
                 for s in self.segments} | {'bss': dict(offset=self.bss_offset, size=self.bss_size)}
 
     def to_elf(self):
-        """Synthetic ELF64 (ET_DYN; payload bytes identical to the NSO except recorded
-        dynsym section-index edits. Returns (elf_bytes, symbol_index_changes)."""
+        """Synthetic ELF64 (ET_DYN; payload bytes identical to the NSO except recorded dynsym section-index
+        edits. Returns (elf_bytes, symbol_index_changes)."""
         segments = [dict(s) for s in self.segments]
         tags = self.tags
         dynoff = self.dynamic_offset

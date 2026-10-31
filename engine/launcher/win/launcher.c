@@ -670,7 +670,9 @@ static int offer_newer_release(void) {
 /* totk.exe is built for x86-64-v3 (mkninja_win.py -march=x86-64-v3): on a CPU without one of these it dies on its first
    such instruction (0xC000001D) with nothing to tell the player why. The launcher itself is baseline x86-64, so it can
    check first. Writes the missing ones to `out` ("" when the CPU has them all). */
-static void cpu_missing(wchar_t *out, size_t n) {
+/* The instructions a build needs that this CPU lacks, comma-separated in out ("" = none): level 3 = x86-64-v3 (every
+ * build but the Builder's --cpu v2), 2 = x86-64-v2 (build.py --march x86-64-v2, package.py cpu=x86-64-v2). */
+static void cpu_missing(wchar_t *out, size_t n, int level) {
     unsigned a, b, c, d, c1 = 0, b7 = 0, ce = 0;
     if (__get_cpuid(1, &a, &b, &c, &d)) c1 = c;
     if (__get_cpuid_count(7, 0, &a, &b, &c, &d)) b7 = b;
@@ -678,14 +680,14 @@ static void cpu_missing(wchar_t *out, size_t n) {
     unsigned xcr0 = 0;
     if (c1 & 1u << 27) { unsigned hi; __asm__ volatile("xgetbv" : "=a"(xcr0), "=d"(hi) : "c"(0)); }   /* OSXSAVE */
     const struct { const wchar_t *name; int ok; } need[] = {
-        {L"SSE4.2", !!(c1 & 1u << 20)}, {L"POPCNT", !!(c1 & 1u << 23)}, {L"AVX", !!(c1 & 1u << 28)},
+        {L"SSE4.2", !!(c1 & 1u << 20)}, {L"POPCNT", !!(c1 & 1u << 23)}, {L"SSSE3", !!(c1 & 1u << 9)}, {L"AVX", !!(c1 & 1u << 28)},
         {ES_EN(L"AVX (activado por Windows)", L"AVX (enabled by Windows)"), (xcr0 & 6) == 6}, {L"AVX2", !!(b7 & 1u << 5)}, {L"FMA", !!(c1 & 1u << 12)},
         {L"BMI1", !!(b7 & 1u << 3)}, {L"BMI2", !!(b7 & 1u << 8)}, {L"F16C", !!(c1 & 1u << 29)},
         {L"LZCNT", !!(ce & 1u << 5)}, {L"MOVBE", !!(c1 & 1u << 22)},
     };
     size_t len = 0;
     out[0] = 0;
-    for (size_t i = 0; i < sizeof need / sizeof need[0]; i++)
+    for (size_t i = 0; i < (level >= 3 ? sizeof need / sizeof need[0] : 3); i++)   /* (v2: the first three) */
         if (!need[i].ok && len + 40 < n) len += swprintf(out + len, n - len, L"%ls%ls", len ? L", " : L"", need[i].name);
 }
 
@@ -810,6 +812,22 @@ static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, si
     }
     package_value(pkg, L"romfs", 1, romfs, MAX_PATH);
     package_value(pkg, L"overlay", 1, overlay, MAX_PATH);
+    {   /* the build's processor level: package.py's cpu= (the key's --march), none = x86-64-v3 */
+        wchar_t cpu[32], miss[256];
+        package_value(pkg, L"cpu", 0, cpu, 32);
+        int v2 = !wcscmp(cpu, L"x86-64-v2");
+        cpu_missing(miss, 256, v2 ? 2 : 3);
+        if (miss[0]) {
+            swprintf(why, whyn, ES_EN(L"%ls: esta versión del juego se creó para procesadores con AVX2, y a este le falta %ls. "
+                                      L"Vuelve a crearla con el Builder en este PC: elige sola la versión para procesadores sin AVX2.",
+                                      L"%ls: this build of the game was made for processors with AVX2, and this one lacks %ls. "
+                                      L"Make it again with the Builder on this PC: it picks the build for processors without AVX2 "
+                                      L"by itself."), name, miss);
+            say(L"%ls", why);
+            return MISSING;
+        }
+        say(L"%ls: cpu level %ls", name, v2 ? L"x86-64-v2" : L"x86-64-v3");
+    }
 
     wchar_t userdata[MAX_PATH], run[MAX_PATH], crashes[MAX_PATH], logs[MAX_PATH], logp[MAX_PATH];
     swprintf(userdata, MAX_PATH, L"%ls\\userdata", g_base);
@@ -956,17 +974,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show) {
     }
     {
         wchar_t miss[256];
-        cpu_missing(miss, 256);
+        cpu_missing(miss, 256, 2);   /* the floor of any build (x86-64-v2); a package's own level: run_package */
         if (miss[0]) {
             message(MB_ICONERROR, ES_EN(L"Este procesador no puede ejecutar el juego: le faltan instrucciones que necesita (%ls).\n\n"
-                                        L"Hace falta un procesador con AVX2: Intel Core de 4.ª generación (Haswell, 2013) o posterior, "
-                                        L"o AMD Ryzen o posterior.",
+                                        L"Hace falta al menos SSE4.2 y POPCNT: Intel Core de 1.ª generación (2008) o posterior, "
+                                        L"o AMD FX o Ryzen.",
                                         L"This processor can't run the game: it lacks instructions the game needs (%ls).\n\n"
-                                        L"You need a processor with AVX2: a 4th-generation Intel Core (Haswell, 2013) or later, "
-                                        L"or an AMD Ryzen or later."), miss);
+                                        L"It needs at least SSE4.2 and POPCNT: a 1st-generation Intel Core (2008) or later, "
+                                        L"or an AMD FX or Ryzen."), miss);
             return 1;
         }
-        say(L"cpu: x86-64-v3 ok, %lu logical processors", GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+        cpu_missing(miss, 256, 3);
+        say(L"cpu: x86-64-v2 ok, x86-64-v3 %ls%ls, %lu logical processors", miss[0] ? L"missing " : L"ok", miss,
+            GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
     }
     {   /* the Vulkan loader (System32\vulkan-1.dll, installed by every GPU driver with Vulkan): totk.exe links it, so
            without it Windows would refuse the game with its own "DLL not found" box. What the GPU itself can do is the

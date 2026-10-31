@@ -98,7 +98,7 @@ PGO_TAG = {'off': '', 'gen': '-pgogen', 'use': '-pgo'}   # tree name / build dir
 
 
 def heavy(cmd, log=print):
-    """    started while free RAM < 8 GB, child at BELOW_NORMAL. Without tools/heavy.py, fall back to the RAM gate."""
+    """Without tools/heavy.py, fall back to the RAM gate."""
     if HEAVY.exists():
         return [sys.executable, str(HEAVY), '--', *cmd]
     wait_for_ram(log=log)
@@ -310,11 +310,12 @@ class Build:
             self.run_steps(steps, t_all)
 
     def pin_recomp(self):
-        """The commit this whole run takes the recompiler and the guest headers from (recomp/ + include/
-        The recompiler runs from there, the generation fingerprints hash it, and CMake compiles the shards against
-        its headers and toolchain.py CFLAGS (NXRECOMP_RECOMP_ROOT). So other workers' uncommitted recomp/ edits are
-        never built, and a commit or edit during the run cannot make the fingerprint checks fail half-way
-        ("generated for another configuration (code, simd)"). --recomp-rev worktree: the working tree, as before."""
+        """The commit this whole run takes the recompiler and the guest headers from, resolved once: `git archive`
+        into <work>/build/recomp-pinned/<commit>, kept while it is used. The recompiler runs from there, the
+        generation fingerprints hash it, and CMake compiles the shards against its headers and toolchain.py CFLAGS
+        (NXRECOMP_RECOMP_ROOT). So other workers' uncommitted recomp/ edits are never built, and a commit or edit
+        during the run cannot make the fingerprint checks fail half-way ("generated for another configuration
+        (code, simd)"). --recomp-rev worktree: the working tree, as before."""
         if self.recomp_commit or self.recomp_root != REPO:
             return self.recomp_commit
         rev = getattr(self.a, 'recomp_rev', None) or 'HEAD'
@@ -363,9 +364,9 @@ class Build:
         return commit
 
     def pin_decomp(self):
-        """decomp on, resolved once. The recompiler gets that
-        commit's replaced.txt and decomp_totk is compiled from that commit's sources (NXRECOMP_DECOMP_COMMIT ->
-        in the next build."""
+        """decomp on, resolved once. The recompiler gets that commit's replaced.txt and decomp_totk is compiled from
+        that commit's sources, so decomp batches committing during the build change neither: they land in the next
+        build."""
         if self.decomp_commit:
             return self.decomp_commit
         rev = getattr(self.a, 'decomp_rev', None) or 'HEAD'
@@ -689,8 +690,7 @@ class Build:
 
     @property
     def tree(self):
-        """This build tree's name: variant, -pgogen / -pgo for the PGO builds
-        linked."""
+        """This build tree's name: variant, -pgogen / -pgo for the PGO builds."""
         return self.a.variant + PGO_TAG[self.a.pgo] + ('-decomp' if self.decomp == 'on' else '')
 
     def shared_main_image(self):
@@ -699,8 +699,8 @@ class Build:
         return (patched, patches) if patched.is_file() and patches.is_file() else (None, None)
 
     def replaced_list(self):
-        """decomp on, compiled from the same commit, defines
-        those bodies); off: an empty list, so the recompiler emits every body."""
+        """decomp on, compiled from the same commit, defines those bodies); off: an empty list, so the recompiler
+        emits every body."""
         if self.decomp == 'on':
             self.pin_decomp()
             return self.decomp_replaced
@@ -737,10 +737,10 @@ class Build:
         """generation_inputs this tree's generated code must match, computed now. recomp/simd and recomp +
         include/guest come from this run's pinned snapshot (pin_recomp: what CMake compiles the shards against, and
         nothing edits it); overrides, layout and replaced are live, so an edit to those during the build fails the
-        check. Only the patched image is frozen to the copy the code was generated
-        from: another tree's patch step may rewrite the shared one at any time. Without a
-        recompile in this run: the tree's own snapshot, unless this run's patch step ran (the shared image is then
-        what a recompile must use, and a snapshot from older patches is not this tree's code any more)."""
+        check. Only the patched image is frozen to the copy the code was generated from: another tree's patch step
+        may rewrite the shared one at any time. Without a recompile in this run: the tree's own snapshot, unless
+        this run's patch step ran (the shared image is then what a recompile must use, and a snapshot from older
+        patches is not this tree's code any more)."""
         if self.run_patched is not None:
             return self.generation_inputs(*self.run_patched)
         shared, shared_patches = self.patched_main
@@ -937,8 +937,8 @@ class Build:
 
     def withdraw_package(self, why):
         """A failed or refused TotK build leaves no TotK.exe in this tree's package, so a boot loop that ignores
-        build.py's exit code cannot run the previous exe as if it were this build. The build dir keeps its
-        own TotK.exe; packaging again restores it."""
+        build.py's exit code cannot run the previous exe as if it were this build. The build dir keeps its own
+        TotK.exe; packaging again restores it."""
         gone = []
         for name in ('TotK.exe', 'TotK.pdb'):
             f = self.package_dir / name

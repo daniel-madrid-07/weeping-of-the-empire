@@ -9,9 +9,9 @@
 // TOTK_AUX=interleaved (default)|planar|bypass, TOTK_AUDIO_LOG=1 (calls), TOTK_AUDIO_LOG=graph (the mix graph with per-mix peaks every 10
 // s, no call log), TOTK_VOLUME=<0..2> master gain. PC output: TOTK_AUDIO_CHANNELS=auto|2|6|8 (default 2; the game is told 6 channels for
 // 6 and 8 and fills its 5.1 sink), TOTK_AUDIO_LATENCY_MS (queued ahead of the device, default 20), TOTK_AUDIO_FOLLOW (default 1: follow
-// Windows default-device changes and reopen a lost device; 0 = off), TOTK_AUDIO_MUSIC / _SFX / _VOICE bus gains over the sub mixes
-// TOTK_AUDIO_BUSMAP names, TOTK_AUDIO_WAV capture (before the master gain). History. Both handled below (event ticks per frame; empty
-// loops produce silence).
+// Windows default-device changes; 0 = off; a lost device is reopened either way), TOTK_AUDIO_STALL_MS (default 1000: a device that takes
+// no audio that long is reopened; 0 = off), TOTK_AUDIO_MUSIC / _SFX / _VOICE bus gains over the sub mixes TOTK_AUDIO_BUSMAP names,
+// TOTK_AUDIO_WAV capture (before the master gain). History. Both handled below (event ticks per frame; empty loops produce silence).
 #include "hle.h"
 #define NOMINMAX
 #include <windows.h>
@@ -954,10 +954,15 @@ void output_thread() {
     auto next = std::chrono::steady_clock::now(), retry = next;
     int last_ch = d.ch;
     bool primed = false; double t_wake = 0;   // primed: frames were queued since the device opened (an empty device then is an underrun)
+    // A device that takes no frame for TOTK_AUDIO_STALL_MS (default 1000, 0 = off) while reporting no error (a sleeping
+    // Bluetooth or HDMI endpoint whose clock stopped) is treated as lost, so the game's audio thread is never starved
+    static const auto stall = std::chrono::milliseconds(std::max(0, env_int("TOTK_AUDIO_STALL_MS", 1000)));
+    auto t_fed = std::chrono::steady_clock::now();
+    IAudioClient* fed_ac = nullptr;   // (the device t_fed belongs to: a new one starts its own count)
     for (;;) {
         if (!d.ac) {
-            // follow mode, no device: the renderer runs on the wall clock (the game's audio thread keeps its pace) and the
-            // default endpoint is tried again on a change notice or every second
+            // no device (lost, stalled or none yet): the renderer runs on the wall clock (the game's audio thread keeps its
+            // pace) and the default endpoint is tried again on a change notice or every second
             next += period;
             std::this_thread::sleep_until(next);
             out_frame(scratch.data(), last_ch);
@@ -976,7 +981,7 @@ void output_thread() {
         const bool changed = cfg.follow && g_dev_changed.exchange(false), asked = g_reopen.exchange(false);
         if (changed || asked) {
             printf("[audio] %s: reopening\n", changed ? "default device changed" : "output settings changed");
-            dev_close(d); primed = false;
+            dev_close(d); primed = false; fed_ac = nullptr;
             if (SUCCEEDED(dev_open(en, ev, d, false))) last_ch = d.ch;
             else { printf("[audio] no device: wall-clock pacing until one comes back\n"); next = retry = std::chrono::steady_clock::now(); }
             continue;
@@ -984,13 +989,16 @@ void output_thread() {
         UINT32 pad = 0;
         hr = d.ac->GetCurrentPadding(&pad);
         if (FAILED(hr)) {
-            if (!cfg.follow) { Sleep(5); continue; }
-            printf("[audio] device lost (hr %08lx): reopening the default device\n", (unsigned long)hr);
-            dev_close(d); primed = false;
+            // (also with following off: it only means not moving to a new default device; a lost one used to spin here
+            // with no frame_done, and the game's audio thread waited for good)
+            printf("[audio] device lost (hr %08lx): wall-clock pacing, reopening the default device\n", (unsigned long)hr);
+            dev_close(d); primed = false; fed_ac = nullptr;
             next = retry = std::chrono::steady_clock::now();
             continue;
         }
         if (primed && pad == 0) g_dry++;
+        const auto now = std::chrono::steady_clock::now();
+        if (fed_ac != d.ac) fed_ac = d.ac, t_fed = now;
         while (pad + (UINT32)g_count <= d.target) {
             BYTE* p = nullptr;
             if (FAILED(d.rc->GetBuffer((UINT32)g_count, &p))) break;
@@ -998,8 +1006,18 @@ void output_thread() {
             d.rc->ReleaseBuffer((UINT32)g_count, 0);
             pad += (UINT32)g_count;
             frame_done();
+            t_fed = now;
         }
         primed = pad > 0;
+        if (stall.count() && now - t_fed > stall) {
+            static int told;
+            if (told++ < 20)
+                printf("[audio] the device took no audio for %lld ms with no error: wall-clock pacing, reopening\n",
+                       (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - t_fed).count());
+            dev_close(d); primed = false; fed_ac = nullptr;
+            next = std::chrono::steady_clock::now();
+            retry = next + std::chrono::seconds(1);   // (a second of wall-clock pacing before trying the device again)
+        }
     }
 }
 #endif

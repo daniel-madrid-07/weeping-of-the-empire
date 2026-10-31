@@ -519,15 +519,39 @@ static HangOp hang_ops[HANG_OPS];
 static uint64_t hang_n;   // render thread
 static int hang_ready;
 static PFN_vkCmdSetCheckpointNV hang_cp;
+// AMD (g_vk.amd_marker): every operation writes its ring position + 1 at the top of the pipe (offset 0: the newest
+// operation started) and the bottom (offset 4: the newest that finished) into a host-visible buffer
+static PFN_vkCmdWriteBufferMarkerAMD hang_mk;
+static VkBuffer hang_mbuf;
+static VmaAllocation hang_mmem;
+static volatile uint32_t *hang_mptr;
+static void hang_marker_init(void) {
+    PFN_vkCmdWriteBufferMarkerAMD fn = (PFN_vkCmdWriteBufferMarkerAMD)vkGetDeviceProcAddr(g_vk.dev, "vkCmdWriteBufferMarkerAMD");
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 256, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                  .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+    VmaAllocationInfo info;
+    if (!fn || vmaCreateBuffer(g_vk.vma, &bi, &ai, &hang_mbuf, &hang_mmem, &info) != VK_SUCCESS || !info.pMappedData) return;
+    hang_mptr = info.pMappedData;
+    hang_mptr[0] = hang_mptr[1] = 0;
+    hang_mk = fn;
+    LOG("[vk] GPU hang breadcrumbs: AMD buffer markers (top / bottom of pipe per operation)\n");
+}
 static inline void hang_op(VkCommandBuffer cb, uint32_t kind, uint64_t a, uint64_t b, uint32_t x, uint32_t y, uint32_t z) {
     if (!hang_ready) {
         hang_ready = 1;
         if (g_vk.checkpoints) hang_cp = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(g_vk.dev, "vkCmdSetCheckpointNV");
+        if (g_vk.amd_marker) hang_marker_init();
     }
     HangOp *o = &hang_ops[hang_n & (HANG_OPS - 1)];
     o->seq = submit_seq + 1, o->a = a, o->b = b, o->kind = kind, o->x = x, o->y = y, o->z = z;
     hang_n++;
     if (hang_cp && cb && !vkq_enabled()) hang_cp(cb, (void *)(uintptr_t)hang_n);   // (marker = ring position + 1)
+    if (hang_mk && cb) {   // (queued in order with the operation's own commands when the recording thread is on)
+        q_mark(hang_mk, cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, hang_mbuf, 0, (uint32_t)hang_n);
+        q_mark(hang_mk, cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, hang_mbuf, 4, (uint32_t)hang_n);
+    }
 }
 static void hang_op_log(const char *tag, uint64_t pos) {   // pos = ring position
     if (pos >= hang_n || hang_n - pos > HANG_OPS) { LOG("[hang] %s: #%llu (no longer in the ring)\n", tag, (unsigned long long)pos); return; }
@@ -616,6 +640,19 @@ static void hang_report(uint64_t hung) {
 }
 // After the device is lost: the driver's last checkpoint per pipeline stage (= ring positions) + what was around them.
 static void hang_checkpoints(void) {
+    if (hang_mptr) {   // AMD buffer markers: the newest operation the GPU started / finished (32-bit ring positions + 1)
+        uint32_t top = hang_mptr[0], bot = hang_mptr[1];
+        uint64_t base = hang_n & ~0xFFFFFFFFull, t = base | top, b = base | bot;   // (back to 64 bits: within 2^32 of hang_n)
+        if (t > hang_n) t -= 1ull << 32;
+        if (b > hang_n) b -= 1ull << 32;
+        LOG("[hang] AMD buffer markers: started #%llu, finished #%llu (of %llu)\n", (unsigned long long)t, (unsigned long long)b,
+            (unsigned long long)hang_n);
+        if (t) hang_op_log("last started", t - 1);
+        if (b) hang_op_log("last finished", b - 1);
+        if (b && t > b && t - b <= 512)
+            for (uint64_t p = b; p < t; p++) hang_op_log("  in flight", p);
+        fflush(stdout);
+    }
     if (!hang_cp) return;
     PFN_vkGetQueueCheckpointDataNV get = (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(g_vk.dev, "vkGetQueueCheckpointDataNV");
     if (!get) return;
@@ -2021,7 +2058,15 @@ static int pass_ntwin;
 static uint64_t stat_blk_copies;
 
 static void blk_copy_back(VkCommandBuffer cb) {
-    for (int i = 0; i < pass_ntwin; i++) vk_depth_twin_copy(cb, pass_twin[i]);
+    // The twin is refreshed when a draw / dispatch next compare-samples it (twins_refresh), not after every pass: TotK draws its
+    // 1600x1600 x4 D16 shadow cascades (colour images off NVIDIA: textures.c renderer_texture_target_kind) in a pass per layer,
+    // and each pass copied the whole array. LARECOMP_TWIN_LAZY=0: a copy after each pass (old).
+    static int lazy = -1;
+    if (lazy < 0) { const char *e = getenv("LARECOMP_TWIN_LAZY"); lazy = !(e && *e == '0'); }
+    for (int i = 0; i < pass_ntwin; i++) {
+        if (lazy) pass_twin[i]->twin_valid = false;
+        else vk_depth_twin_copy(cb, pass_twin[i]);
+    }
     pass_ntwin = 0;
     if (!pass_nblk) return;
     vk_full_barrier(cb);

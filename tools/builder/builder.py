@@ -3,6 +3,7 @@
     Setup.exe / Builder.exe (drag the three onto its window), or:
     py tools/builder/builder.py <dump> <keys file> [<firmware folder|.zip>]   (any order) [--work DIR] [--out DIR] [--dry-run]
     py tools/builder/builder.py <the three> --install DIR    (Setup's layout: fetches the compilers itself, see below)
+                                [--cpu auto|v3|v2]
 
 Everything is made here, on your PC, from files you dumped from your own console: none of it is in this repository.
 The keys file is only passed on as a path and is never printed or copied.
@@ -20,7 +21,9 @@ first stopped, and a run after a `git pull` redoes only what changed):
   2. romfs     romfs.bin proven equal to the extracted folder, so the game reads its data from one file (faster loads)
   3. images    the code modules decompressed -> <work>/engine/img/<id> (checks the supported version, 1.0.0)
   4. patches   our patches (high frame rates, real-time speed, PC controls...) exported for that image
-  5. build     the recompiled code + engine -> the executable (the long step: about 25-45 min the first time)
+  5. build     the recompiled code + engine -> the executable (the long step: about 25-45 min the first time); for
+               this PC's processor: --cpu auto (default) builds for x86-64-v3 (AVX2) when the processor has AVX2, else
+               for x86-64-v2 (Sandy / Ivy Bridge, AMD FX, Pentium / Celeron: runs there, slower: no FMA instructions)
   6. sets      the game-patch sets the Options menu switches between -> <work>/overlays
   7. overlay   the engine's data overlay, its aspect-ratio copies and the PC key glyphs
   8. package   the playable folder with its launcher -> <out>/
@@ -132,12 +135,14 @@ def check_extraction(v100):
 
 
 def check_pc():
-    """What the built game needs from this PC (problems, not notes: building would waste an hour)"""
+    """What the built game needs from this PC (problems, not notes: building would waste an hour). A processor without
+    AVX2 is not one: --cpu auto builds x86-64-v2 for it. Below v2 (the launcher's start-up floor: SSSE3, SSE4.1, SSE4.2
+    and with it POPCNT) the game cannot run at all, so say so before the build."""
     import ctypes
     problems = []
-    if not ctypes.windll.kernel32.IsProcessorFeaturePresent(40):   # PF_AVX2_INSTRUCTIONS_AVAILABLE
-        problems.append('this processor has no AVX2, which the game code is compiled for (x86-64-v3: Intel 2013+ '
-                        'Haswell, AMD 2015+ Excavator / Ryzen)')
+    if not all(ctypes.windll.kernel32.IsProcessorFeaturePresent(f) for f in (36, 37, 38)):   # PF_SSSE3, PF_SSE4_1, _2
+        problems.append('this processor lacks SSE4.2 (or SSSE3 / SSE4.1), which the game needs at the least '
+                        '(x86-64-v2: Intel 2008+ Nehalem, AMD 2011+ Bulldozer)')
     if not os.path.isfile(os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'vulkan-1.dll')):
         problems.append('no Vulkan driver (vulkan-1.dll missing): install the current driver for your graphics card')
     return problems
@@ -363,6 +368,18 @@ def prune(out, keep):
             shutil.rmtree(d, ignore_errors=True)   # (one in use, the game still open: stays until the next update)
 
 
+def host_cpu():
+    """'v3' when this processor has AVX2 (and with it FMA, BMI2, F16C on every AVX2 CPU), else 'v2'"""
+    if os.name == 'nt':
+        import ctypes
+        return 'v3' if ctypes.windll.kernel32.IsProcessorFeaturePresent(40) else 'v2'   # PF_AVX2_INSTRUCTIONS_AVAILABLE
+    try:
+        flags = next((ln for ln in open('/proc/cpuinfo') if ln.startswith('flags')), '').split()
+    except OSError:
+        return 'v3'
+    return 'v3' if 'avx2' in flags else 'v2'
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('inputs', nargs='+', help='the dump, the keys file and, optional, the firmware (folder or .zip)')
@@ -373,6 +390,9 @@ def main(argv=None):
     ap.add_argument('--until', choices=('tools', 'extract', 'romfs'),
                     help=f'stop after this step (romfs: only the game files, about {EXTRACT_GB} GB)')
     ap.add_argument('--dry-run', action='store_true', help='check the inputs and print the steps, build nothing')
+    ap.add_argument('--cpu', choices=['auto', 'v3', 'v2'], default='auto',
+                    help='the processor level to build for: auto = this PC (v3 with AVX2, else v2); v2 also runs on '
+                         'processors without AVX2, slower')
     ap.add_argument('--gui-pid', type=int, help=argparse.SUPPRESS)   # (Builder.exe: stop with it)
     a = ap.parse_args(argv)
     if a.gui_pid:
@@ -482,9 +502,13 @@ def main(argv=None):
     patches = os.path.join(pdir, 'engine-patches.json')
     # 5. build (resumable: build.py reuses every object already compiled)
     say('step 5 is the long one: about 25-45 min the first time, minutes after that')
-    run(f'5/{n} build', [py, build, 'game', '--patches', patches, '--jobs', str(game_jobs), '--jobs-rt', str(rt_jobs)],
+    cpu = host_cpu() if a.cpu == 'auto' else a.cpu
+    march = ['--march', 'x86-64-v2'] if cpu == 'v2' else []   # (the same flag to game and key: it joins the key)
+    say(f'processor level: {cpu}' + (' (no AVX2 here: the build runs on this processor, slower than an AVX2 one)'
+                                    if cpu == 'v2' and a.cpu == 'auto' else ''))
+    run(f'5/{n} build', [py, build, 'game', '--patches', patches, '--jobs', str(game_jobs), '--jobs-rt', str(rt_jobs)] + march,
         env, a.dry_run)
-    k = run(f'5/{n} build', [py, build, 'key', '--patches', patches], env, a.dry_run, quiet=True)
+    k = run(f'5/{n} build', [py, build, 'key', '--patches', patches] + march, env, a.dry_run, quiet=True)
     key = '<key>' if a.dry_run else result(k)['key']
     # 6. the game-patch sets the Options menu switches between (grass / shadow / fog distance, texture cache, output
     #    and aspect sizes, fast travel): every value its sliders offer, as on the release PC
@@ -501,8 +525,11 @@ def main(argv=None):
     if not a.dry_run and not (os.path.isdir(bank) and os.path.getmtime(bank) >= t7 - 2):   # (made by this step)
         fail('no PC key glyph bank was made: the overlay step says why above')
     # 8. package (package.py points the launcher at <work>/overlays itself)
+    # (--commit: the source the exe was just built from. Without it package.py names the folder after the commit the
+    #  key was first made from, so an update that changed only the runtime kept the older version's name)
+    head = subprocess.run(['git', '-C', REPO, 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
     run(f'8/{n} package', [py, os.path.join(REPO, 'engine', 'launcher', 'win', 'package.py'), '--key', key,
-                           '--out', out], env, a.dry_run)
+                           '--out', out] + (['--commit', head] if head else []), env, a.dry_run)
     if a.dry_run:
         say('check done (--dry-run): nothing was built')
         return

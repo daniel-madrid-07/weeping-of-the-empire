@@ -95,6 +95,38 @@ def archive_pack():
     return ARCHIVE
 
 
+def cpu_line(man):
+    """cpu=<level> for a key built at another processor level (build.py --march x86-64-v2: the Builder's --cpu v2); the
+    launcher checks the CPU against it (launcher.c run_package), and no line means x86-64-v3"""
+    march = json.loads((man.get('parts') or {}).get('variant') or '{}').get('march')
+    return [f'cpu={march}'] if march in ('x86-64', 'x86-64-v2') else []
+
+
+def commit_of(exe, man, given=None):
+    """the commit the exe was built from: --commit, else build.py's source.json next to the exe (every runtime link
+    writes it), else the manifest's exe_commit (the key's own exe), else the snapshot the key's objects came from (a
+    key built before 10-31, whose runtime may be newer), else 'unknown'"""
+    if given:
+        return given
+    try:
+        c = json.load(open(os.path.join(os.path.dirname(exe), 'source.json'), encoding='utf-8')).get('commit')
+        if c:
+            return c
+    except (OSError, ValueError):
+        pass
+    src = man.get('src', '')
+    return man.get('exe_commit') or (os.path.basename(os.path.dirname(src)) if src else 'unknown')
+
+
+def dirty_of(exe):
+    """True when build.py's source.json says the exe was linked from a tree with uncommitted engine/ edits: the folder
+    is named -dirty and player.txt says dirty=1, so it cannot pass as its commit"""
+    try:
+        return bool(json.load(open(os.path.join(os.path.dirname(exe), 'source.json'), encoding='utf-8')).get('dirty'))
+    except (OSError, ValueError):
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--key'); ap.add_argument('--out', default=os.path.join(WORK, 'release'))
@@ -117,13 +149,13 @@ def main():
         key, man = newest_key()
     # the key's own exe carries the runtime of the tree the key was built from; a newer runtime relinks against it
     exe = os.path.abspath(a.exe) if a.exe else os.path.join(key_dir(key), 'exe', 'totk.exe')
-    src = man.get('src', '')
-    commit = a.commit or (os.path.basename(os.path.dirname(src)) if src else 'unknown')
+    commit = commit_of(exe, man, a.commit)
+    dirty = dirty_of(exe)
     for p, what in ((exe, 'exe'), (man['img'], 'NSO images'), (ROMFS, 'RomFS'), (overlay, 'romfs overlay')) + \
             (() if a.no_patch_sets else ((PATCH_SETS, 'game-patch sets (TOTK_PATCH_SETS; --no-patch-sets to ship without)'),)):
         if not os.path.exists(p):
             sys.exit(f'missing {what}: {p}')
-    name = f'TotK-PC-{datetime.datetime.now():%Y%m%d-%H%M}-{commit[:9]}'
+    name = f'TotK-PC-{datetime.datetime.now():%Y%m%d-%H%M}-{commit[:9]}' + ('-dirty' if dirty else '')
     dst = os.path.join(a.out, name)
     tmp = dst + '.tmp'
     if os.path.exists(tmp):
@@ -159,7 +191,7 @@ def main():
     env.update(kv.split('=', 1) for kv in a.env)
     lines = [f'img={man["img"]}', f'romfs={ROMFS}', f'overlay={overlay}', f'commit={commit}', f'key={key}',
              f'build={build_name(man)}', f'patches={man.get("patches") or "none"}', f'packaged={datetime.datetime.now().isoformat(timespec="seconds")}',
-             'settings=settings.ini'] + ([f'import={IMPORT}'] if os.path.isdir(IMPORT) else []) + [f'env.{k}={v}' for k, v in env.items()]
+             'settings=settings.ini'] + (['dirty=1'] if dirty else []) + cpu_line(man) + ([f'import={IMPORT}'] if os.path.isdir(IMPORT) else []) + [f'env.{k}={v}' for k, v in env.items()]
     open(os.path.join(tmp, 'player.txt'), 'w', encoding='utf-8', newline='\r\n').write('\n'.join(lines) + '\n')
     open(os.path.join(tmp, 'settings.ini'), 'w', encoding='utf-8', newline='\r\n').write(SETTINGS)
     # the player's guide: LEEME.txt (Spanish), or README.txt where the tree has that one instead

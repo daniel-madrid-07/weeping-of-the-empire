@@ -443,7 +443,13 @@ static void create_device(void) {
     g_vk.checkpoints = has_ext(ep, ne, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME) &&
                        !(getenv("LARECOMP_CHECKPOINTS") && !strcmp(getenv("LARECOMP_CHECKPOINTS"), "0"));
     if (g_vk.checkpoints) ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
-    LOG("[vk] GPU checkpoints (hang reports): %s\n", g_vk.checkpoints ? "on" : "off");
+    // AMD's equivalent: VK_AMD_buffer_marker writes the same marks at the top and bottom of the pipe into a host buffer
+    // read after the loss; it also works with the command-recording thread (queued in order). LARECOMP_CHECKPOINTS=0:
+    // off.
+    g_vk.amd_marker = !g_vk.checkpoints && has_ext(ep, ne, VK_AMD_BUFFER_MARKER_EXTENSION_NAME) &&
+                      !(getenv("LARECOMP_CHECKPOINTS") && !strcmp(getenv("LARECOMP_CHECKPOINTS"), "0"));
+    if (g_vk.amd_marker) ext[n_ext++] = VK_AMD_BUFFER_MARKER_EXTENSION_NAME;
+    LOG("[vk] GPU checkpoints (hang reports): %s\n", g_vk.checkpoints ? "on" : g_vk.amd_marker ? "AMD buffer markers" : "off");
     // shader libraries + fast link (DXVK's stutter fix): each program's shaders compile once into libraries, a new draw
     // state only links them (exec.c). LARECOMP_NO_GPL=1: monolithic pipelines only (old).
     VkPhysicalDeviceVulkan13Properties p13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};

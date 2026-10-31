@@ -129,7 +129,8 @@ int main(int argc, char **argv) {
     CHECK(wcsstr(why, L"Registro:") != NULL);
 
     /* this test machine builds and runs the game, so it has every x86-64-v3 feature */
-    { wchar_t miss[256]; cpu_missing(miss, 256); CHECK(miss[0] == 0); if (miss[0]) fwprintf(stderr, L"missing: %ls\n", miss); }
+    { wchar_t miss[256]; cpu_missing(miss, 256, 3); CHECK(miss[0] == 0); if (miss[0]) fwprintf(stderr, L"missing: %ls\n", miss); }
+    { wchar_t miss[256]; cpu_missing(miss, 256, 2); CHECK(miss[0] == 0); }
 
     /* a crash inside the window: the reason points at the report the game wrote (was: only the log) */
     r = run(fake, "5,100,crash", 5000, why, &game);
@@ -316,6 +317,19 @@ int main(int argc, char **argv) {
         CHECK(log_has("mods: b-tree brings its own resource size table"));
         CHECK(!log_has("message: The mod") && !log_has("message: El mod"));
         g_messages_logged_only = 0;
+    }
+    {   /* a package's processor level: player.txt cpu= (package.py), none = x86-64-v3 (this test PC has both) */
+        wchar_t pkg[MAX_PATH], p[MAX_PATH], why[768];
+        CHECK(log_has("test: cpu level x86-64-v3"));   /* (the packages above have no cpu= line) */
+        swprintf(pkg, MAX_PATH, L"%ls\\cpu-v2", g_root);
+        make_package(pkg, fake, "0,0");
+        swprintf(p, MAX_PATH, L"%ls\\player.txt", pkg);
+        FILE *f = _wfopen(p, L"a"); fprintf(f, "cpu=x86-64-v2\n"); fclose(f);
+        Sleep(1100);
+        HANDLE game = NULL; FILETIME st;
+        g_early_ms = 3000;
+        CHECK(run_package(pkg, L"cpuv2", why, 768, &game, &st) == QUIT);
+        CHECK(log_has("cpuv2: cpu level x86-64-v2"));
     }
     fclose(g_log);
     if (g_fail) { fprintf(stderr, "FAILED: launcher (%d)\n", g_fail); return 1; }

@@ -125,7 +125,7 @@ def fps60():
     it before each frame from the live frame-rate setting, 2 at "30" (the Switch's controller) and 1 otherwise (60 Hz).
     It still raises the interval to 2 or 3 when a frame's work does not fit, so slow scenes fall back at correct speed.
     (Until 2026-10-27 the sites below hard-coded minimum 1: "30" then ran at 60 and present's pacer clamp made the
-    controller flap 1 <-> 2 against 33 ms frames"""
+    controller flap 1 <-> 2 against 33 ms frames.)"""
     p = Patch('fps60')
     p.put(0x8f6c88, a.NOP, 'lower trigger: nop the stored-candidate load (try lower when desired < current)')
     p.put(0x8f6d98, 0x1a9fa555, 'lower path: csinc w21, w10, wzr, ge (result never below 1, a guard: the '
@@ -270,10 +270,10 @@ FMOV_S31_FOV_MAX = 0x1e20d01f   # fmov s31, #2.75
 
 def fov(lay):
     """Field of view: each site branches to a veneer that loads the camera's fovy, records it on the data page (+124, for
-    the overlay's degrees) and, while a multiplier sits on the page (+68, 0 = off), multiplies it, at most to FOV_MAX
-   . The projection, its frustum (culling) and everything sized
-    from it follow; the camera's own value stays, so the game's zoom / aim logic is unchanged. s1 (0.5, the next fmul's
-    operand) is live, so the veneer saves x10 and q31 on the stack and touches no flags."""
+    the overlay's degrees) and, while a multiplier sits on the page (+68, 0 = off), multiplies it, at most to FOV_MAX.
+    The projection, its frustum (culling) and everything sized from it follow; the camera's own value stays, so the
+    game's zoom / aim logic is unchanged. s1 (0.5, the next fmul's operand) is live, so the veneer saves x10 and q31 on
+    the stack and touches no flags."""
     p = Patch('fov')
     d = lay.data_off
     for i, site in enumerate(FOV_SITES):
@@ -691,10 +691,10 @@ GUARD_INLINE, GUARD_INLINE_TO = 0x8f5a20, 0x8f5c60   # FUN_8f5890: ldrb w8, [x8]
 
 
 def vk_guard():
-    """PC controls G1: guard reads its own virtual key, VK_GUARD (27, one the game leaves unused),
-    so a PC key can lock on (VK 2) without raising the shield. The engine's hook on the virtual-key writer
-    (engine/runtime/totk_pc_vk.cpp, hook_f_1ccf894) copies the pad's VK 2 to 27, so ZL still guards on a controller:
-    only for keys whose GEN_MAIN has --hook 1ccf894 (without it nothing sets 27 and the shield never rises)."""
+    """PC controls G1: guard reads its own virtual key, VK_GUARD (27, one the game leaves unused), so a PC key can lock
+    on (VK 2) without raising the shield. The engine's hook on the virtual-key writer (engine/runtime/totk_pc_vk.cpp,
+    hook_f_1ccf894) copies the pad's VK 2 to 27, so ZL still guards on a controller: only for keys whose GEN_MAIN has
+    --hook 1ccf894 (without it nothing sets 27 and the shield never rises)."""
     p = Patch('vk_guard')
     for site in GUARD_SITES:
         p.put(site, a.movz_w(1, VK_GUARD), f'vk_guard: mov w1, #2 -> #{VK_GUARD} (guard: VK hold)')

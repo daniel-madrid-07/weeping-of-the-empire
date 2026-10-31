@@ -330,8 +330,8 @@ def scan(img, fde, findings_out=None, info=None, jobs=1, bin_path=None, _part=No
 
     def analyze(s):
         """one function's dataflow. Its returns and tail transfers read the D registers callee_regs[s] lists (it may
-        produce what a keep site's caller reads, also through its own callees: the closure), and a direct call
-        or tail transfer to an entry reader reads the registers that reader reads at its entry"""
+        produce what a keep site's caller reads, also through its own callees: the closure), and a direct call or tail
+        transfer to an entry reader reads the registers that reader reads at its entry"""
         end = s + fde[s]
         # the lite disassembly (detail mode only per distinct instruction word, in sem_of: it is most of the cost)
         lite = list(lite_cs.disasm_lite(img[s:end], s))

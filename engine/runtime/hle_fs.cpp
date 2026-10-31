@@ -1270,13 +1270,15 @@ static std::string rstb_merged(const std::string& base) {
 #else
     const unsigned long pid = (unsigned long)getpid();
 #endif
-    for (const auto& e : fsys::directory_iterator(dir, ec)) {
-        const std::string n = e.path().filename().string();
+    // (increment(ec), not a range-for: its operator++ throws on an iteration error, here inside call_once
+    for (fsys::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string n = it->path().filename().string();
         std::error_code e2;
         if (n.rfind("totk-rstb-merged-", 0) == 0 &&
-            fsys::last_write_time(e.path(), e2) < fsys::file_time_type::clock::now() - std::chrono::hours(24) && !e2)
-            fsys::remove(e.path(), e2);
+            fsys::last_write_time(it->path(), e2) < fsys::file_time_type::clock::now() - std::chrono::hours(24) && !e2)
+            fsys::remove(it->path(), e2);
     }
+    ec.clear();
     const fsys::path out = dir / ("totk-rstb-merged-" + std::to_string(pid) + ".zs"), tmp = fsys::path(out) += ".tmp";
     const std::vector<u8> z = rstb::zstd_stored(rstb::serialize(t));
     {

@@ -56,6 +56,8 @@ void q_vkCmdBeginQuery(VkCommandBuffer, VkQueryPool, uint32_t, VkQueryControlFla
 void q_vkCmdEndQuery(VkCommandBuffer, VkQueryPool, uint32_t);
 // vkCmdSetAttachmentFeedbackLoopEnableEXT through its function pointer (queued in order like the rest)
 void q_set_fbl(PFN_vkCmdSetAttachmentFeedbackLoopEnableEXT fn, VkCommandBuffer cb, VkImageAspectFlags m);
+// vkCmdWriteBufferMarkerAMD through its function pointer (exec.c hang breadcrumbs; queued in order like the rest)
+void q_mark(PFN_vkCmdWriteBufferMarkerAMD fn, VkCommandBuffer cb, VkPipelineStageFlagBits st, VkBuffer buf, VkDeviceSize off, uint32_t v);
 
 #define vkBeginCommandBuffer(...) q_vkBeginCommandBuffer(__VA_ARGS__)
 #define vkEndCommandBuffer(...) q_vkEndCommandBuffer(__VA_ARGS__)

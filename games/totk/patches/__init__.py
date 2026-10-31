@@ -214,9 +214,9 @@ def resolve_features(spec, table):
 # ---------------------------------------------------------------------------------------------------------- images
 
 def load_main_image(path, game=None):
-    """The flat main image from an NSO or a flat image
-    (<work>/images/main.img), for the build a table's [game] names (default 1.0.0). Refuses anything else: the table's
-    offsets are for that exact build."""
+    """The flat main image from an NSO (decoded by recomp/nso.py, the loader) or a flat image (<work>/images/main.img),
+    for the build a table's [game] names (default 1.0.0). Refuses anything else: the table's offsets are for that
+    exact build."""
     g = game or game_v100()
     raw = Path(path).read_bytes()
     if raw[:4] == b'NSO0':

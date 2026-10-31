@@ -102,7 +102,10 @@ generation) are options.
 
 - **Your own files:** the game, version 1.0.0 (`.nsp` or `.xci`, title `0100F2C0115B6000`) and your `prod.keys`;
   optionally your console's firmware, for its Korean and Chinese fonts.
-- **CPU** with AVX2 (Intel Haswell / AMD Zen or newer). **GPU** with a current Vulkan 1.3 driver.
+- **CPU** with AVX2 (Intel Haswell / AMD Zen or newer) for the build we have tested. Processors with SSE4.2 but
+  without AVX2 (Intel Sandy / Ivy Bridge, AMD FX, many Pentium / Celeron) get a compatible build that the Builder picks
+  by itself; it is untested on such a processor: we have only seen it start on our own AVX2 PC, and its speed is
+  unknown. Reports welcome. Setup refuses processors without SSE4.2. **GPU** with a current Vulkan 1.3 driver.
 - **8 GB of RAM** (16 GB recommended: the build runs fewer compiles at once on less).
 - **About 75 GB free** on an NTFS drive, and an internet connection during the install.
 

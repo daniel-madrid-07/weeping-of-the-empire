@@ -49,6 +49,7 @@ typedef struct {
     bool sampler_aniso, mirror_clamp;  // samplerAnisotropy / samplerMirrorClampToEdge enabled (textures.c samplers fall back)
     bool mem_budget;  // VK_EXT_memory_budget enabled: per-heap budget / usage readable (device.c [vram], residency)
     bool checkpoints;  // VK_NV_device_diagnostic_checkpoints: exec.c marks every GPU operation (hang reports)
+    bool amd_marker;   // VK_AMD_buffer_marker: the same marks as top / bottom-of-pipe writes into a host buffer (exec.c)
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
