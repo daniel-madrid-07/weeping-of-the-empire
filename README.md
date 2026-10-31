@@ -17,6 +17,16 @@ any resolution, PC controls and an in-game settings window.
 **No game files are included, and none are ever shared.** You build it on your PC from your own dump and your own
 keys. [Read LEGAL.md](LEGAL.md).
 
+<p align="center">
+  <img src="https://github.com/daniel-madrid-07/weeping-of-the-empire/releases/download/v0.1.1/screenshot-kakariko.jpg" alt="Kakariko, unlocked frame rate, fps readout at the top right" width="100%">
+</p>
+<p align="center">
+  <img src="https://github.com/daniel-madrid-07/weeping-of-the-empire/releases/download/v0.1.1/screenshot-gliding.jpg" alt="Gliding above the clouds" width="49%">
+  <img src="https://github.com/daniel-madrid-07/weeping-of-the-empire/releases/download/v0.1.1/screenshot-fight.jpg" alt="A fight at a monster camp" width="49%"><br>
+  <sub>Captured from the developer's own copy on a Ryzen 7 9800X3D + RTX 5080 (developer build): a 2560x1415 window,
+  unlocked frame rate, the port's fps overlay at the top right.</sub>
+</p>
+
 ## Install in 3 steps
 
 1. **Download** the Setup exe from the [latest release](https://github.com/daniel-madrid-07/weeping-of-the-empire/releases/latest) and run it (no
@@ -57,8 +67,9 @@ rates. A developer build from October 2026, the developer's everyday settings.
   hitches, median 96 ms, worst 997 ms). Built shaders stay in the cache on disk for later visits.
 
 **Not measured yet:** builds made by Setup from this public tree (they lack some of the developer build's
-optimisations: a profile-guided compile and a shader cache seed, so expect the same or lower numbers); AMD and Intel
-graphics cards; any CPU other than the one above; a real 8 GB card; laptops. Your numbers are welcome: use the
+optimisations: a profile-guided compile and a shader cache seed, so expect the same or lower numbers); dedicated AMD
+and Intel graphics cards (AMD so far: one integrated GPU, see the FAQ); any CPU other than the one above; a real 8 GB
+card; laptops. Your numbers are welcome: use the
 [performance report](https://github.com/daniel-madrid-07/weeping-of-the-empire/issues/new?template=performance.yml).
 
 ## Features
@@ -106,7 +117,9 @@ shared, here or anywhere else. Do not share yours.
 **Where do I get the game and the keys?** From your own console, with your own tools. This project does not help with
 that: issues or messages asking for game files, keys, firmware or builds are closed without reply.
 
-**Does it work on AMD or Intel graphics?** It is written for Vulkan 1.3, but we have not measured those cards yet.
+**Does it work on AMD or Intel graphics?** Fixes for AMD's driver are in. On AMD we have run it only on the small
+integrated Radeon (RDNA2) of the Ryzen 7 9800X3D: it reaches the world and plays without a device loss, at 13.3 fps
+(1600x900 scene) or 31.2 fps (800x450), far below any gaming card. Dedicated AMD and Intel cards are not measured yet.
 Please report how it runs.
 
 **Why only version 1.0.0?** The patches and the recompiled code are tied to that version's code. Later versions are
