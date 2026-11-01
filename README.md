@@ -21,7 +21,7 @@ Most of the code was written by AI coding agents directed by one developer, who 
 
 - **Frame rate:** 30, 60, 90, 120 or unlocked, up to your monitor's refresh rate (240 fps at most), at the game's real speed.
 - **Measured on one PC only** (Ryzen 7 9800X3D + RTX 5080, developer build, 2560x1440 window, 2133x1200 render, one run per place): 116.2-119.7 fps average at the 120 cap, 159.1-178.4 unlocked. Builds made by Setup lack the developer build's shader cache seed, so expect the same or lower. [Full table, and what is not measured](#performance-measured).
-- **Display:** any resolution, ultrawide, borderless or exclusive fullscreen; VRR and HDR options (not measured); NVIDIA DLSS in developer builds (not yet confirmed on Setup builds), FSR 1, SMAA.
+- **Display:** any resolution, ultrawide, borderless or exclusive fullscreen; VRR and HDR options (not measured); NVIDIA DLSS (SR and frame generation) on RTX cards (optional), FSR 1, SMAA.
 - **Controls:** keyboard and mouse with PC prompts in the game; Xbox, PlayStation and Switch controllers; settings window in game (F10).
 - **Limits today:** game version 1.0.0 only, and a save from a later version may not load. Windows only. Dedicated AMD and Intel cards are not measured. First visits can stutter while shaders are built.
 
@@ -41,7 +41,8 @@ Building from a git clone instead: see [Build from a clone](#build-from-a-clone)
 
 Measured on the developer's PC: **AMD Ryzen 7 9800X3D (8 cores, 16 threads), NVIDIA RTX 5080**, Windows, a
 2560x1440 window. Each row is one run at one place, averaged over the run; "1 % low" is the 1st percentile of frame
-rates. A developer build from October 2026, the developer's everyday settings.
+rates. A developer build from October 2026, the developer's everyday settings; DLSS and frame generation were
+off in these runs.
 
 | Place | Render resolution | 120 fps cap: average / 1 % low | Unlocked: average / 1 % low |
 |---|---|---:|---:|
@@ -76,7 +77,7 @@ numbers are welcome: use the
 |---|---|
 | **Frame rate** | 30, 60, 90, 120 or unlocked (up to your monitor's refresh rate, 240 fps at most), with the game running at its real speed |
 | **Display** | Any window size and render resolution, ultrawide, borderless or exclusive fullscreen, VRR, HDR |
-| **Upscaling** | NVIDIA DLSS super resolution and frame generation in developer builds (not yet confirmed on Setup builds), FSR 1, SMAA |
+| **Upscaling** | NVIDIA DLSS (SR and frame generation) on RTX cards (optional), FSR 1, SMAA |
 | **Controls** | Keyboard and mouse made for a PC, with keyboard and mouse glyphs in the game's prompts; Xbox, PlayStation and Switch controllers |
 | **Settings** | In-game settings window (F10): graphics, controls, audio and the game's options |
 | **Saves** | Import from an emulator or a console backup; automatic backups. A save from a later game version may not load |
