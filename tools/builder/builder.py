@@ -643,7 +643,8 @@ def main(argv=None):
             sys.exit(1)
 
     env = dict(os.environ, **tool_env, NXRECOMP_WORK=work, NXR_SOLO_PC='1', PYTHONIOENCODING='utf-8',
-               NXR_GAME_JOBS_MAX=str(game_jobs), NXR_BUILDER_PACKAGE='1')
+               NXR_GAME_JOBS_MAX=str(game_jobs), NXR_BUILDER_PACKAGE='1',
+               PYTHONNOUSERSITE='1')
     py = sys.executable
     build = os.path.join(REPO, 'tools', 'engine', 'build.py')
     n = 9

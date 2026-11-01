@@ -5095,13 +5095,11 @@ static int pa_cmp_u64(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
     return x < y ? -1 : x > y;
 }
-// Records-only seed (installer's option (A): a seed may ship precompile.bin without code/ (those files are the game's own
-// shader bytes, which a release cannot carry). A recorded stage whose code/<hash> file is missing comes from the player's
-// own pack instead: its blobs hash as the recording does (hash_words(0x6a09e667f3bcc908 ^ code size, code), pa_load's
-// compute table): 2,191 of 2,432 programs and 45 of 59 compute programs whole. Only an exact match is served: the record's
-// code size and constants size (a stage without its constants translates without the BRX tables, see PC_PROG2); the rest
-// (agl / UI) still builds at first sight. A copy: the caller keeps it as the program's code, and the pack is freed after
-// the warm-up. TOTK_SEED_FROM_PACK=0: off.
+// A recorded stage whose code/<hash> file is missing comes from the player's own pack instead: its blobs hash as the
+// recording does (hash_words(0x6a09e667f3bcc908 ^ code size, code), pa_load's compute table): 2,191 of 2,432 programs and
+// 45 of 59 compute programs whole. Only an exact match is served: the record's code size and constants size (a stage
+// without its constants translates without the BRX tables, see PC_PROG2); the rest (agl / UI) still builds at first sight.
+// A copy: the caller keeps it as the program's code, and the pack is freed after the warm-up. TOTK_SEED_FROM_PACK=0: off.
 static pthread_mutex_t pa_code_mu = PTHREAD_MUTEX_INITIALIZER;   // (the index, and pa_file against its free)
 static struct { uint64_t hash, blob; } *pa_hix;   // sorted by hash (pa_cmp_u64 reads the first field)
 static _Atomic int pa_served;
@@ -13103,8 +13101,8 @@ int vk_compile_bench(int threads, const char *csv) {
 // recorded in cache/precompile.bin and the seed (a records-only seed's stages come from the player's own pack,
 // TOTK_ARCHIVE_SHADERS: pa_code_copy) is built the way the game's precompile workers build it, on every logical CPU but
 // one, then the driver's pipeline cache is saved and cache/precompile_cold.key stamped (pc_cold_done), so the first start
-// finds SPIR-V, pipeline libraries and pipelines cached and is not a cold one. Measured need (installer 11-01): a Setup
-// player without the seed held 347 frames on the first play, ~32 with the developer seed.
+// finds SPIR-V, pipeline libraries and pipelines cached and is not a cold one. Measured need: a Setup player without the
+// seed held 347 frames on the first play, ~32 with the developer seed.
 static _Atomic int prep_next_comp, prep_next_prog, prep_next_pipe, prep_comps, prep_progs, prep_pipes, prep_progs_seen;
 static _Atomic int prep_nocode, prep_failed, prep_pipes_ok, prep_pipes_skipped, prep_pipes_failed;
 static void *prep_worker(void *arg) {

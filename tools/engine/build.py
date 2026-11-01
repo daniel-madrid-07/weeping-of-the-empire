@@ -1106,6 +1106,16 @@ def small_link(out, pdb, mapfile, variant={}, rt_lto=False, root=None):
         rule = rule.replace(' -Wl,/DEBUG', ' -Wl,/OPT:NOREF -Wl,/OPT:NOICF')
     if not mapfile:
         rule = rule.replace(' -Wl,/MAP:$out.map', '')
+    # The runtime's C++ with _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR, here in the relink's own build.ninja (its game
+    # objects are prebuilt, so cxxflags is the runtime's alone; mkninja_win.py's lines join the key through gen_rule):
+    # since MSVC 14.40 std::mutex's constexpr constructor needs that STL's msvcp140.dll, and a player's older one
+    # (a pre-17.10 VC++ redistributable) crashed totk.exe before main (checked with Microsoft's 14.29 DLLs: the
+    # define makes mutexes initialise through the DLL, _Mtx_init_in_situ). Microsoft's own workaround.
+    mv = re.search(r'^cxxflags = .*$', text, re.M)
+    if not mv:
+        sys.exit(f'{p}: no cxxflags line for -D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR')
+    text = text[:mv.end()] + ' -D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR' + text[mv.end():]
+    m = re.search(r'^rule link\n  command = .*$', text, re.M)
     # a variant key's link side: --pgo gen links the profile runtime (clang's driver adds clang_rt.profile) and
     # builds rt_main.cpp's TOTK_PGO_GEN dump thread (the game is killed, so the at-exit write never runs);
     # --lto thin does the ThinLTO backends at link time, cached across relinks

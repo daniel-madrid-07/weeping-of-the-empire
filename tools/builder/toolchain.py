@@ -413,11 +413,15 @@ def ensure_packages(py=sys.executable):
     if not missing:
         return
     say('installing the Python packages the steps use: ' + ' '.join(s.split('==')[0] for s in missing))
-    if subprocess.run([py, '-m', 'pip', '--version'], capture_output=True).returncode:
-        r = subprocess.run([py, '-m', 'ensurepip', '--default-pip'], capture_output=True, text=True)
+    # -E -s, as Setup starts us: pip sees only this Python's own site-packages. Without them a user site of the same
+    # Python version (a Microsoft Store Python 3.13 with these wheels) made pip say 'already satisfied' and install
+    # nothing, and the import that follows failed ('No module named cryptography', a fresh v0.1.6 install, 11-01)
+    pyx = [py, '-E', '-s']
+    if subprocess.run([*pyx, '-m', 'pip', '--version'], capture_output=True).returncode:
+        r = subprocess.run([*pyx, '-m', 'ensurepip', '--default-pip'], capture_output=True, text=True)
         if r.returncode:
             raise ToolchainError('pip could not be set up: ' + (r.stdout + r.stderr)[-600:])
-    r = subprocess.run([py, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-warn-script-location',
+    r = subprocess.run([*pyx, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-warn-script-location',
                         '--only-binary', ':all:', *missing], capture_output=True, text=True)
     if r.returncode:
         raise ToolchainError('installing the Python packages failed (internet?):\n' + (r.stdout + r.stderr)[-1500:])
