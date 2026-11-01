@@ -5017,6 +5017,10 @@ static const char *pc_seed_dir(void) {
         struct stat sb;
         if (!d && stat("cache-seed/precompile.bin", &sb) == 0) d = "cache-seed";
         if (d && !*d) d = NULL;
+        // (the settings row graphics.shader_seed, off: no seed whatever the launcher set; it outlives Setup's updates,
+        // which rewrite player.txt and bring cache-seed\ back)
+        const char *row = getenv("TOTK_SHADER_SEED");
+        if (row && *row == '0') { if (d) LOG("[precompile] seed %s off (graphics.shader_seed)\n", d); d = NULL; }
     }
     return d;
 }
@@ -5030,9 +5034,10 @@ static FILE *pc_code_open(uint64_t hash, const char *ext) {   // cache/code/<has
     }
     return f;
 }
+static uint8_t *pa_code_copy(uint64_t hash, uint64_t size, uint64_t csize);   // (a records-only seed's stages: below)
 static uint8_t *pc_load_code(uint64_t hash, uint64_t size) {
     FILE *f = pc_code_open(hash, "bin");
-    if (!f) return NULL;
+    if (!f) return pa_code_copy(hash, size, 0);
     uint8_t *b = malloc((size_t)size);
     bool ok = b && fread(b, 1, (size_t)size, f) == size;
     fclose(f);
@@ -5043,7 +5048,8 @@ static uint8_t *pc_load_code(uint64_t hash, uint64_t size) {
 static uint8_t *pc_load_code_c1(uint64_t hash, uint64_t size, uint64_t *csize) {
     if (!*csize) return pc_load_code(hash, size);
     FILE *c = pc_code_open(hash, "bin"), *k = pc_code_open(hash, "c1");
-    uint8_t *b = c ? malloc((size_t)(size + *csize)) : NULL;
+    if (!c) { if (k) fclose(k); return pa_code_copy(hash, size, *csize); }   // (no code file: the player's pack)
+    uint8_t *b = malloc((size_t)(size + *csize));
     bool ok = b && fread(b, 1, (size_t)size, c) == size;
     if (ok && !(k && fread(b + size, 1, (size_t)*csize, k) == *csize)) *csize = 0;   // (no constants: code only)
     if (c) fclose(c);
@@ -5088,6 +5094,42 @@ enum { PA_PROG = 44 };
 static int pa_cmp_u64(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
     return x < y ? -1 : x > y;
+}
+// Records-only seed (installer's option (A): a seed may ship precompile.bin without code/ (those files are the game's own
+// shader bytes, which a release cannot carry). A recorded stage whose code/<hash> file is missing comes from the player's
+// own pack instead: its blobs hash as the recording does (hash_words(0x6a09e667f3bcc908 ^ code size, code), pa_load's
+// compute table): 2,191 of 2,432 programs and 45 of 59 compute programs whole. Only an exact match is served: the record's
+// code size and constants size (a stage without its constants translates without the BRX tables, see PC_PROG2); the rest
+// (agl / UI) still builds at first sight. A copy: the caller keeps it as the program's code, and the pack is freed after
+// the warm-up. TOTK_SEED_FROM_PACK=0: off.
+static pthread_mutex_t pa_code_mu = PTHREAD_MUTEX_INITIALIZER;   // (the index, and pa_file against its free)
+static struct { uint64_t hash, blob; } *pa_hix;   // sorted by hash (pa_cmp_u64 reads the first field)
+static _Atomic int pa_served;
+static uint8_t *pa_code_copy(uint64_t hash, uint64_t size, uint64_t csize) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_SEED_FROM_PACK"); on = !e || *e != '0'; }
+    if (!on) return NULL;
+    uint8_t *out = NULL;
+    pthread_mutex_lock(&pa_code_mu);
+    if (pa_file && !pa_hix && pa_nblobs) {
+        pa_hix = malloc(sizeof *pa_hix * pa_nblobs);
+        for (uint32_t i = 0; pa_hix && i < pa_nblobs; i++) {
+            pa_hix[i].hash = hash_words(0x6a09e667f3bcc908ull ^ pa_blob[i * 4 + 1], pa_code + pa_blob[i * 4], pa_blob[i * 4 + 1]);
+            pa_hix[i].blob = i;
+        }
+        if (pa_hix) qsort(pa_hix, pa_nblobs, sizeof *pa_hix, pa_cmp_u64);
+    }
+    if (pa_file && pa_hix) {
+        size_t lo = 0, hi = pa_nblobs;
+        while (lo < hi) { size_t m = (lo + hi) / 2; if (pa_hix[m].hash < hash) lo = m + 1; else hi = m; }
+        const uint32_t *b = lo < pa_nblobs && pa_hix[lo].hash == hash ? pa_blob + pa_hix[lo].blob * 4 : NULL;
+        if (b && b[1] == size && b[2] == csize && (out = malloc((size_t)(size + csize)))) {
+            memcpy(out, pa_code + b[0], (size_t)(size + csize));
+            atomic_fetch_add(&pa_served, 1);
+        }
+    }
+    pthread_mutex_unlock(&pa_code_mu);
+    return out;
 }
 static void pa_load(void) {
     const char *e = getenv("TOTK_PRECOMPILE_ARCHIVE");
@@ -5743,7 +5785,8 @@ static void *pc_worker(void *arg) {
 extra_out:;
     static _Atomic int phase1_done;
     if (atomic_fetch_add(&phase1_done, 1) == pc_nthreads - 1) {
-        LOG("[precompile] done: %d programs, %d pipelines in %.1f s\n", pc_nprogs, pc_npipes, (SDL_GetTicksNS() - pc_t0) / 1e9);
+        LOG("[precompile] done: %d programs, %d pipelines in %.1f s; %d recorded stages from the pack (no code file)\n",
+            pc_nprogs, pc_npipes, (SDL_GetTicksNS() - pc_t0) / 1e9, atomic_load(&pa_served));
         pc_tm_log();
         pa_t0 = SDL_GetTicksNS();
         if (pc_cold) pc_cold_done();
@@ -5814,11 +5857,15 @@ extra_out:;
                 raw / 1048576.0, packed / 1048576.0, (SDL_GetTicksNS() - t0) / 1e9);
     }
     if (last && pa_file && !pa_full) {   // (warm programs were destroyed: nothing points into the pack any more, ~140 MB)
+        pthread_mutex_lock(&pa_code_mu);   // (pa_code_copy: a records-only seed's stages are copies, never pointers)
+        free(pa_hix);
+        pa_hix = NULL;
         free(pa_file);
         pa_file = NULL;
         pa_blob = NULL;
         pa_prog = pa_code = NULL;   // (pa_nprogs stays: the progress totals count it; pc_start runs once, so no second
                                     // archive loop can index the freed tables)
+        pthread_mutex_unlock(&pa_code_mu);
     }
     if (last && pa_warmup_mode()) {
         extern void vk_pipeline_cache_save(void);
@@ -13049,6 +13096,119 @@ int vk_compile_bench(int threads, const char *csv) {
     extern void vk_pipeline_cache_save(void);
     vk_pipeline_cache_save();
     return 0;
+}
+
+// ---- Prepare mode (totk.exe --prepare / TOTK_PREPARE=1; rt_main.cpp, the installer's Setup step, v0.1.6): the
+// precompile's first-start pass ahead of the first play, without the game. Every compute program, program and pipeline
+// recorded in cache/precompile.bin and the seed (a records-only seed's stages come from the player's own pack,
+// TOTK_ARCHIVE_SHADERS: pa_code_copy) is built the way the game's precompile workers build it, on every logical CPU but
+// one, then the driver's pipeline cache is saved and cache/precompile_cold.key stamped (pc_cold_done), so the first start
+// finds SPIR-V, pipeline libraries and pipelines cached and is not a cold one. Measured need (installer 11-01): a Setup
+// player without the seed held 347 frames on the first play, ~32 with the developer seed.
+static _Atomic int prep_next_comp, prep_next_prog, prep_next_pipe, prep_comps, prep_progs, prep_pipes, prep_progs_seen;
+static _Atomic int prep_nocode, prep_failed, prep_pipes_ok, prep_pipes_skipped, prep_pipes_failed;
+static void *prep_worker(void *arg) {
+    (void)arg;
+    SetThreadPriority(GetCurrentThread(), -1);   // (below normal: the player's PC stays usable while Setup runs)
+    const char *u = getenv("TOTK_PRECOMPILE_UNLOCKED");   // (as the first-start pass: translations without translate_lock)
+    for (;;) {
+        int i = atomic_fetch_add(&prep_next_comp, 1);
+        if (i >= pc_ncomps) break;
+        pc_comp_build(&pc_comps[i]);
+        atomic_fetch_add(&prep_comps, 1);
+    }
+    for (;;) {
+        int i = atomic_fetch_add(&prep_next_prog, 1);
+        if (i >= pc_nprogs) break;
+        const PcProg *r = &pc_progs[i].p;
+        Prog *p = calloc(1, sizeof *p);
+        p->vkey = r->vkey; p->fkey = r->fkey; p->ckey = r->ckey; p->inline_compile = true;
+        bool ok = true;
+        for (int s = 0; s < 2 && ok; s++) {
+            uint64_t cs = pc_progs[i].csize[s];
+            uint8_t *b = pc_load_code_c1(r->code_hash[s], r->cmax[s], &cs);
+            if (!b) { ok = false; break; }
+            p->code[s] = (uint64_t)(uintptr_t)b; p->cmax[s] = r->cmax[s]; p->csize[s] = cs;
+        }
+        if (!ok) {
+            atomic_fetch_add(&prep_nocode, 1);
+            free((void *)(uintptr_t)p->code[0]);
+            free(p);
+        } else if (pc_claim_prog(r->ckey, p) == p) {
+            translate_unlocked = !(u && !strcmp(u, "0"));
+            translate_program(p);
+            translate_unlocked = false;
+            if (atomic_load(&p->state) != 1) atomic_fetch_add(&prep_failed, 1);
+        } else free(p);
+        atomic_fetch_add(&prep_progs, 1);
+    }
+    atomic_fetch_add(&prep_progs_seen, 1);
+    while (atomic_load(&prep_progs) < pc_nprogs) SDL_Delay(5);
+    for (;;) {   // pipelines, keyed exactly as draw() keys them (pc_worker's loop)
+        int i = atomic_fetch_add(&prep_next_pipe, 1);
+        if (i >= pc_npipes) break;
+        const PcPipe *r = &pc_pipes[i];
+        Prog *p = pc_find_prog(r->ckey);
+        if (p && atomic_load(&p->state) == 1) {
+            Pipe *pp = calloc(1, sizeof *pp);
+            pp->k = r->k;
+            pp->k.prog = p;
+            uint64_t ph = hash_mem(0xcbf29ce484222325ull, &pp->k, sizeof pp->k);
+            if (!ph) ph = 1;
+            pp->claimed = 1;
+            if (pc_take_pipe(ph)) free(pp);
+            else {
+                pc_put_pipe(ph, pp);
+                build_pipeline_body(pp);
+                if (atomic_load(&pp->state) == 1) atomic_fetch_add(&prep_pipes_ok, 1);
+                else atomic_fetch_add(&prep_pipes_failed, 1);
+            }
+        } else atomic_fetch_add(&prep_pipes_skipped, 1);   // (its program had no code, or failed)
+        atomic_fetch_add(&prep_pipes, 1);
+    }
+    return NULL;
+}
+int vk_prepare(void) {
+    pc_t0 = SDL_GetTicksNS();
+    pc_cold_decide();   // (pc_cold_key: this GPU, driver and exe; pc_cold_done stamps it)
+    int own = pc_load_file("cache/precompile.bin");
+    if (own == 0) {   // (as pc_start: another heap base / layout is set aside, the game records anew)
+        remove("cache/precompile.bin.old");
+        rename("cache/precompile.bin", "cache/precompile.bin.old");
+    }
+    if (pc_seed_dir()) {
+        char path[600];
+        snprintf(path, sizeof path, "%s/precompile.bin", pc_seed_dir());
+        int r = pc_load_file(path);
+        LOG("[prepare] seed %s: %s\n", path, r < 0 ? "missing" : r ? "loaded" : "another heap base / layout, ignored");
+    }
+    pa_load();   // (the player's pack: the records-only seed's code and the archive's compute programs)
+    const int total = pc_ncomps + pc_nprogs + pc_npipes;
+    if (!pc_nprogs && !pc_ncomps) { printf("[prepare] done in 0 s: nothing to build (no recorded shaders)\n"); return 2; }
+    int ncpu = SDL_GetNumLogicalCPUCores(), nt = ncpu > 2 ? ncpu - 1 : 1;
+    if (nt > 64) nt = 64;
+    pc_nthreads = nt;
+    LOG("[prepare] %d compute programs, %d programs, %d pipelines; %d threads\n", pc_ncomps, pc_nprogs, pc_npipes, nt);
+    pthread_t th[64];
+    for (int i = 0; i < nt; i++) pthread_create(&th[i], NULL, prep_worker, NULL);
+    for (int last = -1;;) {   // (progress for Setup, about once a second)
+        int done = atomic_load(&prep_comps) + atomic_load(&prep_progs) + atomic_load(&prep_pipes);
+        if (done != last) { printf("[prepare] progress %d/%d\n", done, total); fflush(stdout); last = done; }
+        if (done >= total) break;
+        SDL_Delay(1000);
+    }
+    for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
+    const int nocode = atomic_load(&prep_nocode), failed = atomic_load(&prep_failed) + atomic_load(&prep_pipes_failed);
+    pc_cold_done();   // (saves the pipeline cache and stamps cache/precompile_cold.key)
+    // (the installer's Setup shows this line as it is)
+    printf("[prepare] done in %.0f s: programs %d of %d, pipelines %d of %d, compute %d; skipped %d programs and %d pipelines "
+           "(not in the player's archive)%s\n", (SDL_GetTicksNS() - pc_t0) / 1e9, pc_nprogs - nocode - atomic_load(&prep_failed),
+           pc_nprogs, atomic_load(&prep_pipes_ok), pc_npipes, pc_ncomps, nocode, atomic_load(&prep_pipes_skipped),
+           failed ? "; some builds failed" : "");
+    LOG("[prepare] %d recorded stages from the pack; %d program and %d pipeline builds failed\n", atomic_load(&pa_served),
+        atomic_load(&prep_failed), atomic_load(&prep_pipes_failed));
+    fflush(stdout);
+    return failed ? 1 : 0;
 }
 
 #include "vkq_impl.h"   // (deferred command recording, LARECOMP_VKQ=1)

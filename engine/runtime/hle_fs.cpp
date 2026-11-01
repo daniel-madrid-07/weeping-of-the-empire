@@ -4,6 +4,7 @@
 // save/cache/temporary storage -> userdata/<kind>. Paths are "<mount>:/a/b".
 #include "hle.h"
 #include "pc.h"
+#include "pc_lang.h"   // pc_lang_code: the CJK glyph guard (glyph_patches)
 #include "cpu_place.h"
 #include "romfs_image.h"
 #include <windows.h>
@@ -281,6 +282,7 @@ static bool bank_load(const std::string& d) {
 }
 static void glyph_live_served(const std::string& hp, bool common, int style);   // (below)
 static void glyph_live_font(const std::vector<u16>& ids);                       // (below)
+static void glyph_live_rearm();                                                 // (below)
 // Byte patches over a served file: sorted offsets and their bytes (host_pread applies them).
 struct FilePatch { std::vector<u64> off; std::vector<u8> val; };
 static u64 r8_block_linear(int x, int y, int w, int bh) {   // offset of byte x of row y, rows w bytes wide (block-linear)
@@ -305,6 +307,16 @@ template <class F> static void mask_each(const GlyphBank::Mask& m, const u8* src
             for (int k = 0; k < 8; k++) put(r8_block_linear(bx * 8 + k, by, bw * 8, m.bh), src[(by * bw + bx) * 8 + k]);
 }
 // DoCommand's diamond: the copy shown for a style (keys and mouse: none, the key masks say it all)
+// The Korean and Chinese font archives (Font/Font_KRko, Font_CNzh, Font_TWzh .Nin_NX_NVN.bfarc) are not covered by the
+// bank (games/totk/glyphs/README.md): their External.bfotf is the game's own, byte for byte the main archive's before the
+// bank adds its glyphs (U+F0xx, the game's own moved, and U+F100.., the bank's), so its cmap is found and rewritten like
+// the main one's and the font engine's wrap asks it for glyphs it does not have: every button picture in text, the tabs'
+// arrows and the A / B / X / Y prompts came out as tofu in Korean (public issue #12, v0.1.5, while the Korean text drew).
+// Once the game opens one of them the bank's text part stays off: the characters, the cmap slots, the wrap and the
+// DoCommand letter copies keep the game's own (Switch) button pictures; the masks (images) still follow the style.
+// Covering them is the bank's work (one patched archive per language): v0.1.7.
+static std::atomic<bool> g_cjk_text{false};
+static int text_style(int style) { return g_cjk_text.load(std::memory_order_relaxed) && style >= 2 ? 0 : style; }
 static bool pane_shown(const GlyphBank::Pane& p, int style) {
     const char g = p.group.size() > 1 ? p.group[1] : 0;
     return g == 'b' ? style != 1 : g == 's' ? style == 0 : g == 'x' ? style == 2 : g == 'p' && style == 3;
@@ -319,6 +331,19 @@ static u32 pane_codepoint(const GlyphBank::Pane& p) {
 static std::shared_ptr<const FilePatch> glyph_patches(const std::string& hp) {
     const GlyphBank& b = g_bank;
     if (b.dir.empty()) return nullptr;
+    // (only in a Korean or Chinese game: an archive the game might open in another language never turns the bank off
+    // for an en / ja / es player)
+    static const bool cjk_game = [] {
+        const char* l = pc_lang_code();
+        return !strncmp(l, "ko", 2) || !strncmp(l, "zh", 2);
+    }();
+    if (cjk_game && !g_cjk_text.load(std::memory_order_relaxed))
+        for (const char* a : {"Font_KRko.Nin_NX_NVN.bfarc", "Font_CNzh.Nin_NX_NVN.bfarc", "Font_TWzh.Nin_NX_NVN.bfarc"})
+            if (hp.find(a) != std::string::npos && !g_cjk_text.exchange(true)) {
+                printf("[fs] glyph bank: the game opened %s (Korean / Chinese text): the bank's text glyphs stay off, the "
+                       "game's own button pictures in text (the bank does not cover that archive yet)\n", a);
+                glyph_live_rearm();   // (what was rewritten already goes back at the live thread's next look)
+            }
     bool font = hp == b.dir + "/" + b.font, common = hp == b.dir + "/" + b.common;
     if (!font && !common) return nullptr;
     const int style = hid_glyph_active();
@@ -351,7 +376,7 @@ static std::shared_ptr<const FilePatch> glyph_patches(const std::string& hp) {
             mask_each(m, mask_src(m, g->second), [&](u64 off, u8 val) { v.push_back({b.zoff(m.start + off), val}); });
         }
         for (auto& p : b.panes) {
-            v.push_back({b.zoff(p.flag_at), (u8)(p.flag | (pane_shown(p, style) ? 1 : 0))});
+            v.push_back({b.zoff(p.flag_at), (u8)(p.flag | (pane_shown(p, text_style(style)) ? 1 : 0))});
             if (!p.text_at) continue;
             const u32 cp = pane_codepoint(p);
             v.push_back({b.zoff(p.text_at), (u8)cp});
@@ -428,7 +453,7 @@ static u32 game_codepoint(u32 cp) { return cp - 0xE000 + 0xF000; }
 // already laid out is drawn again that way.
 // (a table per glyph epoch: every prompt's characters come through here at layout, and glyph_index builds the bindings)
 static u32 glyph_font_code(u32 cp) {
-    if (cp < 0xE040 || cp > 0xE068 || g_bank.dir.empty()) return cp;
+    if (cp < 0xE040 || cp > 0xE068 || g_bank.dir.empty() || g_cjk_text.load(std::memory_order_relaxed)) return cp;
     static std::mutex m;
     static unsigned memo_epoch = ~0u;
     static u32 memo[0xE068 - 0xE040 + 1];
@@ -457,7 +482,9 @@ extern "C" unsigned pc_glyph_epoch_in(int set) { return hid_glyph_epoch() * 31u 
 extern "C" unsigned pc_glyph_gameplay_epoch(void) { return pc_glyph_epoch_in(0); }   // (pc_input.h's PCX_WORLD)
 extern "C" uint16_t pc_glyph_cp_in(int set, uint16_t cp) {
     constexpr int kKbm = 1, kSets = 64, kCps = 0xE068 - 0xE040 + 1;   // (hle_hid's GlyphKbm; kSets > PCX_COUNT)
-    if (cp < 0xE040 || cp > 0xE068 || g_bank.dir.empty() || set < 0 || set >= kSets) return cp;
+    if (cp < 0xE040 || cp > 0xE068 || g_bank.dir.empty() || set < 0 || set >= kSets ||
+        g_cjk_text.load(std::memory_order_relaxed))
+        return cp;
     static std::mutex m;
     static unsigned memo_epoch[kSets];
     static bool memo_ok[kSets];
@@ -501,6 +528,12 @@ static std::vector<u8> cmap_with(const std::vector<u16>& ids) {
         if (o + 1 < t.size()) { t[o] = (u8)(ids[i] >> 8); t[o + 1] = (u8)ids[i]; }
     }
     return t;
+}
+// The live thread rewrites the game's copies at its next look whatever the epoch (glyph_patches: a Korean / Chinese font
+// archive turned the bank's text part off)
+static void glyph_live_rearm() {
+    std::lock_guard<std::mutex> l(g_live.m);
+    g_live.epoch = ~0u;
 }
 // glyph_patches: the font was served with these ids in the slots
 static void glyph_live_font(const std::vector<u16>& ids) {
@@ -892,7 +925,7 @@ static bool glyph_live_write(int style, bool log) {
     // like the tabs. Without the wrap, the bank glyph's own code point of the style (prompts laid out afterwards only).
     std::vector<u8> gki = b.gki_sig;
     for (auto& e : b.gki) {
-        if (g_font_wrapped.load(std::memory_order_relaxed)) break;
+        if (g_font_wrapped.load(std::memory_order_relaxed) || g_cjk_text.load(std::memory_order_relaxed)) break;
         if (e.first + 1 >= gki.size()) continue;
         int gi = glyph_index(style, e.second);
         u32 cp = gi >= 0 ? glyph_codepoint(gi) : game_codepoint(gki[e.first] | (u32)gki[e.first + 1] << 8);
@@ -914,7 +947,7 @@ static bool glyph_live_write(int style, bool log) {
     }
     int msg_done = 0, msg_gone = 0;
     for (auto& mc : g_live.msg) {
-        const int gi = glyph_index(style, b.slots[mc.slot].control);
+        const int gi = g_cjk_text.load(std::memory_order_relaxed) ? -1 : glyph_index(style, b.slots[mc.slot].control);
         const u16 cp = (u16)(gi >= 0 ? glyph_codepoint(gi) : game_codepoint(mc.cp));
         if (cp == mc.now) continue;
         if (msg_put(mc.at, mc.now, cp)) mc.now = cp, msg_done++;
@@ -924,7 +957,7 @@ static bool glyph_live_write(int style, bool log) {
     // the font's slots too: literal button characters laid out from now on, and any the font engine draws again
     std::vector<u16> ids;
     for (auto& s : b.slots) {
-        const char* g = hid_glyph_for(style, s.control.c_str());
+        const char* g = g_cjk_text.load(std::memory_order_relaxed) ? nullptr : hid_glyph_for(style, s.control.c_str());
         auto it = g ? b.glyphs.find(g) : b.glyphs.end();
         ids.push_back(it != b.glyphs.end() ? it->second.first : s.orig);
     }
@@ -945,7 +978,7 @@ static bool glyph_live_write(int style, bool log) {
     int panes = 0, pane_flips = 0;
     for (size_t i = 0; i < b.panes.size() && i < g_live.pane_obj.size(); i++) {
         const auto& p = b.panes[i];
-        const u8 vis = pane_shown(p, style) ? 1 : 0;
+        const u8 vis = pane_shown(p, text_style(style)) ? 1 : 0;
         panes += !g_live.pane_obj[i].empty();
         for (u8* a : g_live.pane_obj[i])
             if ((*a & 1) != vis) *a = (u8)((*a & 0xFE) | vis), pane_flips++;

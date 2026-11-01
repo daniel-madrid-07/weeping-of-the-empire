@@ -200,6 +200,30 @@ def installed_vs():
     return vs_installation()
 
 
+def vs_env():
+    """INCLUDE / LIB / ... and the PATH entries of the installed Visual Studio checked above (vswhere's newest with the
+    C++ tools, run through its vcvars64.bat), as ensure_msvc returns them for the downloaded tools"""
+    from pipeline.toolchain import MSVC_VARS, msvc_environment
+    base = {k: v for k, v in os.environ.items() if k.upper() not in ('INCLUDE', 'LIB', 'LIBPATH', 'VCTOOLSINSTALLDIR')}
+    env = msvc_environment(base)
+    path = lambda e: next((v for k, v in e.items() if k.upper() == 'PATH'), '')
+    old = {p.lower() for p in path(base).split(';')}
+    out = {k: env[k] for k in MSVC_VARS if k in env}
+    out['PATH_PREFIX'] = ';'.join(p for p in path(env).split(';') if p and p.lower() not in old)   # (what vcvars added)
+    return out
+
+
+def vs_msvc_version(vs):
+    """the default MSVC toolset of an installed Visual Studio (VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt,
+    what its vcvars64.bat picks), e.g. '14.44.35207', or None"""
+    try:
+        with open(os.path.join(vs, 'VC', 'Auxiliary', 'Build', 'Microsoft.VCToolsVersion.default.txt')) as f:
+            v = f.read().strip()
+        return v if re.fullmatch(r'\d+(\.\d+)+', v) else None
+    except OSError:
+        return None
+
+
 def _vs_manifest():
     ch = fetch_json(VS_CHANNEL)
     items = {i['id']: i for i in ch['channelItems']}
@@ -409,10 +433,16 @@ def ensure(tools):
     os.makedirs(tools, exist_ok=True)
     ensure_packages()
     env = {'NXRECOMP_LLVM_DIR': ensure_llvm(tools), 'VULKAN_SDK': ensure_vulkan(tools)}
-    if installed_vs() is None:
-        env.update(ensure_msvc(tools))
+    vs = installed_vs()
+    have = vs_msvc_version(vs) if vs else None
+    if vs and have and _version_key(have)[:2] >= _version_key(MSVC_PIN)[:2]:
+        say(f'using the Visual Studio C++ tools installed on this PC (MSVC {have})')
+        env.update(vs_env())   # (that instance's own variables: the build's other vcvars search may find another one)
     else:
-        say('using the Visual Studio C++ tools installed on this PC')
+        if vs:   # (an older STL lacks the helpers the Vulkan libraries' objects call: __std_min_4u & co., issue #6)
+            say(f'the Visual Studio C++ tools on this PC are MSVC {have or "of an unknown version"}, older than the '
+                f'{MSVC_PIN} the build needs: using the downloaded ones instead (Visual Studio is not changed)')
+        env.update(ensure_msvc(tools))
     return env
 
 

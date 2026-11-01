@@ -13,38 +13,57 @@
 import ctypes, ctypes.util, os, shutil, struct, sys
 
 def _libzstd():
-    """Git for Windows' libzstd.dll: NXR_LIBZSTD, the default install, else the git on PATH's (another drive / user)"""
+    """Git for Windows' libzstd.dll: NXR_LIBZSTD, the default install, the per-user one (winget --scope user), else the
+    git on PATH's (another drive, Setup's MinGit); None: the zstandard package below (public issue #8: no DLL
+    found, step 7 stopped)"""
+    if os.environ.get("NXR_LIBZSTD") == "zstandard":   # (that one asked for: the tests, a PC whose DLL misbehaves)
+        return None
     git = os.path.dirname(shutil.which("git") or "")
-    for p in (os.environ.get("NXR_LIBZSTD"), r'C:\Program Files\Git\mingw64\bin\libzstd.dll', os.path.join(git, "libzstd.dll"),
-              os.path.join(os.path.dirname(git), "mingw64", "bin", "libzstd.dll")):
+    for p in (os.environ.get("NXR_LIBZSTD"), r'C:\Program Files\Git\mingw64\bin\libzstd.dll',
+              os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Git", "mingw64", "bin", "libzstd.dll"),
+              os.path.join(git, "libzstd.dll"), os.path.join(os.path.dirname(git), "mingw64", "bin", "libzstd.dll"),
+              os.path.join(os.path.dirname(git), "ucrt64", "bin", "libzstd.dll")):   # (MinGit 2.5x, Setup's own git)
         if p and os.path.isfile(p):
             return p
-    raise OSError("libzstd.dll not found: install Git for Windows (winget install Git.Git) or set NXR_LIBZSTD")
+    return None
 
 
 if sys.platform == "win32":
-    Z = ctypes.CDLL(_libzstd())
+    _dll = _libzstd()
+    Z = ctypes.CDLL(_dll) if _dll else None
 else:
     Z = ctypes.CDLL(ctypes.util.find_library("zstd") or "libzstd.so.1")
-for f in ("ZSTD_getFrameContentSize",): getattr(Z, f).restype = ctypes.c_ulonglong
-for f in ("ZSTD_decompress", "ZSTD_compressBound", "ZSTD_decompress_usingDict", "ZSTD_compress_usingDict"): getattr(Z, f).restype = ctypes.c_size_t
-Z.ZSTD_isError.restype = ctypes.c_uint
-Z.ZSTD_createDCtx.restype = Z.ZSTD_createCCtx.restype = ctypes.c_void_p
-S = ctypes.c_size_t
+if Z is None:   # (the same zstd frames through the zstandard package: the Builder's engine venv has it)
+    import zstandard
 
-def unzstd(b, d=b""):
-    n = Z.ZSTD_getFrameContentSize(b, S(len(b)))
-    out = ctypes.create_string_buffer(n)
-    r = Z.ZSTD_decompress_usingDict(ctypes.c_void_p(Z.ZSTD_createDCtx()), out, S(n), b, S(len(b)), d, S(len(d)))
-    assert not Z.ZSTD_isError(S(r)) and r == n, r
-    return out.raw[:r]
+    def _zdict(d):
+        return {"dict_data": zstandard.ZstdCompressionDict(d)} if d else {}
 
-def zstd(b, d, level=19):
-    cap = Z.ZSTD_compressBound(S(len(b)))
-    out = ctypes.create_string_buffer(cap)
-    r = Z.ZSTD_compress_usingDict(ctypes.c_void_p(Z.ZSTD_createCCtx()), out, S(cap), b, S(len(b)), d, S(len(d)), level)
-    assert not Z.ZSTD_isError(S(r)), r
-    return out.raw[:r]
+    def unzstd(b, d=b""):
+        return zstandard.ZstdDecompressor(**_zdict(d)).decompress(b)
+
+    def zstd(b, d, level=19):
+        return zstandard.ZstdCompressor(level=level, **_zdict(d)).compress(b)
+else:
+    for f in ("ZSTD_getFrameContentSize",): getattr(Z, f).restype = ctypes.c_ulonglong
+    for f in ("ZSTD_decompress", "ZSTD_compressBound", "ZSTD_decompress_usingDict", "ZSTD_compress_usingDict"): getattr(Z, f).restype = ctypes.c_size_t
+    Z.ZSTD_isError.restype = ctypes.c_uint
+    Z.ZSTD_createDCtx.restype = Z.ZSTD_createCCtx.restype = ctypes.c_void_p
+    S = ctypes.c_size_t
+
+    def unzstd(b, d=b""):
+        n = Z.ZSTD_getFrameContentSize(b, S(len(b)))
+        out = ctypes.create_string_buffer(n)
+        r = Z.ZSTD_decompress_usingDict(ctypes.c_void_p(Z.ZSTD_createDCtx()), out, S(n), b, S(len(b)), d, S(len(d)))
+        assert not Z.ZSTD_isError(S(r)) and r == n, r
+        return out.raw[:r]
+
+    def zstd(b, d, level=19):
+        cap = Z.ZSTD_compressBound(S(len(b)))
+        out = ctypes.create_string_buffer(cap)
+        r = Z.ZSTD_compress_usingDict(ctypes.c_void_p(Z.ZSTD_createCCtx()), out, S(cap), b, S(len(b)), d, S(len(d)), level)
+        assert not Z.ZSTD_isError(S(r)), r
+        return out.raw[:r]
 
 def sarc_member(data, want):
     assert data[:4] == b"SARC"

@@ -22,6 +22,15 @@
   trained on (the game's decrypted program files among them), so the builder can say which changed since. The builder
   checks both files' SHA-256 before using them, and builds without the profile when it is missing, fails the check or
   you opt out (`--no-pgo`); the game is then somewhat slower.
+- **The shader list (optional).** The builder also downloads, from this project's releases, a list of the shader
+  programs and render states the game used on our PC, so that it can prepare them before it first needs them and stutter
+  less on first visits. For each program the list holds a hash of its code (not the code), the sizes of its constant
+  data and a few flags; for each render state, its formats, blending and vertex layout. The shaders themselves are taken
+  from your own copy of the game. It holds no code, data, text or assets from the game. The builder checks its SHA-256
+  before using it. To turn it off, switch off Graphics > Rendering > Shipped shader list in the game's settings window
+  (F10; `graphics.shader_seed = 0` in settings.ini). It takes effect at the next start and stays off across updates;
+  from then on the game prepares only the shaders it recorded in your own sessions. Setup already prepares the list's
+  shaders during the install, into the game's own shader cache; those stay there until you delete that cache.
 - **Do not share builds.** The folders the builder makes, and the work folder, contain code and data recompiled or
   extracted from the game. Do not share or upload them.
 - **Third-party code** keeps its licence: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) lists what is included,

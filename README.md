@@ -20,18 +20,23 @@ Most of the code was written by AI coding agents directed by one developer, who 
 </p>
 
 - **Frame rate:** 30, 60, 90, 120 or unlocked, up to your monitor's refresh rate (240 fps at most), at the game's real speed.
-- **Measured on one PC only** (Ryzen 7 9800X3D + RTX 5080, developer build, 2560x1440 window, 2133x1200 render, one run per place): 116.2-119.7 fps average at the 120 cap, 159.1-178.4 unlocked. Builds made by Setup lack the developer build's shader cache seed, so expect the same or lower. [Full table, and what is not measured](#performance-measured).
+- **Measured on one PC only** (Ryzen 7 9800X3D + RTX 5080, developer build, 2560x1440 window, 2133x1200 render, one run per place): 116.2-119.7 fps average at the 120 cap, 159.1-178.4 unlocked. Builds made by Setup get a list of the developer build's shaders instead of its full shader cache (the difference is not measured), so expect the same or lower. [Full table, and what is not measured](#performance-measured).
 - **Display:** any resolution, ultrawide, borderless or exclusive fullscreen; VRR and HDR options (not measured); NVIDIA DLSS super resolution on RTX cards and DLSS frame generation on RTX 40 / 50 series (both optional), FSR 1, SMAA.
 - **Controls:** keyboard and mouse with PC prompts in the game; Xbox, PlayStation and Switch controllers; settings window in game (F10).
 - **Limits today:** game version 1.0.0 only, and a save from a later version may not load. Windows only. Dedicated AMD and Intel cards are not measured. First visits can stutter while shaders are built.
 
 To hear about new releases, use Watch > Custom > Releases. Later game versions are being worked on; there is no date.
 
+**Community:** ask questions in [Discussions > Q&A](https://github.com/daniel-madrid-07/weeping-of-the-empire/discussions/categories/q-a),
+share your play in [Show and tell](https://github.com/daniel-madrid-07/weeping-of-the-empire/discussions/categories/show-and-tell),
+and send how it runs on your hardware, with the log, as a
+[performance report](https://github.com/daniel-madrid-07/weeping-of-the-empire/issues/new?template=performance.yml).
+
 ## Install in 3 steps
 
 1. **Download** the Setup exe from the [latest release](https://github.com/daniel-madrid-07/weeping-of-the-empire/releases/latest) and run it (no administrator rights needed). Setup is not code-signed, so Windows SmartScreen may warn the first time. Its SHA-256 is in the release notes.
 2. **Drop in your files:** your dump of the game, version 1.0.0 (`.nsp` or `.xci`), and your `prod.keys`. Pick a folder on an NTFS drive with about 75 GB free and press **Install**.
-3. **Wait once, then play.** Setup downloads the tools it needs and an optimisation profile (made by running the game on the developer's PC: function names and how often their branches ran; see [LEGAL.md](LEGAL.md)), decrypts and recompiles the game on your PC, and puts a shortcut on your desktop. Setup's own estimate is 30 to 60 minutes. One full install of an earlier version took about 33 minutes on a 16-thread CPU with 62 GB of RAM while other work was running, and its folder peaked at about 39 GB (Setup asks for 75 GB to be safe). Internet is needed during the install. If it stops, press Install again and it continues where it stopped.
+3. **Wait once, then play.** Setup downloads the tools it needs, an optimisation profile (made by running the game on the developer's PC: function names and how often their branches ran) and a list of the shaders the game used there (hashes and render states; see [LEGAL.md](LEGAL.md) for both), decrypts and recompiles the game on your PC, and puts a shortcut on your desktop. Setup's own estimate is 30 to 60 minutes. One full install of an earlier version took about 33 minutes on a 16-thread CPU with 62 GB of RAM while other work was running, and its folder peaked at about 39 GB (Setup asks for 75 GB to be safe). Internet is needed during the install. If it stops, press Install again and it continues where it stopped.
 
 Optional: your console's firmware, for its own Korean and Chinese fonts. Without it, Korean and Chinese text uses a
 Windows font for that language, or English on a Windows that has none.
@@ -64,7 +69,8 @@ off in these runs.
 
 **Setup builds:** one run so far, of v0.1.5 on the same PC: median 238.9 fps over a 300 s world run, unlocked with a
 240 fps ceiling, a 1920x1080 window, 1600x900 render; no 1 % low was recorded. Fights and towns mostly stay lower.
-Setup builds use the same optimisation profile but lack the developer build's shader cache seed.
+Setup builds use the same optimisation profile, and a list of the developer build's shaders instead of its full
+shader cache.
 
 **Not measured yet:** dedicated AMD and Intel graphics cards
 (AMD so far: one integrated GPU, see the FAQ); any CPU other than the one above; a real 8 GB card; laptops. Your

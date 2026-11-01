@@ -355,7 +355,7 @@ class BuilderForm : Form
     // How long each step takes, roughly (minutes on a first run): the bar moves by these, not by step count
     static readonly Dictionary<string, float> Weight = new Dictionary<string, float> {
         { "tools", 8 }, { "extract", 6 }, { "romfs", 3 }, { "images", 1 }, { "patches", 3 }, { "build", 35 },
-        { "sets", 4 }, { "overlay", 2 }, { "package", 1 } };
+        { "sets", 4 }, { "overlay", 2 }, { "package", 1 }, { "shaders", 5 } };
 
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int value, int size);
 

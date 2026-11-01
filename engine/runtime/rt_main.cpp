@@ -6,6 +6,8 @@
 #include "pc.h"
 #include "cpu_place.h"
 extern "C" void hle_fs_index_romfs_early(void);   // hle_fs.cpp: the RomFS pack's index built ahead of the first open
+extern "C" void ui_window_init(void);   // nvn/vulkan/device.c (prepare mode: the device without the game)
+extern "C" int vk_prepare(void);        // nvn/vulkan/exec.c (prepare mode)
 extern "C" void pc_input_keys_restore(void);   // pc_input.cpp: the accessibility hotkeys back (the boot's end: no atexit)
 #include <windows.h>
 #include <cstdio>
@@ -1121,6 +1123,38 @@ int main(int argc, char** argv) {
     // Where the threads run (cpu_place.h): before the first thread, so every thread created from here is hot by default
     // (the guest's, render, present, audio) and the pools tag themselves; a no-op on one kind of core and one L3.
     cpu_place_init();
+    // Prepare mode (totk.exe --prepare or TOTK_PREPARE=1; the installer's Setup step): the shader / pipeline precompile
+    // the first start would run, without the game (no image, no guest, a hidden device window), into this directory's
+    // cache/, then exit (nvn/vulkan/exec.c vk_prepare: 0 built, 1 some builds failed, 2 nothing to build).
+    {
+        bool prep = false;
+        for (int i = 1; i < argc; i++) prep |= !strcmp(argv[i], "--prepare");
+        const char* pe = getenv("TOTK_PREPARE");
+        if (pe && *pe && strcmp(pe, "0")) prep = true;
+        if (prep) {
+            // the base the game's heap gets (hle_os_mem.cpp SetMemoryHeapSize): translated shaders bake it in, and the
+            // records name it
+            const char* ha = getenv("TOTK_HEAP_ADDR");
+            g_rt_heap_base = ha ? strtoull(ha, nullptr, 0) : 0x1000000000ull;
+#ifdef _WIN32
+            if (!getenv("TOTK_PRIORITY")) SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);   // (its workers: below normal)
+            _putenv("LARECOMP_HIDDEN=1");
+            _putenv("LARECOMP_WINDOW=320x180");
+#else
+            setenv("LARECOMP_HIDDEN", "1", 1);
+            setenv("LARECOMP_WINDOW", "320x180", 1);
+#endif
+            // (Setup reads stdout through a pipe: every line as it is written; and one line before the device and the
+            // compiles, its sign that this exe knows the mode)
+            setvbuf(stdout, nullptr, _IONBF, 0);
+            printf("[prepare] start: heap base %llx, building into cache/\n", (unsigned long long)g_rt_heap_base);
+            ui_window_init();
+            int r = vk_prepare();
+            fflush(stdout);
+            fflush(stderr);
+            _exit(r);
+        }
+    }
     hle_fs_index_romfs_early();   // (the RomFS pack / image index, on its own thread)
     // flush once a second: a run killed by `timeout` otherwise loses its last 64 KiB of log
     CloseHandle(CreateThread(nullptr, 0, [](LPVOID) -> DWORD { for (;;) { Sleep(1000); fflush(stdout); fflush(stderr); } }, nullptr, 0, nullptr));

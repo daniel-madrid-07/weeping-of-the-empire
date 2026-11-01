@@ -80,7 +80,10 @@ def default_image():
     works = [os.environ.get('NXRECOMP_WORK'), str(builder), r'C:\nxrecomp-work']   # (build.py's default)
     for work in filter(None, works):
         for path in sorted(glob.glob(os.path.join(work, 'engine', 'img', '*', 'main.bin'))):
-            if '-p' not in os.path.basename(os.path.dirname(path)):    # (<id>-p<patches>: already patched)
+            # (<id>-p<patches>: already patched; another game version's image (TOTK_GAME_VERSION) sits beside the
+            # 1.0.0 one, so the image is taken by its hash, not by its place in the folder list)
+            if '-p' not in os.path.basename(os.path.dirname(path)) and \
+                    hashlib.sha256(Path(path).read_bytes()).hexdigest() == MAIN_IMAGE_SHA256:
                 return Path(path)
     raise PatchError(f'no unpatched main.bin under <work>/engine/img ({", ".join(filter(None, works))}): pass --image')
 

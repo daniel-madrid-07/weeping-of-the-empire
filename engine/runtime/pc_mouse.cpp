@@ -34,10 +34,13 @@ extern "C" uint64_t hid_game_buttons(void);   // hle_hid.cpp: the Npad buttons t
 extern "C" bool shim_window_fullscreen(void);   // shim_win.c (borderless or exclusive)
 extern "C" bool pc_overlay_open(void);          // pc_overlay.cpp: the settings window (or the Welcome one) is open
 extern "C" void* totk_data_page_current(void);  // games/totk/runtime/totk_patches.c: the data page, or NULL
+extern "C" void pc_mouse_inject(double dx, double dy);   // (below: TOTK_CTL "mouse", and TOTK_MOUSE_FLOOD's events)
 #define WM_APP_CAPTURE (WM_APP + 50)            // wParam 1 / 0, lParam the reason (const char*); shim_win.c: WM_APP + 1 .. 3
 #define WM_APP_RECLIP (WM_APP + 51)
 #define WM_APP_CURSOR (WM_APP + 52)
 #define WM_APP_POINTER (WM_APP + 53)
+#define WM_APP_FLOOD (WM_APP + 54)
+#define WM_APP_RECENTRE (WM_APP + 55)
 
 namespace {
 SRWLOCK g_lock = SRWLOCK_INIT;
@@ -234,10 +237,15 @@ pcclip::Act clip_decide(HWND h, bool force_free, RECT* want_r) {
                          {have.left, have.top, have.right, have.bottom}, g_clip_ours.load());
 }
 RECT g_clip_rect;   // window thread: the rectangle of the game's last ClipCursor (while g_clip_ours)
+SRWLOCK g_clip_rect_lock = SRWLOCK_INIT;   // (its writes, and the keeper thread's copy)
 pcclip::Act clip_apply(HWND h, bool force_free = false) {   // window thread
     RECT want_r = {};
     const pcclip::Act a = clip_decide(h, force_free, &want_r);
-    if (a == pcclip::CLIP) { ClipCursor(&want_r); g_clip_rect = want_r; g_clip_ours.store(true); }
+    if (a == pcclip::CLIP) {
+        ClipCursor(&want_r);
+        AcquireSRWLockExclusive(&g_clip_rect_lock); g_clip_rect = want_r; ReleaseSRWLockExclusive(&g_clip_rect_lock);
+        g_clip_ours.store(true);
+    }
     else if (a == pcclip::FREE) { ClipCursor(NULL); g_clip_ours.store(false); }
     return a;
 }
@@ -264,6 +272,68 @@ void clip_guard(HWND h) {
     RECT have;
     if (!g_clip_ours.load() || !GetClipCursor(&have) || EqualRect(&have, &g_clip_rect)) return;
     if (clip_apply(h) == pcclip::CLIP) clip_again_log(h, have, "at a mouse event");
+}
+// The raw mouse's load on the window thread (a 1000-8000 Hz mouse sends that many WM_INPUT a second while it moves;
+// r/decomps 11-01 on v0.1.5: the game slowed down while the mouse moved fast): per second, the events, the time in
+// their handling and the slowest one, and how many did the pointer's user32 work. Logged when a second had 500 or more:
+// the first 30 such seconds, then one in 60.
+double qpc_us() {
+    static const double per_us = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart / 1e6; }();
+    LARGE_INTEGER n;
+    QueryPerformanceCounter(&n);
+    return n.QuadPart / per_us;
+}
+struct RawStats { unsigned events, user32, busy_s; double busy_us, max_us; ULONGLONG t0; } g_raw;   // window thread
+void raw_stats_note(double us, bool user32, const char* src) {
+    g_raw.events++;
+    g_raw.user32 += user32;
+    g_raw.busy_us += us;
+    if (us > g_raw.max_us) g_raw.max_us = us;
+    const ULONGLONG now = GetTickCount64();
+    if (!g_raw.t0) g_raw.t0 = now;
+    if (now - g_raw.t0 < 1000) return;
+    if (g_raw.events >= 500 && (g_raw.busy_s++ < 30 || g_raw.busy_s % 60 == 0))
+        printf("[mouse] %s: %u events in %.2f s, handled in %.2f ms (slowest %.0f us), %u with the pointer's user32 work\n",
+               src, g_raw.events, (now - g_raw.t0) / 1000.0, g_raw.busy_us / 1000.0, g_raw.max_us, g_raw.user32);
+    g_raw = {0, 0, g_raw.busy_s, 0.0, 0.0, now};
+}
+// The pointer keeper (keeper below): the confinement's and the recentring's user32 calls on a thread of their own
+// every 4 ms, never at a raw event nor in the input reads. TOTK_MOUSE_KEEPER=0: as before (at the raw events, at most
+// once a millisecond, and clip_check in every input read).
+bool keeper_on() {
+    static const bool on = [] {
+        const char* e = getenv("TOTK_MOUSE_KEEPER");
+        return !(e && !strcmp(e, "0"));
+    }();
+    return on;
+}
+std::atomic<bool> g_recentre_posted{false};   // the keeper's WM_APP_RECENTRE is on its way
+// (TOTK_MOUSE_FLOOD's fifth value 1: a captured pointer's user32 reads where a raw event does the pointer's work, as
+// clip_guard and recentre make them while captured: GetClipCursor and GetCursorPos, and every 8th a SetCursorPos to
+// where the pointer already is (recentre's move, without moving it). A boot behind other windows is never captured, so
+// without this its events skip that work; with the keeper on, the keeper makes them, every 4 ms.)
+bool g_flood_emul;
+void flood_emulate() {
+    static unsigned n;
+    RECT r;
+    POINT p;
+    GetClipCursor(&r);
+    if (GetCursorPos(&p) && ++n % 8 == 0) SetCursorPos(p.x, p.y);
+}
+// The pointer's user32 work at a raw event (clip_guard's GetClipCursor, recentre's GetCursorPos / SetCursorPos) at most
+// once a millisecond, not at every event: at 8000 Hz that was 8000+ calls a second into win32k, which the input reads'
+// own user32 calls (GetForegroundWindow, GetAsyncKeyState, GetClipCursor) wait behind. A millisecond is far under what a
+// confinement drop or a quarter of the window takes to matter. TOTK_MOUSE_EVENT_USER32=every: at every event (A/B).
+bool user32_due() {
+    static const bool every = [] {
+        const char* e = getenv("TOTK_MOUSE_EVENT_USER32");
+        return e && !strcmp(e, "every");
+    }();
+    static double last = -1e9;
+    const double t = qpc_us();
+    if (!every && t - last < 1000) return false;
+    last = t;
+    return true;
 }
 // Window thread, captured (the pointer hidden): back to the client centre past a quarter of the way to an edge (pc_clip.h
 // recentre), so a flick in a dropped-confinement gap can't reach another monitor. The box is the confinement's (the
@@ -307,9 +377,13 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_INPUT: {
         RAWINPUT ri; UINT size = sizeof ri;
+        const double t_in = qpc_us();
+        struct Note { double t; bool u; ~Note() { raw_stats_note(qpc_us() - t, u, "raw input"); } } note{t_in, !keeper_on() && user32_due()};
         const bool cap = g_captured.load(), cur = released();   // (the menu cursor: the wheel only)
-        clip_guard(h);   // (every context: the confinement first, before the pointer moves on)
-        if (cap && !g_moving.load()) recentre(h);  // (Alt+Space Move / Size follows the pointer)
+        if (note.u) {
+            clip_guard(h);   // (every context: the confinement first, before the pointer moves on)
+            if (cap && !g_moving.load()) recentre(h);  // (Alt+Space Move / Size follows the pointer)
+        }
         const bool capw = pc_input_capture_wants_wheel();         // (a capture that takes a wheel notch)
         if ((cap || cur || capw) && GetRawInputData((HRAWINPUT)l, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
             ri.header.dwType == RIM_TYPEMOUSE) {
@@ -383,7 +457,8 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         GetClipCursor(&had);
         const RECT old = g_clip_rect;
         // (a move / resize also lands here, the client area changed: Windows still had ours then, not a drop)
-        if (clip_apply(h) == pcclip::CLIP && was_ours && !w && !EqualRect(&had, &old)) clip_again_log(h, had, "at an input read");
+        if (clip_apply(h) == pcclip::CLIP && was_ours && !w && !EqualRect(&had, &old))
+            clip_again_log(h, had, keeper_on() ? "at a check" : "at an input read");
         return 0;
     }
     case WM_ACTIVATE:
@@ -410,6 +485,22 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetCursor(w ? pointer() : NULL);
         return 0;
     }
+    case WM_APP_FLOOD: {   // TOTK_MOUSE_FLOOD (tests): a raw event's work, its counts as TOTK_CTL "mouse" injects them
+        const double t_in = qpc_us();
+        const bool u = !keeper_on() && user32_due();
+        if (u) {
+            clip_guard(h);
+            if (g_captured.load() && !g_moving.load()) recentre(h);
+            if (g_flood_emul && !g_captured.load()) flood_emulate();   // (a boot behind other windows is never captured)
+        }
+        pc_mouse_inject((double)(LONG)w, 0);
+        raw_stats_note(qpc_us() - t_in, u, "flood");
+        return 0;
+    }
+    case WM_APP_RECENTRE:   // (the keeper found the pointer past a quarter of the way: recentre checks again and moves it)
+        g_recentre_posted.store(false);
+        if (g_captured.load() && !g_moving.load()) recentre(h);
+        return 0;
     case WM_APP_POINTER: {   // the device in use changed (pc_mouse_pad_in_use): the released pointer, if over the client area
         RECT s; POINT p;
         if (released() && !g_captured.load() && client_rect(h, &s) && GetCursorPos(&p) && PtInRect(&s, p)) SetCursor(pointer());
@@ -607,6 +698,94 @@ DWORD WINAPI latch_feed(void*) {
         __atomic_store_n((uint32_t*)(p + kLatchSeq), ++seq, __ATOMIC_RELEASE);   // (even: done)
     }
 }
+// TOTK_MOUSE_FLOOD=<Hz>[,<counts>[,<on s>,<off s>[,<emulate 0|1>]]] (tests: the r/decomps slow-down, a 1000-8000 Hz mouse): from the
+// window's subclassing on, a thread posts WM_APP_FLOOD <Hz> times a second (in 1 ms batches) for <on> s (default 20),
+// then none for <off> s (default 20), and again; each runs a raw event's work on the window thread with <counts>
+// (default 8) of x motion, the sign alternating (the camera shakes in place), as TOTK_CTL "mouse" injects them. Without
+// GetRawInputData (posted messages carry no raw input) and never moving the system pointer. Each phase is logged.
+void flood_start(HWND h) {
+    const char* e = getenv("TOTK_MOUSE_FLOOD");
+    double hz = 0, counts = 8, on = 20, off = 20, emul = 0;
+    if (!e || sscanf(e, "%lf,%lf,%lf,%lf,%lf", &hz, &counts, &on, &off, &emul) < 1 || hz <= 0) return;
+    g_flood_emul = emul != 0;
+    printf("[mouse] TOTK_MOUSE_FLOOD: %.0f events a second of %.0f counts, %.0f s on / %.0f s off\n", hz, counts, on, off);
+    CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
+        const double* a = (const double*)((void**)p)[1];
+        const HWND w = (HWND)((void**)p)[0];
+        double carry = 0;
+        long sign = 1;
+        for (unsigned phase = 0;; phase++) {
+            printf("[mouse] flood %s (phase %u)\n", phase % 2 ? "off" : "on", phase);
+            double t = qpc_us();
+            const double end = t + (phase % 2 ? a[3] : a[2]) * 1e6;
+            while (t < end) {
+                Sleep(1);   // (whatever the timer resolution: the events follow the time that passed)
+                const double now = qpc_us();
+                if (!(phase % 2)) {
+                    carry += a[0] * (now - t) / 1e6;
+                    for (; carry >= 1; carry -= 1, sign = -sign) PostMessageW(w, WM_APP_FLOOD, (WPARAM)(LONG)(sign * (long)a[1]), 0);
+                }
+                t = now;
+            }
+        }
+    }, new void*[2]{h, new double[4]{hz, counts, on, off}}, 0, nullptr);
+}
+// The pointer keeper (keeper_on): every 4 ms, the confinement as pc_clip.h wants it (clip_check: a drop or a change
+// posts WM_APP_RECLIP) and, captured, the pointer back to the centre past a quarter of the way (WM_APP_RECENTRE). Both
+// act on the window thread, as before; only the looking moved here, off the raw events (cf481c77 made it at each one:
+// 1000-8000 a second) and off the input reads (every npad poll waits on them). 4 ms: a flick moves the pointer a few
+// pixels in that time, far inside pc_clip's quarter-window margin.
+void clip_check();
+DWORD WINAPI keeper(LPVOID) {
+    HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    printf("[mouse] pointer keeper: every 4 ms on its own thread (%s timer), 50 ms behind other windows; "
+           "TOTK_MOUSE_KEEPER=0: at the raw events\n", t ? "high-resolution" : "Sleep");
+    int ms = 4;
+    for (;;) {
+        if (t) {
+            LARGE_INTEGER due;
+            due.QuadPart = -10000ll * ms;   // relative, in 100 ns
+            if (SetWaitableTimer(t, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(t, INFINITE);
+            else Sleep(ms);
+        } else {
+            Sleep(ms);
+        }
+        const HWND h = g_hwnd;
+        if (!h) continue;
+        const double t_in = qpc_us();
+        clip_check();
+        bool looked = false;
+        if (g_captured.load() && !g_moving.load() && !g_recentre_posted.load()) {
+            RECT s;
+            POINT p;
+            bool box = true;
+            if (g_clip_ours.load()) {
+                AcquireSRWLockShared(&g_clip_rect_lock); s = g_clip_rect; ReleaseSRWLockShared(&g_clip_rect_lock);
+            } else {
+                box = client_rect(h, &s);
+            }
+            looked = true;
+            if (box && GetCursorPos(&p) && pcclip::recentre({s.left, s.top, s.right, s.bottom}, p.x, p.y) &&
+                !g_recentre_posted.exchange(true) && !PostMessageW(h, WM_APP_RECENTRE, 0, 0))
+                g_recentre_posted.store(false);
+        }
+        if (g_flood_emul && !looked) flood_emulate();   // (the flood's captured reads, here: TOTK_MOUSE_FLOOD's fifth value)
+        // (behind other windows or minimised, not captured: nothing to confine or recentre, so 20 checks a second, not 250;
+        // the activation's own messages free and redo the confinement at once: the should on 967e2c49, a laptop's idle
+        // wakeups. The flood's emulation keeps the foreground's rate, which is what it measures)
+        ms = g_captured.load() || g_flood_emul || GetForegroundWindow() == h ? 4 : 50;
+        static double busy, worst;
+        static unsigned ticks, lines;
+        static ULONGLONG t0 = GetTickCount64();
+        const double us = qpc_us() - t_in;
+        busy += us; ticks++; if (us > worst) worst = us;
+        if (GetTickCount64() - t0 >= 10000) {
+            if (lines++ < 6) printf("[mouse] pointer keeper: %u checks in 10 s, %.2f ms in all (slowest %.0f us)\n", ticks,
+                                    busy / 1000.0, worst);
+            busy = worst = 0; ticks = 0; t0 = GetTickCount64();
+        }
+    }
+}
 // Input thread: finds the game window (class TotKRecomp, this process) once it exists and subclasses it.
 // (from the input thread and, through the menu cursor's calls, the game thread: one at a time, or the window could be
 // subclassed twice and its procedure call itself)
@@ -640,6 +819,8 @@ void attach() {
     g_orig = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)proc);
     g_hwnd = h;
     if (GetForegroundWindow() == h) g_armed.store(true);
+    flood_start(h);
+    if (keeper_on()) CreateThread(nullptr, 0, keeper, nullptr, 0, nullptr);
 }
 // Input thread, every read: the pointer captured exactly when it should be, and still confined.
 void policy() {
@@ -804,7 +985,7 @@ extern "C" void pc_mouse_redirect_take(double* dx, double* dy) {
 // hle_hid.cpp, once per read: the PC scheme's context is a menu, the title or a dialogue (pc_input.cpp pc_ctx_is_ui)
 extern "C" void pc_mouse_ui(bool on) {
     attach();
-    clip_check();
+    if (!keeper_on()) clip_check();   // (with the keeper: its 4 ms checks, not every input read)
     const bool was = g_captured.load();
     if (g_ui.exchange(on) == on) return;
     static int logs;

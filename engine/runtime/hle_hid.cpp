@@ -304,6 +304,30 @@ static HidPad g_synthpad;
 static std::atomic<int> g_sixaxis_mask{kSixAll};
 #ifdef _WIN32
 static const char* glyph_probe();   // (below the raw-HID scan)
+// glyph_probe opens every HID device (CreateFileW) and reads the XInput slots: never on the caller's thread, which is
+// hle_fs's glyph patching on the game's loader thread (ARes_Loading_0). A device whose open blocks in the kernel (a
+// sleeping Bluetooth pad, a filter driver, a device being installed) hung the boot before the title with every thread
+// idle, and it ran 33 times in one boot. Now it runs once, on a thread of its own; its answer is cached; the first
+// ask waits for it up to 250 ms, then (and until it answers) the prompts are the keyboard's.
+static std::atomic<int> g_probe{-1};   // -1 not answered yet; else 0 kbm, 1 ps, 2 the game's own (Nintendo), 3 xbox
+static const char* probe_style() {
+    static std::atomic<bool> started{false}, waited{false};
+    if (!started.exchange(true))
+        std::thread([] {
+            const char* s = glyph_probe();
+            g_probe = !s ? 2 : !strcmp(s, "ps") ? 1 : !strcmp(s, "xbox") ? 3 : 0;
+        }).detach();
+    if (!waited.exchange(true))
+        for (int i = 0; i < 50 && g_probe.load() < 0; i++) Sleep(5);
+    static const char* const kStyles[] = {"kbm", "ps", nullptr, "xbox"};
+    const int p = g_probe.load();
+    if (p < 0) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) printf("[hid] glyph probe: no answer in 250 ms (a device slow to open): keyboard prompts until it answers\n");
+        return "kbm";
+    }
+    return kStyles[p];
+}
 #endif
 // hle_fs.cpp TOTK_GLYPHS=auto: the prompt style for the pads connected now (raw-HID pads first, then XInput). The first
 // prompt archive opens at present 0: "glyphs kbm (auto)" at present 0), so with no pad seen yet the pads are looked for
@@ -317,7 +341,7 @@ extern "C" const char* hid_glyph_style(void) {
             if (k == PadPro || k == PadJoyL || k == PadJoyR) return nullptr;   // the game's own prompts
         }
 #ifdef _WIN32
-    return g_xslot >= 0 ? "xbox" : g_pads_scanned.load() == 3 ? "kbm" : glyph_probe();
+    return g_xslot >= 0 ? "xbox" : g_pads_scanned.load() == 3 ? "kbm" : probe_style();
 #else
     return g_xslot >= 0 ? "xbox" : "kbm";
 #endif
@@ -1719,11 +1743,77 @@ static unsigned key_min_hold_ms() {
     return ms;
 }
 static pckh::Hold g_key_hold;   // input thread (keyboard_read)
-static void keyboard_read(HostInput* in) {
-    const Bindings& bd = bindings();   // (first: its layout / unknown-key lines reach the log of any boot)
+// The keyboard's state for the input reads, sampled once a millisecond on a thread of its own (keysnap_thread): every
+// input read used to ask Windows key by key (GetAsyncKeyState), and the PC scheme's router walks every key several times
+// a read, so ~800-1300 calls into win32k per read, 1000 reads a second, on the game's own threads (every npad poll waits
+// on a read). Behind a mouse at 4000-8000 Hz, whose raw input holds win32k's lock that often, each call waited, game
+// threads 'other' 150-350 ms a frame, with Razer's software closed (the mouse at its own rate; 60 fps with it open), as
+// the r/decomps reporter's. Now the reads only look at the snapshot; the sampler alone waits on win32k. The mouse
+// buttons stay the window's messages (pc_mouse_buttons). TOTK_KEYSNAP=0: each read asks Windows itself, as before (A/B).
+static std::atomic<u64> g_keysnap[4];
+static std::atomic<bool> g_keysnap_front{false};
+static bool keysnap_on() {
+    static const bool on = [] {
+        const char* e = getenv("TOTK_KEYSNAP");
+        return !(e && !strcmp(e, "0"));
+    }();
+    return on;
+}
+// TOTK_KEYS_FRONT=1 (tests): the keys are read as if the game were in front, the cost an A/B of TOTK_KEYSNAP needs to
+// see (behind other windows a read asks nothing)
+static bool game_in_front() {
+    static const bool forced = getenv("TOTK_KEYS_FRONT") && !strcmp(getenv("TOTK_KEYS_FRONT"), "1");
+    if (forced) return true;
     DWORD pid = 0;
     HWND fg = GetForegroundWindow();
-    const bool front = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
+    return fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
+}
+static void keysnap_thread() {
+    HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    printf("[hid] keyboard sampled every 1 ms on its own thread (%s timer); TOTK_KEYSNAP=0: in each input read\n",
+           t ? "high-resolution" : "Sleep");
+    double busy = 0, worst = 0;
+    unsigned n = 0, lines = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        if (t) {
+            LARGE_INTEGER due;
+            due.QuadPart = -10000;   // 1 ms, relative
+            if (SetWaitableTimer(t, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(t, INFINITE);
+            else Sleep(1);
+        } else {
+            Sleep(1);
+        }
+        const auto s0 = std::chrono::steady_clock::now();
+        const bool front = game_in_front();
+        u64 w[4] = {};
+        if (front)
+            for (int vk = 1; vk < 255; vk++) {
+                if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) continue;   // (the window's messages)
+                if (GetAsyncKeyState(vk) & 0x8000) w[vk >> 6] |= 1ull << (vk & 63);
+            }
+        for (int i = 0; i < 4; i++) g_keysnap[i].store(w[i], std::memory_order_relaxed);
+        g_keysnap_front.store(front, std::memory_order_release);
+        const auto s1 = std::chrono::steady_clock::now();
+        const double us = std::chrono::duration<double, std::micro>(s1 - s0).count();
+        busy += us; n++; if (us > worst) worst = us;
+        if (std::chrono::duration<double>(s1 - t0).count() >= 10.0) {   // (the first minute, and any 10 s with a 5 ms sample)
+            if (lines < 6 || (worst >= 5000 && lines < 100)) {
+                lines++;
+                printf("[hid] keyboard sampler: %u samples in 10 s, mean %.0f us, slowest %.1f ms%s\n", n, busy / n,
+                       worst / 1000.0, front ? "" : " (behind other windows: not asked)");
+            }
+            busy = worst = 0; n = 0; t0 = s1;
+        }
+    }
+}
+static bool keysnap_down(int vk) {
+    return vk > 0 && vk < 256 && (g_keysnap[vk >> 6].load(std::memory_order_relaxed) >> (vk & 63) & 1);
+}
+static void keyboard_read(HostInput* in) {
+    const Bindings& bd = bindings();   // (first: its layout / unknown-key lines reach the log of any boot)
+    static const bool snap = keysnap_on() && (std::thread(keysnap_thread).detach(), true);
+    const bool front = snap ? g_keysnap_front.load(std::memory_order_acquire) : game_in_front();
     const bool injected = key_injected_any();   // TOTK_CTL "key": unattended tests of the bindings
     // the PC scheme's context, once per read: the overlay, the title, the screen, else screen_track's guess (the pause
     // menu / the Purah Pad), else the world
@@ -1749,6 +1839,7 @@ static void keyboard_read(HostInput* in) {
         if (!front) return false;
         if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON)
             return (pc_mouse_buttons() & (vk == VK_LBUTTON ? 1u : vk == VK_RBUTTON ? 2u : 4u)) != 0;
+        if (snap) return keysnap_down(vk);   // (the sampler's snapshot: no win32k call in the read)
         return (GetAsyncKeyState(vk) & 0x8000) != 0;
     };
     auto mouse_vk = [](int vk) { return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2; };
@@ -2868,6 +2959,20 @@ static HostInput host_input() {
             g_title_burst_end = n + kTitleBurst;
         }
         title_ab_was = title_ab;
+        // How long a refresh takes (every guest thread that polls the npad waits on mtx meanwhile): per 10 s, the reads,
+        // the mean and the slowest, logged when one took 2 ms or more (r/decomps 11-01, v0.1.5: the game slowed down
+        // while a fast mouse moved; the pad scan's 0.5-3.6 s stalls were found the same way)
+        static double read_sum, read_max;
+        static u64 read_n, read_logs;
+        static std::chrono::steady_clock::time_point read_t0 = now_t;
+        const double took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - now_t).count();
+        read_sum += took; read_n++; if (took > read_max) read_max = took;
+        if (std::chrono::duration<double>(now_t - read_t0).count() >= 10.0) {
+            if (read_max >= 2.0 && read_logs++ < 100)
+                printf("[hid] input refresh: %llu in %.0f s, mean %.3f ms, slowest %.1f ms\n", (unsigned long long)read_n,
+                       std::chrono::duration<double>(now_t - read_t0).count(), read_sum / read_n, read_max);
+            read_sum = read_max = 0; read_n = 0; read_t0 = now_t;
+        }
     }
     return cur;
 }

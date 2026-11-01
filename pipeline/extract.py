@@ -16,7 +16,7 @@ from pathlib import Path
 from .nx import romfs as romfs_mod
 from .nx.common import below_normal_priority, require, wait_for_ram, write_json
 from .nx.bktr import CRYPT_CTR_EX, BktrSection
-from .nx.container import (CRYPT_CTR, FS_PFS0, FS_ROMFS, NcaSection, load_keys, partition_entries,
+from .nx.container import (CRYPT_CTR, CRYPT_NONE, CRYPT_NAMES, FS_PFS0, FS_ROMFS, NcaSection, load_keys, partition_entries,
                             program_sections, update_program)
 
 
@@ -58,7 +58,12 @@ def extract_exefs(nsp, keys_path, out_dir, log=print, update=None):
         found = [s for s in sections if s.kind == FS_PFS0]
         require(found, 'No ExeFS section found')
         s = found[0]
-        require(s.crypt == CRYPT_CTR, 'Only AES-CTR ExeFS is supported')
+        # AES-CTR as the console stores it, or plain (crypt type 1: some dump tools / converters write the NCA's
+        # sections decrypted); the hashes below check either the same way
+        require(s.crypt in (CRYPT_CTR, CRYPT_NONE),
+                f'the ExeFS section is {CRYPT_NAMES.get(s.crypt, f"crypt type {s.crypt}")}, neither AES-CTR nor plain: '
+                'pick the base game file (version 1.0.0) as dumped from your console, not an update, a DLC or a '
+                'converted file')
         blocksize, levels = struct.unpack_from('<II', s.fs, 0x28)
         hashoff, hashsize, pfsoff, pfssize = struct.unpack_from('<QQQQ', s.fs, 0x30)
         require(levels == 2 and blocksize > 0 and pfssize <= 512 * 1024 * 1024, 'Unsupported ExeFS hash layout')

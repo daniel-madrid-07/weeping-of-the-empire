@@ -26,6 +26,10 @@ FS_PFS0 = (1, 2)    # PartitionFs, HierarchicalSha256
 FS_ROMFS = (0, 3)   # RomFs, HierarchicalIntegrity (IVFC)
 CRYPT_NONE = 1
 CRYPT_CTR = 3
+# the FS header's crypt type (fs[4]), for messages
+CRYPT_NAMES = {0: 'crypt type 0 (auto)', 1: 'plain (crypt type 1)', 2: 'AES-XTS (crypt type 2)',
+               3: 'AES-CTR (crypt type 3)', 4: "AES-CTR-EX (crypt type 4: an update's BKTR patch)",
+               5: 'AES-CTR, layer hash skipped (crypt type 5)', 6: 'AES-CTR-EX, layer hash skipped (crypt type 6)'}
 
 
 def hfs(f, offset, bound):

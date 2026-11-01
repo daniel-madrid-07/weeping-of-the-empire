@@ -215,11 +215,15 @@ def run(cmd, **kw):
 
 
 def ensure_venv():
-    if os.path.exists(PY) and os.path.exists(NINJA):
+    # zstandard: the overlay's three engine fixes use it when the PC has no Git for Windows libzstd.dll (public issue #8);
+    # a venv made before it gets it on its next build
+    zst = os.path.join(VENV, 'Lib', 'site-packages', 'zstandard')
+    if os.path.exists(PY) and os.path.exists(NINJA) and os.path.isdir(zst):
         return
     os.makedirs(SIG, exist_ok=True)
-    run([sys.executable, '-m', 'venv', VENV])
-    run([PY, '-m', 'pip', 'install', '--quiet', 'capstone==5.0.9', 'lz4', 'ninja'])
+    if not os.path.exists(PY):
+        run([sys.executable, '-m', 'venv', VENV])
+    run([PY, '-m', 'pip', 'install', '--quiet', 'capstone==5.0.9', 'lz4', 'ninja', 'zstandard==0.25.0'])
 
 
 def build_env():

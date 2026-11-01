@@ -15,40 +15,54 @@ ROMFS = os.environ.get("TOTK_ROMFS", "C:/totk/extract/romfs")
 REL = "System/Resource/ResourceSizeTable.Product.100.rsizetable.zs"
 OUT = os.environ.get("TOTK_OVERLAY_OUT", "C:/totk/overlay/romfs") + "/" + REL
 def _libzstd():
-    """Git for Windows' libzstd.dll: NXR_LIBZSTD, the default install, else the git on PATH's (another drive / user)"""
+    """Git for Windows' libzstd.dll: NXR_LIBZSTD, the default install, the per-user one (winget --scope user), else the
+    git on PATH's (another drive, Setup's MinGit); None: the zstandard package below (public issue #8: no DLL
+    found, step 7 stopped)"""
+    if os.environ.get("NXR_LIBZSTD") == "zstandard":   # (that one asked for: the tests, a PC whose DLL misbehaves)
+        return None
     git = os.path.dirname(shutil.which("git") or "")
-    for p in (os.environ.get("NXR_LIBZSTD"), r'C:\Program Files\Git\mingw64\bin\libzstd.dll', os.path.join(git, "libzstd.dll"),
-              os.path.join(os.path.dirname(git), "mingw64", "bin", "libzstd.dll")):
+    for p in (os.environ.get("NXR_LIBZSTD"), r'C:\Program Files\Git\mingw64\bin\libzstd.dll',
+              os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Git", "mingw64", "bin", "libzstd.dll"),
+              os.path.join(git, "libzstd.dll"), os.path.join(os.path.dirname(git), "mingw64", "bin", "libzstd.dll"),
+              os.path.join(os.path.dirname(git), "ucrt64", "bin", "libzstd.dll")):   # (MinGit 2.5x, Setup's own git)
         if p and os.path.isfile(p):
             return p
-    raise OSError("libzstd.dll not found: install Git for Windows (winget install Git.Git) or set NXR_LIBZSTD")
+    return None
 
 
 if sys.platform == "win32":
-    ZSTD = ctypes.CDLL(_libzstd())
+    _dll = _libzstd()
+    ZSTD = ctypes.CDLL(_dll) if _dll else None
 else:
     ZSTD = ctypes.CDLL(ctypes.util.find_library("zstd") or "libzstd.so.1")
-ZSTD.ZSTD_getFrameContentSize.restype = ctypes.c_ulonglong
-ZSTD.ZSTD_decompress.restype = ctypes.c_size_t
-ZSTD.ZSTD_compressBound.restype = ctypes.c_size_t
-ZSTD.ZSTD_compress.restype = ctypes.c_size_t
-ZSTD.ZSTD_isError.restype = ctypes.c_uint
+if ZSTD is None:   # (the same zstd frames through the zstandard package: the Builder's engine venv has it)
+    import zstandard
 
+    def unzstd(b):
+        return zstandard.ZstdDecompressor().decompress(b)
 
-def unzstd(b):
-    n = ZSTD.ZSTD_getFrameContentSize(b, ctypes.c_size_t(len(b)))
-    out = ctypes.create_string_buffer(n)
-    r = ZSTD.ZSTD_decompress(out, ctypes.c_size_t(n), b, ctypes.c_size_t(len(b)))
-    assert not ZSTD.ZSTD_isError(ctypes.c_size_t(r)) and r == n, r
-    return out.raw[:r]
+    def zstd(b, level=19):
+        return zstandard.ZstdCompressor(level=level).compress(b)
+else:
+    ZSTD.ZSTD_getFrameContentSize.restype = ctypes.c_ulonglong
+    ZSTD.ZSTD_decompress.restype = ctypes.c_size_t
+    ZSTD.ZSTD_compressBound.restype = ctypes.c_size_t
+    ZSTD.ZSTD_compress.restype = ctypes.c_size_t
+    ZSTD.ZSTD_isError.restype = ctypes.c_uint
 
+    def unzstd(b):
+        n = ZSTD.ZSTD_getFrameContentSize(b, ctypes.c_size_t(len(b)))
+        out = ctypes.create_string_buffer(n)
+        r = ZSTD.ZSTD_decompress(out, ctypes.c_size_t(n), b, ctypes.c_size_t(len(b)))
+        assert not ZSTD.ZSTD_isError(ctypes.c_size_t(r)) and r == n, r
+        return out.raw[:r]
 
-def zstd(b, level=19):
-    cap = ZSTD.ZSTD_compressBound(ctypes.c_size_t(len(b)))
-    out = ctypes.create_string_buffer(cap)
-    r = ZSTD.ZSTD_compress(out, ctypes.c_size_t(cap), b, ctypes.c_size_t(len(b)), level)
-    assert not ZSTD.ZSTD_isError(ctypes.c_size_t(r)), r
-    return out.raw[:r]
+    def zstd(b, level=19):
+        cap = ZSTD.ZSTD_compressBound(ctypes.c_size_t(len(b)))
+        out = ctypes.create_string_buffer(cap)
+        r = ZSTD.ZSTD_compress(out, ctypes.c_size_t(cap), b, ctypes.c_size_t(len(b)), level)
+        assert not ZSTD.ZSTD_isError(ctypes.c_size_t(r)), r
+        return out.raw[:r]
 
 
 def main():

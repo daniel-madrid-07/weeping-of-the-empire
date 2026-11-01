@@ -36,6 +36,7 @@ import glob
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -178,6 +179,21 @@ def firmware_dir(firmware, work):
     return os.path.dirname(ncas[0])
 
 
+MSVC_MIN = (14, 44)   # (toolchain.py's MSVC_PIN: VS 2022 17.14)
+
+
+def msvc_too_old(env):
+    """Public issue #6: the Vulkan SDK's shaderc_combined.lib calls STL helpers (__std_min_4u, __std_search_1...) an
+    older MSVC lacks, and the link fails at the end of the long build. The problem, said before it starts, or None."""
+    v = next((x for k, x in env.items() if k.upper() == 'VCTOOLSVERSION'), '').strip()
+    m = re.match(r'(\d+)\.(\d+)', v)
+    if not m or (int(m[1]), int(m[2])) >= MSVC_MIN:
+        return None
+    return (f'Visual Studio C++ tools: this build would use MSVC {v}, older than the 14.44 the game\'s libraries need '
+            '(the link would fail). Update Visual Studio 2022 / Build Tools to 17.14 or newer (Visual Studio Installer, '
+            'Update) and start again')
+
+
 def check_tools(managed=False):
     """What a fresh PC needs installed; a clear list instead of a failure halfway through the build. Returns
     (missing, notes, env): notes are differences from the PC the releases are built on, env what the build must be
@@ -195,7 +211,9 @@ def check_tools(managed=False):
         env['NXRECOMP_LLVM_DIR'] = os.environ['NXRECOMP_LLVM_DIR'] = llvm
     try:   # the build's own search (Visual Studio env + LLVM + PATH), not just PATH
         from pipeline.toolchain import native_env
-        native_env()
+        old = msvc_too_old(native_env()[0])
+        if old:
+            missing.append(old)
     except ImportError:
         pass   # (a missing Python package: the list below names it)
     except BaseException as e:   # (require() exits with the tool's name and the winget id to install it)
@@ -396,6 +414,147 @@ def pgo_args(work, off, dry):
     return ['--pgo', dest]
 
 
+# The release's shader seed: cache-seed/precompile.bin alone, the records of the programs and pipelines the game
+# compiles (code hashes, sizes, shader keys, pipeline state; no shader code). The runtime takes each program's code
+# from the player's own archive_shaders.bin by its hash, so first sight of a shader no longer hitches. None: this
+# source has no published seed (nothing fetched, nothing said). A release asset, pinned like PGO.
+SEED = dict(tag='v0.1.6', name='precompile.bin', size=4550776,
+            sha256='9ed350d4ea5c536d61a33725f4ce34ee79242646a7f8ea5f6eb3c048bcd69d2f')
+
+
+def shader_seed(work, dry):
+    """<work>/engine/seed/precompile.bin from the pinned release asset (package.py copies that folder as cache-seed);
+    any failure: no seed, said, the build goes on. The package's seed is always this source's pin or nothing: a file
+    left by an earlier install (another pin) goes when this one has none or its fetch fails."""
+    if dry:
+        return
+    dest = os.path.join(work, 'engine', 'seed', 'precompile.bin')
+    mine = dest + '.builder'   # (the Builder put it there: never remove a seed someone else made in a shared work folder)
+    if SEED:
+        import toolchain
+        try:
+            toolchain.download('the shader seed', PGO_URL.format(**SEED), dest, SEED['sha256'], SEED['size'])
+            open(mine, 'w').write(SEED['sha256'])
+            return
+        except Exception as e:
+            say(f'shader seed: not used ({e}); the game compiles each shader at its first sight (short hitches)')
+    if os.path.exists(mine):
+        for p in (dest, mine):
+            if os.path.exists(p):
+                os.remove(p)
+
+
+# Step 9: totk.exe --prepare builds every program and pipeline the package's records-only list (cache-seed) names, from
+# the player's own shader archive, into the cache play reads (%LOCALAPPDATA%\nxrecomp\TotK-engine\run\cache: driver
+# pipeline cache, SPIR-V, the precompile_cold.key stamp): no window, no guest code, minutes, for this GPU and driver.
+# Without it (a failure) each shader compiles the first time it is seen (short hitches the first play). False: this
+# source's runtime has no prepare mode (an older totk.exe would start the game instead).
+PREPARE_SHADERS = True
+PREPARE_COUNTS = re.compile(r'(\d+)/(\d+)')   # ('[prepare] programs a/b, pipelines c/d, compute e/f': summed)
+PREPARE_FIRST_LINE_S = 120   # (no '[prepare]' line by then: not a prepare mode; stopped, skipped)
+PREPARE_MAX_S = 45 * 60
+
+
+def player_values(pkg):
+    """player.txt's key=value lines, as the launcher reads them (launcher.c package_value / package_env)"""
+    out = {}
+    try:
+        with open(os.path.join(pkg, 'player.txt'), encoding='utf-8-sig') as f:
+            for ln in f:
+                k, eq, v = ln.rstrip('\r\n').partition('=')
+                if eq and k and k not in out:
+                    out[k] = v
+    except OSError:
+        pass
+    return out
+
+
+def player_path(pkg, v):
+    v = v.rstrip(' ').replace('/', '\\')
+    return v if not v or v[1:2] == ':' or v.startswith('\\\\') else os.path.abspath(os.path.join(pkg, v))
+
+
+def prepare_env(pkg, environ=None):
+    """(run dir, environment) as the launcher gives the game (launcher.c run_package): the per-user folders, the
+    package's img / romfs / overlay, cache-seed as TOTK_PRECOMPILE_SEED, player.txt's env.* lines. settings.ini: the
+    package's defaults copied where the game reads them when the player has none (as the launcher's first start)."""
+    environ = dict(os.environ if environ is None else environ)
+    roam = os.path.join(environ.get('APPDATA', ''), 'nxrecomp', 'TotK-engine')
+    local = os.path.join(environ.get('LOCALAPPDATA', ''), 'nxrecomp', 'TotK-engine')
+    vals, run = player_values(pkg), os.path.join(local, 'run')
+    env = {k: v for k, v in environ.items() if not k.upper().startswith(('TOTK_', 'NXR_'))}
+    env.update(TOTK_USERDATA=os.path.join(roam, 'userdata'), TOTK_IMG=player_path(pkg, vals.get('img', '')),
+               TOTK_PRIORITY='normal', TOTK_CRASH_DIR=os.path.join(local, 'crashes'))
+    for k in ('romfs', 'overlay'):
+        if vals.get(k, '').strip():
+            env['TOTK_' + k.upper()] = player_path(pkg, vals[k])
+    if os.path.isfile(os.path.join(pkg, 'cache-seed', 'precompile.bin')):
+        env['TOTK_PRECOMPILE_SEED'] = os.path.join(pkg, 'cache-seed')
+    env.update((k[4:], v) for k, v in vals.items() if k.startswith('env.') and len(k) > 4)
+    return run, env, roam, player_path(pkg, vals.get('settings', ''))
+
+
+def prepare_shaders(pkg, n, dry, cmd=None):
+    if not PREPARE_SHADERS:
+        return
+    exe = os.path.join(pkg, 'totk.exe')
+    cmd = cmd or [exe, '--prepare']   # (the tests: a fake)
+    say(f'step 9/{n} shaders: "{exe}" --prepare')
+    if dry:
+        return
+    run, env, roam, defaults = prepare_env(pkg)
+    for d in (run, env['TOTK_USERDATA'], env['TOTK_CRASH_DIR']):
+        os.makedirs(d, exist_ok=True)
+    if defaults and os.path.isfile(defaults) and not os.path.exists(os.path.join(roam, 'settings.ini')):
+        shutil.copyfile(defaults, os.path.join(roam, 'settings.ini'))   # (settings change some translations)
+    t0, last, rc, tail, done_line = time.monotonic(), 0.0, None, [], None
+    try:
+        p = subprocess.Popen(cmd, cwd=run, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='replace', bufsize=1,
+                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    except OSError as e:
+        p, rc, tail = None, -1, [str(e)]
+    if p:
+        lines, seen = queue.Queue(), False
+        threading.Thread(target=lambda: ([lines.put(ln) for ln in p.stdout], lines.put(None)), daemon=True).start()
+        while True:
+            limit = PREPARE_MAX_S if seen else PREPARE_FIRST_LINE_S
+            try:
+                ln = lines.get(timeout=max(1.0, t0 + limit - time.monotonic()))
+            except queue.Empty:
+                p.kill()   # (this run's own child)
+                tail.append(f'stopped after {round(time.monotonic() - t0)} s' if seen else 'no prepare mode')
+                p.wait()
+                rc = -2
+                break
+            if ln is None:
+                rc = p.wait()
+                break
+            ln = ln.rstrip()
+            seen = seen or ln.startswith('[prepare]')
+            tail = (tail + [ln])[-6:]
+            counts = PREPARE_COUNTS.findall(ln) if ln.startswith('[prepare]') else []
+            if ln.startswith('[prepare] done'):
+                done_line = ln
+            elif counts and time.monotonic() - last >= 2:   # (the window moves its bar by 'NN% (' lines)
+                last = time.monotonic()
+                done, total = sum(int(a) for a, _ in counts), sum(int(b) for _, b in counts)
+                say(f'shaders: {done * 100 // max(total, 1)}% ({done}/{total} programs and pipelines)')
+    secs = round(time.monotonic() - t0)
+    if done_line:
+        say(f'shaders: {done_line[len("[prepare] "):]}')
+    if rc == 0:
+        say(f'shaders: prepared in {secs} s')
+    elif rc == 1:
+        say(f'shaders: prepared in {secs} s, some builds failed: the game builds those the first time it sees them')
+    elif rc == 2:
+        say('shaders: nothing to prepare (no shader list or shader archive); the game builds each one the first time '
+            'it is seen')
+    else:
+        say(f'shaders: not prepared (exit {rc}, {secs} s: {" | ".join(tail[-3:])}); the game builds each one the first '
+            'time it is seen (short hitches the first time you play an area)')
+
+
 def newest_package(out):
     folders = sorted((d for d in glob.glob(os.path.join(out, 'TotK-PC-*')) if os.path.isdir(d) and not d.endswith('.tmp')),
                      key=os.path.getmtime)
@@ -487,7 +646,7 @@ def main(argv=None):
                NXR_GAME_JOBS_MAX=str(game_jobs), NXR_BUILDER_PACKAGE='1')
     py = sys.executable
     build = os.path.join(REPO, 'tools', 'engine', 'build.py')
-    n = 8
+    n = 9
 
     # 0. tools (--install): the compilers and libraries, fetched into <install>/tools
     if install:
@@ -500,6 +659,9 @@ def main(argv=None):
                 env = toolchain.apply(toolchain.ensure(tools), env)
             except toolchain.ToolchainError as e:
                 fail(str(e))
+            old = msvc_too_old(env)   # (ensure() takes the pinned tools over an older Visual Studio: a guard)
+            if old:
+                fail(old)
         if a.until == 'tools':
             say('DONE (--until tools)')
             return
@@ -569,18 +731,21 @@ def main(argv=None):
     run(f'7/{n} overlay', [py, build, 'overlay', '--force'], env, a.dry_run)   # (~1.5 min; after a git pull it changes)
     if not a.dry_run and not (os.path.isdir(bank) and os.path.getmtime(bank) >= t7 - 2):   # (made by this step)
         fail('no PC key glyph bank was made: the overlay step says why above')
-    # 8. package (package.py points the launcher at <work>/overlays itself)
+    # 8. package (package.py points the launcher at <work>/overlays itself, and copies <work>/engine/seed as cache-seed)
+    shader_seed(work, a.dry_run)
     # (--commit: the source the exe was just built from. Without it package.py names the folder after the commit the
     #  key was first made from, so an update that changed only the runtime kept the older version's name)
     head = subprocess.run(['git', '-C', REPO, 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
     run(f'8/{n} package', [py, os.path.join(REPO, 'engine', 'launcher', 'win', 'package.py'), '--key', key,
                            '--out', out] + (['--commit', head] if head else []), env, a.dry_run)
+    newest = None if a.dry_run else newest_package(out)
+    if not a.dry_run and not newest:
+        fail(f'no playable folder in {out} after packaging')
+    # 9. the shaders the game would compile the first time it sees them, built now into the player's own cache
+    prepare_shaders(newest or out, n, a.dry_run)
     if a.dry_run:
         say('check done (--dry-run): nothing was built')
         return
-    newest = newest_package(out)
-    if not newest:
-        fail(f'no playable folder in {out} after packaging')
     if install:
         prune(out, newest)
     say('DONE: ' + os.path.join(newest, 'TotK Launcher.exe'))

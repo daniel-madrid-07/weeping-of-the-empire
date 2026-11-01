@@ -845,14 +845,20 @@ static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, si
     swprintf(g_restart_file, MAX_PATH, L"%ls\\restart.env", g_local);   /* (the game's restart request: RESTART_CODE) */
     DeleteFileW(g_restart_file);
     SetEnvironmentVariableW(L"NXR_LAUNCHER_RESTART", g_restart_file);
+    package_env(pkg);
     {   /* cache-seed\ next to totk.exe (package.py: the precompiled programs and pipelines). The engine only looks in
-           its working folder (exec.c pc_seed_dir), which is run\, so the path goes in TOTK_PRECOMPILE_SEED. */
-        wchar_t seed[MAX_PATH], bin[MAX_PATH];
+           its working folder (exec.c pc_seed_dir), which is run\, so the path goes in TOTK_PRECOMPILE_SEED. After
+           player.txt: a TOTK_PRECOMPILE_SEED it already set is kept, empty included (env.TOTK_PRECOMPILE_SEED=: no
+           seed, the engine's own off value; the seed-only opt-out). The shell's value never gets here
+           (clean_environment).*/
+        wchar_t seed[MAX_PATH], bin[MAX_PATH], have[8];
         swprintf(seed, MAX_PATH, L"%ls\\cache-seed", pkg);
         swprintf(bin, MAX_PATH, L"%ls\\precompile.bin", seed);
-        if (exists(bin)) SetEnvironmentVariableW(L"TOTK_PRECOMPILE_SEED", seed);
+        SetLastError(0);
+        const BOOL set = GetEnvironmentVariableW(L"TOTK_PRECOMPILE_SEED", have, 8) || GetLastError() != ERROR_ENVVAR_NOT_FOUND;
+        if (set) say(L"cache-seed: TOTK_PRECOMPILE_SEED from player.txt kept");
+        else if (exists(bin)) SetEnvironmentVariableW(L"TOTK_PRECOMPILE_SEED", seed);
     }
-    package_env(pkg);
     {   /* settings=<file>: the build's defaults, copied where the game reads settings.ini (next to userdata, pc_settings.cpp)
            when the player has none yet; the player's own file is never overwritten */
         wchar_t defs[MAX_PATH], dst[MAX_PATH];

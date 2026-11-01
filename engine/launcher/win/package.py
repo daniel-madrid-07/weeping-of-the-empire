@@ -74,13 +74,20 @@ def key_dir(key):
     sys.exit(f'no key {key} under ' + os.path.join(ENG, 'game') + ' or game-var')
 
 
+def guide_name():
+    """the player's guide: LEEME.txt (Spanish), or README.txt where the tree has that one instead (the public tree)"""
+    return next(n for n in ('LEEME.txt', 'README.txt') if os.path.isfile(os.path.join(HERE, n)))
+
+
 def build_name(man):
-    """The game objects' build, for LEEME: the key's variant (build.py VARIANT), else the -O2 base."""
+    """The game objects' build, for the guide, player.txt's build= and the log: the key's variant (build.py VARIANT),
+    else the -O2 base; in the guide's language (release.py's copy is the Spanish one)"""
     v = json.loads((man.get('parts') or {}).get('variant') or '{}')
+    es = guide_name() == 'LEEME.txt'
     if v.get('pgo'):
-        return f'optimizada con perfil, PGO {v["pgo"][:8]}'
+        return f'{"optimizada con perfil" if es else "optimised with a profile"}, PGO {v["pgo"][:8]}'
     if v:
-        return 'variante ' + ' '.join(str(x) for x in v.values())
+        return ('variante ' if es else 'variant ') + ' '.join(str(x) for x in v.values())
     return 'base -O2'
 
 
@@ -194,12 +201,11 @@ def main():
              'settings=settings.ini'] + (['dirty=1'] if dirty else []) + cpu_line(man) + ([f'import={IMPORT}'] if os.path.isdir(IMPORT) else []) + [f'env.{k}={v}' for k, v in env.items()]
     open(os.path.join(tmp, 'player.txt'), 'w', encoding='utf-8', newline='\r\n').write('\n'.join(lines) + '\n')
     open(os.path.join(tmp, 'settings.ini'), 'w', encoding='utf-8', newline='\r\n').write(SETTINGS)
-    # the player's guide: LEEME.txt (Spanish), or README.txt where the tree has that one instead
-    guide_name = next(n for n in ('LEEME.txt', 'README.txt') if os.path.isfile(os.path.join(HERE, n)))
-    guide = open(os.path.join(HERE, guide_name), encoding='utf-8').read()
+    guide_file = guide_name()
+    guide = open(os.path.join(HERE, guide_file), encoding='utf-8').read()
     guide = guide.replace('{commit}', commit[:9]).replace('{key}', key).replace('{build}', build_name(man)).replace('{img}', man['img']) \
                  .replace('{romfs}', ROMFS).replace('{overlay}', overlay)
-    open(os.path.join(tmp, guide_name), 'w', encoding='utf-8-sig', newline='\r\n').write(guide)
+    open(os.path.join(tmp, guide_file), 'w', encoding='utf-8-sig', newline='\r\n').write(guide)
     os.rename(tmp, dst)
     size = sum(os.path.getsize(os.path.join(dst, f)) for f in os.listdir(dst))
     log(f'{dst} ({size / 2**20:.0f} MB): key {key} ({build_name(man)}), commit {commit[:9]}, patches {man.get("patches") or "none"}')

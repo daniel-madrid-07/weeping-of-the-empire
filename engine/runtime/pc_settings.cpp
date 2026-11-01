@@ -385,29 +385,31 @@ void boot() {
     // The package's settings.ini says display.fps_cap = 120 for every PC and nothing of VRR or HDR (package.py); on its
     // first start (no pc.welcome_done yet) the monitor decides:
     //  - Frame rate (only the package's 120): first_run_fps_cap.
-    //  - VRR (no display.vrr line yet): on where the driver says it is on (G-SYNC on for the monitor in NVIDIA's
-    //    driver): FIFO, no tearing, no judder. A FreeSync / Adaptive-Sync monitor only its EDID declares is suggested by
-    //    the Display line, not set.
+    //  - VRR (no display.vrr line yet): on where the driver says it is on (G-SYNC on for the monitor in NVIDIA's driver):
+    //    FIFO, no tearing, no judder. A FreeSync / Adaptive-Sync monitor only its EDID declares is suggested by the
+    //    Display line, not set.
     //  - HDR peak (no display.hdr_peak line yet, Windows HDR on): the monitor's, so HDR output is right once turned on.
     //    HDR output itself stays off: it expands the picture's highlights (present.c).
     // The Welcome screen then sets pc.welcome_done, so the player's own choices are never touched. No file: left alone.
-    // Scripted boots (TOTK_PRESS / TOTK_CTL) get the frame rate only: their measurements must not follow the host's VRR.
-    // The file's values are in g_kv before anything below can translate a text (first_run_display's monitor line,
-    // pc_tr): the language's first use registers game.language (pc_lang.cpp), whose start value comes from g_kv. Until
-    // 10-31 they came after: "[lang] es (Windows' display language es-ES)" with game.language = en-US).
+    // Only for the package's file itself (g_fresh_file: no pc.welcome_done line at all), as the Welcome screen: the first
+    // start's own save writes pc.welcome_done = 0, and until 11-01 this ran at every start that never saw the Welcome
+    // through (its value not 1), putting a 120 the player had chosen back to the monitor's. Scripted boots (TOTK_PRESS /
+    // TOTK_CTL) get the frame rate only: their measurements must not follow the host's VRR. The file's values are in g_kv
+    // before anything below can translate a text (first_run_display's monitor line, pc_tr): the language's first use
+    // registers game.language (pc_lang.cpp), whose start value comes from g_kv. Until 10-31 they came after: "[lang] es
+    // (Windows' display language es-ES)" with game.language = en-US).
     g_kv = kv;
     {
-        bool welcomed = false, has_vrr = false, has_peak = false;
+        bool has_vrr = false, has_peak = false;
         int cap = -1;   // (an index: the pushes below may move kv)
         for (size_t i = 0; i < kv.size(); i++) {
-            welcomed |= kv[i].first == "pc.welcome_done" && kv[i].second == "1";
             if (kv[i].first == "display.fps_cap") cap = (int)i;   // (the last one is the one start_value keeps)
             has_vrr |= kv[i].first == "display.vrr";
             has_peak |= kv[i].first == "display.hdr_peak";
         }
         const bool scripted = getenv("TOTK_PRESS") || getenv("TOTK_CTL");
         pcd_caps c;
-        if (!welcomed && cap >= 0 && first_run_display(&c)) {
+        if (g_fresh_file && cap >= 0 && first_run_display(&c)) {
             // A new key goes into the lines too: pc_window.cpp's rows come after this start's save, which keeps a line
             // no row has yet (in the file from this start on, so the Options rows and settings.ini agree)
             auto set = [&](const char *k, const char *v, bool add) {
@@ -819,6 +821,10 @@ const pc_setting k_engine[] = {
      "rate.", "0", V_OFFON, N_OFFON, 0, 0, 0, R, "TOTK_DYNRES", nullptr, nullptr, nullptr},
     {"graphics.upscaler_3d", "Graphics", "Rendering", "3D upscaler", "TOTK_SSAA.", "", V_SSAA, N_SSAA, 0, 0, 0, R,
      "TOTK_SSAA", nullptr, nullptr, nullptr},
+    {"graphics.shader_seed", "Graphics", "Rendering", "Shipped shader list", "TOTK_SHADER_SEED: on, the shader list "
+     "that comes with the build lets the game prepare those shaders before you meet them (fewer stutters the first "
+     "time). Off: only the shaders this PC has met itself. Takes effect at the next start.", "1", V_OFFON, N_OFFON, 0, 0,
+     0, R, "TOTK_SHADER_SEED", nullptr, nullptr, nullptr},
     {"graphics.window_upscaler", "Graphics", "Rendering", "Window upscaler", "TOTK_UPSCALE.", "", V_UPSCALE, N_UPSCALE,
      0, 0, 0, 0, "TOTK_UPSCALE", nullptr, upscale_apply, nullptr},
     {"graphics.antialiasing", "Graphics", "Rendering", "Anti-aliasing", "TOTK_AA, on the presented image.", "", V_AA,

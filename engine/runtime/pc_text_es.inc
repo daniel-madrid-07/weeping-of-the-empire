@@ -914,6 +914,14 @@ PC_ES("F12 screenshots",
       "Capturas de pantalla con F12")
 PC_ES("TOTK_PC_SHOT: PNGs in the Screenshots folder.",
       "TOTK_PC_SHOT: archivos PNG en la carpeta Screenshots.")
+PC_ES("Shipped shader list",
+      "Lista de shaders incluida")
+PC_ES("TOTK_SHADER_SEED: on, the shader list that comes with the build lets the game prepare those shaders before you "
+      "meet them (fewer stutters the first time). Off: only the shaders this PC has met itself. Takes effect at the next "
+      "start.",
+      "TOTK_SHADER_SEED: activada, la lista de shaders que viene con la versión permite al juego preparar esos shaders "
+      "antes de que te los encuentres (menos tirones la primera vez). Desactivada: solo los shaders que este PC ya ha "
+      "visto. Se aplica en el siguiente inicio.")
 PC_ES("Crash reports",
       "Informes de errores")
 PC_ES("TOTK_PC_CRASH: a report and a minidump per crash.",

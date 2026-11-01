@@ -135,6 +135,36 @@ check('apply: PATH order, variables set, no PATH_PREFIX', env['Path'] == r'T:\ll
 env = toolchain.apply({'NXRECOMP_LLVM_DIR': r'T:\llvm', 'VULKAN_SDK': r'T:\vk'}, {'PATH': r'C:\x'})
 check('apply: Visual Studio installed (no MSVC part)', env['PATH'] == r'T:\llvm\bin;C:\x', env['PATH'])
 
+# an installed Visual Studio is used only if its default MSVC is at least the pin's (issue #6: an older STL lacks the
+# helpers the Vulkan libraries' objects call); else the downloaded tools, said
+with tempfile.TemporaryDirectory() as t:
+    vs = os.path.join(t, 'VS')
+    os.makedirs(os.path.join(vs, 'VC', 'Auxiliary', 'Build'))
+    open(os.path.join(vs, 'VC', 'Auxiliary', 'Build', 'Microsoft.VCToolsVersion.default.txt'), 'w').write('14.34.31933\n')
+    check('vs_msvc_version reads the default toolset', toolchain.vs_msvc_version(vs) == '14.34.31933')
+    check('vs_msvc_version: none -> None', toolchain.vs_msvc_version(t) is None)
+    real = (toolchain.installed_vs, toolchain.ensure_msvc, toolchain.vs_env, toolchain.ensure_packages,
+            toolchain.ensure_llvm, toolchain.ensure_vulkan)
+    toolchain.ensure_packages = lambda *a: None
+    toolchain.ensure_llvm = toolchain.ensure_vulkan = lambda tools: tools
+    toolchain.ensure_msvc = lambda tools: {'LIB': 'downloaded'}
+    toolchain.vs_env = lambda: {'LIB': 'installed'}
+    toolchain.installed_vs = lambda: vs
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        e = toolchain.ensure(os.path.join(t, 'tools'))
+    check('ensure: an older installed MSVC -> the downloaded tools, said', e['LIB'] == 'downloaded' and
+          'older than' in buf.getvalue(), buf.getvalue())
+    open(os.path.join(vs, 'VC', 'Auxiliary', 'Build', 'Microsoft.VCToolsVersion.default.txt'), 'w').write('14.44.35207\n')
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        e = toolchain.ensure(os.path.join(t, 'tools'))
+    check('ensure: a new enough installed MSVC -> its own variables', e['LIB'] == 'installed', buf.getvalue())
+    toolchain.installed_vs = lambda: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        e = toolchain.ensure(os.path.join(t, 'tools'))
+    check('ensure: no Visual Studio -> the downloaded tools', e['LIB'] == 'downloaded')
+    (toolchain.installed_vs, toolchain.ensure_msvc, toolchain.vs_env, toolchain.ensure_packages, toolchain.ensure_llvm,
+     toolchain.ensure_vulkan) = real
+
 srv.shutdown()
 print(f'{len(fails)} failed: {fails}' if fails else 'all passed')
 sys.exit(1 if fails else 0)
