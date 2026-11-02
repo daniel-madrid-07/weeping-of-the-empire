@@ -166,10 +166,12 @@ HOOKS_NEEDED = {'vk_guard': ('1ccf894',)}
 ENGINE_DEFAULT = ('vk_guard',)
 
 
-def engine_spec(spec):
-    """--features for the engine: each `default` also selects ENGINE_DEFAULT."""
+def engine_spec(spec, known=None):
+    """--features for the engine: each `default` also selects ENGINE_DEFAULT (those of them the table has, `known`:
+    another version's table may lack them)."""
     items = [s.strip() for s in (spec or 'default').split(',') if s.strip()]
-    return ','.join(x for s in items for x in ([s, *ENGINE_DEFAULT] if s == 'default' else [s]))
+    extra = [f for f in ENGINE_DEFAULT if known is None or f in known]
+    return ','.join(x for s in items for x in ([s, *extra] if s == 'default' else [s]))
 
 
 def runtime_env(features, safe=()):

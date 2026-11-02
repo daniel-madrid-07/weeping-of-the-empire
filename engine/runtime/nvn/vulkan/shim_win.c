@@ -318,6 +318,21 @@ void shim_host_line(char *out, size_t n) {
              pc.WorkingSetSize / gb, rate, (unsigned long)handles, th, (unsigned long)gdi, (unsigned long)user);
 }
 
+// exec.c's slow-build watchdog and compile gate: this process's commit (private bytes)
+uint64_t shim_proc_commit(void) {
+    PROCESS_MEMORY_COUNTERS_EX pc = {sizeof pc};
+    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pc, sizeof pc);
+    return pc.PrivateUsage;
+}
+// exec.c's compile gate: commit headroom / limit and free / total RAM
+void shim_mem_room(uint64_t *commit_avail, uint64_t *commit_limit, uint64_t *ram_avail, uint64_t *ram_total) {
+    MEMORYSTATUSEX ms = {sizeof ms};
+    GlobalMemoryStatusEx(&ms);
+    *commit_avail = ms.ullAvailPageFile;
+    *commit_limit = ms.ullTotalPageFile;
+    *ram_avail = ms.ullAvailPhys;
+    *ram_total = ms.ullTotalPhys;
+}
 // textures.c VRAM residency: the system's commit headroom (bytes before the commit limit) and the limit
 void shim_commit_room(uint64_t *avail, uint64_t *limit) {
     MEMORYSTATUSEX ms = {sizeof ms};
@@ -351,18 +366,26 @@ void shim_remove_old_files(const char *pattern, int min_age_s) {
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 }
-// on-screen fps readout (device.c): shown while fullscreen (no title bar there), F3 toggles it in either mode
-static volatile LONG g_fps_osd = -2;   // -1 = automatic (fullscreen only), 0 off, 1 on (TOTK_FPS_OVERLAY=1 / 0 at start)
-bool shim_fps_overlay(void) {
+// The fps readout (pc_overlay.cpp; hle_osd.cpp's box without the PC overlay): 0 off, 1 minimal, 2 detailed. F3 shows
+// the last style chosen or hides it. Start: display.fps_readout through TOTK_FPS_OVERLAY ("minimal", "detailed"; an
+// older "1": minimal; else off)
+static volatile LONG g_fps_osd = -2, g_fps_osd_last = 1;   // -2: not read yet; last: what F3 brings back
+int shim_fps_overlay_mode(void) {
     if (g_fps_osd == -2) {  // (from -2 only: a set racing the first read wins)
         const char *e = getenv("TOTK_FPS_OVERLAY");
-        InterlockedCompareExchange(&g_fps_osd, e ? (*e != '0') : -1, -2);
+        const LONG m = !e ? 0 : !strcmp(e, "detailed") ? 2 : !strcmp(e, "minimal") || !strcmp(e, "1") ? 1 : 0;
+        InterlockedCompareExchange(&g_fps_osd, m, -2);
     }
-    return g_fps_osd < 0 ? g_fs != 0 : g_fps_osd != 0;
+    return (int)g_fps_osd;
 }
-// display.fps_readout, live (pc_settings.cpp fps_readout_apply / fps_readout_now): "" automatic, "1" on, "0" off
-void shim_set_fps_overlay(int mode) { InterlockedExchange(&g_fps_osd, mode < 0 ? -1 : mode != 0); }
-int shim_fps_overlay_mode(void) { shim_fps_overlay(); return (int)g_fps_osd; }
+bool shim_fps_overlay(void) { return shim_fps_overlay_mode() != 0; }
+// display.fps_readout, live (pc_settings.cpp fps_readout_apply / fps_readout_now)
+void shim_set_fps_overlay(int mode) {
+    const LONG m = mode == 2 ? 2 : mode == 1 ? 1 : 0;
+    if (m) InterlockedExchange(&g_fps_osd_last, m);
+    InterlockedExchange(&g_fps_osd, m);
+}
+static void fps_overlay_f3(void) { shim_set_fps_overlay(shim_fps_overlay_mode() ? 0 : (int)g_fps_osd_last); }
 
 // Windows blanks the display and may sleep after its idle timeout, and pad input does not count as activity (a whole
 // session on a controller went dark: totk-pc-recomp #7). While the window is up and not minimised it holds the display
@@ -379,6 +402,7 @@ static void keep_awake(bool on) {
 void oe_focus_update(bool focused);   // hle_oe.cpp: TOTK_PAUSE_UNFOCUSED (review N20: from activation, not a poll)
 void hid_devices_changed(void);       // hle_hid.cpp: the pad readers look for pads at once (hot-plug)
 void pc_input_focus(bool focused);    // pc_input.cpp: Sticky / Toggle / Filter Keys hotkeys off while the game is in front
+static void set_window_icons(HWND h);   // (below: the app icon)
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (pc_wndproc(h, m, (uintptr_t)w, (intptr_t)l)) return m == WM_SETCURSOR ? TRUE : 0;   // nxrecomp overlay (pc_overlay.h)
     switch (m) {
@@ -453,6 +477,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_DPICHANGED: {   // (per-monitor DPI v2) keep the client size in pixels: the swapchain does not change size
+        set_window_icons(h);
         if (g_fs) return 0;  // (fullscreen: the popup is placed on the monitor rect)
         RECT c, *s = (RECT *)l;
         GetClientRect(h, &c);
@@ -466,7 +491,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_EXITSIZEMOVE: remember_place(h); break;   // (a drag to the other monitor, a resize)
     case WM_KEYDOWN:
         if (w == VK_F11 && !(l & (1 << 30))) { apply_fullscreen(h, !g_fs); return 0; }
-        if (w == VK_F3 && !(l & (1 << 30))) { InterlockedExchange(&g_fps_osd, shim_fps_overlay() ? 0 : 1); return 0; }
+        if (w == VK_F3 && !(l & (1 << 30))) { fps_overlay_f3(); return 0; }
         if (w == VK_F12 && !(l & (1 << 30))) { pc_shot_request(); return 0; }   // nxrecomp: screenshot (pc_shot.cpp)
         break;
     case WM_SYSKEYDOWN: {   // Alt+Enter
@@ -507,14 +532,42 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+// The app icon: the exe's ICON 1, which the Builder links in from the player's own game files (games/totk/app_icon.py);
+// else totk.ico beside the exe (a folder of a relinked or older exe); else Windows' own. small: the title bar / taskbar
+// size, else Alt+Tab's; dpi 0: the system's.
+static HICON app_icon(int small, UINT dpi) {
+    const int px = dpi ? GetSystemMetricsForDpi(small ? SM_CXSMICON : SM_CXICON, dpi) : GetSystemMetrics(small ? SM_CXSMICON : SM_CXICON);
+    HICON i = (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1), IMAGE_ICON, px, px, LR_DEFAULTCOLOR);
+    if (!i) {
+        wchar_t path[MAX_PATH];
+        DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+        wchar_t *slash = n && n < MAX_PATH ? wcsrchr(path, L'\\') : NULL;
+        if (slash && (size_t)(slash + 1 - path) + 9 <= MAX_PATH) {
+            wcscpy(slash + 1, L"totk.ico");
+            i = (HICON)LoadImageW(NULL, path, IMAGE_ICON, px, px, LR_LOADFROMFILE);
+        }
+    }
+    return i ? i : LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);   // (shared: DestroyIcon leaves it alone)
+}
+static void set_window_icons(HWND h) {   // (again at a DPI change: the sizes Windows asks for change with it)
+    static HICON big, small;   // the window's own, freed when replaced (the class keeps its pair)
+    const UINT dpi = GetDpiForWindow(h);
+    HICON b = app_icon(0, dpi), s = app_icon(1, dpi);
+    SendMessageW(h, WM_SETICON, ICON_BIG, (LPARAM)b);
+    SendMessageW(h, WM_SETICON, ICON_SMALL, (LPARAM)s);
+    if (big) DestroyIcon(big);
+    if (small) DestroyIcon(small);
+    big = b, small = s;
+}
+
 bool SDL_Init(uint32_t flags) { (void)flags; SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); return true; }
 bool SDL_SetHint(const char *n, const char *v) { (void)n, (void)v; return true; }
 const char *SDL_GetError(void) { return g_err; }
 
 SDL_Window *SDL_CreateWindow(const char *title, int w, int h, SDL_WindowFlags flags) {
     HINSTANCE inst = GetModuleHandleW(NULL);
-    WNDCLASSEXW wc = {sizeof wc, CS_HREDRAW | CS_VREDRAW, wndproc, 0, 0, inst, LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION),
-                      LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), NULL, NULL, L"TotKRecomp", NULL};
+    WNDCLASSEXW wc = {sizeof wc, CS_HREDRAW | CS_VREDRAW, wndproc, 0, 0, inst, app_icon(0, 0),
+                      LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), NULL, NULL, L"TotKRecomp", app_icon(1, 0)};
     RegisterClassExW(&wc);
     {   // window modes (above): the fullscreen kind, the monitor and the exclusive display mode
         const char *m = getenv("TOTK_WINDOW_MODE"), *mon = getenv("TOTK_MONITOR"), *es = getenv("TOTK_EXCLUSIVE_SIZE"),
@@ -720,7 +773,7 @@ void settings_load(void) {
 void pc_input_keys_restore(void);   // pc_input.cpp: the accessibility hotkeys back (no atexit on this path)
 void plat_terminate(void) { pc_input_keys_restore(); TerminateProcess(GetCurrentProcess(), 0); }
 int rt_reboot_requested(void) { return 0; }
-void rt_window_icon(SDL_Window *w) { (void)w; }
+void rt_window_icon(SDL_Window *w) { if (w && w->hwnd) set_window_icons(w->hwnd); }
 const char *game_level_name(void) { return "-"; }
 void menu_render(void *cb, uint32_t w, uint32_t h) { (void)cb, (void)w, (void)h; }
 bool menu_handle_event(const SDL_Event *e) { (void)e; return false; }

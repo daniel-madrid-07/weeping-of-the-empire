@@ -16,7 +16,7 @@ from unicorn.arm64_const import (UC_ARM64_REG_NZCV, UC_ARM64_REG_PC, UC_ARM64_RE
 from games.totk.patches.sites_v100 import (ACTOR_LOD_SITE, ASPECT_SITES, BOUNCE_SITE, CAMERA_SITE, DP_ACTOR_LOD,
                                            DP_CAMERA, DP_FOV_BASE, DP_FOV_SCALE, DP_FRAME_RATIO, DP_LOD_SCALE, DP_MOUSE_BEAT,
                                            DP_MOUSE_LAST, DP_MOUSE_PITCH, DP_MOUSE_PITCH_ACK, DP_MOUSE_SCALE, DP_PC, DP_PRESENTS, DP_RES_FLOOR,
-                                           DP_SHADOW_SCALE, DP_SIM_RADIUS, DP_TERRAIN_LOD, DYNRES_SITE, FOV_SITES, LOD_SITES,
+                                           DP_SHADOW_FIXED, DP_SHADOW_SCALE, DP_SIM_RADIUS, DP_TERRAIN_LOD, DYNRES_SITE, FOV_SITES, LOD_SITES,
                                            MOUSE_SITE, MOUSE_STALE, PC_CAPTURED, PC_CLAIMED, PC_MOUSE_X, SHADOW_SITE, SIM_SITE,
                                            FOV_MAX, TERRAIN_CTX_SP, TERRAIN_LOD_MORPH_FIRST, TERRAIN_LOD_MORPH_FLAG,
                                            TERRAIN_LOD_MORPH_PAIR, TERRAIN_LOD_THRESHOLD)
@@ -180,26 +180,32 @@ def fov(original, patched):
 
 
 def shadowres(original, patched):
-    """Only the size multiply: s1 = factor * multiplier * base width, s0 = the scaled factor; x10 (the 32 minimum), q31,
-    sp and the flags come back."""
+    """Only the size multiply: s1 = factor * multiplier * base width, s0 = the scaled factor, the factor the cap s8 with
+    the fixed size on; x10 (the 32 minimum), x11, q31, sp and the flags come back."""
     out = []
-    for slot in (0.0, 2.0, 0.5):
-        for name, image in (('patched', patched), ('original', original)):
-            mu = machine(image, _page(shadow=(DP_SHADOW_SCALE, '<f', slot)))
-            mu.reg_write(reg_s(0), bits(0.75))
-            mu.reg_write(reg_s(2), bits(2048.0))
-            mu.reg_write(UC_ARM64_REG_X10, 0x20)
-            mu.reg_write(UC_ARM64_REG_Q31, 0x0123456789abcdef0011223344556677)
-            mu.reg_write(UC_ARM64_REG_NZCV, 0x60000000)
-            mu.emu_start(SHADOW_SITE, SHADOW_SITE + 4, count=20)
-            assert mu.reg_read(UC_ARM64_REG_PC) == SHADOW_SITE + 4, 'shadowres: did not return'
-            k = slot if name == 'patched' and slot else 1.0
-            assert abs(get_s(mu, 1) - 0.75 * k * 2048) < 1e-2 and abs(get_s(mu, 0) - 0.75 * k) < 1e-6, (name, slot, get_s(mu, 1))
-            assert mu.reg_read(UC_ARM64_REG_X10) == 0x20, 'shadowres: x10 changed'
-            assert mu.reg_read(UC_ARM64_REG_Q31) == 0x0123456789abcdef0011223344556677, 'shadowres: q31 changed'
-            assert mu.reg_read(UC_ARM64_REG_SP) == STACK + 0x4000, 'shadowres: sp changed'
-            assert mu.reg_read(UC_ARM64_REG_NZCV) == 0x60000000, 'shadowres: flags changed'
-        out.append(f'multiplier {slot}')
+    for fixed in (0.0, 1.0):
+        for slot in (0.0, 2.0, 0.5):
+            for name, image in (('patched', patched), ('original', original)):
+                mu = machine(image, _page(shadow=(DP_SHADOW_SCALE, '<f', slot), fixed=(DP_SHADOW_FIXED, '<f', fixed)))
+                mu.reg_write(reg_s(0), bits(0.75))
+                mu.reg_write(reg_s(2), bits(2048.0))
+                mu.reg_write(reg_s(8), bits(1.25))
+                mu.reg_write(UC_ARM64_REG_X10, 0x20)
+                mu.reg_write(UC_ARM64_REG_X11, 0x1122334455667788)
+                mu.reg_write(UC_ARM64_REG_Q31, 0x0123456789abcdef0011223344556677)
+                mu.reg_write(UC_ARM64_REG_NZCV, 0x60000000)
+                mu.emu_start(SHADOW_SITE, SHADOW_SITE + 4, count=24)
+                assert mu.reg_read(UC_ARM64_REG_PC) == SHADOW_SITE + 4, 'shadowres: did not return'
+                k = slot if name == 'patched' and slot else 1.0
+                f = 1.25 if name == 'patched' and fixed else 0.75
+                assert abs(get_s(mu, 1) - f * k * 2048) < 1e-2 and abs(get_s(mu, 0) - f * k) < 1e-6, (name, fixed, slot, get_s(mu, 1))
+                assert get_s(mu, 8) == 1.25, 'shadowres: s8 changed'
+                assert mu.reg_read(UC_ARM64_REG_X10) == 0x20, 'shadowres: x10 changed'
+                assert mu.reg_read(UC_ARM64_REG_X11) == 0x1122334455667788, 'shadowres: x11 changed'
+                assert mu.reg_read(UC_ARM64_REG_Q31) == 0x0123456789abcdef0011223344556677, 'shadowres: q31 changed'
+                assert mu.reg_read(UC_ARM64_REG_SP) == STACK + 0x4000, 'shadowres: sp changed'
+                assert mu.reg_read(UC_ARM64_REG_NZCV) == 0x60000000, 'shadowres: flags changed'
+            out.append(f'multiplier {slot}' + (', fixed size' if fixed else ''))
     return out
 
 

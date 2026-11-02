@@ -11,6 +11,7 @@
 #endif
 #include "../include/totk/data_page.h"
 #include "../include/totk/totk_patches.h"
+#include "../../../engine/runtime/totk_version.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -28,7 +29,9 @@
 #define PATH_SEP ':'
 #endif
 
+#ifndef TOTK_MAIN_SPAN   /* another game version's build passes its table's span (tools/engine/build.py) */
 #define TOTK_MAIN_SPAN 0x4666000ull   /* main's loaded size, .bss included (v100.toml `span`) */
+#endif
 
 static TotkSettings g_s;
 static int g_on;
@@ -51,12 +54,27 @@ static uint64_t now_ns(void) {
    the engine's TOTK_SPEED_FIX hook rescales that step after the call, so a patched build boots with TOTK_SPEED_FIX=0
    (engine-patches.json `runtime_env`). Only a warning here, not a switch: TOTK_IMG can name another build's images
    (tools/engine/boot.py falls back to the newest image directory), so the loaded image does not prove what the exe
-   was generated from. */
+   was generated from. 1.4.3 has its own sites (games/totk/patches/sites_v143.py): its realtime's global ratio site,
+   main+0x2daa54, was `ldr s0, [x19, #0x250]`. */
 static int main_has_realtime(uint64_t main_base) {
     uint32_t w;
-    memcpy(&w, (const void *)(uintptr_t)(main_base + 0x7a83f4), 4);
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION == 143
+    static const uint64_t kRealtimeSite143 = 0x2daa54;   /* a 1.4.3 offset already: no totk_main_off */
+    memcpy(&w, (const void *)(uintptr_t)(main_base + kRealtimeSite143), 4);
+    return w != 0xbd425260;
+#else
+    if (!totk_main_known(0x7a83f4)) return 0;   /* (a diagnostic build of another version: the site has no place) */
+    memcpy(&w, (const void *)(uintptr_t)(main_base + totk_main_off(0x7a83f4)), 4);
     return w != 0x1e220020;
+#endif
 }
+
+/* Another game version's set (sites_v143.py) has, of the Settings rows' features, only dynres and fov, and no RomFS
+   sets (the restart rows and the canvas shape need 1.0.0's): its build offers those two live rows alone. Each split is
+   an #ifdef that a 1.0.0 build drops, so its preprocessed code stays what it was (tools/engine/proof_totk_same.py). */
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+#define TOTK_OTHER_VERSION 1
+#endif
 
 /* Default on since the all-on round (the play package runs the patched key): with the realtime step in main and
    TOTK_SPEED_FIX not given, the speed fix goes off here, before its hook's first call reads the variable. A
@@ -75,7 +93,7 @@ static void speed_fix_default(uint64_t main_base) {
     }
 }
 
-/* The data page is main + 0x4668000 (16 KiB): engine commits main as roundup64K(mod0 + bss_end) = 0x4670000 bytes, so
+/* The data page is main + 0x4668000 on 1.0.0 (16 KiB, after TOTK_MAIN_SPAN): engine commits main as roundup64K(mod0 + bss_end) = 0x4670000 bytes, so
    it lies in that mapping's slack. Checked rather than assumed, so another loader layout cannot make this a crash. */
 static int data_page_mapped(uint64_t main_base) {
 #ifdef _WIN32
@@ -244,7 +262,8 @@ static void overlay_sets(void) {
 
 static const struct { const char *key, *env; } k_row_env[] = {
     {"graphics.min_resolution", "TOTK_DYNAMIC_RES"}, {"graphics.fov", "TOTK_FOV"},
-    {"graphics.shadow_resolution", "TOTK_SHADOW_RES"}, {"graphics.lod_distance", "TOTK_LOD"},
+    {"graphics.shadow_resolution", "TOTK_SHADOW_RES"}, {"graphics.shadow_fixed", "TOTK_SHADOW_FIXED"},
+    {"graphics.lod_distance", "TOTK_LOD"},
     {"graphics.actor_detail_distance", "TOTK_ACTOR_LOD"}, {"graphics.terrain_detail_distance", "TOTK_TERRAIN_LOD"},
     {"game.simulation_distance", "TOTK_SIM_DISTANCE"},
 };
@@ -292,6 +311,9 @@ static const char *fov_format(float k) {
     return buf;
 }
 
+/* The sun shadow map size row (0 / 1): its two choices by name (a format with no conversion) */
+static const char *shadow_fixed_format(float k) { return k >= 0.5f ? "Fixed (steady)" : "The game's (changes)"; }
+
 #define APPLY(i) static void apply_##i(const char *v) { write_slot(i, v); }
 APPLY(0) APPLY(1) APPLY(2) APPLY(3) APPLY(4) APPLY(5) APPLY(6) APPLY(7) APPLY(8) APPLY(9) APPLY(10) APPLY(11)
 static void (*const k_apply[MAX_LIVE_ROWS])(const char *) = {apply_0, apply_1, apply_2, apply_3, apply_4, apply_5,
@@ -331,6 +353,10 @@ static const pc_setting k_restart_rows[] = {
    so they are not offered (the gate: "Aspect ratio" was visible and inert).*/
 static int g_restart_rows;
 static void add_restart_rows(void) {
+#ifdef TOTK_OTHER_VERSION
+    fprintf(stderr, "[totk] game-patch restart rows hidden: their RomFS sets are made from 1.0.0's files\n");
+    return;
+#endif
     const char *sets = getenv("TOTK_PATCH_SETS");
     if (!sets || !*sets) {
         fprintf(stderr, "[totk] game-patch restart rows hidden: TOTK_PATCH_SETS not set (aspect ratio, texture cache, "
@@ -357,6 +383,9 @@ static void add_live_rows(void) {
     int k = 0;
     for (unsigned i = 0; i < n && k < MAX_LIVE_ROWS; i++) {
         const TotkSettingRow *r = &rows[i];
+#ifdef TOTK_OTHER_VERSION
+        if (strcmp(r->key, "graphics.min_resolution") && strcmp(r->key, "graphics.fov")) continue;   /* (no site) */
+#endif
         /* (the engine's own controls row, hle_hid.cpp, has this key and feeds the slot too, pc_mouse.cpp reload: a second
            row meant one meaning or the other by registration order)*/
         if (!strcmp(r->key, "controls.mouse_camera_scale")) continue;
@@ -365,6 +394,7 @@ static void add_live_rows(void) {
         g_live[k] = (pc_setting){r->key, r->group, "Game patches", r->label, r->help, g_live_def[k], NULL, NULL,
                                  (float)r->min, (float)r->max, (float)r->step, 0, NULL, NULL, k_apply[k], NULL};
         if (!strcmp(r->key, "graphics.fov")) g_live[k].format = fov_format;
+        if (!strcmp(r->key, "graphics.shadow_fixed")) g_live[k].format = shadow_fixed_format;
         k++;
     }
     pc_settings_add(g_live, k);
@@ -449,6 +479,9 @@ static int layout_overlay(const char *set, char *dir, size_t cap) {
 }
 
 static void wide_canvas(void) {
+#ifdef TOTK_OTHER_VERSION
+    return;   /* (no output_res, no layout overlay) */
+#endif
     const char *wide = getenv("TOTK_WIDE"), *out = getenv("TOTK_OUTPUT_RES");
     if (!wide || strcmp(wide, "window") || aspect_row_off()) return;
     if (out && *out) {
@@ -501,7 +534,7 @@ static void boot_failed(uint64_t main_base, const char *why) {
 
 void totk_engine_boot(uint64_t main_base) {
     if (!data_page_mapped(main_base)) {
-        boot_failed(main_base, "the data page (main+0x4668000) is not committed RW");
+        boot_failed(main_base, "the data page (after main's span) is not committed RW");
         return;
     }
     int patched = main_has_realtime(main_base);

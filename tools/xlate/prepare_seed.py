@@ -231,12 +231,13 @@ def nso_image(raw):
 _dicts = None
 
 
-def _decoder(romfs):
+def _decoder(romfs, read=None):
+    """read: the RomFS's file reader (rel path -> bytes), else files under the romfs folder"""
     global _dicts
     import zstandard
     if _dicts is None:
         _dicts = {}
-        raw = (Path(romfs)/'Pack'/'ZsDic.pack.zs').read_bytes()
+        raw = read('Pack/ZsDic.pack.zs') if read else (Path(romfs)/'Pack'/'ZsDic.pack.zs').read_bytes()
         for member in sarc(zstandard.ZstdDecompressor().decompress(raw, max_output_size=64 << 20)).values():
             d = zstandard.ZstdCompressionDict(member)
             _dicts[d.dict_id()] = d

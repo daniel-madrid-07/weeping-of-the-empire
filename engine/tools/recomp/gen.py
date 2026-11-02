@@ -272,6 +272,12 @@ def fwrite(o, e):
     if k == 'h': return f'c->v[{r}] = vU16({e});'
     raise Unhandled('fwrite ' + o)
 
+def scalar_d(o, e):
+    """write statement for a D register given its 64-bit integer value (the upper half cleared)"""
+    k, r = freg(o)
+    if k != 'd': raise Unhandled('scalar_d ' + o)
+    return f'{{ V128 r_ = vzero(); r_.d[0] = (u64)({e}); c->v[{r}] = r_; }}'
+
 def lanes_loop(dreg, cnt, esz, body, field):
     """emit V128 loop: body uses 'i' and returns lane value"""
     return f'{{ V128 r_ = vzero(); LANES(0, {cnt}, r_.{field}[i] = {body}); c->v[{dreg}] = r_; }}'
@@ -764,7 +770,7 @@ class Emitter:
         self.fc_use = fc
         code = self._insn(a, m, o, jt)   # (raises for an unhandled insn: fc stays dropped)
         self.fc_use = None
-        if m == 'fcmp' and self.fc_new:
+        if m in ('fcmp', 'fcmpe') and self.fc_new:
             self.fc, self.fc_new = self.fc_new, None
         elif fc and not fc_kills(m, o, fc['r']):
             self.fc = fc
@@ -825,6 +831,8 @@ class Emitter:
     # ---------------- integer ALU
     def _arith(self, ops, op, flags):
         d, n_ = ops[0], ops[1]
+        if FREG.match(d) and not flags:   # (1.4.x: add / sub d, d, d)
+            return scalar_d(d, f'c->v[{freg(n_)[1]}].d[0] {"+" if op == "add" else "-"} c->v[{freg(ops[2])[1]}].d[0]')
         if d.startswith('v'):
             return self.vint(ops, {'add': '+', 'sub': '-'}[op])
         n = gsize(d) if not flags or d not in ('xzr', 'wzr') else gsize(n_)
@@ -847,6 +855,10 @@ class Emitter:
     def i_adcs(self, a, ops): n = gsize(ops[0]); return W(ops[0], f'adds{n}(c, {R(ops[1])}, {R(ops[2])}, c->c)')
     def i_sbcs(self, a, ops): n = gsize(ops[0]); return W(ops[0], f'adds{n}(c, {R(ops[1])}, ~({T(n)})({R(ops[2])}), c->c)')
     def i_ngcs(self, a, ops): n = gsize(ops[0]); return W(ops[0], f'adds{n}(c, 0, ~({T(n)})({R(ops[1])}), c->c)')
+    # (1.4.x: the carry forms without flags, 128-bit arithmetic; 1.0.0's toolchain never emitted them)
+    def i_adc(self, a, ops): n = gsize(ops[0]); return W(ops[0], f'({T(n)})({R(ops[1])} + {R(ops[2])} + c->c)')
+    def i_sbc(self, a, ops): n = gsize(ops[0]); return W(ops[0], f'({T(n)})({R(ops[1])} + ~({T(n)})({R(ops[2])}) + c->c)')
+    def i_ngc(self, a, ops): n = gsize(ops[0]); return W(ops[0], f'({T(n)})(~({T(n)})({R(ops[1])}) + c->c)')
 
     def _logic(self, ops, op, inv=False, flags=False):
         d = ops[0]
@@ -922,6 +934,8 @@ class Emitter:
 
     def i_bfi(self, a, ops):
         n = gsize(ops[0]); return W(ops[0], f'bfi{n}({R(ops[0])}, {R(ops[1])}, {imm(ops[2])}, {imm(ops[3])})')
+    def i_bfc(self, a, ops):   # bfc wd, #lsb, #w = bfm from wzr: clear the field
+        n = gsize(ops[0]); return W(ops[0], f'bfi{n}({R(ops[0])}, 0, {imm(ops[1])}, {imm(ops[2])})')
     def i_bfxil(self, a, ops):
         n = gsize(ops[0]); w = imm(ops[3])
         return W(ops[0], f'bfi{n}({R(ops[0])}, ubfx{n}({R(ops[1])}, {imm(ops[2])}, {w}), 0, {w})')
@@ -947,8 +961,11 @@ class Emitter:
     def i_smaddl(self, a, ops): return W(ops[0], f'{R(ops[3])} + (u64)((s64)(s32){R(ops[1])} * (s64)(s32){R(ops[2])})')
     def i_smsubl(self, a, ops): return W(ops[0], f'{R(ops[3])} - (u64)((s64)(s32){R(ops[1])} * (s64)(s32){R(ops[2])})')
     def i_umaddl(self, a, ops): return W(ops[0], f'{R(ops[3])} + (u64)(u32){R(ops[1])} * (u64)(u32){R(ops[2])}')
+    def i_umsubl(self, a, ops): return W(ops[0], f'{R(ops[3])} - (u64)(u32){R(ops[1])} * (u64)(u32){R(ops[2])}')
     def i_smull(self, a, ops): return W(ops[0], f'(u64)((s64)(s32){R(ops[1])} * (s64)(s32){R(ops[2])})')
     def i_umull(self, a, ops): return W(ops[0], f'(u64)(u32){R(ops[1])} * (u64)(u32){R(ops[2])}')
+    def i_smnegl(self, a, ops): return W(ops[0], f'(u64)0 - (u64)((s64)(s32){R(ops[1])} * (s64)(s32){R(ops[2])})')   # (1.4.x)
+    def i_umnegl(self, a, ops): return W(ops[0], f'(u64)0 - (u64)(u32){R(ops[1])} * (u64)(u32){R(ops[2])}')   # (1.4.x)
     def i_smulh(self, a, ops): return W(ops[0], f'smulh((s64){R(ops[1])}, (s64){R(ops[2])})')
     def i_umulh(self, a, ops): return W(ops[0], f'umulh({R(ops[1])}, {R(ops[2])})')
     def i_sdiv(self, a, ops): n = gsize(ops[0]); return W(ops[0], f'({T(n)})sdiv{n}(({ST(n)}){R(ops[1])}, ({ST(n)}){R(ops[2])})')
@@ -991,6 +1008,14 @@ class Emitter:
     def i_xpaclri(self, a, ops): return ';'     # strip PAC from lr: no pointer auth here
     def i_prfum(self, a, ops): return ';'
     def i_dmb(self, a, ops): return 'dmb_full();' if ops[0] in ('ish', 'sy') else 'dmb_light();'
+    def i_dsb(self, a, ops): return 'dmb_full();'   # (the host has no separate completion barrier: a full fence)
+    def i_isb(self, a, ops): return ';'             # no fetched-instruction state to flush in recompiled code
+    def i_csdb(self, a, ops): return ';'            # speculation barrier (hint space)
+    def i_dc(self, a, ops):
+        # cache clean / clean+invalidate to PoU / PoC: host memory is coherent, nothing to do. dc zva (zeroes a block)
+        # and the set/way and invalidate-only ops stay traps.
+        if ops[0] in ('cvau', 'cvac', 'civac', 'cvap'): return ';'
+        raise Unhandled('dc ' + ops[0])
     def i_clrex(self, a, ops): return 'clrex(c);'
     def i_mrs(self, a, ops):
         if ops[1] == 'tpidr_el0': return W(ops[0], 'c->tpidr')
@@ -998,11 +1023,13 @@ class Emitter:
         if ops[1] == 'cntpct_el0': return W(ops[0], 'rt_cntpct()')         # 19.2 MHz system counter (sdk only)
         if ops[1] == 'fpsr': return W(ops[0], 'c->fpsr')
         if ops[1] == 'fpcr': return W(ops[0], 'rt_read_fpcr(cx)')
+        if ops[1] == 'nzcv': return W(ops[0], '(u64)c->n << 31 | (u64)c->z << 30 | (u64)c->c << 29 | (u64)c->vf << 28')
         raise Unhandled('mrs ' + ops[1])
     def i_msr(self, a, ops):
         if ops[0] == 'fpcr': return f'rt_write_fpcr(cx, {R(ops[1])});'
         if ops[0] == 'tpidr_el0': return f'c->tpidr = {R(ops[1])};'
         if ops[0] == 'fpsr': return f'c->fpsr = (u32){R(ops[1])};'
+        if ops[0] == 'nzcv': return f'setnzcv(c, (u32)({R(ops[1])} >> 28) & 15);'
         raise Unhandled('msr ' + ops[0])
 
     # ---------------- loads / stores
@@ -1091,6 +1118,42 @@ class Emitter:
     def i_ldarb(self, a, ops): return W(ops[0], f'lda8({R(MEM.match(ops[1]).group(1))})')
     def i_stlr(self, a, ops): n = gsize(ops[0]); return f'stl{n}({R(MEM.match(ops[1]).group(1))}, {R(ops[0])});'
     def i_stlrb(self, a, ops): return f'stl8({R(MEM.match(ops[1]).group(1))}, (u8){R(ops[0])});'
+    # (1.4.x: halfword exclusives / acquire-release and exclusive pairs, written inline like rt.h's ldx / stx: the monitor
+    # holds the address and the value read, a store-exclusive is a compare-exchange against that value)
+    def i_ldxrh(self, a, ops):
+        ea = R(MEM.match(ops[1]).group(1))
+        return W(ops[0], f'({{ u64 a_ = {ea}; u16 v_ = __atomic_load_n((u16*)a_, __ATOMIC_SEQ_CST); '
+                         f'c->excl_addr = a_; c->excl_val = v_; v_; }})')
+    i_ldaxrh = i_ldxrh
+    def i_stxrh(self, a, ops):
+        ea = R(MEM.match(ops[2]).group(1))
+        return W(ops[0], f'({{ u64 a_ = {ea}; u32 r_ = 1; if (c->excl_addr == a_) {{ c->excl_addr = ~0ull; '
+                         f'u16 e_ = (u16)c->excl_val; r_ = __atomic_compare_exchange_n((u16*)a_, &e_, (u16){R(ops[1])}, '
+                         f'false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 0 : 1; }} r_; }})')
+    i_stlxrh = i_stxrh
+    def i_ldarh(self, a, ops): return W(ops[0], f'__atomic_load_n((u16*){R(MEM.match(ops[1]).group(1))}, __ATOMIC_SEQ_CST)')
+    def i_stlrh(self, a, ops):
+        return f'__atomic_store_n((u16*){R(MEM.match(ops[1]).group(1))}, (u16){R(ops[0])}, __ATOMIC_SEQ_CST);'
+    def i_ldxp(self, a, ops):
+        t1, t2 = ops[0], ops[1]; ea = R(MEM.match(ops[2]).group(1))
+        if gsize(t2) == 64:
+            return (f'{{ u64 a_ = {ea}; unsigned __int128 v_ = __atomic_load_n((unsigned __int128*)a_, __ATOMIC_SEQ_CST); '
+                    f'c->excl_addr = a_; c->excl_val = (u64)v_; c->excl_val2 = (u64)(v_ >> 64); '
+                    f'{W(t1, "(u64)v_")} {W(t2, "(u64)(v_ >> 64)")} }}')
+        return (f'{{ u64 a_ = {ea}; u64 v_ = __atomic_load_n((u64*)a_, __ATOMIC_SEQ_CST); c->excl_addr = a_; '
+                f'c->excl_val = v_; {W(t1, "(u32)v_")} {W(t2, "(u32)(v_ >> 32)")} }}')
+    i_ldaxp = i_ldxp
+    def i_stxp(self, a, ops):
+        ws, t1, t2 = ops[0], ops[1], ops[2]; ea = R(MEM.match(ops[3]).group(1))
+        if gsize(t1) == 64:
+            cas = (f'unsigned __int128 e_ = (unsigned __int128)c->excl_val2 << 64 | c->excl_val, '
+                   f'v_ = (unsigned __int128){R(t2)} << 64 | {R(t1)}; r_ = __atomic_compare_exchange_n('
+                   f'(unsigned __int128*)a_, &e_, v_, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 0 : 1;')
+        else:
+            cas = (f'u64 e_ = c->excl_val, v_ = (u64)(u32){R(t2)} << 32 | (u32){R(t1)}; '
+                   f'r_ = __atomic_compare_exchange_n((u64*)a_, &e_, v_, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 0 : 1;')
+        return W(ws, f'({{ u64 a_ = {ea}; u32 r_ = 1; if (c->excl_addr == a_) {{ c->excl_addr = ~0ull; {cas} }} r_; }})')
+    i_stlxp = i_stxp
 
     # ---------------- SIMD structure loads/stores
     def _vlist(self, s):
@@ -1222,10 +1285,18 @@ class Emitter:
         d, cnt, esz = varr(ops[0]); n, _, _ = varr(ops[1]); m_, _, _ = varr(ops[2]); nb = cnt * esz // 64
         return lanes_loop(d, nb, 64, f'(c->v[{d}].d[i] & c->v[{m_}].d[i]) | (c->v[{n}].d[i] & ~c->v[{m_}].d[i])', 'd')
     def _vcmp(self, ops, op, signed):
+        if FREG.match(ops[0]):   # (1.4.x: the scalar D form, cmeq d, d, d / #0)
+            f = 'sd' if signed else 'd'
+            y = '0' if ops[2].startswith('#') else f'c->v[{freg(ops[2])[1]}].{f}[0]'
+            return scalar_d(ops[0], f'(c->v[{freg(ops[1])[1]}].{f}[0] {op} {y}) ? ~0ull : 0')
         return self.vbin(ops, lambda x, y, t: f'({x} {op} ({t}){y}) ? ({t})~0ull : 0', signed=signed)
     def i_cmeq(self, a, ops): return self._vcmp(ops, '==', False)
     def i_cmgt(self, a, ops): return self._vcmp(ops, '>', True)
     def i_cmhi(self, a, ops): return self._vcmp(ops, '>', False)
+    def i_cmge(self, a, ops): return self._vcmp(ops, '>=', True)    # (1.4.x)
+    def i_cmlt(self, a, ops): return self._vcmp(ops, '<', True)     # (1.4.x: #0 only)
+    def i_cmle(self, a, ops): return self._vcmp(ops, '<=', True)    # (#0 only)
+    def i_cmhs(self, a, ops): return self._vcmp(ops, '>=', False)
     def i_cmtst(self, a, ops): return self.vbin(ops, lambda x, y, t: f'(({x} & {y}) != 0) ? ({t})~0ull : 0')
     def i_smax(self, a, ops): return self.vbin(ops, lambda x, y, t: f'({x} > {y} ? {x} : {y})', signed=True)
     def i_smin(self, a, ops): return self.vbin(ops, lambda x, y, t: f'({x} < {y} ? {x} : {y})', signed=True)
@@ -1235,7 +1306,22 @@ class Emitter:
     def i_mls(self, a, ops):
         d, cnt, esz = varr(ops[0])
         return self.vbin(ops, lambda x, y, t: f'({t})(c->v[{d}].{UF[esz]}[i] - {x} * {y})')
-    def i_sqadd(self, a, ops): return self.vbin(ops, lambda x, y, t: f'satT<{t}>((s64){x} + (s64){y})', signed=True)
+    def i_umax(self, a, ops): return self.vbin(ops, lambda x, y, t: f'({x} > {y} ? {x} : {y})')   # (1.4.x)
+    def i_umin(self, a, ops): return self.vbin(ops, lambda x, y, t: f'({x} < {y} ? {x} : {y})')   # (1.4.x)
+    def _sq_scalar(self, ops, op):   # (1.4.x: sqadd / sqsub b, h, s: the scalar form, upper bits zeroed)
+        k, d = freg(ops[0]); n, m_ = freg(ops[1])[1], freg(ops[2])[1]
+        esz = ESZ[k]
+        if esz == 64: raise Unhandled('scalar saturating d ' + ops[0])   # (s64 sum would overflow)
+        f = SF[esz]
+        return (f'{{ V128 r_ = vzero(); r_.{f}[0] = satT<{STT[esz]}>((s64)c->v[{n}].{f}[0] {op} (s64)c->v[{m_}].{f}[0]); '
+                f'c->v[{d}] = r_; }}')
+    def i_sqadd(self, a, ops):
+        if FREG.match(ops[0]): return self._sq_scalar(ops, '+')
+        return self.vbin(ops, lambda x, y, t: f'satT<{t}>((s64){x} + (s64){y})', signed=True)
+    def i_sqsub(self, a, ops):   # (1.4.x)
+        if FREG.match(ops[0]): return self._sq_scalar(ops, '-')
+        if varr(ops[0])[2] == 64: raise Unhandled('sqsub .2d')
+        return self.vbin(ops, lambda x, y, t: f'satT<{t}>((s64){x} - (s64){y})', signed=True)
     def _pairwise(self, ops, fn, field_kind):
         d, cnt, esz = varr(ops[0]); n, _, _ = varr(ops[1]); m_, _, _ = varr(ops[2])
         f = {'u': UF, 's': SF, 'f': FF}[field_kind][esz]
@@ -1246,13 +1332,27 @@ class Emitter:
     def i_addp(self, a, ops): d, cnt, esz = varr(ops[0]); return self._pairwise(ops, lambda x, y: f'({UT[esz]})({x} + {y})', 'u')
     def i_sminp(self, a, ops): return self._pairwise(ops, lambda x, y: f'({x} < {y} ? {x} : {y})', 's')
     def i_faddp(self, a, ops):
+        if FREG.match(ops[0]): return self._fpair_scalar(ops, 'faddA')   # faddp s0, v0.2s / d0, v0.2d (ARMv8.0 has no H form)
         if self.simd and not FREG.match(ops[0]) and len(ops) == 3:   # vector: rt.h vfaddp (one SIMD add + one NaN test)
             d, cnt, esz = varr(ops[0]); n, _, _ = varr(ops[1]); m_, _, _ = varr(ops[2])
             if cnt * esz in (64, 128):
                 return f'c->v[{d}] = vfaddp<{cnt}, {FT[esz]}>(c->v[{n}], c->v[{m_}]);'
         return self._pairwise(ops, lambda x, y: f'faddA({x}, {y})', 'f')
-    def i_fmaxp(self, a, ops): return self._pairwise(ops, lambda x, y: f'fmaxA({x}, {y})', 'f')
-    def i_fminp(self, a, ops): return self._pairwise(ops, lambda x, y: f'fminA({x}, {y})', 'f')
+    def i_fmaxp(self, a, ops):
+        if FREG.match(ops[0]): return self._fpair_scalar(ops, 'fmaxA')
+        return self._pairwise(ops, lambda x, y: f'fmaxA({x}, {y})', 'f')
+    def i_fminp(self, a, ops):
+        if FREG.match(ops[0]): return self._fpair_scalar(ops, 'fminA')
+        return self._pairwise(ops, lambda x, y: f'fminA({x}, {y})', 'f')
+    def _fpair_scalar(self, ops, fn):   # (1.4.x: fmaxp s0, v0.2s / d0, v0.2d)
+        n, cnt, esz = varr(ops[1]); f = FF[esz]
+        return fwrite(ops[0], f'{fn}(c->v[{n}].{f}[0], c->v[{n}].{f}[1])')
+    def _fvreduce(self, ops, fn):   # (1.4.x: fmaxv / fminv s, v.4s: ARM's Reduce halves, op(op(e0, e1), op(e2, e3)))
+        n, cnt, esz = varr(ops[1])
+        if cnt != 4 or esz != 32: raise Unhandled('fmaxv / fminv ' + ops[1])
+        return fwrite(ops[0], f'{fn}({fn}(c->v[{n}].f[0], c->v[{n}].f[1]), {fn}(c->v[{n}].f[2], c->v[{n}].f[3]))')
+    def i_fmaxv(self, a, ops): return self._fvreduce(ops, 'fmaxA')
+    def i_fminv(self, a, ops): return self._fvreduce(ops, 'fminA')
     def _reduce(self, ops, fn, field_kind, outw):
         k, d = freg(ops[0]); n, cnt, esz = varr(ops[1])
         f = {'u': UF, 's': SF, 'f': FF}[field_kind][esz]
@@ -1268,6 +1368,15 @@ class Emitter:
     def i_sminv(self, a, ops):
         if self.vdirect: return self._vreduce(ops, 1, STT)
         return self._reduce(ops, lambda x, y, t: f'({x} < {y} ? {x} : {y})', 's', 0)
+    def i_smaxv(self, a, ops):   # (1.4.x)
+        if self.vdirect: return self._vreduce(ops, 2, STT)
+        return self._reduce(ops, lambda x, y, t: f'({x} > {y} ? {x} : {y})', 's', 0)
+    def i_uminv(self, a, ops):   # (1.4.x: the SDK's string routines)
+        if self.vdirect: return self._vreduce(ops, 1, UT)
+        return self._reduce(ops, lambda x, y, t: f'({x} < {y} ? {x} : {y})', 'u', 0)
+    def i_umaxv(self, a, ops):   # (1.4.x: the SDK's string routines)
+        if self.vdirect: return self._vreduce(ops, 2, UT)
+        return self._reduce(ops, lambda x, y, t: f'({x} > {y} ? {x} : {y})', 'u', 0)
     def i_fmaxnmv(self, a, ops):  # ARM reduces pairwise tree for 4s: max(max(a0,a1),max(a2,a3))
         k, d = freg(ops[0]); n, cnt, esz = varr(ops[1])
         if self.simd: return f'c->v[{d}] = vS(fnmvS<true>(c->v[{n}]));'
@@ -1339,6 +1448,7 @@ class Emitter:
             return (f'{{ V128 r_ = c->v[{d}]; LANES(0, {ncnt}, r_.{UF[esz]}[i + {ncnt}] = {fn(f"c->v[{n}].{fs}[i]")}); c->v[{d}] = r_; }}')
         return lanes_loop(d, cnt, esz, fn(f'c->v[{n}].{fs}[i]'), UF[esz])
     def i_xtn(self, a, ops): d, cnt, esz = varr(ops[0]); return self._narrow(ops, lambda x: f'({UT[esz]}){x}', False)
+    def i_xtn2(self, a, ops): d, cnt, esz = varr(ops[0]); return self._narrow(ops, lambda x: f'({UT[esz]}){x}', True)
     def i_sqxtn(self, a, ops): d, cnt, esz = varr(ops[0]); return self._narrow(ops, lambda x: f'({UT[esz]})satT<{STT[esz]}>({x})', False, True)
     def i_sqxtn2(self, a, ops): d, cnt, esz = varr(ops[0]); return self._narrow(ops, lambda x: f'({UT[esz]})satT<{STT[esz]}>({x})', True, True)
     def i_sqxtun(self, a, ops): d, cnt, esz = varr(ops[0]); return self._narrow(ops, lambda x: f'satT<{UT[esz]}>({x})', False, True)
@@ -1480,13 +1590,18 @@ class Emitter:
     def i_frintm(self, a, ops): return self._fun(ops, lambda x: f'frintA({x}, 2)')
     def i_frintp(self, a, ops): return self._fun(ops, lambda x: f'frintA({x}, 1)')
     def i_fmla(self, a, ops):
+        if FREG.match(ops[0]): return self._fma_elem(ops, False)
         d, cnt, esz = varr(ops[0]); f = FF[esz]
         return self._fbin(ops, lambda x, y: f'fmlaA(c->v[{d}].{f}[i], {x}, {y})',
                           nat=lambda x, y: f'std::fma({x}, {y}, c->v[{d}].{f}[i])', vop=4)
     def i_fmls(self, a, ops):
+        if FREG.match(ops[0]): return self._fma_elem(ops, True)
         d, cnt, esz = varr(ops[0]); f = FF[esz]
         return self._fbin(ops, lambda x, y: f'fmlaA(c->v[{d}].{f}[i], -({x}), {y})',
                           nat=lambda x, y: f'std::fma(-({x}), {y}, c->v[{d}].{f}[i])', vop=5)
+    def _fma_elem(self, ops, neg):   # (1.4.x: fmla / fmls s, s, v.s[i]: the scalar form by element, fused)
+        acc, _ = fscal(ops[0]); x, _ = fscal(ops[1]); m_, e, j = velem(ops[2])
+        return fwrite(ops[0], f'fmlaS({acc}, {"-" if neg else ""}({x}), c->v[{m_}].{FF[e]}[{j}])')
     def _fma4(self, ops, neg_prod, neg_acc):
         x, w = fscal(ops[1]); y, _ = fscal(ops[2]); acc, _ = fscal(ops[3])
         if neg_prod: x = f'-({x})'
@@ -1505,6 +1620,9 @@ class Emitter:
     def i_fccmp(self, a, ops):
         x, w = fscal(ops[0]); y, _ = fscal(ops[1])
         return f'if ({self.cnd(ops[3])}) fcmpA(c, {x}, {y}); else setnzcv(c, {imm(ops[2])});'
+    # (1.4.x) fcmpe / fccmpe set the same flags; they differ only in raising Invalid for a quiet NaN (FPSR, unmodelled)
+    def i_fcmpe(self, a, ops): return self.i_fcmp(a, ops)
+    def i_fccmpe(self, a, ops): return self.i_fccmp(a, ops)
     def i_fcsel(self, a, ops):
         k, d = freg(ops[0]); _, n = freg(ops[1]); _, m_ = freg(ops[2])
         f = 'vU32(c->v[{}].s[0])' if k == 's' else 'vU64(c->v[{}].d[0])'
@@ -1638,6 +1756,7 @@ class Out(io.StringIO):
 def plt_map(img, info, imports_by_got, text_end, nslots=0):
     """map PLT stub address -> import name by decoding adrp/ldr x17 pairs"""
     md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+    md.skipdata = True   # (a main with data words in .text before its PLT: disasm_lite would stop at the first one)
     out = {}
     plt0 = None
     # PLT lies at the end of .text; scan back far enough for 'adrp x16; ldr x17, [x16, #off]; add; br x17' x nslots

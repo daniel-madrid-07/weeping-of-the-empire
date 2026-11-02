@@ -115,6 +115,11 @@ const char *totk_settings_from_env(TotkSettings *s) {
         if (sscanf(e, "%lf%c", &f, &rest) != 1 || !(f == 0 || (f >= 0.5 && f <= 2))) return "TOTK_SHADOW_RES must be a multiplier between 0.5 and 2, or 0 (the game's own)";
         s->shadow_scale = f == 1 ? 0.0f : (float)f;
     }
+    if ((e = getenv("TOTK_SHADOW_FIXED")) && *e) {
+        if (!strcmp(e, "1") || !strcmp(e, "on")) s->shadow_fixed = 1.0f;
+        else if (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "game")) s->shadow_fixed = 0.0f;
+        else return "TOTK_SHADOW_FIXED must be 1 / on (the shadow map at its largest size) or 0 / off (the game's own)";
+    }
     if ((e = getenv("TOTK_LOD")) && *e) {
         double f;
         char rest;
@@ -199,6 +204,7 @@ const char *totk_patches_init(void *main_base, uint64_t main_span, const TotkSet
     put_f32(TOTK_DP_RES_FLOOR, s->res_floor);
     put_f32(TOTK_DP_FOV_SCALE, s->fov_scale);
     put_f32(TOTK_DP_SHADOW_SCALE, s->shadow_scale);
+    put_f32(TOTK_DP_SHADOW_FIXED, s->shadow_fixed);
     put_f32(TOTK_DP_LOD_SCALE, s->lod_scale);
     put_f32(TOTK_DP_ACTOR_LOD, s->actor_lod_scale);
     put_f32(TOTK_DP_TERRAIN_LOD, s->terrain_lod_scale);
@@ -210,11 +216,12 @@ const char *totk_patches_init(void *main_base, uint64_t main_span, const TotkSet
     else if (s->res_floor <= 0.0f) snprintf(dyn, sizeof dyn, "on (the game's own)");
     else snprintf(dyn, sizeof dyn, "on, floor %.0f %%", s->res_floor * 100.0);
     fprintf(stderr, "[totk] data page at %p: frame step %s, scene %ux%u, output %ux%u (swapchain %ux%u), aspect %.4f%s, "
-            "dynamic resolution %s, field of view x%.2f, shadow map x%.2f, LOD distance x%.2f\n",
+            "dynamic resolution %s, field of view x%.2f, shadow map x%.2f%s, LOD distance x%.2f\n",
             (void *)g_page, s->realtime ? "real time" : "shipping (present interval)", s->render_w, s->render_h,
             s->output_w, s->output_h, s->max_w, s->max_h, totk_aspect_current(),
             totk_aspect_current() == 0 ? " (the game's own 16:9)" : "", dyn, s->fov_scale > 0 ? s->fov_scale : 1.0,
-            s->shadow_scale > 0 ? s->shadow_scale : 1.0, s->lod_scale > 0 ? s->lod_scale : 1.0);
+            s->shadow_scale > 0 ? s->shadow_scale : 1.0, s->shadow_fixed ? " (fixed size)" : "",
+            s->lod_scale > 0 ? s->lod_scale : 1.0);
     return NULL;
 }
 
@@ -524,6 +531,11 @@ static const TotkSettingRow g_rows[] = {
     {"graphics.shadow_resolution", "Graphics", "Shadow resolution",
      "Multiplier of the shadow map's width and height (2 = sharper, 4x the memory).", TOTK_DP_SHADOW_SCALE, 1.0, 0.5,
      2.0, 0.25, 0},
+    {"graphics.shadow_fixed", "Graphics", "Sun shadow map size",
+     "The game's: the sun's shadow map shrinks and grows with the area its cascades cover, so near the ground foliage "
+     "shadows turn coarse, and every size change moves the shadow texels (leaf shadows jump instead of sliding). Fixed: "
+     "always the largest size the game picks (times the shadow resolution), steady and sharper; costs some GPU.",
+     TOTK_DP_SHADOW_FIXED, 0.0, 0.0, 1.0, 1.0, 0},
     {"graphics.lod_distance", "Graphics", "Detail distance",
      "Multiplier of the distance at which models switch to lower detail (2 = full detail twice as far).",
      TOTK_DP_LOD_SCALE, 1.0, 0.5, 8.0, 0.25, 0},

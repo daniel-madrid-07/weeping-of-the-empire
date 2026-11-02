@@ -80,6 +80,9 @@ const pc_setting kRows[] = {
 [[maybe_unused]] const bool g_rows = (pc_settings_add(kRows, 1), true);
 
 bool enabled() {
+#ifdef TOTK_BETA_OFF_PC_MENUS
+    return false;   // (a beta of another game version without eui::UIController::updateState's hook)
+#endif
     int on = g_on.load();
     if (on < 0) {
         const char* e = getenv("TOTK_MENU_CURSOR");
@@ -94,6 +97,12 @@ bool enabled() {
 #ifdef _WIN32
 constexpr u64 kMain = 0x7100000000ull;          // main's base in the engine (gen.py IMGBASE)
 constexpr u64 kScreenMgr = totk_main(0x4640010);   // eui::ScreenMgr::sInstance
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+// another game version: a ScreenMgr the porter could not place reads as none (no menu screen known), never the sentinel
+#define SCREEN_MGR() (totk_main_known_rt(0x4640010) ? rd<u64>(kScreenMgr) : 0ull)
+#else
+#define SCREEN_MGR() rd<u64>(kScreenMgr)
+#endif
 
 // eui::ScreenMgr, BoxCursorMgr, BoxCursorControl
 constexpr u64 kSmBoxCursorMgr = 0x3f8, kBmControls = 0x28, kCtlActive = 0x58, kCtlReserved = 0x60;
@@ -210,7 +219,7 @@ bool pane_hit_ndc(u64 pane, const Xf& t, float ndx, float ndy) {
 struct Focus { u64 control, node, screen; int target; };   // (target: the draw target, 0 or 1)
 // The focused node of an open screen, from the draw targets' box cursors (all 0: none, as in gameplay)
 Focus focus_now() {
-    const u64 sm = rd<u64>(kScreenMgr);
+    const u64 sm = SCREEN_MGR();
     if (!game_object(sm)) return {};
     const u64 bm = rd<u64>(sm + kSmBoxCursorMgr);
     if (!ptr_ok(bm)) return {};
@@ -672,7 +681,7 @@ int quick_of(u64 scr, const char* nm) {
 void census(u64 now) {
     static u64 last_at, last_hash;
     static int lines;
-    const u64 sm = rd<u64>(kScreenMgr);
+    const u64 sm = SCREEN_MGR();
     if (!game_object(sm)) return;
     const s32 n = rd<s32>(sm + 0x8);
     const u64 arr = rd<u64>(sm + 0x10);
@@ -1095,7 +1104,7 @@ void glyph_pass() {
         static unsigned n;
         const bool all = !strcmp(ds, "*");
         if (!all || n++ % 30 == 0) {
-            const u64 sm = rd<u64>(kScreenMgr);
+            const u64 sm = SCREEN_MGR();
             const s32 cnt = game_object(sm) ? rd<s32>(sm + 0x8) : 0;
             const u64 arr = game_object(sm) ? rd<u64>(sm + 0x10) : 0;
             for (s32 i = 0; i < cnt && i < 1024 && ptr_ok(arr); i++) {
@@ -1496,7 +1505,7 @@ void take_tasks(ULONGLONG now, UiTask* run, int* nrun, UiTask* drop, int* ndrop)
 int press_down(u64 node, int target) {
     const u64 btn = rd<u64>(node + kNodeButton);
     if (!ptr_ok(btn) || (rd<u32>(btn + kBtnFlags) & 0x14) != 0x14) return -1;
-    const u64 sm = rd<u64>(kScreenMgr), bm = game_object(sm) ? rd<u64>(sm + kSmBoxCursorMgr) : 0;
+    const u64 sm = SCREEN_MGR(), bm = game_object(sm) ? rd<u64>(sm + kSmBoxCursorMgr) : 0;
     if (!ptr_ok(bm) || rd<s32>(bm + 0x14) != -1) return 0;
     Ctx* const c = guest_bridge::tl_ctx;
     const u64 nvt = rd<u64>(node), dec = ptr_ok(nvt) ? rd<u64>(nvt + 0x30) : 0;
@@ -1532,7 +1541,7 @@ int press_down(u64 node, int target) {
 // it makes. True when it wrote them (the caller then re-raises the request bit until the focus is there).
 bool move_focus(const Focus& f, u64 node) {
     if (g_in_hook) {
-        const u64 sm = rd<u64>(kScreenMgr), bm = game_object(sm) ? rd<u64>(sm + kSmBoxCursorMgr) : 0;
+        const u64 sm = SCREEN_MGR(), bm = game_object(sm) ? rd<u64>(sm + kSmBoxCursorMgr) : 0;
         if (ptr_ok(bm)) MoveBoxCursor(bm, node);
         return false;
     }
@@ -1598,7 +1607,7 @@ u64 walk_step(const Focus& f, ULONGLONG now) {
 bool verbose();
 // An open screen by its layout's name (0: none)
 u64 open_screen(const char* name) {
-    const u64 sm = rd<u64>(kScreenMgr);
+    const u64 sm = SCREEN_MGR();
     if (!game_object(sm)) return 0;
     const s32 n = rd<s32>(sm + 0x8);
     const u64 arr = rd<u64>(sm + 0x10);
@@ -1827,7 +1836,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
             else if (++st_wait > 3) snap("the step was not made");
         }
         if (scr && getenv("TOTK_MC_STRIP_DIAG")) {   // tests: where the strip keeps its focus (logged as it changes)
-            const u64 sm = rd<u64>(kScreenMgr), bm = game_object(sm) ? rd<u64>(sm + kSmBoxCursorMgr) : 0;
+            const u64 sm = SCREEN_MGR(), bm = game_object(sm) ? rd<u64>(sm + kSmBoxCursorMgr) : 0;
             const u64 slide = rd<u64>(scr + 0x1a8), slc = ptr_ok(slide) ? rd<u64>(slide + 0x50) : 0;
             u64 c[2] = {}, cs[2] = {};
             for (int i = 0; i < 2 && ptr_ok(bm); i++) {
@@ -2328,6 +2337,9 @@ extern "C" void totk_menu_pad_hold(uint32_t buttons) {
 // moves the focus to the item under the pointer; returns the pad buttons the clicks give (HidNpadButton A / B).
 // One read at a time (its state is shared); a read that finds the lock taken gets the last answer.
 extern "C" u64 totk_menu_cursor_frame(void) {
+#ifdef TOTK_BETA_OFF_PC_MENUS
+    return 0;   // (a beta without the PC menus' hooks: nothing to read or drive)
+#endif
 #ifdef _WIN32
     static std::atomic<u64> last{0};
     // Design A: eui's thread runs it all; the pad gets only the hook's Purah Pad page walk (L / R)

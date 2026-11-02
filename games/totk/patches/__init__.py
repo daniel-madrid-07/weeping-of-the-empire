@@ -152,6 +152,8 @@ def read_table(path=TABLE_V100, image=None):
     its `new`, after every feature's original_sha256 was checked (resolve)."""
     with open(path, 'rb') as f:
         t = tomllib.load(f)
+    t.setdefault('patch', [])     # (a diagnostic table of another version: its build's facts, no word yet)
+    t.setdefault('veneer', [])
     for p in t['patch']:
         p['new'] = bytes.fromhex(p['new']) if 'new' in p else None
         p['original'] = None
@@ -274,5 +276,5 @@ def apply(image, table, features):
         veneers=[dict(feature=v['feature'], start=hex(v['start']), end=hex(v['end'])) for v in veneers],
         data_page=dict(module='main', offset=hex(g['data_page']), size=hex(g['data_page_size']),
                        header='games/totk/include/totk/data_page.h'),
-        uses_data_page=any(f not in ('fps60', 'highfps') for f in features),
+        uses_data_page=any(f not in ('fps60', 'highfps', 'fade') for f in features),
         image_sha256=hashlib.sha256(image).hexdigest())

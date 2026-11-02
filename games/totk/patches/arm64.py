@@ -158,6 +158,21 @@ def sub_w(rd, rn, rm):
     return 0x4b000000 | _reg(rm) << 16 | _reg(rn) << 5 | _reg(rd)
 
 
+def add_w(rd, rn, rm):
+    return 0x0b000000 | _reg(rm) << 16 | _reg(rn) << 5 | _reg(rd)
+
+
+def clz_w(rd, rn):
+    return 0x5ac01000 | _reg(rn) << 5 | _reg(rd)
+
+
+def lsr_w(rd, rn, shift):
+    """lsr w<rd>, w<rn>, #shift (ubfm w<rd>, w<rn>, #shift, #31)."""
+    if not 0 <= shift < 32:
+        raise ValueError(f'lsr w, #{shift}')
+    return 0x53007c00 | shift << 16 | _reg(rn) << 5 | _reg(rd)
+
+
 def cmp_w_imm(rn, imm):
     """cmp w<rn>, #imm (subs wzr, w<rn>, #imm)."""
     if not 0 <= imm < 0x1000:

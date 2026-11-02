@@ -13,6 +13,8 @@ import argparse, ctypes, ctypes.util, os, shutil, struct, sys, zlib
 # overlay romfs directory to write (the runtime reads <exe dir>/data/overlay/romfs, or TOTK_OVERLAY), libzstd from the system.
 ROMFS = os.environ.get("TOTK_ROMFS", "C:/totk/extract/romfs")
 REL = "System/Resource/ResourceSizeTable.Product.100.rsizetable.zs"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from romfs_src import RomFS   # (the folder, or romfs.bin beside it: a player's install unpacks none)
 OUT = os.environ.get("TOTK_OVERLAY_OUT", "C:/totk/overlay/romfs") + "/" + REL
 def _libzstd():
     """Git for Windows' libzstd.dll: NXR_LIBZSTD, the default install, the per-user one (winget --scope user), else the
@@ -73,17 +75,16 @@ def main():
     a = ap.parse_args()
     exts = tuple(e.strip() for e in a.ext.split(',') if e.strip())
 
-    d = bytearray(unzstd(open(os.path.join(ROMFS, REL), 'rb').read()))
+    rom = RomFS(ROMFS)
+    d = bytearray(unzstd(rom.read(REL)))
     assert d[:6] == b'RESTBL', d[:6]
     ver, slen, ncrc, nname = struct.unpack_from('<4I', d, 6)
     hdr = 22
     names = {}                                            # crc32(path) -> path for the selected suffixes
-    for root, _, files in os.walk(ROMFS):
-        for f in files:
-            p = os.path.relpath(os.path.join(root, f), ROMFS).replace('\\', '/')
-            for sfx in ('.zs', '.mc'):                     # RSTB keys name the decoded file (x.bfres for x.bfres.mc)
-                if p.endswith(sfx): p = p[:-len(sfx)]
-            if p.endswith(exts): names[zlib.crc32(p.encode())] = p
+    for p in rom.names():
+        for sfx in ('.zs', '.mc'):                         # RSTB keys name the decoded file (x.bfres for x.bfres.mc)
+            if p.endswith(sfx): p = p[:-len(sfx)]
+        if p.endswith(exts): names[zlib.crc32(p.encode())] = p
     grown = 0; added = 0
     for i in range(ncrc):
         o = hdr + 8 * i

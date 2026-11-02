@@ -45,22 +45,26 @@ std::atomic<int> g_hand{TPH_NONE};   // the weapon class last seen in hand (totk
 #ifdef _WIN32
 constexpr u64 kMain = 0x7100000000ull;           // main's base in the engine (gen.py IMGBASE)
 constexpr u64 kEventMgrSlot = 0x4557b30;   // GOT slot of EventMgr*; +0x58 mpMainEvent != 0 while an event runs (D1)
+constexpr u64 kEmMainEvent = totk_field(EventMgr, 0x58);
 // GameDataMgr (its GOT slot), its setBool, and the bool the bow strip sets to take the bow out (totk_player_game_calls)
 constexpr u64 kGameDataMgrSlot = 0x4557b20, kGameDataSetBool = 0xa02aec;
 constexpr u32 kGdBowTakeOut = 0x2f03cd3e;
 // the actor's component array and the components read here
-constexpr u64 kActorComponents = 0x220, kCompAttention = 0x128, kCompAS = 0x158, kCompPlayer = 0x3a8,
-              kCompSpecialPower = 0x478;
-constexpr u64 kASSlots = 0x1f0, kSlotVerb = 0x28, kSlotVerbAlt = 0x4c;   // BSA: 5 slots, each one's verb
-constexpr u64 kPlStateBytes = 0x1424;                                    // Player
+constexpr u64 kActorComponents = totk_field(Actor, 0x220), kCompAttention = totk_field(ActorComps, 0x128),
+              kCompAS = totk_field(ActorComps, 0x158), kCompPlayer = totk_field(ActorComps, 0x3a8),
+              kCompSpecialPower = totk_field(ActorComps, 0x478);
+constexpr u64 kASSlots = totk_field(BSA, 0x1f0), kSlotVerb = totk_field(BsaSlot, 0x28),   // BSA: 5 slots, each one's
+              kSlotVerbAlt = totk_field(BsaSlot, 0x4c);                                     // verb
+constexpr u64 kPlStateBytes = totk_field(Player, 0x1424);                                   // Player
 // The Player's move rate as the game reads it for the running attack (main+0x1076b40: +0xf24, a float, clamped to
 // 0..0.5; when it is ~0, 0.5 if +0xad8 bit 0 else 0); the walk scheduler's DashAttack test (main+0x16e9130) wants
 // >= 0.25 with slot-0 verb Walk (1), the weapon sheathed and a VK 9 trigger: the draw-slash
-constexpr u64 kPlMoveRate = 0xf24, kPlMoveFlags = 0xad8;
+constexpr u64 kPlMoveRate = totk_field(Player, 0xf24), kPlMoveFlags = totk_field(Player, 0xad8);
 constexpr int kVerbWalk = 1;
-constexpr u64 kAttState = 0xe8;                                          // AttentionReceiver
-constexpr u64 kSpRequested = 0x68, kSpCurrent = 0x6c, kSpUltraHand = 0x28;   // SpecialPower
-constexpr u64 kUhState = 0x18;                                           // UltraHand
+constexpr u64 kAttState = totk_field(AttentionReceiver, 0xe8);
+constexpr u64 kSpRequested = totk_field(SpecialPower, 0x68), kSpCurrent = totk_field(SpecialPower, 0x6c),
+              kSpUltraHand = totk_field(SpecialPower, 0x28);
+constexpr u64 kUhState = totk_field(UltraHand, 0x18);
 // What is in the hands: the game's own test, the state test's WeaponDrawn (27) = Equipment::isSlotValidActor
 // (main+0x8f4c60) on DynamicEquipmentSlot 0 Weapon, 3 Bow, 4 Shield. The component array's EquipmentUser (+0x230)
 // links each slot's equipment actor (mDynamicEquipmentLinks +0x20, 8 ActorLinks of 0x18: +8 the link data, +0x10 the
@@ -69,22 +73,26 @@ constexpr u64 kUhState = 0x18;                                           // Ultr
 // EquipedDrawn, 2 / 4 sheathed (isSheathed main+0x697a9c, getEquipState main+0x8b738c); bit 0 clear counts as
 // sheathed. EquipmentUser +0x4610 + slot, a byte per slot, overrides it: bit 1 drawn, bit 2 sheathed. On the game
 // thread (a calc thread) the game reads all this with no lock.
-constexpr u64 kCompEquipmentUser = 0x230, kCompDynamicEquipment = 0x208;
-constexpr u64 kEuLinks = 0x20, kEuLinkSize = 0x18, kEuSlotForce = 0x4610;
-constexpr u64 kLinkData = 0x8, kLinkProcId = 0x10, kLinkDataProc = 0x40, kLinkDataId = 0x48, kProcState = 0x24;
-constexpr u64 kDeStateFlags = 0x3d0, kDeState = 0x3d4;
+constexpr u64 kCompEquipmentUser = totk_field(ActorComps, 0x230), kCompDynamicEquipment = totk_field(ActorComps, 0x208);
+constexpr u64 kEuLinks = totk_field(EquipmentUser, 0x20), kEuLinkSize = 0x18,
+              kEuSlotForce = totk_field(EquipmentUser, 0x4610);
+// (the ActorLinks are BaseProcLinks, read as totk_globals.h reads the player's)
+constexpr u64 kLinkData = totk_field(BaseProcLink, 0x8), kLinkProcId = totk_field(BaseProcLink, 0x10),
+              kLinkDataProc = totk_field(BaseProcUnit, 0x40), kLinkDataId = totk_field(BaseProcUnit, 0x48),
+              kProcState = totk_field(BaseProc, 0x24);
+constexpr u64 kDeStateFlags = totk_field(DynamicEquipment, 0x3d0), kDeState = totk_field(DynamicEquipment, 0x3d4);
 constexpr int kSlotWeapon = 0, kSlotBow = 3, kSlotShield = 4;   // enum game::equipment::DynamicEquipmentSlot
 // a slot's state: none (no live equipment actor), drawn, sheathed, or kHandRaw | another EquipState (0 too: the
 // actor is there, so it is equipped; logged raw)
 constexpr u8 kHandNone = 0, kHandDrawn = 1, kHandSheathed = 2, kHandRaw = 0x80;
 // (logged only, a lead for the class LMB uses: does either keep "bow" after the bow strip's cancel?)
 // EquipmentUser.mEquippedDrawnWeaponType (+0x3ebc) and mAttachReadySlot (+0x3ee4, a DynamicEquipmentSlot)
-constexpr u64 kEuDrawnType = 0x3ebc, kEuReadySlot = 0x3ee4;
+constexpr u64 kEuDrawnType = totk_field(EquipmentUser, 0x3ebc), kEuReadySlot = totk_field(EquipmentUser, 0x3ee4);
 constexpr int kVerbInvalid = 284;
 // the SHIELD SURF's refused latch (Player::preCalc clears it once either key is up). Not the parry
-constexpr u64 kParryWord = 0x28;
+constexpr u64 kParryWord = totk_field(Player, 0x28);
 // the active slow motion
-constexpr u64 kSpStepType = 0x12e8;
+constexpr u64 kSpStepType = totk_field(Player, 0x12e8);
 constexpr u32 kSpStepNone = 0x11, kSpStepGuardJust = 1;
 constexpr int kParryBit = 57;
 // The steering stick. Holding one shows only as verb 48 Manipulate, which other held devices share, and no Player
@@ -95,11 +103,27 @@ constexpr int kParryBit = 57;
 // update), gated on slot-0 verb 48 and a live link, and asked again only when the link changes. There it takes no lock
 // (the link's mutex +0x28 is taken only off a BaseProcMgr thread, FUN_10006fd914) and the reference it takes on the
 // linked actor (ActorLinkBase::getReference) it drops before it returns.
-constexpr u64 kCompRideLink = 0x410;
-constexpr u64 kLinkId = 0x30, kLinkLive = 0x38, kLinkSlot = 0x3c;
+constexpr u64 kCompRideLink = totk_field(ActorComps, 0x410);
+constexpr u64 kLinkId = totk_field(RideLink, 0x30), kLinkLive = totk_field(RideLink, 0x38),
+              kLinkSlot = totk_field(RideLink, 0x3c);
 constexpr u64 kQueryPlayerState = 0x12af610;   // FUN_10012af610(actor, EventQueryPlayerState) -> bool
 constexpr u32 kQueryRideControlStick = 23;
 constexpr int kVerbManipulate = 48;
+constexpr u64 kRootPlayerLink = totk_field(PlayerRoot, 0x20);   // (logged only: totk_globals.h's walk)
+
+// The fields are 1.0.0 offsets through totk_field (totk_version.h): another version's build maps each one or does not
+// compile; a diagnostic one leaves an unplaced field at TOTK_FIELD_UNKNOWN, and then the walks read nothing (no
+// player). 1.0.0: always true.
+constexpr bool kFieldsKnown = [] {
+    for (const u64 f : {kEmMainEvent, kActorComponents, kCompAttention, kCompAS, kCompPlayer, kCompSpecialPower,
+                        kASSlots, kSlotVerb, kSlotVerbAlt, kPlStateBytes, kPlMoveRate, kPlMoveFlags, kAttState,
+                        kSpRequested, kSpCurrent, kSpUltraHand, kUhState, kCompEquipmentUser, kCompDynamicEquipment,
+                        kEuLinks, kEuSlotForce, kLinkData, kLinkProcId, kLinkDataProc, kLinkDataId, kProcState,
+                        kDeStateFlags, kDeState, kEuDrawnType, kEuReadySlot, kParryWord, kSpStepType, kCompRideLink,
+                        kLinkId, kLinkLive, kLinkSlot, kRootPlayerLink})
+        if (f == TOTK_FIELD_UNKNOWN) return false;
+    return true;
+}();
 
 template <class T> T rd(u64 a) {
     T v;
@@ -187,11 +211,12 @@ u8 hand_state(u64 eu, int slot) {
     return kHandRaw | (u8)(st >= 0 && st < 0x7f ? st : 0x7e);
 }
 bool sample_walk(Sample* s, int req) {
+    if (!kFieldsKnown) return true;
     __try {
         // an event (talk, cutscene): ExecutePlayerCalcKey's own test for cutting the player's input, read with or
         // without a player
         const u64 em = totk_global(kEventMgrSlot);
-        s->event = ptr_ok(em) && rd<u64>(em + 0x58) != 0;
+        s->event = ptr_ok(em) && rd<u64>(em + kEmMainEvent) != 0;
         const u64 actor = player_actor();
         const u64 comps = actor ? rd<u64>(actor + kActorComponents) : 0;
         const u64 as = ptr_ok(comps) ? rd<u64>(comps + kCompAS) : 0;
@@ -202,15 +227,15 @@ bool sample_walk(Sample* s, int req) {
                 if (now - last > 2000) {
                     last = now;
                     // totk_globals.h's walk: the global's link (+0x20): id (+0x10), unit (+0x8, its id +0x48), proc
-                    const u64 root = totk_global(0x4562308), link = root + 0x20;
-                    const u64 unit = ptr_ok(root) ? rd<u64>(link + 8) : 0;
-                    const u64 proc = ptr_ok(unit) ? rd<u64>(unit + 0x40) : 0;
+                    const u64 root = totk_global(0x4562308), link = root + kRootPlayerLink;
+                    const u64 unit = ptr_ok(root) ? rd<u64>(link + kLinkData) : 0;
+                    const u64 proc = ptr_ok(unit) ? rd<u64>(unit + kLinkDataProc) : 0;
                     printf("[player] no player: root %#llx id %d unit %#llx unit id %d proc %#llx vt %#llx state %u; "
                            "actor %#llx comps %#llx as %#llx as vt %#llx\n",
-                           (unsigned long long)root, ptr_ok(root) ? rd<s32>(link + 0x10) : 0, (unsigned long long)unit,
-                           ptr_ok(unit) ? rd<s32>(unit + 0x48) : 0, (unsigned long long)proc,
+                           (unsigned long long)root, ptr_ok(root) ? rd<s32>(link + kLinkProcId) : 0, (unsigned long long)unit,
+                           ptr_ok(unit) ? rd<s32>(unit + kLinkDataId) : 0, (unsigned long long)proc,
                            ptr_ok(proc) ? (unsigned long long)rd<u64>(proc) : 0ull,
-                           ptr_ok(proc) ? rd<u32>(proc + 0x24) : 0u, (unsigned long long)actor,
+                           ptr_ok(proc) ? rd<u32>(proc + kProcState) : 0u, (unsigned long long)actor,
                            (unsigned long long)comps, (unsigned long long)as,
                            ptr_ok(as) ? (unsigned long long)rd<u64>(as) : 0ull);
                 }
@@ -285,6 +310,7 @@ bool sample(Sample* s, int req) {
 // The ride link's identity, plain loads under SEH (the walk's rules): false without a live link.
 struct RideLink { u64 actor; s32 id; u32 slot; };
 bool ride_link_walk(RideLink* r) {
+    if (!kFieldsKnown) return false;
     __try {
         const u64 actor = player_actor();
         const u64 comps = actor ? rd<u64>(actor + kActorComponents) : 0;
@@ -312,9 +338,18 @@ bool ride_link(RideLink* r) {
 // (components +0x128): active (state +0xe8 2 or 3) with clients (+0x58), the best client entry (**(+0x60), its +0x20
 // bit 0), the client actor (+0x8), its affordance mask (+0x5a0) bit 5. No lock (the game takes +0x78 for this read):
 // every pointer checked, a torn read is one frame's 'no'
-constexpr u64 kRideLinkData = 0x28, kRecvState = 0xe8, kRecvClients = 0x58, kRecvBest = 0x60, kClientEntryFlags = 0x20,
-              kClientEntryActor = 0x8, kActorAffordance = 0x5a0;
+constexpr u64 kRideLinkData = totk_field(RideLink, 0x28), kRecvState = totk_field(AttentionReceiver, 0xe8),
+              kRecvClients = totk_field(AttentionReceiver, 0x58), kRecvBest = totk_field(AttentionReceiver, 0x60),
+              kClientEntryFlags = totk_field(AttentionClientEntry, 0x20),
+              kClientEntryActor = totk_field(AttentionClientEntry, 0x8), kActorAffordance = totk_field(Actor, 0x5a0);
+constexpr bool kReachFieldsKnown = [] {   // (kFieldsKnown's rule)
+    for (const u64 f : {kRideLinkData, kRecvState, kRecvClients, kRecvBest, kClientEntryFlags, kClientEntryActor,
+                        kActorAffordance})
+        if (f == TOTK_FIELD_UNKNOWN) return false;
+    return kFieldsKnown;
+}();
 int construct_reach_walk() {
+    if (!kReachFieldsKnown) return -1;
     __try {
         const u64 actor = player_actor();
         const u64 comps = actor ? rd<u64>(actor + kActorComponents) : 0;
@@ -594,7 +629,7 @@ extern "C" void totk_player_game_calls(Ctx* c) {
     const uint32_t st = totk_player_state();
     const u64 gdm = totk_global(kGameDataMgrSlot);
     const bool stale = GetTickCount64() - asked > 250;
-    const bool ok = !stale && bow_request_ok(st) && ptr_ok(gdm);
+    const bool ok = !stale && bow_request_ok(st) && ptr_ok(gdm) && totk_main_known(kGameDataSetBool);
     if (ok) {   // (after this the hook reads no guest register but sets x0 itself: totk_pc_vk.cpp)
         c->x[0] = gdm;
         c->x[1] = 1;
@@ -642,7 +677,8 @@ extern "C" void totk_player_stick_frame(Ctx* c) {
     static int logs;
     bool now = false;
     RideLink r;
-    if (g_verb[0].load(std::memory_order_relaxed) == kVerbManipulate && ride_link(&r)) {
+    if (g_verb[0].load(std::memory_order_relaxed) == kVerbManipulate && totk_main_known(kQueryPlayerState) &&
+        ride_link(&r)) {
         if (r.actor != asked.actor || r.id != asked.id || r.slot != asked.slot) {
             asked = r;
             c->x[0] = r.actor;

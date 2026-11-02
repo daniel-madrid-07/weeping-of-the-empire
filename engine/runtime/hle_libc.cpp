@@ -1,5 +1,6 @@
 // HLE: libc / libm / C++ ABI imports. Guest pointers are host pointers (identity mapping).
 #include "hle.h"
+#include "nxr_game.h"   // (NXR_GAME_TOTK: forms TotK's build leaves out)
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
@@ -101,3 +102,39 @@ HLE_AS(sj, "setjmp") {
 HLE_AS(sj_, "_setjmp") { hle_sj(c); }
 HLE_AS(lj, "longjmp") { rt_trap(c, c->x[30], "longjmp (error path in sdk code; not supported yet)"); }
 HLE_AS(lj_, "_longjmp") { hle_lj(c); }
+
+#if !NXR_GAME_TOTK
+// HLE: the SDK's abort / error paths and nn::Result's C helpers (SDK 11.4 forms; TotK imports none of these names).
+// An abort logs its condition, function, file, line and format string, then traps: a boot that dies there names the
+// failed check instead of running on from a stub's 0. Semantics from an SDK 11.4 sdk's code:
+// nndetailDiagAbortFormatImpl(cond, func, file, line, fmt,...) forwards to nn::diag::detail::AbortImpl(char const*,
+// char const*, char const*, int, char const*,...); nnResult* are bit tests (module = bits 0-8, description = 9-21).
+
+static const char* str_or(u64 p, const char* dflt) { return p ? (const char*)p : dflt; }
+static void abort_log(Ctx* c, const char* what, u64 cond, u64 func, u64 file, u64 line, u64 fmt, u32 result) {
+    printf("[diag] %s: '%s' failed in %s (%s:%d)%s%s", what, str_or(cond, "?"), str_or(func, "?"), str_or(file, "?"), (int)line,
+           fmt ? " - " : "", fmt ? (const char*)fmt : "");
+    if (result) printf(" result %#x (module %u, description %u)", result, result & 0x1FF, (result >> 9) & 0x1FFF);
+    printf(" lr=%llx\n", (unsigned long long)c->x[30]);
+    fflush(stdout);
+    rt_trap(c, c->x[30], what);
+}
+HLE_AS(diag_AbortImpl4, "_ZN2nn4diag6detail9AbortImplEPKcS3_S3_i") { abort_log(c, "nn::diag abort", c->x[0], c->x[1], c->x[2], c->x[3], 0, 0); }
+HLE_AS(diag_AbortImplResult, "_ZN2nn4diag6detail9AbortImplEPKcS3_S3_iPKNS_6ResultES3_z") {
+    abort_log(c, "nn::diag abort", c->x[0], c->x[1], c->x[2], c->x[3], c->x[5], c->x[4] ? *(u32*)c->x[4] : 0);
+}
+HLE_AS(diag_AbortFormatC, "nndetailDiagAbortFormatImpl") { abort_log(c, "nn::diag abort", c->x[0], c->x[1], c->x[2], c->x[3], c->x[4], 0); }
+HLE_AS(detail_UnexpectedDefault, "_ZN2nn6detail21UnexpectedDefaultImplEPKcS2_i") {
+    abort_log(c, "unexpected default", 0, c->x[0], c->x[1], c->x[2], 0, 0);
+}
+// nn::err::ShowError(ErrorCode): the error applet; logged, the game carries on (ErrorCode = category, number)
+HLE_AS(err_ShowErrorCode, "_ZN2nn3err9ShowErrorENS0_9ErrorCodeE") {
+    printf("[err] ShowError(ErrorCode %u-%u) lr=%llx\n", (u32)c->x[0], (u32)(c->x[0] >> 32), (unsigned long long)c->x[30]);
+    fflush(stdout);
+}
+HLE_AS(res_IsSuccess, "nnResultIsSuccess") { c->x[0] = (u32)c->x[0] == 0; }
+HLE_AS(res_IsFailure, "nnResultIsFailure") { c->x[0] = (u32)c->x[0] != 0; }
+HLE_AS(res_GetModule, "nnResultGetModule") { c->x[0] = (u32)c->x[0] & 0x1FF; }
+HLE_AS(res_GetDescription, "nnResultGetDescription") { c->x[0] = ((u32)c->x[0] >> 9) & 0x1FFF; }
+
+#endif

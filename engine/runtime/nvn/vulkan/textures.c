@@ -13,6 +13,7 @@
 #include <x86intrin.h>
 #endif
 
+#include "contact.h"
 #include "vk.h"
 #include "../../cpu_place.h"   // nxrecomp: which cores each pool runs on
 #include "shaders.h"
@@ -491,13 +492,32 @@ static Dead *dead;
 static int ndead, cap_dead;
 static void views_forget(TexBackend *b);
 
-void vk_collect_dead(void) {
+// At most LARECOMP_FREE_FRAME=<images>,<MB> images / buffers freed a frame (default 48,256; 0 = all at once, as before).
+// A residency round (512 textures) plus the recycle pool's frees came due together, one vk_collect_dead freed them all:
+// their 333-422 ms frames from bulk drops, fixed the same way). What waits is freed at the next submissions; views always
+// go.
+VkDeviceSize vma_shim_size(VmaAllocation al);
+static void vk_collect_dead_(bool all);
+void vk_collect_dead(void) { vk_collect_dead_(false); }
+static void vk_collect_dead_(bool all) {
+    static int lim_n = -1;
+    static uint64_t lim_b, frame, n_fr, b_fr;
+    if (lim_n < 0) {
+        const char *e = getenv("LARECOMP_FREE_FRAME");
+        lim_n = 48; lim_b = 256ull << 20;
+        if (e) { lim_n = atoi(e); const char *c = strchr(e, ','); lim_b = (c ? strtoull(c + 1, NULL, 10) : 256ull) << 20; }
+    }
+    const uint64_t fc = vk_frame_counter();
+    if (fc != frame) { frame = fc; n_fr = b_fr = 0; }
     uint64_t done = vk_completed_seq();
-    int k = 0;
+    int k = 0, held = 0;
     for (int i = 0; i < ndead; i++) {
         if (dead[i].seq > done) { dead[k++] = dead[i]; continue; }
-        if (dead[i].view) vkDestroyImageView(g_vk.dev, dead[i].view, NULL);
-        else if (dead[i].buf) vmaDestroyBuffer(g_vk.vma, dead[i].buf, dead[i].mem);
+        if (dead[i].view) { vkDestroyImageView(g_vk.dev, dead[i].view, NULL); continue; }
+        // (next time; a backlog over 512 is freed anyway, so a steady stream above the limit never piles up)
+        if (!all && lim_n > 0 && (n_fr >= (uint64_t)lim_n || b_fr >= lim_b) && held < 512) { dead[k++] = dead[i]; held++; continue; }
+        n_fr++; b_fr += vma_shim_size(dead[i].mem);
+        if (dead[i].buf) vmaDestroyBuffer(g_vk.vma, dead[i].buf, dead[i].mem);
         else vmaDestroyImage(g_vk.vma, dead[i].img, dead[i].mem);
     }
     ndead = k;
@@ -623,6 +643,9 @@ static void create_image_(NvnTexture *t, TexBackend *b) {
     // (render targets the game also samples while they are bound: exec.c declares those feedback loops, device.c)
     if ((g_vk.feedback_loop || g_vk.fbl_layout) && (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
         usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    // (contact.c: with TOTK_CONTACT_SHADOWS on, the scene colour the contact-shadow march writes in place)
+    if ((usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && contact_wants_storage(vf) && format_supports(vf, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+        usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageCreateFlags flags = 0;
     if (!depthfmt) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // format views (NVN texture views, raw sRGB views)
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1 && (cube_compat_all() || t->target == 8 || t->target == 9))
@@ -716,6 +739,7 @@ uint64_t vk_twin_copies;   // (device.c stats window)
 static VkFormat twin_format(VkFormat f) {
     return f == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : f == VK_FORMAT_R16_UNORM ? VK_FORMAT_D16_UNORM : VK_FORMAT_UNDEFINED;
 }
+bool vk_depth_twin_format(VkFormat f) { return twin_format(f) != VK_FORMAT_UNDEFINED; }   // (exec.c: a colour format a compare can mean)
 static int twin_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -1368,6 +1392,7 @@ void backend_texture_destroyed(NvnTexture *t) {
             (void *)b->image);
     if (b) {
         live_remove(b);
+        contact_forget(b);   // (contact.c: pooled or freed, the pointer may come back as another texture's)
         if (!recycle_put(t, b)) free_backend(b);
     }
     t->backend = NULL;
@@ -1378,7 +1403,7 @@ void vk_textures_reset(void) {
     int n = g_nlive;
     while (g_nlive > 0) backend_texture_destroyed(g_live[g_nlive - 1]);
     recycle_flush();
-    vk_collect_dead();
+    vk_collect_dead_(true);   // (GPU idle: all of it)
     LOG("[vk] reboot: %d textures released\n", n);
 }
 
@@ -1437,6 +1462,9 @@ uint64_t vk_residency_pressure(bool *commit) { if (commit) *commit = res_pressur
 // SDL_GetTicksNS() of the last measurement that found pressure (need > 0, before this round's frees; 0 = never): VRAM or
 // commit is short even when the round's own frees answer it
 uint64_t vk_residency_need_ns(void) { return res_need_ns; }
+// short now, or a measurement found pressure within the last 2 s (res_pressure reads 0 in a round's cool-down and once the
+// round's frees answer it on paper, before they complete): shim_vma makes no big block or spare then
+bool vk_residency_tight(void) { uint64_t t = res_need_ns; return res_pressure || (t && SDL_GetTicksNS() - t < 2000000000ull); }
 static int res_cmp(const void *a, const void *b) {
     uint64_t x = ((const TexBackend *)((NvnTexture *const *)a)[0]->backend)->last_use;
     uint64_t y = ((const TexBackend *)((NvnTexture *const *)b)[0]->backend)->last_use;
@@ -1515,6 +1543,8 @@ void vk_residency_tick(void) {
     if (need) res_need_ns = now;
     res_pressure_commit = cneed != 0;
     if (!need) return;
+    extern void vma_shim_drop_spares(void);
+    vma_shim_drop_spares();   // (idle spare blocks first: 256 MB each held for nothing while short)
     // 1. the recycle pool, oldest first
     int npool = 0;
     while (freed < need) {
@@ -1531,7 +1561,9 @@ void vk_residency_tick(void) {
         free_backend(old);
         npool++;
     }
-    // 2. idle sampled textures, least recently used first (at most 512 MB / 512 textures a round: one view-table scan)
+    // 2. idle sampled textures, least recently used first: at most 128 textures / 256 MB a round (one view-table scan),
+    // a round every 250 ms while still short (was 512 / 512 MB a second: the frees and the re-creations after them came
+    // as one burst, the 499 ms image right after a 512-texture round)
     uint64_t idle = vk_residency_idle_frames(), fr = vk_frame_counter();
     static NvnTexture **cand;
     static int cap_cand;
@@ -1547,7 +1579,7 @@ void vk_residency_tick(void) {
     if (nc > 1) qsort(cand, nc, sizeof *cand, res_cmp);
     int nev = 0;
     uint64_t evb = 0;
-    for (int i = 0; i < nc && freed < need && nev < 512 && evb < (512ull << 20); i++) {
+    for (int i = 0; i < nc && freed < need && nev < 128 && evb < (256ull << 20); i++) {
         TexBackend *b = cand[i]->backend;
         uint64_t sz = vma_shim_size(b->mem);
         b->evicted = true;   // (marks it for the view scan below)
@@ -1567,7 +1599,7 @@ void vk_residency_tick(void) {
     res_pressure = freed < need ? need - freed : 0;   // (what this round could not free: the mirrors' share, vk_mirror_release_tick)
     if (npool || nev) {
         res_rounds++;
-        cool_until = now + 1000000000ull;
+        cool_until = now + (freed < need ? 250000000ull : 1000000000ull);   // (still short: the next tick goes on)
         if (res_rounds <= 50 || res_rounds % 50 == 0)
             LOG("[vram] residency: heap %d usage %llu MB of budget %llu MB, commit headroom %llu MB%s: freed %d pooled images, evicted %d "
                 "idle textures (%llu MB, idle >= %llu frames); since start evicted %llu (%llu MB), re-created on use %llu (%llu MB)\n", h,
@@ -2169,6 +2201,14 @@ static void upload_texture_(NvnTexture *t, TexBackend *b) {
             // a device loss below 1x after a seed switch.
             if (w > level_w(b, lv)) w = level_w(b, lv);
             if (hh > level_h(b, lv)) hh = level_h(b, lv);
+            if (b->scalable && (w < level_w(b, lv) || hh < level_h(b, lv))) {
+                // (above 1x the guest texels fill only the top-left of the scaled level: public #24's movie plane, which
+                // came by a buffer copy, exec.c buf2tex_scaled; says whether a CPU-filled one shows up too)
+                static int nlog;
+                if (nlog++ < 8)
+                    LOG("[tex] CPU upload into a scaled texture fills its top-left %ux%u of %ux%u: addr %llx %ux%u f%#x flags %#x kind %d\n",
+                        w, hh, level_w(b, lv), level_h(b, lv), (unsigned long long)t->addr, t->width, t->height, t->format, t->flags, b->scale_kind);
+            }
             VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.wb * fi->bw, .bufferImageHeight = l.hb * fi->bh,
                                     .imageSubresource = {b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect, lv,
                                                          b->depth > 1 ? 0 : layer, 1},
@@ -2393,6 +2433,7 @@ void backend_texture_cpu_written(NvnTexture *t) { if (t->backend) ((TexBackend *
 // Host-produced texel data (decoded video, any thread): applied on the render thread at the texture's next use.
 static _Atomic unsigned long long video_frames;   // (hle_vi.cpp: a video playing is not a load on screen)
 unsigned long long renderer_video_frames(void) { return video_frames; }
+void renderer_note_video_frame(void) { video_frames++; }   // (hle_movie.cpp: a decoded frame the game took)
 void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride) {
     video_frames++;
     TexBackend *b = t->backend;
@@ -2416,6 +2457,7 @@ static ViewEnt view_tab[VIEW_TAB];
 void vk_views_forget(TexBackend *b) { views_forget(b); }
 uint32_t vk_view_gen;  // bumped whenever a cached view may be destroyed (exec.c's per-frame texture memo)
 static void views_forget(TexBackend *b) {
+    contact_forget(b);   // (contact.c: its remembered G-buffer images; the image is being destroyed or replaced)
     vk_view_gen++;
     for (int i = 0; i < VIEW_TAB; i++)
         if (view_tab[i].b == b) { defer((Dead){.view = view_tab[i].view}); view_tab[i].b = NULL; view_tab[i].view = VK_NULL_HANDLE; }
@@ -2683,6 +2725,46 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     return vk_dummy_view(want_textype);
 }
 
+// The dummies' views live outside view_tab: vk_image_view's 16-probe eviction could destroy a cached one there, and the
+// dummies' statics would then hand out a dead view.
+static VkImageView dummy_view_of(VkImage img, VkImageViewType vt, VkFormat fmt, VkImageAspectFlags aspect, uint32_t layers) {
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img, .viewType = vt, .format = fmt,
+                                .components = IDENTITY, .subresourceRange = {aspect, 0, 1, 0, layers}};
+    VkImageView v;
+    VK_CHECK(vkCreateImageView(g_vk.dev, &vi, NULL, &v));
+    return v;
+}
+// 1x1 D32 at 0.0 for a depth-compare binding that holds no image a compare can read (exec.c LARECOMP_DREF_DUMMY): 0, as the
+// red of the colour dummy those slots had; 2D / 2D array / cube (depth images have no 1D / 3D), NULL for the others
+VkImageView vk_dummy_depth_view(int textype) {
+    static TexBackend dummies[10];
+    static VkImageView views[10];
+    if (textype < 0 || textype >= 10) textype = TEXTYPE_2D;
+    if (views[textype]) return views[textype];
+    VkImageViewType vt = view_type_for(textype);
+    if (vt != VK_IMAGE_VIEW_TYPE_2D && vt != VK_IMAGE_VIEW_TYPE_2D_ARRAY && vt != VK_IMAGE_VIEW_TYPE_CUBE && vt != VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)
+        return VK_NULL_HANDLE;
+    TexBackend *b = &dummies[textype];
+    bool cube = vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
+                            .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_D32_SFLOAT, .extent = {1, 1, 1}, .mipLevels = 1,
+                            .arrayLayers = cube ? 6 : 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL));
+    VkCommandBuffer cb = vk_upload_cmd();
+    vk_image_init_layout(cb, b->image, VK_IMAGE_ASPECT_DEPTH_BIT);
+    VkClearDepthStencilValue zero = {0.0f, 0};
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, cube ? 6 : 1};
+    vkCmdClearDepthStencilImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+    b->format = VK_FORMAT_D32_SFLOAT;
+    b->aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    b->levels = 1;
+    b->layers = cube ? 6 : 1;
+    views[textype] = dummy_view_of(b->image, vt, b->format, VK_IMAGE_ASPECT_DEPTH_BIT, cube ? 6 : 1);
+    return views[textype];
+}
+
 // 1x1 black textures for unbound slots, per type
 VkImageView vk_dummy_view(int textype) {
     static TexBackend dummies[10];
@@ -2708,7 +2790,7 @@ VkImageView vk_dummy_view(int textype) {
     b->format = VK_FORMAT_R8G8B8A8_UNORM;
     b->levels = 1;
     b->layers = cube ? 6 : 1;
-    views[textype] = vk_image_view(b, vt, b->format, 0, 1, 0, cube ? 6 : 1, IDENTITY, VK_IMAGE_ASPECT_COLOR_BIT);
+    views[textype] = dummy_view_of(b->image, vt, b->format, VK_IMAGE_ASPECT_COLOR_BIT, cube ? 6 : 1);
     return views[textype];
 }
 
@@ -3077,8 +3159,8 @@ static VkSampler samp_get(const VkSamplerCreateInfo *ci, const VkSamplerCustomBo
     return s;
 }
 
-VkSampler vk_sampler(NvnSamplerDesc *d) {
-    if (d->backend) return (VkSampler)d->backend;
+// cmp = false: the same sampler without the depth compare (vk_sampler_plain)
+static VkSampler sampler_make(const NvnSamplerDesc *d, bool cmp, VkSamplerCreateInfo *out) {
     VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = d->mag_filter == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     uint32_t mf = d->min_filter;
@@ -3118,7 +3200,7 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
     // every desktop GPU has 16x, so nothing changes there)
     if (si.anisotropyEnable && !g_vk.sampler_aniso) si.anisotropyEnable = VK_FALSE, si.maxAnisotropy = 1;
     if (si.anisotropyEnable && si.maxAnisotropy > g_vk.props.limits.maxSamplerAnisotropy) si.maxAnisotropy = g_vk.props.limits.maxSamplerAnisotropy;
-    if (d->compare_mode) {
+    if (d->compare_mode && cmp) {
         si.compareEnable = VK_TRUE;
         si.compareOp = getenv("LARECOMP_NO_SHADOW") ? VK_COMPARE_OP_ALWAYS : compare_op(d->compare_func);
     }
@@ -3134,7 +3216,13 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
             si.pNext = &cb;
         } else si.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     }
-    VkSampler s = samp_get(&si, &cb);
+    if (out) *out = si;
+    return samp_get(&si, &cb);
+}
+VkSampler vk_sampler(NvnSamplerDesc *d) {
+    if (d->backend) return (VkSampler)d->backend;
+    VkSamplerCreateInfo si;
+    VkSampler s = sampler_make(d, true, &si);
     d->backend = (void *)s;
     {   // measurement (blurry ground, 2026-10-14): the guest's LOD settings per sampler, first 64
         static int nlog;
@@ -3144,6 +3232,14 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
                 (double)d->max_aniso, d->compare_mode, si.minLod, si.maxLod);
     }
     return s;
+}
+// A compare sampler on a binding the shader samples without a reference: Maxwell's TSC depth compare acts only on its
+// depth-compare fetches, while Vulkan leaves a non-Dref sample through a compareEnable sampler undefined (NVIDIA ignores
+// the compare. The same sampler without the compare; samp_get keeps one per content, so this is a lookup after the
+// first.
+VkSampler vk_sampler_plain(NvnSamplerDesc *d) {
+    if (!d->compare_mode) return vk_sampler(d);
+    return sampler_make(d, false, NULL);
 }
 
 VkSampler vk_default_sampler(bool linear) {

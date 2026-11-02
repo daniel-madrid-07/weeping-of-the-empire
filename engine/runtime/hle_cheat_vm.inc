@@ -1,5 +1,6 @@
 // ---- Cheats (included at the end of hle_hid.cpp; launcher 2026-10-20). TOTK_CHEATS = an Atmosphere-format cheat file holding
-// only the entries the player enabled (the launcher writes it). Our interpreter of that documented cheat format (no code
+// only the entries the player enabled (the Linux launcher writes it); nxr_cheat_program() replaces the program at any time
+// (the mods' cheats/<build id>.txt, toggled in F10 Cheats: mods_exefs.cpp). Our interpreter of that documented cheat format (no code
 // taken from Atmosphere): a thread runs the program 12 times a second, registers reset each run, static registers persist,
 // 0x8 tests HELD keys, 0xC4 has its own press edge per run. Guest memory is identity-mapped: MainNso = 0x7100000000 (FTAB_BASE),
 // heap = g_rt_heap_base. Deviations: alias / aslr region accesses are skipped, pause / resume / debug-log are no-ops, and a run
@@ -26,7 +27,8 @@ static bool mem(u64 a, void* b, size_t n, bool wr) {   // a failed access is sil
     return (wr ? process_vm_writev(getpid(), &l, 1, &r, 1, 0) : process_vm_readv(getpid(), &l, 1, &r, 1, 0)) == (ssize_t)n;
 #endif
 }
-static std::vector<u32> g_prog;
+static std::vector<u32> g_prog;   // the thread runs a copy taken under g_prog_mu each run
+static std::mutex g_prog_mu;
 static u64 g_static[0x100];
 static int g_warned;
 static void warn(const char* m) { if (g_warned++ < 8) printf("[cheat] %s\n", m); }
@@ -207,25 +209,40 @@ static bool load(const char* path) {
         cur->push_back((u32)strtoul(s.substr(i, 8).c_str(), nullptr, 16));
         i = j;
     }
-    g_prog = master; g_prog.insert(g_prog.end(), rest.begin(), rest.end());
-    if (g_prog.size() > 0x400) { printf("[cheat] %zu words > 1024 (dmnt runs nothing)\n", g_prog.size()); g_prog.clear(); }
-    printf("[cheat] %d entries, %zu words from %s\n", entries, g_prog.size(), path);
+    std::vector<u32> prog = master; prog.insert(prog.end(), rest.begin(), rest.end());
+    if (prog.size() > 0x400) { printf("[cheat] %zu words > 1024 (dmnt runs nothing)\n", prog.size()); prog.clear(); }
+    printf("[cheat] %d entries, %zu words from %s\n", entries, prog.size(), path);
+    std::lock_guard<std::mutex> l(g_prog_mu);
+    g_prog = prog;
     return !g_prog.empty();
 }
-static struct Start {
-    Start() {
-        const char* p = getenv("TOTK_CHEATS");
-        if (!p || !*p || !load(p)) return;
+static std::once_flag g_thread_once;
+static void start_thread() {
+    std::call_once(g_thread_once, [] {
         std::thread([] {
             u64 keyold = 0;
             for (;;) {
                 std::this_thread::sleep_for(std::chrono::microseconds(1000000 / 12));   // dmnt TimesPerSecond = 12
                 u64 held = g_cheat_keys.load();
-                Run r(g_prog, held, keyold);
-                r.exec();
+                std::vector<u32> prog;
+                { std::lock_guard<std::mutex> l(g_prog_mu); prog = g_prog; }
+                if (!prog.empty()) { Run r(prog, held, keyold); r.exec(); }
                 keyold = held;
             }
         }).detach();
+    });
+}
+static struct Start {
+    Start() {
+        const char* p = getenv("TOTK_CHEATS");
+        if (p && *p && load(p)) start_thread();
     }
 } g_start;
 }   // namespace cheatvm
+// the whole program (masters first, then the enabled cheats); empty stops it. The thread starts with the first program.
+extern "C" void nxr_cheat_program(const uint32_t* w, size_t n) {
+    if (n > 0x400) { printf("[cheat] %zu words > 1024 (dmnt runs nothing)\n", n); n = 0; }
+    { std::lock_guard<std::mutex> l(cheatvm::g_prog_mu); cheatvm::g_prog.assign(w, w + n); }
+    printf("[cheat] program: %zu words\n", n);
+    if (n) cheatvm::start_thread();
+}

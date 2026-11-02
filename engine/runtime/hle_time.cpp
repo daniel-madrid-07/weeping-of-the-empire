@@ -2,6 +2,7 @@
 // seconds), host time zone = the console's. Layouts follow Eden's core/hle/service/time (PosixTime s64 CalendarTime 8
 // bytes CalendarAdditionalInfo 0x18 SteadyClockTimePoint 0x18 SystemClockContext 0x20 ClockSnapshot 0xD0).
 #include "hle.h"
+#include "nxr_game.h"   // (NXR_GAME_TOTK: forms TotK's build leaves out)
 #include <windows.h>
 #include <ctime>
 #include <cstring>
@@ -87,6 +88,10 @@ HLE_AS(time_ClockSnapshotCreate, "_ZN2nn4time13ClockSnapshot29CreateWithStandard
     s->automatic_correction = 1;
     c->x[0] = 0;
 }
+#if !NXR_GAME_TOTK
+// CreateWithAdjustableSystemClock (SDK 11.4): the same snapshot (the PC's clock is the only clock)
+HLE_AS(time_ClockSnapshotCreateAdjustable, "_ZN2nn4time13ClockSnapshot31CreateWithAdjustableSystemClockEPS1_") { hle_time_ClockSnapshotCreate(c); }
+#endif
 // span between two snapshots from the steady clock (same source: always, in one run)
 HLE_AS(time_CalculateSpanBetween, "_ZN2nn4time20CalculateSpanBetweenEPNS_8TimeSpanERKNS0_13ClockSnapshotES5_") {
     const ClockSnapshot *a = (const ClockSnapshot*)c->x[1], *b = (const ClockSnapshot*)c->x[2];

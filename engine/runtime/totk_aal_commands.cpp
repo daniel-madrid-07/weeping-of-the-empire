@@ -165,3 +165,81 @@ void hook_f_9c2ef0(Ctx *__restrict c) {   // flush the frame's command list (x0:
 #endif
     f_9c2ef0_orig(c);
 }
+
+// ---------------------------------------------------------------- aal's jam watchdog in time, not frames
+// AudioRendererController::calc (main+0x9c2964; once a game frame from aal::System::calc, and in aal's resource-release
+// wait loops) ends by tail-calling main+0x9c2b70, after the frame's flush (9c2ef0) and the source / bus / stream-cache
+// calcs. 9c2b70 keeps a jam counter at this+0x1d8; the hook is on it, so it reads exactly the state its check reads. On
+// a call with the command buffer manager enabled (ld64(this+0x1a0)+8), the free queue empty (CommandManager
+// ld64(this+0x1a8): push +0x401a0 == pop +0x401a4) and queue A holding exactly 12 (+0x401c8 - +0x401cc), it adds 1; at
+// every multiple of 300 it runs the queued lists, switches commands off for good (main+0x21ef964: enabled = 0) and
+// stops the sources. A call with the free queue not empty sets it to 0. 300 calls are 10 s at the Switch's 30 fps, 1.25
+// s at 240. The hook times the jam instead: while that condition holds it adds the time since the previous call (at
+// most 100 ms a call, so a pause or a stall between calls does not count) and keeps the counter below 299 until the jam
+// has lasted kJamSeconds (10 s, TOTK_AAL_WATCHDOG_S); then it sets 299, so the original's own +1 reaches 300 and the
+// game's own code does the rest. The counter still runs from 0 as before up to 298 (its jam == 3 step keeps its place).
+// A counter at -1 (the game's "off") is left alone. TOTK_AAL_WATCHDOG=0: the original's frame count alone. gen.py
+// --hook 9c2b70.
+namespace {
+u64 g_wd_last_ns;        // the previous call (only aal's calc paths call it, one at a time under the game's own use)
+double g_wd_jam_s;       // how long the current jam has lasted
+std::atomic<u64> g_wd_fired{0};
+
+bool watchdog_timed() {
+    static const bool on = [] {
+        const char *e = getenv("TOTK_AAL_WATCHDOG");
+        return !e || strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+double jam_seconds() {
+    static const double v = [] {
+        const char *e = getenv("TOTK_AAL_WATCHDOG_S");
+        const double s = e ? atof(e) : 0;
+        return s > 0 ? s : 10.0;
+    }();
+    return v;
+}
+}  // namespace
+
+extern "C" u64 totk_aal_watchdog_fired(void) { return g_wd_fired.load(std::memory_order_relaxed); }
+
+#ifdef _WIN32
+void f_9c2b70_orig(Ctx *__restrict c);
+#pragma comment(linker, "/alternatename:?f_9c2b70_orig@@YAXPEIAUCtx@@@Z=?aalcmd_orig_stub@@YAXPEIAUCtx@@@Z")
+#else
+__attribute__((weak)) void f_9c2b70_orig(Ctx *__restrict c);
+#endif
+
+void hook_f_9c2b70(Ctx *__restrict c) {   // the watchdog step AudioRendererController::calc ends with (this)
+    const u64 now = now_ns();
+    const u64 gap = g_wd_last_ns ? now - g_wd_last_ns : 0;
+    g_wd_last_ns = now;
+    const u64 self = c->x[0];
+    if (watchdog_timed() && totk_ptr_ok(self)) {
+        const u64 cbm = ld64(self + 0x1a0), cm = ld64(self + 0x1a8);
+        if (totk_ptr_ok(cbm) && totk_ptr_ok(cm) && ld8(cbm + 8)) {
+            const bool free_empty = ld32(cm + kFreePush) == ld32(cm + kFreePop);
+            const bool a12 = (s32)(ld32(cm + kRingPush) - ld32(cm + kRingPop)) == 12;
+            const u64 cnt = ld64(self + 0x1d8);
+            if (!free_empty) {
+                g_wd_jam_s = 0;   // (the original sets the counter to 0 on this call)
+            } else if (a12 && cnt != ~0ull) {
+                g_wd_jam_s += (gap < 100000000ull ? gap : 100000000ull) / 1e9;
+                if (g_wd_jam_s >= jam_seconds()) {
+                    if ((cnt + 1) % 300 != 0) st64(self + 0x1d8, 299);   // the original's +1 fires it now
+                    g_wd_fired.fetch_add(1, std::memory_order_relaxed);
+                    printf("[aal] audio command jam for %.1f s: the game's watchdog switches commands off (TOTK_AAL_WATCHDOG)\n",
+                           g_wd_jam_s);
+                    g_wd_jam_s = 0;
+                } else if (cnt >= 299) {
+                    st64(self + 0x1d8, 298);   // not yet: the original's +1 stays under 300
+                }
+            }
+        }
+    }
+#ifndef _WIN32
+    if (!f_9c2b70_orig) return;
+#endif
+    f_9c2b70_orig(c);
+}

@@ -694,6 +694,9 @@ static void create_device(void) {
     b->vertexPipelineStoresAndAtomics = h->vertexPipelineStoresAndAtomics;
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
+    extern int contact_strength(void);   // (contact.c: asked for only with TOTK_CONTACT_SHADOWS on; the default device as before)
+    g_vk.storage_ext = h->shaderStorageImageExtendedFormats && contact_strength() > 0;
+    b->shaderStorageImageExtendedFormats = g_vk.storage_ext;
     g_vk.fill_nonsolid = h->fillModeNonSolid;   // (exec.c: wireframe draws fill without it)
     g_vk.dual_src_blend = h->dualSrcBlend;      // (exec.c: SRC1 blend factors fall back to SRC0's)
     g_vk.depth_clamp = h->depthClamp;           // (exec.c: clamped draws clip without it)
@@ -1159,7 +1162,13 @@ static void osd_blit(VkCommandBuffer cb, const uint32_t *px, int bw, int bh, int
     vkCmdCopyBufferToImage(cb, s.buf, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
     image_barrier(cb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 }
-static char g_fps_text[96];   // backend_present's 0.5 s fps line (window title + fps readout)
+static char g_fps_text[96];   // backend_present's 0.5 s fps line (hle_osd.cpp's fps box)
+// The fps readout's numbers (pc_overlay.cpp), from backend_present every 0.5 s while the readout is on: shown fps,
+// their mean frame time (ms), the 1% low (fps: the mean of the slowest 1% of the last 1000 shown frames; 0 below 100
+// of them) and the worst gap between shown frames (ms). Present thread only, as the overlay.
+static float g_fps_stats[4];
+static uint64_t g_fps_stats_n;   // updates so far (0: none yet)
+uint64_t vk_fps_readout_stats(float out[4]) { memcpy(out, g_fps_stats, sizeof g_fps_stats); return g_fps_stats_n; }
 
 static uint64_t total_frames;   // (tentative: the frame counters are below, with backend_present)
 static bool g_game_present;     // vk_frame_end called from backend_present (a game frame; not backend_clear_window)
@@ -1270,11 +1279,12 @@ void vk_frame_end(const char *shot_path) {
         const uint32_t *px = osd_precompile((int)g_vk.sc_extent.height, &bw, &bh);
         if (px) osd_blit(cb, px, bw, bh, (int)g_vk.sc_extent.width - bw - bh / 3, (int)g_vk.sc_extent.height - bh - bh / 3);
     }
-    {   // fps readout, top right (top left covers the hearts): while fullscreen (no title bar) or after F3 (shim_win.c)
+    {   // fps readout without the PC overlay (NXR_PC_OVERLAY=0: hle_osd.cpp's box), top right (top left covers the
+        // hearts); with it, pc_overlay.cpp draws the readout (display.fps_readout, F3)
         extern bool shim_fps_overlay(void);
         extern const uint32_t *osd_fps(const char *text, int target_h, int *w, int *h);
         int bw = 0, bh = 0;
-        const uint32_t *px = shim_fps_overlay() ? osd_fps(g_fps_text, (int)g_vk.sc_extent.height, &bw, &bh) : NULL;
+        const uint32_t *px = !pc_overlay_enabled() && shim_fps_overlay() ? osd_fps(g_fps_text, (int)g_vk.sc_extent.height, &bw, &bh) : NULL;
         if (px) osd_blit(cb, px, bw, bh, (int)g_vk.sc_extent.width - bw - bh / 3, bh / 3);
     }
     {   // Graphics menu (hle_osd.cpp: L3 + R3 / F10), centred
@@ -1283,7 +1293,23 @@ void vk_frame_end(const char *shot_path) {
         const uint32_t *px = osd_menu((int)g_vk.sc_extent.height, &bw, &bh);
         if (px) osd_blit(cb, px, bw, bh, ((int)g_vk.sc_extent.width - bw) / 2, ((int)g_vk.sc_extent.height - bh) / 2);
     }
-    if (pc_overlay_enabled()) pc_overlay_vk_record();   // nxrecomp's F10 settings / F9 perf overlay, over the OSD (NXR_PC_OVERLAY=1)
+    if (pc_overlay_enabled()) {   // nxrecomp's F10 settings / F9 perf overlay / fps readout, over the OSD (NXR_PC_OVERLAY=1)
+        // NXR_PC_OVERLAY_COST=1: its CPU time a frame (ImGui's frame + the draw recorded), logged every 600 frames
+        static int cost = -1;
+        if (cost < 0) { const char *e = getenv("NXR_PC_OVERLAY_COST"); cost = e && *e == '1'; }
+        const uint64_t t0 = cost ? SDL_GetTicksNS() : 0;
+        pc_overlay_vk_record();
+        if (cost) {
+            static uint64_t sum, n, top;
+            const uint64_t d = SDL_GetTicksNS() - t0;
+            sum += d;
+            if (d > top) top = d;
+            if (++n == 600) {
+                LOG("[pc-overlay] cost: mean %.1f us, max %.1f us a frame (600 frames)\n", sum / 600 / 1e3, top / 1e3);
+                sum = n = top = 0;
+            }
+        }
+    }
     VkSpan shot = {0};
     if (shot_path) save_window_image(cb, &shot);
     // HDR probe (present.c, TOTK_HDR_PROBE=<frame>,...): the encode on this frame into offscreen HDR targets, saved below
@@ -2059,41 +2085,48 @@ void backend_present(NvnTexture *t) {
         // a series (SCREENSHOT_FROM) runs on until LARECOMP_WINDOW_SHOT exits
         if (getenv("LARECOMP_EXIT_AFTER_SHOT") && !shot_from) { fflush(stderr); _exit(0); }
     }
-    {   // window title: shown fps (held frames excluded) and the worst gap between shown frames, every 0.5 s
-        // (user 2026-10-15: "add an fps counter to the window top bar so i can monitor the fps")
-        static const char *cap;
-        static char cap_buf[32];
-        static int cap_key = -1;
-        extern int vi_fps_setting(void), vi_unlock_setting(void);   // hle_vi.cpp: the frame-rate setting, live
-        const int un = vi_unlock_setting(), f = vi_fps_setting();
-        if (un * 100000 + f != cap_key) {
-            cap_key = un * 100000 + f;
-            // (hle_vi.cpp: unlocked = up to the monitor's refresh in gameplay, loads at the game's interval; raw = unpaced)
-            if (un) cap = un == 1 ? "unlocked" : "unpaced";
-            else if (f > 0) { snprintf(cap_buf, sizeof cap_buf, "cap %d", f); cap = cap_buf; }
-            else cap = "cap 30 (Switch)";
-        }
+    {   // the fps readout (F3, display.fps_readout): shown fps (held frames excluded) and the worst gap between shown
+        // frames, every 0.5 s. The window title stays the game's name, so none of it goes there
+        extern bool shim_fps_overlay(void);
+        enum { kGaps = 1000 };
+        static float gaps[kGaps];   // the last shown frames' gaps (ms): the 1% low, only while the readout is on
+        static int gaps_n, gaps_at;
         static double t_from, last_t, worst;
         static uint64_t shown_n;
+        const bool on = shim_fps_overlay();
         double tn = SDL_GetTicksNS() / 1e9;
         if (have) {
             shown_n++;
             if (last_t > 0 && tn - last_t > worst) worst = tn - last_t;
+            if (on && last_t > 0) {
+                gaps[gaps_at] = (float)((tn - last_t) * 1000.0);
+                gaps_at = (gaps_at + 1) % kGaps;
+                if (gaps_n < kGaps) gaps_n++;
+            } else if (!on) gaps_n = gaps_at = 0;
             last_t = tn;
         }
         if (t_from == 0) t_from = tn;
         else if (tn - t_from >= 0.5) {
-            char title[200];
             if (last_t > 0 && tn - last_t > worst) worst = tn - last_t;  // nothing shown lately (frames held): the stall so far
-            int pdone, ptotal;
-            extern int vk_precompile_progress(int *done, int *total);
-            char pre[48] = "";
-            if (vk_precompile_progress(&pdone, &ptotal) && ptotal)
-                snprintf(pre, sizeof pre, "  |  precompiling shaders %d %%", pdone * 100 / ptotal);
-            snprintf(title, sizeof title, "TotK recomp  |  %.1f fps  |  worst frame %.0f ms  |  %s%s", shown_n / (tn - t_from),
-                     worst * 1000.0, cap, pre);
-            SDL_SetWindowTitle(window, title);
             snprintf(g_fps_text, sizeof g_fps_text, "%.0f fps  |  worst %.0f ms", shown_n / (tn - t_from), worst * 1000.0);
+            if (on) {
+                float low = 0;
+                if (gaps_n >= 100) {   // the k slowest of the ring by selection (k <= 10: ~10k compares every 0.5 s)
+                    const int k = gaps_n / 100;
+                    float top[10] = {0}, sum = 0;
+                    for (int i = 0; i < gaps_n; i++) {
+                        float g = gaps[i];
+                        for (int j = 0; j < k; j++) if (g > top[j]) { float t = top[j]; top[j] = g; g = t; }
+                    }
+                    for (int j = 0; j < k; j++) sum += top[j];
+                    low = sum > 0 ? 1000.0f * k / sum : 0;
+                }
+                g_fps_stats[0] = (float)(shown_n / (tn - t_from));
+                g_fps_stats[1] = shown_n ? (float)((tn - t_from) * 1000.0 / shown_n) : 0;
+                g_fps_stats[2] = low;
+                g_fps_stats[3] = (float)(worst * 1000.0);
+                g_fps_stats_n++;
+            }
             t_from = tn, shown_n = 0, worst = 0;
         }
     }
@@ -2154,6 +2187,16 @@ void backend_present(NvnTexture *t) {
             LOG("[vram] ours: astc->rgba8 %llu MB (%u), other images %llu MB (%u) of which recycle pool %llu MB (%d), block shadows "
                 "%llu MB (%u), heap mirror %llu MB, alias mirror %llu MB\n", (unsigned long long)(b1 >> 20), c1, (unsigned long long)(b2 >> 20), c2,
                 (unsigned long long)(rec >> 20), nrec, (unsigned long long)(b3 >> 20), c3, (unsigned long long)(hm >> 20), (unsigned long long)(al >> 20));
+            {  // (shim_vma: 256 MB blocks of 4-64 MB images: a freed image there returns nothing until its block is empty)
+                extern void vma_shim_big(VmaAllocator a, uint32_t *n, uint64_t *bytes, uint64_t *live, uint64_t *spare_bytes, uint64_t *dropped);
+                uint32_t nb;
+                uint64_t bb, bl, sb, sd;
+                vma_shim_big(g_vk.vma, &nb, &bb, &bl, &sb, &sd);
+                if (nb || sb || sd)
+                    LOG("[vram] big image blocks: %u of 256 MB, %llu of %llu MB live (%.0f %%), spares held %llu MB, given back %llu\n", nb,
+                        (unsigned long long)(bl >> 20), (unsigned long long)(bb >> 20), bb ? 100.0 * bl / bb : 0.0, (unsigned long long)(sb >> 20),
+                        (unsigned long long)sd);
+            }
             {   // (textures.c: live game textures by kind; idle = unused for LARECOMP_VRAM_IDLE_MS, what residency may evict)
                 extern void vk_tex_vram_split(uint64_t idle_frames, uint64_t bytes[3], uint32_t count[4]);
                 extern uint64_t vk_residency_idle_frames(void);
@@ -2295,7 +2338,7 @@ void ui_window_init(void) {
     if (getenv("LARECOMP_WINDOW")) sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", &win_w, &win_h);
     SDL_WindowFlags wflags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (getenv("LARECOMP_HIDDEN")) wflags |= SDL_WINDOW_HIDDEN;
-    window = SDL_CreateWindow("TotK recomp", win_w, win_h, wflags);
+    window = SDL_CreateWindow("Tears of the Kingdom", win_w, win_h, wflags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows,

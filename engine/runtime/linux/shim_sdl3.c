@@ -26,7 +26,7 @@ static pthread_mutex_t g_title_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_title[256];
 static atomic_int g_title_dirty;
 static atomic_int g_fs_req = -1;    // -1 none, 0 windowed, 1 fullscreen (SDL_SetWindowFullscreen from another thread)
-static atomic_int g_fps_osd = -2;   // -1 automatic (fullscreen only), 0 off, 1 on (TOTK_FPS_OVERLAY=1 / 0 at start); F3 toggles
+static atomic_int g_fps_osd = -2, g_fps_osd_last = 1;   // the fps readout as shim_win.c's: 0 off, 1 minimal, 2 detailed
 
 bool totk_set_window_title(SDL_Window *w, const char *title) {
     if (!w) return false;
@@ -67,19 +67,23 @@ bool shim_window_target_size(int *w, int *h, int wait_ms) {
     }
     return SDL_GetWindowSizeInPixels(win, w, h) && *w > 0 && *h > 0;
 }
-// on-screen fps readout (device.c): shown while fullscreen (no title bar there), F3 toggles it in either mode
-bool shim_fps_overlay(void) {
+// The fps readout (as shim_win.c): 0 off, 1 minimal, 2 detailed; F3 shows the last style chosen or hides it
+int shim_fps_overlay_mode(void) {
     if (atomic_load(&g_fps_osd) == -2) {  // (from -2 only: a set racing the first read wins)
         const char *e = getenv("TOTK_FPS_OVERLAY");
         int want = -2;
-        atomic_compare_exchange_strong(&g_fps_osd, &want, e ? (*e != '0') : -1);
+        atomic_compare_exchange_strong(&g_fps_osd, &want,
+                                       !e ? 0 : !strcmp(e, "detailed") ? 2 : !strcmp(e, "minimal") || !strcmp(e, "1") ? 1 : 0);
     }
-    int v = atomic_load(&g_fps_osd);
-    return v < 0 ? shim_window_fullscreen() : v != 0;
+    return atomic_load(&g_fps_osd);
 }
-// display.fps_readout, live (pc_settings.cpp fps_readout_apply / fps_readout_now): "" automatic, "1" on, "0" off
-void shim_set_fps_overlay(int mode) { atomic_store(&g_fps_osd, mode < 0 ? -1 : mode != 0); }
-int shim_fps_overlay_mode(void) { shim_fps_overlay(); return atomic_load(&g_fps_osd); }
+bool shim_fps_overlay(void) { return shim_fps_overlay_mode() != 0; }
+// display.fps_readout, live (pc_settings.cpp fps_readout_apply / fps_readout_now)
+void shim_set_fps_overlay(int mode) {
+    const int m = mode == 2 ? 2 : mode == 1 ? 1 : 0;
+    if (m) atomic_store(&g_fps_osd_last, m);
+    atomic_store(&g_fps_osd, m);
+}
 static void apply_fullscreen(bool fs) {
     SDL_Window *w = ui_window();
     if (!w || fs == shim_window_fullscreen()) return;
@@ -123,7 +127,7 @@ bool totk_wait_event(SDL_Event *out, Sint32 ms) {
         case SDL_EVENT_KEY_DOWN:
             if (e.key.repeat) break;
             if (e.key.key == SDLK_F11 || (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT))) apply_fullscreen(!shim_window_fullscreen());
-            else if (e.key.key == SDLK_F3) atomic_store(&g_fps_osd, shim_fps_overlay() ? 0 : 1);
+            else if (e.key.key == SDLK_F3) shim_set_fps_overlay(shim_fps_overlay_mode() ? 0 : atomic_load(&g_fps_osd_last));
             break;
         default: break;
         }

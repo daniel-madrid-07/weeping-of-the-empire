@@ -29,6 +29,7 @@ SENS = tuple(f'{i / 10:g}' for i in range(1, 21)) + tuple(f'{i / 10:g}' for i in
     tuple(f'{i / 2:g}' for i in range(9, 17)) + tuple(str(i) for i in range(9, 21))
 # the bow's aiming multiplier (kAimScale): 0.1 .. 1.5 in 0.05 steps, then 1.6 .. 3
 AIM = tuple(f'{i / 100:g}' for i in range(10, 151, 5)) + ('1.6', '1.7', '1.8', '1.9', '2', '2.25', '2.5', '2.75', '3')
+VOLUME = [{'en': f'{p} %'} for p in range(0, 101, 5)]   # the volume rows' choices (kVolume: 0 .. 1 by 0.05)
 # the choice words of an on / off row
 OFF = {'en': 'Off', 'es': 'No', 'fr': 'Non', 'de': 'Aus', 'it': 'No', 'nl': 'Uit', 'ru': 'Выкл.', 'ja': 'オフ', 'ko': '끔',
        'zhs': '关', 'zht': '關'}
@@ -64,6 +65,22 @@ ENTRIES = [
                    'de': 'Exklusives Vollbild', 'it': 'Intero esclusivo', 'nl': 'Exclusief volledig',
                    'ru': 'Эксклюзивный полный', 'ja': '排他的全画面', 'ko': '전용 전체 화면', 'zhs': '独占全屏',
                    'zht': '獨佔全螢幕'}]),
+    dict(type=124, key='display.window_size',
+         label={'en': 'Window resolution', 'es': 'Resolución de ventana', 'fr': 'Résolution de la fenêtre',
+                'de': 'Fensterauflösung', 'it': 'Risoluzione finestra', 'nl': 'Vensterresolutie',
+                'ru': 'Разрешение окна', 'ja': 'ウィンドウ解像度', 'ko': '창 해상도', 'zhs': '窗口分辨率',
+                'zht': '視窗解析度'},
+         caption={'en': "The window's size in windowed mode (PC).\nBorderless and exclusive fill the monitor.",
+                  'es': 'El tamaño de la ventana en modo ventana\n(PC). Sin bordes y exclusiva llenan el\nmonitor.',
+                  'fr': "La taille de la fenêtre en mode fenêtré\n(PC). Sans bordure et exclusif remplissent\n"
+                        "l'écran.",
+                  'de': 'Die Fenstergröße im Fenstermodus (PC).\nRandlos und exklusiv füllen den Monitor.',
+                  'it': 'La dimensione della finestra in modalità\nfinestra (PC). Senza bordi ed esclusivo\n'
+                        'riempiono il monitor.'},
+         choices=[{'en': '1280 x 720 (default)', 'es': '1280 x 720 (por defecto)', 'fr': '1280 x 720 (par défaut)',
+                   'de': '1280 x 720 (Standard)', 'it': '1280 x 720 (predefinita)', 'nl': '1280 x 720 (standaard)',
+                   'ru': '1280 x 720 (по умолчанию)', 'ja': '1280 x 720 (標準)', 'ko': '1280 x 720 (기본)',
+                   'zhs': '1280 x 720 (默认)', 'zht': '1280 x 720 (預設)'}]),
     dict(type=109, key='display.monitor',
          label={'en': 'Monitor', 'es': 'Monitor', 'fr': 'Écran', 'de': 'Monitor', 'it': 'Monitor', 'nl': 'Beeldscherm',
                 'ru': 'Монитор', 'ja': 'モニター', 'ko': '모니터', 'zhs': '显示器', 'zht': '螢幕'},
@@ -75,10 +92,10 @@ ENTRIES = [
          choices=[{'en': 'Remember', 'es': 'Recordar', 'fr': 'Mémoriser', 'de': 'Merken', 'it': 'Ricorda',
                    'nl': 'Onthouden', 'ru': 'Запомнить', 'ja': '記憶する', 'ko': '기억', 'zhs': '记住', 'zht': '記住'}]),
     dict(type=110, key='display.exclusive_size',
-         label={'en': 'Exclusive resolution', 'es': 'Resolución exclusiva', 'fr': 'Résolution exclusive',
-                'de': 'Exklusive Auflösung', 'it': 'Risoluzione esclusiva', 'nl': 'Exclusieve resolutie',
-                'ru': 'Разрешение (эксклюзив)', 'ja': '排他的解像度', 'ko': '전용 해상도', 'zhs': '独占分辨率',
-                'zht': '獨佔解析度'},
+         label={'en': 'Fullscreen resolution', 'es': 'Resolución de pantalla completa',
+                'fr': 'Résolution plein écran', 'de': 'Vollbildauflösung', 'it': 'Risoluzione a schermo intero',
+                'nl': 'Resolutie volledig scherm', 'ru': 'Разрешение полного экрана', 'ja': '全画面解像度',
+                'ko': '전체 화면 해상도', 'zhs': '全屏分辨率', 'zht': '全螢幕解析度'},
          caption={'en': "The monitor's mode in exclusive fullscreen.\nBorderless and windowed keep the desktop's (PC).",
                   'es': 'El modo del monitor en pantalla completa\nexclusiva. Sin bordes y en ventana usan el\n'
                         'del escritorio (PC).',
@@ -128,6 +145,64 @@ ENTRIES = [
                    'de': 'Unbegrenzt, stabil', 'it': 'Illimitato, stabile', 'nl': 'Onbeperkt, stabiel',
                    'ru': 'Без лимита, стабильно', 'ja': '無制限（安定）', 'ko': '무제한 (안정)', 'zhs': '无限制（稳定）',
                    'zht': '無限制（穩定）'}]),
+    # the fps readout: pc_overlay.cpp draws it, F3 shows or hides it
+    dict(type=125, key='display.fps_readout',
+         label={'en': 'FPS counter', 'es': 'Contador de FPS', 'fr': 'Compteur de FPS', 'de': 'FPS-Anzeige',
+                'it': 'Contatore FPS', 'nl': 'FPS-teller', 'ru': 'Счётчик FPS', 'ja': 'FPS表示', 'ko': 'FPS 표시',
+                'zhs': '帧率显示', 'zht': '影格率顯示'},
+         caption={'en': 'Frames per second over the game (PC). F3\nshows or hides it. Detailed adds the frame\n'
+                        'time, the 1% low and the worst frame.',
+                  'es': 'Imágenes por segundo sobre el juego (PC).\nF3 lo muestra u oculta. Detallado añade el\n'
+                        'tiempo de fotograma, 1% mínimo y el peor.',
+                  'fr': "Images par seconde sur le jeu (PC). F3\nl'affiche ou le masque. Détaillé ajoute le\n"
+                        "temps d'image, le 1 % bas et le pire.",
+                  'de': 'Bilder pro Sekunde über dem Spiel (PC). F3\nzeigt oder verbirgt sie. Detailliert: dazu\n'
+                        'Frametime, 1%-Tief, schlechtester Frame.',
+                  'it': 'Fotogrammi al secondo sul gioco (PC). F3\nlo mostra o nasconde. Dettagliato aggiunge\n'
+                        'tempo fotogramma, 1% minimo e il peggiore.'},
+         choices=[OFF,
+                  {'en': 'Minimal', 'es': 'Mínimo', 'fr': 'Minimal', 'de': 'Minimal', 'it': 'Minimo', 'nl': 'Minimaal',
+                   'ru': 'Минимум', 'ja': 'シンプル', 'ko': '간단히', 'zhs': '简洁', 'zht': '簡潔'},
+                  {'en': 'Detailed', 'es': 'Detallado', 'fr': 'Détaillé', 'de': 'Detailliert', 'it': 'Dettagliato',
+                   'nl': 'Uitgebreid', 'ru': 'Подробно', 'ja': '詳細', 'ko': '자세히', 'zhs': '详细', 'zht': '詳細'}]),
+    dict(type=126, key='display.fps_position',
+         label={'en': 'FPS counter position', 'es': 'Posición del contador', 'fr': 'Position du compteur',
+                'de': 'Position der FPS-Anzeige', 'it': 'Posizione del contatore', 'nl': 'Positie FPS-teller',
+                'ru': 'Положение счётчика', 'ja': 'FPS表示の位置', 'ko': 'FPS 표시 위치', 'zhs': '帧率显示位置',
+                'zht': '影格率顯示位置'},
+         caption={'en': 'The corner the FPS counter sits in (PC).\nTop right keeps clear of the hearts and\nthe map.',
+                  'es': 'La esquina del contador de FPS (PC).\nArriba a la derecha no tapa los corazones\nni el mapa.',
+                  'fr': 'Le coin du compteur de FPS (PC). En haut à\ndroite, il ne cache ni les cœurs ni la\ncarte.',
+                  'de': 'Die Ecke der FPS-Anzeige (PC). Oben rechts\nverdeckt sie weder Herzen noch Karte.',
+                  'it': "L'angolo del contatore FPS (PC). In alto a\ndestra non copre i cuori né la mappa."},
+         choices=[{'en': 'Top right', 'es': 'Arriba a la derecha', 'fr': 'En haut à droite', 'de': 'Oben rechts',
+                   'it': 'In alto a destra', 'nl': 'Rechtsboven', 'ru': 'Вверху справа', 'ja': '右上',
+                   'ko': '오른쪽 위', 'zhs': '右上', 'zht': '右上'},
+                  {'en': 'Top left', 'es': 'Arriba a la izquierda', 'fr': 'En haut à gauche', 'de': 'Oben links',
+                   'it': 'In alto a sinistra', 'nl': 'Linksboven', 'ru': 'Вверху слева', 'ja': '左上', 'ko': '왼쪽 위',
+                   'zhs': '左上', 'zht': '左上'},
+                  {'en': 'Bottom right', 'es': 'Abajo a la derecha', 'fr': 'En bas à droite', 'de': 'Unten rechts',
+                   'it': 'In basso a destra', 'nl': 'Rechtsonder', 'ru': 'Внизу справа', 'ja': '右下',
+                   'ko': '오른쪽 아래', 'zhs': '右下', 'zht': '右下'},
+                  {'en': 'Bottom left', 'es': 'Abajo a la izquierda', 'fr': 'En bas à gauche', 'de': 'Unten links',
+                   'it': 'In basso a sinistra', 'nl': 'Linksonder', 'ru': 'Внизу слева', 'ja': '左下',
+                   'ko': '왼쪽 아래', 'zhs': '左下', 'zht': '左下'}]),
+    dict(type=127, key='display.fps_size',
+         label={'en': 'FPS counter size', 'es': 'Tamaño del contador', 'fr': 'Taille du compteur',
+                'de': 'Größe der FPS-Anzeige', 'it': 'Dimensione del contatore', 'nl': 'Grootte FPS-teller',
+                'ru': 'Размер счётчика', 'ja': 'FPS表示の大きさ', 'ko': 'FPS 표시 크기', 'zhs': '帧率显示大小',
+                'zht': '影格率顯示大小'},
+         caption={'en': 'The size of the FPS counter (PC). It grows\nwith the window, from 1080p to 4K.',
+                  'es': 'El tamaño del contador de FPS (PC). Crece\ncon la ventana, de 1080p a 4K.',
+                  'fr': 'La taille du compteur de FPS (PC). Elle\nsuit la fenêtre, de 1080p à la 4K.',
+                  'de': 'Die Größe der FPS-Anzeige (PC). Sie wächst\nmit dem Fenster, von 1080p bis 4K.',
+                  'it': 'La dimensione del contatore FPS (PC).\nCresce con la finestra, da 1080p a 4K.'},
+         choices=[{'en': 'Small', 'es': 'Pequeño', 'fr': 'Petit', 'de': 'Klein', 'it': 'Piccolo', 'nl': 'Klein',
+                   'ru': 'Маленький', 'ja': '小', 'ko': '작게', 'zhs': '小', 'zht': '小'},
+                  {'en': 'Medium', 'es': 'Mediano', 'fr': 'Moyen', 'de': 'Mittel', 'it': 'Medio', 'nl': 'Middel',
+                   'ru': 'Средний', 'ja': '中', 'ko': '보통', 'zhs': '中', 'zht': '中'},
+                  {'en': 'Large', 'es': 'Grande', 'fr': 'Grand', 'de': 'Groß', 'it': 'Grande', 'nl': 'Groot',
+                   'ru': 'Большой', 'ja': '大', 'ko': '크게', 'zhs': '大', 'zht': '大'}]),
     dict(type=51, key='graphics.preset',
          label={'en': 'Graphics preset', 'es': 'Calidad gráfica', 'fr': 'Préréglage graphique',
                 'de': 'Grafikvoreinstellung', 'it': 'Preimpostazione grafica', 'nl': 'Grafische voorinstelling',
@@ -483,6 +558,46 @@ ENTRIES = [
                   'de': 'Kein Ton, solange das Spielfenster nicht\nvorn ist; das Spiel läuft weiter (PC).',
                   'it': 'Niente audio finché la finestra del gioco\nnon è davanti; il gioco continua (PC).'},
          choices=[OFF, ON]),
+    # the PC audio rows F10 had alone, all live; the volumes in 5 % steps
+    dict(type=120, key='audio.volume',   # pc_settings.cpp's master gain
+         label={'en': 'Volume', 'es': 'Volumen', 'fr': 'Volume', 'de': 'Lautstärke', 'it': 'Volume', 'nl': 'Volume',
+                'ru': 'Громкость', 'ja': '音量', 'ko': '음량', 'zhs': '音量', 'zht': '音量'},
+         caption={'en': "All of the game's sound, on top of the\nWindows volume (PC).",
+                  'es': 'Todo el sonido del juego, además del\nvolumen de Windows (PC).',
+                  'fr': 'Tout le son du jeu, en plus du volume\nde Windows (PC).',
+                  'de': 'Der gesamte Ton des Spiels, zusätzlich\nzur Windows-Lautstärke (PC).',
+                  'it': "Tutto l'audio del gioco, oltre al volume\ndi Windows (PC)."},
+         choices=VOLUME),
+    dict(type=121, key='audio.music',   # hle_audio.cpp's music sub mix
+         label={'en': 'Music', 'es': 'Música', 'fr': 'Musique', 'de': 'Musik', 'it': 'Musica', 'nl': 'Muziek',
+                'ru': 'Музыка', 'ja': '音楽', 'ko': '음악', 'zhs': '音乐', 'zht': '音樂'},
+         caption={'en': 'The music alone (PC).', 'es': 'Solo la música (PC).', 'fr': 'La musique seule (PC).',
+                  'de': 'Nur die Musik (PC).', 'it': 'Solo la musica (PC).'},
+         choices=VOLUME),
+    dict(type=122, key='audio.effects',   # hle_audio.cpp's effects sub mix
+         label={'en': 'Effects', 'es': 'Efectos', 'fr': 'Effets', 'de': 'Effekte', 'it': 'Effetti', 'nl': 'Effecten',
+                'ru': 'Эффекты', 'ja': '効果音', 'ko': '효과음', 'zhs': '音效', 'zht': '音效'},
+         caption={'en': 'The sound effects alone (PC).', 'es': 'Solo los efectos de sonido (PC).',
+                  'fr': 'Les effets sonores seuls (PC).', 'de': 'Nur die Soundeffekte (PC).',
+                  'it': 'Solo gli effetti sonori (PC).'},
+         choices=VOLUME),
+    dict(type=123, key='audio.follow_device',   # hle_audio.cpp: to the new default device, a lost one recovered
+         label={'en': 'Follow the Windows device', 'es': 'Seguir el dispositivo de Windows',
+                'fr': 'Suivre le périphérique Windows', 'de': 'Windows-Gerät folgen',
+                'it': 'Segui il dispositivo di Windows', 'nl': 'Windows-apparaat volgen',
+                'ru': 'Следовать за устройством Windows', 'ja': 'Windowsの出力先に従う', 'ko': 'Windows 장치 따르기',
+                'zhs': '跟随 Windows 设备', 'zht': '跟隨 Windows 裝置'},
+         caption={'en': 'The sound moves to headphones plugged in\nor out, and comes back after a lost device,\n'
+                        'without a restart (PC).',
+                  'es': 'El sonido pasa a los auriculares al\nconectarlos o quitarlos, y vuelve tras perder\n'
+                        'el dispositivo, sin reiniciar (PC).',
+                  'fr': 'Le son passe au casque branché ou retiré,\net revient après une perte du\n'
+                        'périphérique, sans redémarrer (PC).',
+                  'de': 'Der Ton wechselt auf eingesteckte oder\nentfernte Kopfhörer, kehrt nach verlorenem\n'
+                        'Gerät zurück, ohne Neustart (PC).',
+                  'it': "L'audio passa alle cuffie collegate o tolte\ne torna dopo un dispositivo perso, senza\n"
+                        'riavviare (PC).'},
+         choices=[ON, OFF]),
     dict(type=66, key='controls.gameplay',  # the (pc_input.cpp), live; the key block's first row
          label={'en': 'Keyboard controls', 'es': 'Controles de teclado', 'fr': 'Commandes clavier',
                 'de': 'Tastatursteuerung', 'it': 'Comandi da tastiera', 'nl': 'Toetsenbordbediening',

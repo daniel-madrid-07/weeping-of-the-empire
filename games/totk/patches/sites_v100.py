@@ -31,6 +31,7 @@ DP_ASPECT = 56                                  # f32: aspect ratio for the came
 DP_RES_FLOOR = 64                               # f32: lowest dynamic-resolution scale, 1.0 = fixed, 0 = the game's own
 DP_FOV_SCALE = 68                               # f32: camera field-of-view multiplier, 0 = the game's own
 DP_SHADOW_SCALE = 72                            # f32: depth shadow map size multiplier, 0 = the game's own
+DP_SHADOW_FIXED = 208                           # f32 / u32: non-zero = the shadow map at its largest size, not the view's
 DP_LOD_SCALE = 76                               # f32: model LOD distance multiplier, 0 = the game's own
 DP_MOUSE_SCALE = 80                             # f32: mouse camera multiplier (setting), 0 = off (platform's stick)
 DP_MOUSE_RATE = 84                              # f32: stick deflection per mouse count at the 30 Hz ratio (runtime)
@@ -108,7 +109,7 @@ PAD_BOUNCE = 128      # 20-byte trampoline veneer
 PAD_CLOTH = 160       # cloth / hair veneers (224 bytes)
 PAD_DYNRES = 384      # 20-byte dynamic-resolution floor veneer
 PAD_FOV = 416         # 2 x 64-byte field-of-view veneers
-PAD_SHADOW = 544      # 52-byte shadow map size veneer
+PAD_SHADOW = 544      # 64-byte shadow map size veneer
 PAD_LOD = 608         # 3 x 52-byte LOD metric veneers, 64 apart
 PAD_MOUSE = 800       # mouse camera veneers: the camera pointer (16 bytes), the input veneer (+16, 176 bytes)
 PAD_ACTOR_LOD = 992   # 56-byte actor LOD distance veneer
@@ -308,23 +309,30 @@ SHADOW_SITE = 0xa22658
 
 def shadowres(lay):
     """Shadow map resolution: the veneer multiplies the factor s0 by the data page's multiplier (+72, 0 = off) before
-    both sizes are computed from it, so width, height, viewport and texture stay consistent. x10 holds the 32 minimum
-    (csel below) and is saved with q31 on the stack; no flags are touched. Bigger maps need more GPU memory: 2x is 4x."""
+    both sizes are computed from it, so width, height, viewport and texture stay consistent. With the fixed size on
+    (+208 non-zero) the factor is first the cap s8, the largest the game ever picks, instead of the view-derived one:
+    the map no longer shrinks and grows with the area the cascades cover (coarse foliage shadows near the ground, and
+    texels that move at every size change, so leaf shadows jumped). x10 (the 32 minimum, csel below) and x11 are saved
+    with q31 on the stack; no flags are touched. Bigger maps need more GPU memory: 2x is 4x."""
     p = Patch('shadowres')
     at = lay.pad + PAD_SHADOW
     veneer = [0xd10083ff,                              # sub sp, sp, #32
-              0xf90003ea,                              # str x10, [sp]
+              0xa9002fea,                              # stp x10, x11, [sp]
               0x3d8007ff,                              # str q31, [sp, #16]
               a.adrp(10, at + 12, lay.data_off),
+              a.ldr_w(11, 10, DP_SHADOW_FIXED),        # ldr w11, [x10, #208]
+              a.cbz_w(11, at + 20, at + 28),           # the game's view-derived factor
+              0x1e204100,                              # fmov s0, s8 (fixed: the cap)
               a.ldr_w(10, 10, DP_SHADOW_SCALE),        # ldr w10, [x10, #72]
-              a.cbz_w(10, at + 20, at + 32),           # off: keep the game's factor (to the restore)
+              a.cbz_w(10, at + 32, at + 44),           # off: keep the factor (to the restore)
               a.fmov_s_w(31, 10),
               a.fmul_s(0, 0, 31),                      # factor *= multiplier
               0x3dc007ff,                              # ldr q31, [sp, #16]
-              0xf94003ea,                              # ldr x10, [sp]
+              0xa9402fea,                              # ldp x10, x11, [sp]
               0x910083ff,                              # add sp, sp, #32
               Orig(SHADOW_SITE),                       # the site's fmul (width = factor * base width)
-              a.b(at + 48, SHADOW_SITE + 4)]
+              a.b(at + 60, SHADOW_SITE + 4)]
+    assert len(veneer) * 4 <= PAD_LOD - PAD_SHADOW
     p.put(SHADOW_SITE, a.b(SHADOW_SITE, at), 'shadowres: fmul s1, s0, s2 (shadow width) -> b <veneer>')
     p.code(at, veneer, 'shadow map size veneer')
     return p

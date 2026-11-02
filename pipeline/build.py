@@ -263,8 +263,10 @@ class Build:
     def __init__(self, args):
         self.a = args
         self.work = args.work.resolve()
-        self.ext = self.work / 'extracted' / VERSION_DIR
         self.expected = read_json(args.expected)
+        # 1.0.0 (no --update): extracted/v100 as before; an update (e.g. 1.4.3): extracted/v<digits of its version>
+        self.ext = self.work / 'extracted' / (VERSION_DIR if not args.update else
+                                              'v' + self.expected['display_version'].replace('.', ''))
         self.manifest = Manifest(self.work)
         self.results = []
         self.changed_sources = {}   # module -> generated C/H files the last recompile changed
@@ -439,7 +441,10 @@ class Build:
 
     # ---- extraction ------------------------------------------------------------------------------------------------
     def nsp_inputs(self):
-        return dict(nsp=file_identity(self.need('--nsp', self.a.nsp)))
+        inputs = dict(nsp=file_identity(self.need('--nsp', self.a.nsp)))
+        if self.a.update:   # (1.0.0's inputs as before: no update key)
+            inputs['update'] = file_identity(self.a.update)
+        return inputs
 
     def step_exefs(self):
         inputs = self.nsp_inputs()
@@ -455,9 +460,11 @@ class Build:
         status = 'adopted existing (hashes match)'
         if not matches():
             self.need('--keys', self.a.keys)
-            extract.extract_exefs(self.a.nsp, self.a.keys, self.ext, log=log)
+            extract.extract_exefs(self.a.nsp, self.a.keys, self.ext, log=log, update=self.a.update)
             status = 'extracted'
-        require(matches(), 'ExeFS modules do not match the pinned 1.0.0 hashes (not a TotK 1.0.0 base dump?)')
+        ver = self.expected['display_version']
+        require(matches(), f'ExeFS modules do not match the pinned {ver} hashes (not a TotK {ver} '
+                           + ('update dump?)' if self.a.update else 'base dump?)'))
         self.manifest.record('exefs', inputs, [exefs / n for n in pinned] + [exefs / 'main.npdm'])
         return status + f', {len(pinned)} modules pinned'
 
@@ -483,6 +490,8 @@ class Build:
                    str(self.a.keys), '--out', str(self.ext), '--expected', str(self.a.expected)]
             if self.a.no_unpack:
                 cmd.append('--no-unpack')
+            if self.a.update:   # the update's RomFS merged over the base game's (BKTR)
+                cmd += ['--update', str(self.a.update)]
             p = subprocess.run(heavy(cmd, log), cwd=REPO)
             if p.returncode != 0:
                 raise BuildError(f'RomFS extraction failed (exit {p.returncode})')
@@ -1221,11 +1230,14 @@ def pick_seed(work):
 def parse(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--nsp', type=Path, help='base game 1.0.0 (.nsp or .xci)')
+    p.add_argument('--update', type=Path, help="the player's dump of a game update (.nsp, e.g. 1.4.3): the build is "
+                   "that version (extracted/v<version>, --expected defaults to its pin, e.g. totk-1.4.3.json)")
     p.add_argument('--keys', type=Path, help='prod.keys (path only; never printed)')
     p.add_argument('--firmware', type=Path, help='firmware NCA dir (default: %%APPDATA%%/Ryujinx/bis/system/Contents/registered)')
     p.add_argument('--work', type=Path, default=DEFAULT_WORK)
     p.add_argument('-o', '--out', type=Path, help='output folder (default: <work>/out); TotK/ is created inside')
-    p.add_argument('--expected', type=Path, default=REPO / 'pipeline' / 'expected' / 'totk-1.0.0.json')
+    p.add_argument('--expected', type=Path, default=None, help='the version pin (default: totk-1.0.0.json, with '
+                   '--update totk-1.4.3.json)')
     p.add_argument('--steps', default='all', help=f'comma list or "all": {",".join(STEPS)}; "from:<step>" also works')
     p.add_argument('--force', type=lambda s: s.split(','), default=[], help='steps to redo even when up to date')
     p.add_argument('--no-unpack', action='store_true', help='keep only romfs.bin + index (no unpacked tree)')
@@ -1273,6 +1285,8 @@ def parse(argv=None):
                         '<work>/generated-decomp, '
                         'build/cmake[-variant]-decomp and out/TotK[-variant]-decomp')
     a = p.parse_args(argv)
+    if a.expected is None:   # the version's pin: 1.0.0, or the update's (1.4.3, the one update supported)
+        a.expected = REPO / 'pipeline' / 'expected' / ('totk-1.4.3.json' if a.update else 'totk-1.0.0.json')
     if a.lto is None:
         a.lto = 'thin' if a.variant == 'release' else 'off'
     if a.quick:

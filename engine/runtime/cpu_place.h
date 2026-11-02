@@ -11,8 +11,8 @@
 //   the efficiency cores on a hybrid CPU, the other CCD(s) on a dual-CCD one (off the V-Cache). render the render thread
 //   (exec.c async_main) alone on one physical core: both of its logical processors are kept out of every other set, so no
 //   thread of ours runs on its SMT sibling. The last SMT core of hot (of the fastest class where hot is unrestricted),
-//   when that class has >= 6 SMT cores; none without SMT (no sibling) or with fewer (a 4c/8t gives up 2 of 8 logical
-//   processors: LARECOMP_RENDER_PIN=auto takes it from 4 until an A/B shows the net). LARECOMP_RENDER_PIN=0: none; =<n>:
+//   when that class has >= 4 SMT cores (6 until v0.1.8: on a 4c/8t the render thread is the cap and the game's threads are
+//   mostly blocked); none without SMT (no sibling) or with fewer. LARECOMP_RENDER_PIN=0: none (=auto: the default); =<n>:
 //   the core holding logical processor n instead; also none when there is no render thread (exec.c backend_async_on:
 //   LARECOMP_ASYNC_EXEC=0, a capture).
 // A CPU with one kind of core and one L3 (the 9800X3D, most 6 / 8-core parts) places nothing else.
@@ -42,6 +42,9 @@ int cpu_place_count(int cls);
 bool cpu_place_active(void);
 // The hot CPU Set ids (up to n) into ids; 0 when hot is not restricted (exec.c render_pin keeps its rest inside them).
 int cpu_place_hot(uint32_t *ids, int n);
+// 1: the fastest class's cores in the process affinity have SMT siblings; 0: none (an i7-9700K's 8c/8t, a 285K's
+// P-cores, a 4c/4t); -1: unknown (no topology, not Windows). hle_os_thread.cpp's yield default reads it.
+int cpu_place_smt(void);
 
 // The planner on its own (tools/engine/test_cpu_place.py): one entry per logical processor.
 typedef struct cpu_lp {

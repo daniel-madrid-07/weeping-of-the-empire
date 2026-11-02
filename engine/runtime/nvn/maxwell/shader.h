@@ -78,6 +78,8 @@ typedef struct {
                             // c1): every instruction became a switch case (slow; exec.c rebuilds it when the game asks)
     uint32_t local_mem;     // bytes of local memory
     uint32_t num_insts;
+    uint32_t pc_cases;      // GLSL pc-loop case labels (0: no pc loop); exec.c pa_job: AMD's driver takes minutes and GBs
+                            // on a few hundred (issue #9)
     char error[256];        // set when translation fails
 } ShaderInfo;
 

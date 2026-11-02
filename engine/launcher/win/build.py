@@ -31,20 +31,29 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     saves = os.path.join(HERE, 'saves.c')
+    au = [os.path.join(HERE, 'autoupdate.c')]   # (the automatic update: WinHTTP + BCrypt)
+    au_libs = ['-lwinhttp', '-lbcrypt']
     if a.what == 'test':
         exe = os.path.join(a.out, 'test_saves.exe')
         clang(CFLAGS + [os.path.join(HERE, 'test_saves.c'), saves, '-o', exe])
         rc = subprocess.call([exe])
+        ta = os.path.join(a.out, 'test_autoupdate.exe')
+        clang(CFLAGS + [os.path.join(HERE, 'test_autoupdate.c')] + au + ['-o', ta] + au_libs)
+        rc = rc or subprocess.call([ta])
         # launcher.c's log pruning and early-exit window, with fake_game.exe as the packages' totk.exe
         fake, tl = os.path.join(a.out, 'fake_game.exe'), os.path.join(a.out, 'test_launcher.exe')
         clang(CFLAGS + [os.path.join(HERE, 'fake_game.c'), '-o', fake])
-        clang(CFLAGS + MANIFEST + [os.path.join(HERE, 'test_launcher.c'), saves, '-o', tl, '-luser32', '-lshell32', '-lcomctl32',
-                        '-lole32', '-luuid', '-ladvapi32'])
+        clang(CFLAGS + MANIFEST + [os.path.join(HERE, 'test_launcher.c'), saves] + au + ['-o', tl, '-luser32', '-lshell32',
+                        '-lcomctl32', '-lole32', '-luuid', '-ladvapi32'] + au_libs)
         sys.exit(rc or subprocess.call([tl, fake]))
     exe = os.path.join(a.out, 'TotK Launcher.exe')
-    clang(CFLAGS + MANIFEST + [os.path.join(HERE, 'launcher.c'), saves, '-o', exe, '-Wl,/subsystem:windows',
+    # the app icon (games/totk/app_icon.py: the Builder makes it from the player's own game files and sets the variable,
+    # as for totk.exe): the desktop shortcut points at this exe and shows its icon
+    icon = os.environ.get('TOTK_APP_ICON_RES', '')
+    icon = [icon] if icon and os.path.exists(icon) else []
+    clang(CFLAGS + MANIFEST + icon + [os.path.join(HERE, 'launcher.c'), saves] + au + ['-o', exe, '-Wl,/subsystem:windows',
                                '-Wl,/entry:wWinMainCRTStartup', '-luser32', '-lshell32', '-lcomctl32', '-lole32',
-                               '-luuid', '-ladvapi32'])
+                               '-luuid', '-ladvapi32'] + au_libs)
     print('->', exe)
 
 

@@ -41,6 +41,11 @@ from games.totk.overlays.engine_dir import RSTB, rstb_entries, rstb_key
 from . import BNTX_MEMBER, R8_UNORM, bbox, bntx_textures, read_r8
 
 FONT_ARCHIVE = 'Font/Font.Nin_NX_NVN.bfarc.zs'
+# The Korean and Chinese text's font archives (public issue #12): each holds its own copy of External.bfotf, byte for byte
+# the main archive's, so each gets the same bank font (with its own XOR key) and its slots' offsets as 'fontalt' /
+# 'altslot' lines. A copy that differs from the main one is left out (the engine then keeps the game's own glyphs there).
+CJK_FONT_ARCHIVES = ['Font/Font_KRko.Nin_NX_NVN.bfarc.zs', 'Font/Font_CNzh.Nin_NX_NVN.bfarc.zs',
+                     'Font/Font_TWzh.Nin_NX_NVN.bfarc.zs']
 EXTERNAL = 'scft/External.bfotf'
 BANK_BASE = 0xF100
 GAME_BASE = 0xF000              # U+E0xx's own glyph also at U+F0xx (the live switch back to a Nintendo pad)
@@ -685,15 +690,40 @@ def build_bank(romfs, zstd, common_zs, art, out_dir, preview=None, rstb_zs=None)
                 img = np.clip(a * (peak / max(1.0, a.max())), 0, 255).astype(np.uint8)
             bc4_bank += bc4_encode(img)
 
+    # the CJK archives: the same bank font in each copy of External that is the main one's
+    alts = []   # (path, archive zstd, decompressed, new External offset, its key bytes)
+    for path in CJK_FONT_ARCHIVES:
+        try:
+            raw_alt = romfs.read(path)
+        except (OSError, KeyError):
+            continue
+        dec, _ = zstd.decompress(raw_alt)
+        dec = bytes(dec)
+        if EXTERNAL not in sarc_members(dec):
+            continue
+        a_lo, a_hi = sarc_members(dec)[EXTERNAL]
+        a_otf, a_key = decrypt_bfotf(dec[a_lo:a_hi])
+        if a_otf != external:
+            print(f'glyph bank: {path}: its External is not the main one, left as the game has it')
+            continue
+        a_bf = encrypt_bfotf(otf, a_key)
+        dec2 = sarc_replace(dec, EXTERNAL, a_bf)
+        a_new = sarc_members(dec2)[EXTERNAL][0]
+        if decrypt_bfotf(dec2[a_new:a_new + len(a_bf)])[0] != otf:
+            raise AssertionError(f'{path}: bfotf round trip')
+        alts.append((path, raw_zstd(dec2), dec2, len(dec), a_new, struct.pack('>I', a_key)))
+
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / 'Font').mkdir(exist_ok=True)
     (out_dir / 'UI/LayoutArchive').mkdir(parents=True, exist_ok=True)
     (out_dir / 'System/Resource').mkdir(parents=True, exist_ok=True)
     rstb_zs = rstb_zs or romfs.read(RSTB)
-    rstb_out = raise_rstb(zstd, rstb_zs, {FONT_ARCHIVE: len(fonts2) - len(fonts), COMMON_ARCHIVE: len(blarc2) - len(blarc)})
+    grow = {FONT_ARCHIVE: len(fonts2) - len(fonts), COMMON_ARCHIVE: len(blarc2) - len(blarc)}
+    grow.update({path: len(dec2) - n for path, _, dec2, n, _, _ in alts})
+    rstb_out = raise_rstb(zstd, rstb_zs, grow)
     font_zs = raw_zstd(fonts2)
     common_out = raw_zstd(blarc2)
-    for path, data, dec in ((FONT_ARCHIVE, font_zs, fonts2), (COMMON_ARCHIVE, common_out, blarc2)):
+    for path, data, dec in [(FONT_ARCHIVE, font_zs, fonts2), (COMMON_ARCHIVE, common_out, blarc2)] +             [(path, data, dec) for path, data, dec, _, _, _ in alts]:
         if zstd.decompress(data)[0] != dec:
             raise AssertionError(f'{path}: raw zstd round trip')
     coff, clen = table_offset(otf, 'cmap')
@@ -704,6 +734,11 @@ def build_bank(romfs, zstd, common_zs, art, out_dir, preview=None, rstb_zs=None)
         o = new_lo + 8 + off   # the u16 (big endian) inside the decrypted otf -> archive -> file
         lines.append(f'slot {cp:04X} {SLOTS[cp]} {zstd_offset(o)} {kb[off % 4]:d} {zstd_offset(o + 1)} '
                      f'{kb[(off + 1) % 4]:d} {orig[cp]} {off - coff}')
+    for i, (path, _, _, _, a_new, akb) in enumerate(alts):   # (each slot again, in the same order, in that archive)
+        lines.append(f'fontalt {i} {path}')
+        for cp, off in sorted(slots.items()):
+            o = a_new + 8 + off
+            lines.append(f'altslot {i} {cp:04X} {zstd_offset(o)} {akb[off % 4]:d} {zstd_offset(o + 1)} {akb[(off + 1) % 4]:d}')
     for name, gid, cp in bank:
         lines.append(f'glyph {name} {gid} {cp:04X}')
     lines.append(f'cmaptable {otf[coff:coff + clen].hex()}')   # (the slots' table, for the live rewrite in memory)
@@ -725,6 +760,8 @@ def build_bank(romfs, zstd, common_zs, art, out_dir, preview=None, rstb_zs=None)
     (out_dir / 'masks.bin').write_bytes(masks.tobytes())
     (out_dir / 'masks_bc4.bin').write_bytes(bytes(bc4_bank))
     (out_dir / FONT_ARCHIVE).write_bytes(font_zs)
+    for path, data, _, _, _, _ in alts:
+        (out_dir / path).write_bytes(data)
     (out_dir / COMMON_ARCHIVE).write_bytes(common_out)
     (out_dir / RSTB).write_bytes(rstb_out)
     # the bases the engine checks: the overlay's Common archive and resource size table this was built on
@@ -733,6 +770,7 @@ def build_bank(romfs, zstd, common_zs, art, out_dir, preview=None, rstb_zs=None)
     if preview:
         sheet_preview(otf, bank, masks, preview)
     return dict(dir=str(out_dir), bank=len(bank), slots=len(slots), letters=len(letters), mask_groups=len(groups),
+                cjk_archives=len(alts),
                 font_bytes=len(otf), common_sha=hashlib.sha256(common_out).hexdigest()[:16])
 
 

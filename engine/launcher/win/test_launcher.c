@@ -52,6 +52,9 @@ static void make_release(const wchar_t *parent, const wchar_t *name, const wchar
 }
 
 static int g_answer, g_asked;
+static int vp9_none(void) { return 0; }
+static int vp9_no_mf(void) { return -1; }
+static int vp9_here(void) { return 1; }
 static int answer_update(const wchar_t *name) { (void)name; g_asked++; return g_answer; }
 
 static int log_has(const char *text) {
@@ -81,6 +84,8 @@ static int run(const wchar_t *fake_exe, const char *spec, DWORD early_ms, wchar_
 int main(int argc, char **argv) {
     wchar_t tmp[MAX_PATH], fake[MAX_PATH], p[MAX_PATH], logs[MAX_PATH], crashes[MAX_PATH];
     if (argc < 2) { fprintf(stderr, "usage: test_launcher.exe <fake_game.exe>\n"); return 2; }
+    /* never a real message box: every check reads launcher.log, 2026-11-01)*/
+    g_messages_logged_only = 1;
     MultiByteToWideChar(CP_UTF8, 0, argv[1], -1, fake, MAX_PATH);
     GetTempPathW(MAX_PATH, tmp);
     swprintf(g_root, MAX_PATH, L"%lstotk-launcher-test-%lu", tmp, GetCurrentProcessId());
@@ -255,7 +260,6 @@ int main(int argc, char **argv) {
         g_ask_update = ask_update;
     }
     {   /* restarts: early and late are restarts, not failed starts; a loop stops at the cap*/
-        g_messages_logged_only = 1;
         wchar_t pkg[MAX_PATH], why[768];
         swprintf(pkg, MAX_PATH, L"%ls\\rstr-early", g_root);
         make_package(pkg, fake, "0,0,rstr");
@@ -290,33 +294,23 @@ int main(int argc, char **argv) {
         CHECK(play_package(pkg, L"gpulate", why, 768) == RUNNING);
         CHECK(log_has("gpulate exited (code 0x47505530)"));
         CHECK(!log_has("0x47505530)."));   /* (the error message's "(code 0x...)." form) */
-        g_messages_logged_only = 0;
     }
-    {   /* mods_env: <g_base>\mods\<name>\romfs (or the folder itself) sorted by name, '_' / '.' off, exefs-only skipped */
-        wchar_t m[MAX_PATH], v[4096], want[4096];
-        CHECK(mods_env() == 0);   /* (creates the folder and its readme; no mods: TOTK_USER_MODS unset) */
-        CHECK(GetEnvironmentVariableW(L"TOTK_USER_MODS", v, 4096) == 0);
-        swprintf(m, MAX_PATH, L"%ls\\mods\\LEEME-README.txt", g_base); CHECK(exists(m));
-        swprintf(m, MAX_PATH, L"%ls\\mods\\b-tree\\Actor", g_base); mkdirs(m);
-        swprintf(m, MAX_PATH, L"%ls\\mods\\A-emu\\romfs\\Actor", g_base); mkdirs(m);
-        swprintf(m, MAX_PATH, L"%ls\\mods\\_off\\romfs", g_base); mkdirs(m);
-        swprintf(m, MAX_PATH, L"%ls\\mods\\code\\exefs", g_base); mkdirs(m);
-        swprintf(m, MAX_PATH, L"%ls\\mods\\file.txt", g_base); touch(m);
-        CHECK(mods_env() == 2);
-        CHECK(GetEnvironmentVariableW(L"TOTK_USER_MODS", v, 4096) > 0);
-        swprintf(want, 4096, L"%ls\\mods\\A-emu\\romfs;%ls\\mods\\b-tree", g_base, g_base);
+    {   /* mods_env (since the mods commits b06bf5c6 / 7717c9d0): TOTK_MODS_DIR = <launcher folder>\mods;<g_base>\mods,
+           both made with their readme; the game itself enumerates and orders them (hle_fs.cpp); an older launcher's
+           TOTK_USER_MODS left in the environment is cleared */
+        wchar_t local[MAX_PATH], user[MAX_PATH], v[4096], want[4096], m[MAX_PATH];
+        swprintf(local, MAX_PATH, L"%ls\\mods", g_dir);
+        swprintf(user, MAX_PATH, L"%ls\\mods", g_base);
+        SetEnvironmentVariableW(L"TOTK_USER_MODS", L"stale");
+        int two = _wcsicmp(local, user) != 0;
+        CHECK(mods_env() == (two ? 2 : 1));
+        CHECK(GetEnvironmentVariableW(L"TOTK_MODS_DIR", v, 4096) > 0);
+        if (two) swprintf(want, 4096, L"%ls;%ls", local, user); else swprintf(want, 4096, L"%ls", local);
         CHECK(!wcscmp(v, want));
-        CHECK(log_has("mods: code skipped (exefs only"));
-        /* a romfs mod's exefs is named in the log; a mod's own RSTB is logged (the game merges it: hle_fs.cpp), no dialog */
-        g_messages_logged_only = 1;
-        swprintf(m, MAX_PATH, L"%ls\\mods\\A-emu\\exefs", g_base); mkdirs(m);
-        swprintf(m, MAX_PATH, L"%ls\\mods\\b-tree\\System\\Resource", g_base); mkdirs(m);
-        swprintf(m, MAX_PATH, L"%ls\\mods\\b-tree\\System\\Resource\\ResourceSizeTable.Product.100.rsizetable.zs", g_base); touch(m);
-        CHECK(mods_env() == 2);
-        CHECK(log_has("mods: A-emu: its exefs folder is not used"));
-        CHECK(log_has("mods: b-tree brings its own resource size table"));
-        CHECK(!log_has("message: The mod") && !log_has("message: El mod"));
-        g_messages_logged_only = 0;
+        CHECK(GetEnvironmentVariableW(L"TOTK_USER_MODS", v, 4096) == 0);
+        swprintf(m, MAX_PATH, L"%ls\\LEEME-README.txt", user); CHECK(exists(m));
+        swprintf(m, MAX_PATH, L"%ls\\LEEME-README.txt", local); CHECK(exists(m));
+        CHECK(log_has("mods: TOTK_MODS_DIR="));
     }
     {   /* a package's processor level: player.txt cpu= (package.py), none = x86-64-v3 (this test PC has both) */
         wchar_t pkg[MAX_PATH], p[MAX_PATH], why[768];
@@ -330,6 +324,53 @@ int main(int argc, char **argv) {
         g_early_ms = 3000;
         CHECK(run_package(pkg, L"cpuv2", why, 768, &game, &st) == QUIT);
         CHECK(log_has("cpuv2: cpu level x86-64-v2"));
+    }
+    {   /* another game version (player.txt version=1.4.3): its own userdata-v143, seeded once with a copy of the 1.0.0
+           saves; the 1.0.0 folder untouched, the copy never overwritten later */
+        wchar_t pkg[MAX_PATH], p[MAX_PATH], why[768], s100[MAX_PATH], s143[MAX_PATH];
+        swprintf(s100, MAX_PATH, L"%ls\\userdata\\save\\slot_00", g_base); mkdirs(s100);
+        swprintf(p, MAX_PATH, L"%ls\\progress.sav", s100);
+        { FILE *f = _wfopen(p, L"w"); fprintf(f, "v100"); fclose(f); }
+        swprintf(pkg, MAX_PATH, L"%ls\\ver143", g_root);
+        make_package(pkg, fake, "0,0");
+        swprintf(p, MAX_PATH, L"%ls\\player.txt", pkg);
+        { FILE *f = _wfopen(p, L"a"); fprintf(f, "version=1.4.3\nbeta=1\n"); fclose(f); }
+        Sleep(1100);
+        HANDLE game = NULL; FILETIME st;
+        g_early_ms = 3000;
+        CHECK(run_package(pkg, L"v143", why, 768, &game, &st) == QUIT);
+        swprintf(s143, MAX_PATH, L"%ls\\userdata-v143\\save\\slot_00\\progress.sav", g_base);
+        CHECK(exists(s143));
+        CHECK(log_has("v143: version 1.4.3, its own saves in") && log_has("the 1.0.0 saves copied there (ok)"));
+        CHECK(log_has("(beta). This version plays at 30 fps") || log_has("(beta). Esta versi"));   /* the notice, once */
+        CHECK(log_has("Your 1.0.0 saves were copied") || log_has("Tus partidas de 1.0.0 se han copiado"));   /* (it copied) */
+        { wchar_t mk[MAX_PATH]; swprintf(mk, MAX_PATH, L"%ls\\userdata-v143\\beta-notice-shown", g_base); CHECK(exists(mk)); }
+        { FILE *f = _wfopen(s143, L"w"); fprintf(f, "v143 wrote this"); fclose(f); }   /* the game saves in 1.4.3 */
+        Sleep(1100);
+        CHECK(run_package(pkg, L"v143b", why, 768, &game, &st) == QUIT);
+        { char b[64] = {0}; FILE *f = _wfopen(s143, L"r"); fgets(b, sizeof b, f); fclose(f); CHECK(!strcmp(b, "v143 wrote this")); }
+        swprintf(p, MAX_PATH, L"%ls\\progress.sav", s100);
+        { char b[64] = {0}; FILE *f = _wfopen(p, L"r"); fgets(b, sizeof b, f); fclose(f); CHECK(!strcmp(b, "v100")); }
+    }
+    {   /* vp9_notice (#22, #25): no VP9 MFT is logged at every start and said once; a present one says nothing */
+        wchar_t mark[MAX_PATH]; swprintf(mark, MAX_PATH, L"%ls\\vp9-notice.txt", g_local);
+        DeleteFileW(mark);
+        g_vp9_probe = vp9_here;
+        vp9_notice();
+        CHECK(log_has("vp9: Media Foundation decoder found") && !exists(mark));
+        g_vp9_probe = vp9_none;
+        vp9_notice();
+        CHECK(log_has("vp9: no VP9 MFT (the game decodes movies with libvpx)") && exists(mark));
+        CHECK(log_has("solo sale una vez") || log_has("only shows once"));
+        { wchar_t p[MAX_PATH]; swprintf(p, MAX_PATH, L"%ls\\launcher.log", g_local); fflush(g_log); }
+        long before = ftell(g_log);
+        g_vp9_probe = vp9_no_mf;
+        vp9_notice();   /* the marker is there: logged, not said again */
+        fflush(g_log);
+        CHECK(log_has("vp9: no Media Foundation") && ftell(g_log) - before < 200);
+        g_vp9_probe = vp9_mft_present;
+        int real = vp9_mft_present();   /* the real probe runs (either answer is fine on a test PC) */
+        CHECK(real == 1 || real == 0 || real == -1);
     }
     fclose(g_log);
     if (g_fail) { fprintf(stderr, "FAILED: launcher (%d)\n", g_fail); return 1; }

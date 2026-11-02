@@ -25,6 +25,8 @@
 #include <fstream>
 
 #include "rstb_merge.h"
+#include "mods.h"
+#include "mods_scan.h"
 #ifndef _WIN32
 #include <unistd.h>   // (getpid: the merged resource size table's name)
 #endif
@@ -193,6 +195,11 @@ struct GlyphBank {
     std::string dir, font, common;
     u64 zhdr = 13, zblock = 131072;
     struct Slot { std::string control; u64 hi, lo; u8 xhi, xlo; u16 orig; u32 toff = ~0u; u16 cp = 0; };   // (toff: in cmap_sig)
+    // The Korean / Chinese font archives the bank covers too (bank.py CJK_FONT_ARCHIVES: 'fontalt' / 'altslot'): each
+    // with the same bank font, its slots at their own offsets and key bytes, in g_bank.slots' order
+    struct AltSlot { u64 hi, lo; u8 xhi, xlo; u16 cp; };
+    struct Alt { std::string path; std::vector<AltSlot> slots; };
+    std::vector<Alt> alts;
     struct Mask { std::string control; u64 start; int w, h, bh, group; bool bc4 = false; };   // (bc4: BC4 blocks, else R8)
     std::vector<Slot> slots;
     std::vector<Mask> masks;
@@ -228,6 +235,10 @@ static bool bank_load(const std::string& d) {
         unsigned long long x1, x2, x3; unsigned v1, v2, v3, v4, cp;
         if (sscanf(line, "zstd %llu %llu", &x1, &x2) == 2) { b.zhdr = x1; b.zblock = x2; }
         else if (sscanf(line, "font %255s", a) == 1) b.font = a;
+        else if (sscanf(line, "fontalt %u %255s", &v1, a) == 2) { if (v1 == b.alts.size()) b.alts.push_back({a, {}}); }
+        else if (sscanf(line, "altslot %u %x %llu %u %llu %u", &v1, &cp, &x1, &v2, &x2, &v3) == 6) {
+            if (v1 < b.alts.size()) b.alts[v1].slots.push_back({x1, x2, (u8)v2, (u8)v3, (u16)cp});
+        }
         else if (sscanf(line, "common %255s", a) == 1) b.common = a;
         else if (int k = sscanf(line, "slot %x %255s %llu %u %llu %u %u %u", &cp, a, &x1, &v1, &x2, &v2, &v3, &v4); k >= 7)
             b.slots.push_back({a, x1, x2, (u8)v1, (u8)v2, (u16)v3, k == 8 ? v4 : ~0u, (u16)cp});
@@ -257,6 +268,16 @@ static bool bank_load(const std::string& d) {
         }
     }
     fclose(f);
+    // an alt archive whose slots are not the main slots, in their order, is dropped: its text keeps the game's own glyphs
+    // (the CJK guard) rather than pictures at the wrong code points
+    for (auto& alt : b.alts) {
+        bool same = alt.slots.size() == b.slots.size();
+        for (size_t i = 0; same && i < alt.slots.size(); i++) same = alt.slots[i].cp == b.slots[i].cp;
+        if (!same) {
+            printf("[fs] glyph bank %s: %s's slots do not match the main ones: not covered\n", d.c_str(), alt.path.c_str());
+            alt.slots.clear();
+        }
+    }
     if (b.font.empty() || b.common.empty() || b.slots.empty() || b.count != (int)b.glyphs.size()) {
         printf("[fs] glyph bank %s: glyphs.txt incomplete\n", d.c_str());
         return false;
@@ -328,6 +349,13 @@ static u32 pane_codepoint(const GlyphBank::Pane& p) {
     const char* abxy = strchr("ABXY", p.control[0]);
     return it != g_bank.glyphs.end() ? 0xF100 + (u32)it->second.second : 0xF040 + (u32)(abxy ? abxy - "ABXY" : 0);
 }
+// A bank built with bank.py's CJK_FONT_ARCHIVES serves those archives with its glyphs (their slots: 'altslot'); one
+// without them (older) leaves them as the game has them, and the CJK guard below keeps the text at the game's own
+static bool bank_covers(const char* archive) {
+    for (auto& alt : g_bank.alts)
+        if (alt.path.find(archive) != std::string::npos && alt.slots.size() == g_bank.slots.size()) return true;
+    return false;
+}
 static std::shared_ptr<const FilePatch> glyph_patches(const std::string& hp) {
     const GlyphBank& b = g_bank;
     if (b.dir.empty()) return nullptr;
@@ -339,12 +367,15 @@ static std::shared_ptr<const FilePatch> glyph_patches(const std::string& hp) {
     }();
     if (cjk_game && !g_cjk_text.load(std::memory_order_relaxed))
         for (const char* a : {"Font_KRko.Nin_NX_NVN.bfarc", "Font_CNzh.Nin_NX_NVN.bfarc", "Font_TWzh.Nin_NX_NVN.bfarc"})
-            if (hp.find(a) != std::string::npos && !g_cjk_text.exchange(true)) {
+            if (hp.find(a) != std::string::npos && !bank_covers(a) && !g_cjk_text.exchange(true)) {
                 printf("[fs] glyph bank: the game opened %s (Korean / Chinese text): the bank's text glyphs stay off, the "
                        "game's own button pictures in text (the bank does not cover that archive yet)\n", a);
                 glyph_live_rearm();   // (what was rewritten already goes back at the live thread's next look)
             }
     bool font = hp == b.dir + "/" + b.font, common = hp == b.dir + "/" + b.common;
+    const GlyphBank::Alt* alt = nullptr;   // (one of the Korean / Chinese archives the bank covers)
+    for (auto& a : b.alts)
+        if (hp == b.dir + "/" + a.path && a.slots.size() == b.slots.size()) alt = &a, font = true;
     if (!font && !common) return nullptr;
     const int style = hid_glyph_active();
     std::vector<std::pair<u64, u8>> v;
@@ -363,6 +394,12 @@ static std::shared_ptr<const FilePatch> glyph_patches(const std::string& hp) {
             u16 id = g ? g->first : s.orig;
             changed += g != nullptr;
             ids.push_back(id);
+            if (alt) {
+                const GlyphBank::AltSlot& a = alt->slots[&s - b.slots.data()];
+                v.push_back({a.hi, (u8)((id >> 8) ^ a.xhi)});
+                v.push_back({a.lo, (u8)((id & 0xFF) ^ a.xlo)});
+                continue;
+            }
             v.push_back({s.hi, (u8)((id >> 8) ^ s.xhi)});
             v.push_back({s.lo, (u8)((id & 0xFF) ^ s.xlo)});
         }
@@ -719,6 +756,12 @@ static bool msg_put(u8* at, u16 expect, u16 v) {   // the character at at, if it
 // byte +0x3e is set (ResetTextureCache, the alternate glyphs registered again, the generation +0x38 counted on), on its
 // own thread between frames: that byte is set, after a check of the singleton's vtable (main+0x44fd948).
 static u64 font_mgr_request() {   // the manager, its reset byte set; 0 when there is none (yet)
+#if !NXR_GAME_TOTK
+    return 0;   // (TotK's ScalableFontMgr: another game has none at these addresses, nxr_game.h)
+#endif
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    if (!totk_main_known_rt(0x463fef0) || !totk_main_known_rt(0x44fd948)) return 0;   // (another version: not placed)
+#endif
     const u64 inst = totk_main(0x463fef0), vtbl = totk_main(0x44fd948);
     u64 r = 0;
     pc_fault_guard(1);
@@ -1156,9 +1199,55 @@ static std::vector<std::string> mod_dirs(const char* var, const char* what) {
     }
     return v;
 }
-static const std::vector<std::string>& user_mods() {   // TOTK_USER_MODS, read once
-    static const std::vector<std::string> v = mod_dirs("TOTK_USER_MODS", "user mod");
-    return v;
+// The player's mods (mods.cpp: the launchers' mods folders, or TOTK_USER_MODS): their RomFS roots this run, top first
+// (none with TOTK_NO_OVERLAY, the pristine RomFS A/B)
+static const std::vector<std::string>& user_mods() {
+    static const std::vector<std::string> none;
+    static const bool no_overlay = getenv("TOTK_NO_OVERLAY") != nullptr;
+    return no_overlay ? none : mods_romfs_start();
+}
+enum { kByPort = -1 };   // rom_replacement's *who for a port file; a user mod's is its index in user_mods()
+// The file that replaces the RomFS file `rel` ("/a/b"), if one does: the port's own first (skip-opening, our sets, the
+// glyph bank, the overlay), then the player's mods (`user`). *who: kByPort or the mod's index. `log`: the open path's
+// "[fs] ..." lines (host_path_ours; the mods' file count passes false). No other side effects.
+static bool rom_replacement(const std::string& rel, bool user, std::string* out, int* who, bool log) {
+    auto hit = [&](const std::string& p, int w) { *out = p; if (who) *who = w; return true; };
+    if (g_skip_opening && replacement_exists(kSkipDir, rel)) {
+        if (log) printf("[fs] skip-opening overlay %s\n", (kSkipDir + rel).c_str());
+        return hit(kSkipDir + rel, kByPort);
+    }
+    // TOTK_MODS: our RomFS sets (totk_engine.c puts them here), first listed wins
+    static const std::vector<std::string> sets = mod_dirs("TOTK_MODS", "mod");
+    for (const auto& d : sets)
+        if (replacement_exists(d, rel)) {
+            static int logged; if (log && logged++ < 64) printf("[fs] mod file %s\n", (d + rel).c_str());
+            return hit(d + rel, kByPort);
+        }
+    static const bool glyphs = true;   // (TOTK_GLYPHS: glyph_dir decides; on by default)
+    if (glyphs && (rel.rfind("/UI/", 0) == 0 || rel.rfind("/Font/", 0) == 0 || rel == "/" + std::string(kGlyphRstb))) {
+        const std::string& gd = glyph_dir();   // pad glyphs (above)
+        if (!gd.empty() && replacement_exists(gd, rel)) {
+            static int logged; if (log && logged++ < 8) printf("[fs] glyph file %s\n", (gd + rel).c_str());
+            return hit(gd + rel, kByPort);
+        }
+    }
+    // LayeredFS-style overlay: an existing file overlay/romfs/<path> replaces the romfs one
+    if (replacement_exists(overlay_dir(), rel)) {
+        static int logged; if (log && logged++ < 32) printf("[fs] overlay %s\n", (overlay_dir() + rel).c_str());
+        return hit(overlay_dir() + rel, kByPort);
+    }
+    // The player's mods come after our sets, the glyph bank and the overlay, so a mod cannot take away the port's own
+    // files (PC glyphs, the game-over and quick-menu fixes, our RSTB); among themselves the top of the list wins.
+    // Their resource size tables are merged into the winner's instead (host_path below)
+    if (user && rel != "/" + std::string(kGlyphRstb)) {
+        const auto& um = user_mods();
+        for (int i = 0; i < (int)um.size(); i++)
+            if (replacement_exists(um[i], rel)) {
+                static int logged; if (log && logged++ < 64) printf("[fs] user mod file %s\n", (um[i] + rel).c_str());
+                return hit(um[i] + rel, i);
+            }
+    }
+    return false;
 }
 // Where a game path is on the host, without the mods' resource size tables merged (host_path below adds that)
 static bool host_path_ours(const char* p, std::string* out) {
@@ -1194,59 +1283,7 @@ static bool host_path_ours(const char* p, std::string* out) {
             n++; printf("[fs] title-phase open %s at present %llu\n", p, (unsigned long long)nvn_present_count());
         }
     }
-    if (it->second == kRomDir && g_skip_opening && !no_overlay) {
-        std::string sk = kSkipDir + rel;
-        if (replacement_exists(kSkipDir, rel)) {
-            printf("[fs] skip-opening overlay %s\n", sk.c_str());
-            *out = sk;
-            return true;
-        }
-    }
-    if (it->second == kRomDir && !no_overlay) {    // TOTK_MODS: our RomFS sets (totk_engine.c puts them here), first listed wins
-        // shortcut: replacement files only (a mod's NEW files don't show in directory listings, no RSTB merge); fine for
-        // the usual texture / model / param replacements, upgrade when a mod needs added files.
-        static const std::vector<std::string> mods = mod_dirs("TOTK_MODS", "mod");
-        for (const auto& d : mods) {
-            std::string mp = d + rel;
-            if (replacement_exists(d, rel)) {
-                static int logged; if (logged++ < 64) printf("[fs] mod file %s\n", mp.c_str());
-                *out = mp;
-                return true;
-            }
-        }
-    }
-    static const bool glyphs = true;   // (TOTK_GLYPHS: glyph_dir decides; on by default)
-    if (it->second == kRomDir && !no_overlay && glyphs && (rel.rfind("/UI/", 0) == 0 || rel.rfind("/Font/", 0) == 0 ||
-                                                       rel == "/" + std::string(kGlyphRstb))) {   // pad glyphs (above)
-        const std::string& gd = glyph_dir();
-        std::string gp = gd + rel;
-        if (!gd.empty() && replacement_exists(gd, rel)) {
-            static int logged; if (logged++ < 8) printf("[fs] glyph file %s\n", gp.c_str());
-            *out = gp;
-            return true;
-        }
-    }
-    if (it->second == kRomDir && !no_overlay) {    // LayeredFS-style overlay: an existing file overlay/romfs/<path> replaces the romfs one
-        std::string ov = overlay_dir() + s.substr(k + 1);
-        if (replacement_exists(overlay_dir(), rel)) {
-            static int logged; if (logged++ < 32) printf("[fs] overlay %s\n", ov.c_str());
-            *out = ov;
-            return true;
-        }
-    }
-    // TOTK_USER_MODS (the launchers' mods folder): the player's mods come after our sets, the glyph bank and the overlay,
-    // so a mod cannot take away the port's own files (PC glyphs, the game-over and quick-menu fixes, our RSTB); among
-    // themselves the first listed wins. Their resource size tables are merged into the winner's instead (host_path below)
-    if (it->second == kRomDir && !no_overlay && rel != "/" + std::string(kGlyphRstb)) {
-        for (const auto& d : user_mods()) {
-            if (replacement_exists(d, rel)) {
-                std::string mp = d + rel;
-                static int logged; if (logged++ < 64) printf("[fs] user mod file %s\n", mp.c_str());
-                *out = mp;
-                return true;
-            }
-        }
-    }
+    if (it->second == kRomDir && !no_overlay) rom_replacement(rel, true, out, nullptr, true);
     return true;
 }
 
@@ -1269,18 +1306,42 @@ static std::vector<u8> read_host_file(const std::string& p) {
     return v;
 }
 
-// The resource size table the game gets when the player's mods bring their own: the one that wins without them (ours: the
-// overlay's, or our sets' combined one) with every mod's entries merged in at the larger size (rstb_merge.h), written once
-// per start as a stored zstd frame to the temp folder. "" (serve `base`) without mod tables, or when one does not read as
-// a table.
+struct ModsIndex;
+static const ModsIndex& mods_index();
+static bool rom_base_head(const std::string& rel, u8* head, size_t n, size_t* got, u64* size);
+static u64 host_content_size(const std::string& path, const std::string& rel, u64 size);
+static size_t rstb_mod_files(rstb::Table& out, const rstb::Table& base, size_t* estimated, size_t* other);
+
+// The resource size table the game gets with the player's mods on: the one that wins without them (ours: the
+// overlay's, or our sets' combined one) with every mod's own table merged in at the larger size (rstb_merge.h), then
+// each file a mod serves raised to what its size needs (rstb_mod_files: the tables mods for other versions bring, and
+// estimates), written once per start as a stored zstd frame to the temp folder. "" (serve `base`) when nothing needed
+// raising, or when `base` does not read as a table.
+bool hle_fs_read_romfs(const char* rel, std::vector<u8>* out);
+// a file the guest's paths resolved to: one under the RomFS folder through hle_fs_read_romfs (the pack when one serves
+// the RomFS: a player's install keeps no unpacked folder), any other (an overlay's, our sets') as is
+static std::vector<u8> read_resolved(const std::string& hp) {
+    const size_t n = strlen(kRomDir);
+    if (hp.compare(0, n, kRomDir) == 0 && hp.size() > n && (hp[n] == '/' || hp[n] == '\\')) {
+        const size_t a = hp.find_first_not_of("/\\", n);
+        std::vector<u8> v;
+        if (a == std::string::npos) return v;
+        std::string rel = hp.substr(a);
+        for (char& ch : rel) if (ch == '\\') ch = '/';
+        hle_fs_read_romfs(rel.c_str(), &v);
+        return v;
+    }
+    return read_host_file(hp);
+}
 static std::string rstb_merged(const std::string& base) {
     const std::string rel = "/" + std::string(kGlyphRstb);
     rstb::Table t;
     std::vector<u8> raw;
-    if (!rstb::unzstd(read_host_file(base), &raw) || !rstb::parse(raw, &t)) {
+    if (!rstb::unzstd(read_resolved(base), &raw) || !rstb::parse(raw, &t)) {
         printf("[fs] resource size table %s: not readable, mods' tables not merged\n", base.c_str());
         return "";
     }
+    const rstb::Table ours = t;
     int n = 0;
     rstb::Counts c;
     for (const auto& d : user_mods()) {
@@ -1292,7 +1353,11 @@ static std::string rstb_merged(const std::string& base) {
         }
         n++;
     }
-    if (!n) return "";
+    size_t estimated = 0, other = 0;
+    const size_t computed = rstb_mod_files(t, ours, &estimated, &other);
+    printf("[fs] resource size table: %zu entries raised for the mods' files (%zu added files estimated, %zu from tables "
+           "for another version)\n", computed, estimated, other);
+    if (!n && !computed) return "";
     std::error_code ec;
     const fsys::path dir = fsys::temp_directory_path(ec);
     if (ec) return "";
@@ -1323,8 +1388,8 @@ static std::string rstb_merged(const std::string& base) {
     if (ec) { fsys::remove(tmp, ec); return ""; }
     const std::u8string u8 = out.u8string();
     const std::string path(u8.begin(), u8.end());
-    printf("[fs] resource size table: %s + %d mod table(s): %zu entries raised, %zu added -> %s\n", base.c_str(), n, c.raised,
-           c.added, path.c_str());
+    printf("[fs] resource size table: %s + %d mod table(s): %zu entries raised, %zu added; %zu raised for mod files -> %s\n",
+           base.c_str(), n, c.raised, c.added, computed, path.c_str());
     return path;
 }
 
@@ -1402,6 +1467,47 @@ static void wait_publisher(DWORD ms = INFINITE) {
     if (ms == INFINITE) g_pub_cv.wait(l, [] { return !g_pub_busy; });
     else g_pub_cv.wait_for(l, std::chrono::milliseconds(ms), [] { return !g_pub_busy; });
 }
+// The snapshot in the background (TOTK_SAVE_SNAP_BG, default on with the async publish; =0: on the game thread as
+// before; stutter plan fix 6: 31 and 63 ms frames at autosaves). The working copy must not change while it is taken, or
+// a commit could hold some files of the game's next save and not others. So Commit starts it only after the changes
+// already under way have finished, and every change to the save mount waits in a SaveWrite while it is pending. The
+// changes are the guest's WriteFile, SetFileSize, CreateFile, DeleteFile, RenameFile, CreateDirectory,
+// DeleteDirectoryRecursively and CleanDirectoryRecursively on the save mount: the only ways nn::fs changes it (OpenFile
+// and FlushFile change no bytes), and nothing else in the runtime writes the working copy (it is this process's own
+// save.work.<pid>). Reads go on: the snapshot only reads.
+static const bool g_snap_bg = g_save_async && !(getenv("TOTK_SAVE_SNAP_BG") && !strcmp(getenv("TOTK_SAVE_SNAP_BG"), "0"));
+static std::mutex g_snap_mtx;
+static std::condition_variable g_snap_cv;
+static bool g_snap_pending;    // a Commit's snapshot not taken yet: changes wait
+static int g_snap_writers;     // changes to the save mount under way
+static std::atomic<u32> g_snap_waits;      // changes that waited for a snapshot, and how long in all (the publish line)
+static std::atomic<u64> g_snap_wait_ms;
+static std::atomic<u32> g_save_changes;    // changes to the save mount since the last Commit (the publish line: > 0 at a save)
+static bool in_save(const std::string& hp) {   // a host path inside the save mount's working copy
+    const size_t n = g_save_work.size();
+    return n && hp.size() >= n && !hp.compare(0, n, g_save_work) && (hp.size() == n || hp[n] == '/' || hp[n] == '\\');
+}
+struct SaveWrite {   // a change to the save mount: waits while a snapshot is pending, and holds the next one off
+    bool on = false;
+    explicit SaveWrite(bool save) {
+        if (save) g_save_changes++;
+        if (!save || !g_snap_bg) return;
+        std::unique_lock<std::mutex> l(g_snap_mtx);
+        if (g_snap_pending) {
+            u64 t = GetTickCount64();
+            g_snap_cv.wait(l, [] { return !g_snap_pending; });
+            g_snap_waits++; g_snap_wait_ms += GetTickCount64() - t;
+        }
+        g_snap_writers++; on = true;
+    }
+    ~SaveWrite() {
+        if (!on) return;
+        { std::lock_guard<std::mutex> l(g_snap_mtx); g_snap_writers--; }
+        g_snap_cv.notify_all();
+    }
+    SaveWrite(const SaveWrite&) = delete;
+    SaveWrite& operator=(const SaveWrite&) = delete;
+};
 
 static bool wexists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
 static bool remove_tree(const std::wstring& p) { std::error_code ec; fsys::remove_all(p, ec); return !ec; }
@@ -1684,6 +1790,51 @@ static void commit_save() {
     u64 t0 = GetTickCount64();
     if (t0 - tw >= 50) printf("[fs] save commit: waited %llu ms for the previous commit's background publish\n", (unsigned long long)(t0 - tw));
     auto copied = std::make_shared<std::vector<std::wstring>>();
+    if (g_snap_bg) {   // the snapshot too in the background (SaveWrite above)
+        {
+            std::unique_lock<std::mutex> l(g_snap_mtx);
+            g_snap_pending = true;
+            g_snap_cv.wait(l, [] { return g_snap_writers == 0; });   // (a change under way on another thread finishes)
+        }
+        { std::lock_guard<std::mutex> p(g_pub_mtx); g_pub_busy = true; }
+        const u64 game = GetTickCount64() - t0;
+        const u32 changes = g_save_changes.exchange(0);
+        g_snap_waits = 0; g_snap_wait_ms = 0;
+        std::thread([copied, game, changes] {
+            // the.pending marker (its create + flush: the commit's last game-thread stall) first: it only has to be on
+            // disk before finish_locked touches the published save; the snapshot writes save.new alone. Until the
+            // publish lands; a failed snapshot is retried at the next Commit / start.
+            pending(true);
+            u64 t1 = GetTickCount64();
+            commits_lock();
+            u64 tl = GetTickCount64();
+            // TOTK_SAVE_SNAP_DELAY_MS=<ms> (tests): the snapshot starts that much later, so the game's next changes wait
+            static const DWORD delay = getenv("TOTK_SAVE_SNAP_DELAY_MS") ? (DWORD)atoi(getenv("TOTK_SAVE_SNAP_DELAY_MS")) : 0;
+            if (delay) Sleep(delay);
+            bool ok = snapshot_locked(g_work, copied.get());
+            u64 ts = GetTickCount64();
+            { std::lock_guard<std::mutex> l(g_snap_mtx); g_snap_pending = false; }
+            g_snap_cv.notify_all();
+            u64 ms[3] = {};
+            g_move_retries = 0; g_move_max_ms = 0;
+            ok = ok && finish_locked(*copied, ms);
+            commits_unlock();
+            if (ok) {
+                pending(false);
+                printf("[fs] save commit published: %llu ms on the game thread, snapshot %llu ms + flush + rename + swap %llu ms in the"
+                       " background (mutex %llu, flush %llu ms for %zu files, .ready %llu, swap + backup %llu; renames retried %u,"
+                       " longest %u ms; %u changes to the save since the last commit; %u later ones waited %llu ms for the"
+                       " snapshot)\n",
+                       (unsigned long long)game, (unsigned long long)(ts - tl), (unsigned long long)(GetTickCount64() - ts),
+                       (unsigned long long)(tl - t1), (unsigned long long)ms[0], copied->size(), (unsigned long long)ms[1],
+                       (unsigned long long)ms[2], g_move_retries.load(), g_move_max_ms.load(), changes, g_snap_waits.load(),
+                       (unsigned long long)g_snap_wait_ms.load());
+            }
+            { std::lock_guard<std::mutex> p(g_pub_mtx); g_pub_busy = false; }
+            g_pub_cv.notify_all();
+        }).detach();
+        return;
+    }
     commits_lock();
     bool ok = snapshot_locked(g_work, copied.get());
     commits_unlock();
@@ -1710,6 +1861,9 @@ static void commit_save() {
         g_pub_cv.notify_all();
     }).detach();
 }
+#else
+static bool in_save(const std::string&) { return false; }   // (no save commits off Windows: writes go in place)
+struct SaveWrite { explicit SaveWrite(bool) {} };
 #endif
 // Handle tables: a fixed array of slots, reused through a free list. The guest's handle value is (generation << 32) |
 // (slot + 1), so a handle used after its Close does not reach the slot's next file. Lookups take no lock (the streaming
@@ -1948,6 +2102,194 @@ static RomPack* rompack_first_open() {
 #else
 extern "C" void hle_fs_index_romfs_early(void) {}
 #endif
+
+// ---- the game's own RomFS (the pack, else the folder) under the replacements, for the mods' file count and table
+// The game's RomFS has `rel` ("/a/b") as: 1 file, 0 directory, -1 neither
+static int rom_base_type(const std::string& rel) {
+#ifdef _WIN32
+    if (RomPack* pk = rompack()) {
+        const size_t a = rel.find_first_not_of('/');
+        return pack_type(pk, a == std::string::npos ? std::string() : rel.substr(a));
+    }
+#endif
+    std::string hp = kRomDir + rel;
+    ci_fix(hp);
+    std::error_code ec;
+    auto st = fsys::status(widen(hp), ec);
+    return ec || !fsys::exists(st) ? -1 : fsys::is_directory(st) ? 0 : 1;
+}
+// The first bytes of the game's own file `rel` (no replacement) and its size; false: no such file
+static bool rom_base_head(const std::string& rel, u8* head, size_t n, size_t* got, u64* size) {
+#ifdef _WIN32
+    if (RomPack* pk = rompack()) {
+        const PackEntry* e = pack_find(pk, rel.substr(rel.find_first_not_of('/')));
+        if (!e) return false;
+        *size = e->size;
+        *got = (size_t)pack_read(pk->h, e->data_off, head, std::min<u64>(n, e->size));
+        return true;
+    }
+#endif
+    std::string hp = kRomDir + rel;
+    ci_fix(hp);
+    std::ifstream f(fsys::path(widen(hp)), std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    *size = (u64)f.tellg();
+    f.seekg(0);
+    f.read((char*)head, (std::streamsize)std::min<u64>(n, *size));
+    *got = (size_t)f.gcount();
+    return true;
+}
+static u64 host_content_size(const std::string& path, const std::string& rel, u64 size) {   // a mod file's (rstb::content_size)
+    if (rel.size() < 3 || rel.compare(rel.size() - 3, 3, ".zs")) return size;   // (only a .zs file is opened)
+    std::ifstream f(fsys::path(widen(path)), std::ios::binary | std::ios::ate);
+    if (!f) return size;
+    u8 head[18] = {};
+    f.seekg(0);
+    f.read((char*)head, sizeof head);
+    return rstb::content_size(rel, head, (size_t)f.gcount(), size);
+}
+
+// The files the player's mods serve, counted once (the first RomFS open with mods): what each mod replaces or adds,
+// what the port's files or a higher mod serve instead, and its files for another game version (mods.h counts, the
+// F10 Mods tab). Added files and the folders only mods have go into the directory listings (OpenDirectory,
+// GetEntryType).
+struct ModFile { std::string rel, path; int mod; bool added; u64 size; };
+struct ModEnt { std::string name; int type; s64 size; };   // (type: 0 directory, 1 file, as nn::fs)
+struct ModsIndex {
+    std::vector<ModFile> served;
+    std::vector<std::vector<std::string>> other_tables;            // per mod: its tables for another game version
+    std::unordered_map<std::string, std::vector<ModEnt>> listing;  // lower-cased folder ("" the root) -> added entries
+    std::unordered_set<std::string> dirs;                          // lower-cased folders only mods have
+};
+// The RomFS path ("/a/b", "" the root) of host path `hp` under the RomFS folder; false: elsewhere
+static bool rom_rel(const std::string& hp, std::string* rel) {
+    const size_t n = strlen(kRomDir);
+    if (hp.compare(0, n, kRomDir) != 0 || (hp.size() > n && hp[n] != '/' && hp[n] != '\\')) return false;
+    rel->assign(hp, n, std::string::npos);
+    for (char& ch : *rel) if (ch == '\\') ch = '/';
+    while (!rel->empty() && rel->back() == '/') rel->pop_back();
+    if (!rel->empty() && (*rel)[0] != '/') rel->insert(0, "/");
+    return true;
+}
+static std::string lower(std::string s) { for (auto& ch : s) ch = (char)tolower((unsigned char)ch); return s; }
+// this game's version in RomFS names ("100" from ResourceSizeTable.Product.100.rsizetable.zs)
+static std::string rom_version() {
+    std::string t = kGlyphRstb;
+    const size_t a = t.find(".Product.") + 9;
+    return t.substr(a, t.find('.', a) - a);
+}
+static const ModsIndex& mods_index() {
+    static ModsIndex x;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const auto& um = user_mods();
+        if (um.empty()) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string ver = rom_version(), rstb_rel = "/" + std::string(kGlyphRstb);
+        x.other_tables.resize(um.size());
+        for (int i = 0; i < (int)um.size(); i++) {
+            int replaced = 0, added = 0, by_port = 0, by_mod = 0, other = 0;
+            std::string by_mod_name;
+            std::error_code ec;
+            const fsys::path root = fsys::path(widen(um[i]));
+            const std::u8string bu = root.generic_u8string();
+            const std::string base(bu.begin(), bu.end());
+            for (fsys::recursive_directory_iterator d(root, fsys::directory_options::skip_permission_denied, ec), e;
+                 !ec && d != e; d.increment(ec)) {
+                if (!d->is_regular_file(ec)) continue;
+                const std::u8string g = d->path().generic_u8string();
+                std::string p(g.begin(), g.end());
+                if (p.size() <= base.size()) continue;
+                const std::string rel = p.substr(base.size());
+                if (mods_scan::other_version(rel, ver.c_str())) {
+                    other++;
+                    if (rel.rfind("/System/Resource/ResourceSizeTable.", 0) == 0) x.other_tables[i].push_back(p);
+                    continue;
+                }
+                if (rel == rstb_rel) continue;   // (its table: merged, rstb_merged)
+                std::string winner;
+                int who = i;
+                if (!rom_replacement(rel, true, &winner, &who, false) || who == i) {
+                    const bool add = rom_base_type(rel) != 1;
+                    x.served.push_back({rel, p, i, add, (u64)d->file_size(ec)});
+                    (add ? added : replaced)++;
+                    if (add) {   // into its folder's listing, and each folder only mods have into its parent's
+                        std::string child = rel;
+                        s64 size = (s64)d->file_size(ec);
+                        int type = 1;
+                        while (true) {
+                            const size_t sl = child.rfind('/');
+                            const std::string dir = child.substr(0, sl), name = child.substr(sl + 1);
+                            auto& v = x.listing[lower(dir)];
+                            bool have = false;
+                            for (const auto& en : v) have |= mods_scan::ieq(en.name, name);
+                            if (!have) v.push_back({name, type, type ? size : 0});
+                            if (dir.empty() || rom_base_type(dir) == 0 || !x.dirs.insert(lower(dir)).second) break;
+                            child = dir, type = 0, size = 0;
+                        }
+                    }
+                } else if (who == kByPort) {
+                    by_port++;
+                } else {
+                    if (!by_mod++) {
+                        for (const auto& m : mods_list())
+                            if (m.romfs == um[who]) by_mod_name = m.name;
+                    }
+                }
+            }
+            mods_set_counts(um[i], replaced, added, by_port, by_mod, other, by_mod_name);
+            printf("[mods] %s: %d replaced, %d added, %d left to the port's files, %d to a higher mod, %d for another "
+                   "game version\n", um[i].c_str(), replaced, added, by_port, by_mod, other);
+        }
+        printf("[mods] %zu mod file(s) served, %zu folder(s) added, counted in %.0f ms\n", x.served.size(), x.dirs.size(),
+               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    });
+    return x;
+}
+
+// rstb_merged: each file a mod serves gets the entry its size needs in `out` (never lowered): a mod's table for another
+// game version gives its own files' entries; a replaced file that `base` (the port's table, before the mods' own) lists
+// grows by what the file grew (rstb::grow; one it does not list is sized by the game without the table, left alone);
+// an added file is estimated (rstb::estimate). Returns the entries raised; *estimated / *other: of those, the
+// estimates and the other-version tables' entries. After totk-pc-recomp runtime/romfs.c restbl_overlay (MIT,
+// Copyright (c) 2026 Valiantsin Dzerakh).
+static size_t rstb_mod_files(rstb::Table& out, const rstb::Table& base, size_t* estimated, size_t* other) {
+    const ModsIndex& x = mods_index();
+    size_t raised = 0;
+    for (size_t i = 0; i < x.other_tables.size(); i++)
+        for (const auto& p : x.other_tables[i]) {
+            rstb::Table m;
+            std::vector<u8> raw;
+            if (!rstb::unzstd(read_host_file(p), &raw) || !rstb::parse(raw, &m)) {
+                printf("[fs] resource size table %s: not a table this game reads, left out\n", p.c_str());
+                continue;
+            }
+            for (const auto& f : x.served) {
+                uint32_t v;
+                const std::string k = rstb::key(f.rel);
+                if (f.mod == (int)i && rstb::get(m, k, &v) && rstb::raise(out, k, v)) raised++, (*other)++;
+            }
+        }
+    for (const auto& f : x.served) {
+        const std::string k = rstb::key(f.rel);
+        const bool mc = f.rel.size() >= 3 && !f.rel.compare(f.rel.size() - 3, 3, ".mc");
+        uint32_t want = 0, entry;
+        if (!f.added && !rstb::get(base, k, &entry)) continue;   // (sized by the game without the table)
+        const u64 now = host_content_size(f.path, f.rel, f.size);   // (.mc: its size; the factor is in grow / estimate)
+        if (!f.added) {
+            u8 head[18] = {};
+            size_t got = 0;
+            u64 size = 0;
+            if (!rom_base_head(f.rel, head, sizeof head, &got, &size)) continue;
+            want = rstb::grow(k, entry, mc ? size : rstb::content_size(f.rel, head, got, size), now, mc);
+        } else if ((want = rstb::estimate(k, mc ? now * 8 : now))) {   // (a mesh codec file unpacks to several times its size)
+            (*estimated)++;
+        }
+        if (want && rstb::raise(out, k, want)) raised++;
+    }
+    return raised;
+}
+
 struct HFile { FH h = kClosed; int mode = 0; std::string path; std::atomic<u32> gen{0}; volatile bool live = false;
                std::shared_ptr<const FilePatch> patch;    // (patch: the glyph bank's bytes over the file's)
                bool packed = false; u64 pk_off = 0, pk_size = 0; };   // (packed: served from the RomFS pack, h unused)
@@ -1989,6 +2331,10 @@ HLE_AS(fs_Commit, "_ZN2nn2fs6CommitEPKc") {
 HLE_AS(fs_Commit, "_ZN2nn2fs6CommitEPKc") { c->x[0] = 0; }
 #endif
 HLE_AS(fs_SetPriorityOnCurrentThread, "_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE") { }
+#if !NXR_GAME_TOTK
+// CommitSaveData(mount): the SDK 11 name of Commit for a save mount (SDK 11.4)
+HLE_AS(fs_CommitSaveData, "_ZN2nn2fs14CommitSaveDataEPKc") { hle_fs_Commit(c); }
+#endif
 
 // ---- open-ahead Windows scans a file the first time it is opened (Defender real-time protection: 4-14 ms a file on
 // the dev PC, cached for about a minute), and the game's two loader threads open ~6.6 k files one after the other from
@@ -2241,6 +2587,7 @@ HLE_AS(fs_ReadFile4, "_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm") {
 }
 HLE_AS(fs_WriteFile, "_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE") {
     HFile* f = file(c->x[0]); if (!f) { c->x[0] = kUnsupported; return; }
+    SaveWrite sw(in_save(f->path));
 #ifdef _WIN32
     OVERLAPPED ov{}; u64 o = c->x[1]; ov.Offset = (DWORD)o; ov.OffsetHigh = (DWORD)(o >> 32);
     DWORD n = 0; BOOL ok = WriteFile(f->h, (void*)c->x[2], (DWORD)c->x[3], &n, &ov);
@@ -2275,6 +2622,7 @@ HLE_AS(fs_GetFileSize, "_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE") {
 }
 HLE_AS(fs_SetFileSize, "_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl") {
     HFile* f = file(c->x[0]); if (!f) { c->x[0] = kUnsupported; return; }
+    SaveWrite sw(in_save(f->path));
 #ifdef _WIN32
     FILE_END_OF_FILE_INFO e; e.EndOfFile.QuadPart = (s64)c->x[1];
     c->x[0] = SetFileInformationByHandle(f->h, FileEndOfFileInfo, &e, sizeof e) ? 0 : kUnsupported;
@@ -2322,11 +2670,16 @@ HLE_AS(fs_GetEntryType, "_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc")
 #endif
     ci_fix(hp);
     auto st = fsys::status(widen(hp), ec);
-    if (ec || !fsys::exists(st)) { c->x[0] = kPathNotFound; return; }
+    if (ec || !fsys::exists(st)) {
+        std::string rel;   // a folder only the player's mods have
+        if (!user_mods().empty() && rom_rel(hp, &rel) && mods_index().dirs.count(lower(rel))) { *(u32*)c->x[0] = 0; c->x[0] = 0; return; }
+        c->x[0] = kPathNotFound; return;
+    }
     *(u32*)c->x[0] = fsys::is_directory(st) ? 0 : 1; c->x[0] = 0;
 }
 HLE_AS(fs_CreateFile, "_ZN2nn2fs10CreateFileEPKcl") {
     std::string hp; if (!host_path((const char*)c->x[0], &hp)) { c->x[0] = kPathNotFound; return; }
+    SaveWrite sw(in_save(hp));
 #ifdef _WIN32
     HANDLE h = CreateFileW(widen(hp).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) { c->x[0] = GetLastError() == ERROR_FILE_EXISTS ? kPathExists : kPathNotFound; return; }
@@ -2341,6 +2694,7 @@ HLE_AS(fs_CreateFile, "_ZN2nn2fs10CreateFileEPKcl") {
 }
 HLE_AS(fs_DeleteFile, "_ZN2nn2fs10DeleteFileEPKc") {
     std::string hp; std::error_code ec; if (!host_path((const char*)c->x[0], &hp)) { c->x[0] = kPathNotFound; return; }
+    SaveWrite sw(in_save(hp));
     bool removed = false;
     retry_locked(ec, [&] { removed = fsys::remove(widen(hp), ec); });
     c->x[0] = removed ? 0 : ec ? fs_err(ec, "DeleteFile") : kPathNotFound;
@@ -2348,18 +2702,36 @@ HLE_AS(fs_DeleteFile, "_ZN2nn2fs10DeleteFileEPKc") {
 HLE_AS(fs_RenameFile, "_ZN2nn2fs10RenameFileEPKcS2_") {
     std::string a, b; std::error_code ec;
     if (!host_path((const char*)c->x[0], &a) || !host_path((const char*)c->x[1], &b)) { c->x[0] = kPathNotFound; return; }
+    SaveWrite sw(in_save(a) || in_save(b));
     retry_locked(ec, [&] { fsys::rename(widen(a), widen(b), ec); }); c->x[0] = fs_err(ec, "RenameFile");
 }
 HLE_AS(fs_CreateDirectory, "_ZN2nn2fs15CreateDirectoryEPKc") {
     std::string hp; std::error_code ec; if (!host_path((const char*)c->x[0], &hp)) { c->x[0] = kPathNotFound; return; }
+    SaveWrite sw(in_save(hp));
     c->x[0] = fsys::create_directory(widen(hp), ec) ? 0 : (ec ? fs_err(ec, "CreateDirectory") : kPathExists);
 }
 HLE_AS(fs_DeleteDirectoryRecursively, "_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc") {
     std::string hp; std::error_code ec; if (!host_path((const char*)c->x[0], &hp)) { c->x[0] = kPathNotFound; return; }
+    SaveWrite sw(in_save(hp));
     if (hp.rfind(kRomDir, 0) == 0) { c->x[0] = kUnsupported; return; }      // never touch the extracted romfs
     retry_locked(ec, [&] { fsys::remove_all(widen(hp), ec); }); c->x[0] = fs_err(ec, "DeleteDirectoryRecursively");
 }
 
+#if !NXR_GAME_TOTK
+// CleanDirectoryRecursively(path): the directory's contents go, the directory stays (SDK 11.4)
+HLE_AS(fs_CleanDirectoryRecursively, "_ZN2nn2fs25CleanDirectoryRecursivelyEPKc") {
+    std::string hp; std::error_code ec; if (!host_path((const char*)c->x[0], &hp)) { c->x[0] = kPathNotFound; return; }
+    SaveWrite sw(in_save(hp));
+    if (hp.rfind(kRomDir, 0) == 0) { c->x[0] = kUnsupported; return; }      // never touch the extracted romfs
+    for (const auto& e : fsys::directory_iterator(widen(hp), ec)) {
+        std::error_code e2;
+        retry_locked(e2, [&] { fsys::remove_all(e.path(), e2); });
+        if (e2) { ec = e2; break; }
+    }
+    c->x[0] = fs_err(ec, "CleanDirectoryRecursively");
+}
+
+#endif
 // ---- directories. nn::fs::DirectoryEntry: name[0x301], pad[3], s8 type @0x304, pad[3], s64 size @0x308 (0x310)
 typedef std::vector<std::pair<std::string, std::pair<int, s64>>> DirEnts;
 struct HDir { DirEnts ents; size_t pos = 0; std::atomic<u32> gen{0}; volatile bool live = false; };
@@ -2386,14 +2758,25 @@ HLE_AS(fs_OpenDirectory, "_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci")
         }
     } else
 #endif
-    {
-    if (ci_fix(hp), !fsys::is_directory(widen(hp), ec)) { c->x[0] = kPathNotFound; return; }
+    if (std::string mrel; ci_fix(hp), !fsys::is_directory(widen(hp), ec)) {
+        if (user_mods().empty() || !rom_rel(hp, &mrel) || !mods_index().dirs.count(lower(mrel))) { c->x[0] = kPathNotFound; return; }
+    } else {   // (else a folder only the player's mods have: their entries, below)
     for (auto& e : fsys::directory_iterator(widen(hp), ec)) {
         bool dir = e.is_directory(ec);
         if ((dir && !(mode & 1)) || (!dir && !(mode & 2))) continue;
         std::u8string nm = e.path().filename().u8string();
         ents.push_back({ std::string(nm.begin(), nm.end()), { dir ? 0 : 1, dir ? 0 : (s64)e.file_size(ec) } });
     }
+    }
+    if (std::string mrel; !user_mods().empty() && rom_rel(hp, &mrel)) {   // the files and folders the player's mods add
+        const auto& ls = mods_index().listing;
+        if (auto it = ls.find(lower(mrel)); it != ls.end())
+            for (const ModEnt& m : it->second) {
+                if ((m.type == 0 && !(mode & 1)) || (m.type == 1 && !(mode & 2))) continue;
+                bool have = false;
+                for (const auto& e : ents) have |= mods_scan::ieq(e.first, m.name);
+                if (!have) ents.push_back({ m.name, { m.type, m.size } });
+            }
     }
     u64 v = g_dirs.put([&](HDir* d) { d->ents = std::move(ents); d->pos = 0; });
     if (!v) { printf("[fs] OpenDirectory: no free directory handle\n"); c->x[0] = kUnsupported; return; }
@@ -2423,4 +2806,35 @@ extern "C" void hle_fs_set_save_backups(int n) {
 #else
     (void)n;
 #endif
+}
+
+// One whole file of the game's RomFS for host code (pc_ui_font.cpp: the game's UI font for the fps readout): the RomFS
+// pack when one serves the RomFS (TOTK_ROMFS_PACK), else the RomFS folder; never an overlay or a mod (the game's own
+// file). rel: RomFS-relative, '/' separators. False (out empty) when the file is not there.
+bool hle_fs_read_romfs(const char* rel, std::vector<u8>* out) {
+    out->clear();
+#ifdef _WIN32
+    if (RomPack* pk = rompack()) {
+        if (const PackEntry* e = pack_find(pk, rel)) {
+            out->resize((size_t)e->size);
+            if (pack_read(pk->h, e->data_off, out->data(), e->size) == e->size) return true;
+            out->clear();
+            return false;
+        }
+    }
+#endif
+    *out = read_host_file(std::string(kRomDir) + "/" + rel);
+    return !out->empty();
+}
+// hle_movie.cpp: a RomFS file the pack serves (hp under the RomFS folder and in the pack) as the pack's file handle,
+// offset and size, for a read-only mapping of that slice (a player's install keeps no unpacked folder). False: hp itself
+// is the file (an overlay's or a mod's, or the folder when no pack serves the RomFS). The handle stays the pack's.
+bool hle_fs_pack_slice(const std::string& hp, void** h, u64* off, u64* size) {
+#ifdef _WIN32
+    std::string rel;
+    if (RomPack* pk = rompack(); pk && pack_rel(hp, &rel))
+        if (const PackEntry* e = pack_find(pk, rel)) { *h = pk->h; *off = e->data_off; *size = e->size; return true; }
+#endif
+    (void)hp; (void)h; (void)off; (void)size;
+    return false;
 }

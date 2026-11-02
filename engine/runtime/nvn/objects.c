@@ -233,13 +233,14 @@ static void sync_wait_body(Cpu *c) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     // without; frame shots equal. One frame more of GPU latency; relies on the game's CPU-written GPU data being double-buffered.
     static int lag = -1;
     if (lag < 0) { const char *e = getenv("LARECOMP_SYNC_LAG"); lag = !(e && *e == '0'); if (!lag) LOG("[nvn] SyncWait lag off (LARECOMP_SYNC_LAG=0)\n"); }
-    // LARECOMP_SYNC_TICKET_LAG=1 (async, with the lag; off by default): the render thread only has to pass this sync's
-    // PREVIOUS fence too, not this one, so the game builds frame N+1 while frame N is still replayed (the wait for N's
-    // replay was the render thread's 8-13 % idle per frame: Main finishing a frame before it submits). The GPU wait is for
-    // that previous fence, as with the lag alone. Relies on the game not rewriting frame N's command memory and the data
-    // the replay reads (guest_copy / guest_direct) while it builds N+1.
+    // Ticket lag (async, with the lag; default on since the 2026-11-01 stutter sprint, 5-plan.md fix 7
+    // LARECOMP_SYNC_TICKET_LAG=0 = wait for this sync's own replay as before): the render thread only has to pass this
+    // sync's PREVIOUS fence too, not this one, so the game builds frame N+1 while frame N is still replayed (the wait for
+    // N's replay was the render thread's 8-13 % idle per frame: Main finishing a frame before it submits). The GPU wait is
+    // for that previous fence, as with the lag alone. Relies on the game not rewriting frame N's command memory and the
+    // data the replay reads (guest_copy / guest_direct) while it builds N+1.
     static int tlag = -1;
-    if (tlag < 0) { const char *e = getenv("LARECOMP_SYNC_TICKET_LAG"); tlag = e && *e == '1'; if (tlag) LOG("[nvn] SyncWait ticket lag on (LARECOMP_SYNC_TICKET_LAG=1)\n"); }
+    if (tlag < 0) { const char *e = getenv("LARECOMP_SYNC_TICKET_LAG"); tlag = !(e && *e == '0'); if (!tlag) LOG("[nvn] SyncWait ticket lag off (LARECOMP_SYNC_TICKET_LAG=0)\n"); }
     if (backend_async_on() && tlag && lag && !flush && !whole) {
         NvnSync *s = sync_of(A(0));
         uint64_t pt = s->prev_ticket, k = s->nfence;

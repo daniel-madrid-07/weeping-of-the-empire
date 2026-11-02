@@ -1,5 +1,6 @@
 // HLE: nn::os memory (heap, memory blocks, pages, QueryMemoryInfo) and nn::mem::StandardAllocator.
 #include "hle.h"
+#include "nxr_game.h"   // (NXR_GAME_TOTK: forms TotK's build leaves out)
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 #include <vector>
 #include <map>
 #include <atomic>
+#include <chrono>
 #ifndef _WIN32
 #include <sys/mman.h>
 // runtime/linux/plat_posix.cpp: the range in a driver-owned GTT buffer (amdgpu) instead of host memory the GPU imports as userptr
@@ -51,31 +53,86 @@ static bool ww_default() {
 static bool g_heap_ww;
 static std::vector<u32> g_page_epoch;   // per 4 KiB heap page: epoch of the last check that found it written
 static u32 g_ww_epoch;
+static u64 g_ww_steps;   // locked sweep steps so far, by any caller (ww_sweep: did anyone run between two of mine?)
 static std::mutex g_ww_mtx;
+// One GetWriteWatch over a whole range held g_ww_mtx (and the kernel's lock on our address space) for the whole walk,
+// commit 111 of 120 GB) and the vsync thread stopped as long. ww_sweep walks [a, e) in steps of at most
+// LARECOMP_WW_CHUNK_MB (default 4; 0 = one step), each its own GetWriteWatch under g_ww_mtx, the lock dropped in
+// between, so other threads (and the memory manager) get in between steps. Epochs stay exact across the dropped lock:
+// a step stamps the pages it found written with an epoch this sweep made itself (a new one if anyone ran since this
+// sweep's previous step, so a stamp is always newer than any epoch another caller saw), and *level (what the caller
+// may treat as "seen") stops advancing at the first step someone else ran before: a write another caller took after
+// that is stamped newer than *level and shows up at the next check. Cost of an interleave: one extra "changed" at the
+// next check, never a missed write. on_step(first page, pages) runs under the lock after a step's stamps. A failed
+// GetWriteWatch stamps its whole step (as written: never a missed write; the watch bits stay set, so the next sweep
+// sees them again).
+static u64 ww_chunk_bytes() {
+    static const u64 c = [] { const char* e = getenv("LARECOMP_WW_CHUNK_MB"); u64 mb = e ? strtoull(e, nullptr, 0) : 4; return mb ? mb << 20 : ~0ull; }();
+    return c;
+}
+static struct { u64 calls, steps, fails, ns, max_ns; std::chrono::steady_clock::time_point since; } g_ww_st;
+template <class F> static void ww_sweep(u64 a, u64 e, u32* level, F&& on_step) {
+    static std::vector<void*> hits;
+    u64 mine_step = ~0ull;   // g_ww_steps after this sweep's previous step
+    u32 mine = 0;            // the epoch this sweep made (0: none yet)
+    bool frozen = false;
+    const u64 chunk = ww_chunk_bytes();
+    for (u64 c = a; c < e;) {
+        u64 ce = e - c > chunk ? c + chunk : e, np = (ce - c) >> 12;
+        std::lock_guard<std::mutex> l(g_ww_mtx);
+        bool other = mine_step != g_ww_steps;   // (first step: always)
+        if (other && mine_step != ~0ull) frozen = true;
+        if (g_page_epoch.size() < (g_heap_size >> 12)) g_page_epoch.resize(g_heap_size >> 12, 0);
+        if (hits.size() < np) hits.resize(np);
+        ULONG_PTR count = np;
+        DWORD gran = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        bool ok = GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void*)c, (SIZE_T)(ce - c), hits.data(), &count, &gran) == 0;
+        u64 ns = (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (!ok) {
+            for (u64 i = 0; i < np; i++) hits[i] = (void*)(c + (i << 12));
+            count = np;
+            g_ww_st.fails++;
+        }
+        if (count) {
+            if (!mine || other || g_ww_epoch != mine) mine = ++g_ww_epoch;
+            for (ULONG_PTR i = 0; i < count; i++) g_page_epoch[((u64)hits[i] - g_heap_base) >> 12] = mine;
+        }
+        on_step((c - g_heap_base) >> 12, np);
+        if (!frozen) *level = g_ww_epoch;
+        mine_step = ++g_ww_steps;
+        g_ww_st.steps++;
+        g_ww_st.ns += ns;
+        if (ns > g_ww_st.max_ns) g_ww_st.max_ns = ns;
+        if (c == a) {
+            auto now = std::chrono::steady_clock::now();
+            if (!g_ww_st.calls++) g_ww_st.since = now;
+            double s = std::chrono::duration<double>(now - g_ww_st.since).count();
+            if (s >= 2.0) {
+                printf("[os] heap write watch, last %.1f s: %llu sweeps, %llu steps, %.1f ms in GetWriteWatch, longest step %.1f ms, %llu failed\n",
+                       s, (unsigned long long)g_ww_st.calls, (unsigned long long)g_ww_st.steps, g_ww_st.ns / 1e6, g_ww_st.max_ns / 1e6,
+                       (unsigned long long)g_ww_st.fails);
+                g_ww_st = {};
+                g_ww_st.since = now;
+            }
+        }
+        c = ce;
+    }
+}
 // Were any pages of [addr, addr + size) in the heap written since *seen (the caller's epoch from its previous call)?
-// 1 yes, 0 no, -1 unknown (no write watch, outside the committed heap, or the call failed). The watch bits of the range
-// are fetched and reset in one GetWriteWatch, and every written page gets the new epoch, so textures sharing pages all
-// see the write (a plain per-range reset would hide it from the others). A write after the fetch shows up next time.
+// 1 yes, 0 no, -1 unknown (no write watch or outside the committed heap). The watch bits of the range are fetched and
+// reset (ww_sweep), and every written page gets a new epoch, so textures sharing pages all see the write (a plain
+// per-range reset would hide it from the others). A write after the fetch shows up next time.
 // CPU writes only: GPU / DMA writes into the imported heap are not seen (callers keep a periodic full check).
 extern "C" int heap_ww_changed(u64 addr, u64 size, u64* seen) {
     if (!g_heap_ww || !size || addr < g_heap_base || addr + size > g_heap_base + g_heap_used) return -1;
     u64 a = addr & ~0xFFFull, e = (addr + size + 0xFFF) & ~0xFFFull;
-    u64 first = (a - g_heap_base) >> 12, npages = (e - a) >> 12;
-    std::lock_guard<std::mutex> l(g_ww_mtx);
-    if (g_page_epoch.size() < (g_heap_size >> 12)) g_page_epoch.resize(g_heap_size >> 12, 0);
-    static std::vector<void*> hits;
-    if (hits.size() < npages) hits.resize(npages);
-    ULONG_PTR count = npages;
-    DWORD gran = 0;
-    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void*)a, (SIZE_T)(e - a), hits.data(), &count, &gran) != 0) return -1;
-    if (count) {
-        ++g_ww_epoch;
-        for (ULONG_PTR i = 0; i < count; i++) g_page_epoch[((u64)hits[i] - g_heap_base) >> 12] = g_ww_epoch;
-    }
-    u32 newest = 0;
-    for (u64 i = 0; i < npages; i++) if (g_page_epoch[first + i] > newest) newest = g_page_epoch[first + i];   // (windows.h max macro)
+    u32 newest = 0, level = 0;
+    ww_sweep(a, e, &level, [&](u64 first, u64 np) {
+        for (u64 i = 0; i < np; i++) if (g_page_epoch[first + i] > newest) newest = g_page_epoch[first + i];   // (windows.h max macro)
+    });
     bool changed = newest > *seen;
-    *seen = g_ww_epoch;
+    *seen = level;
     return changed;
 }
 // exec.c's VRAM mirror of the heap (vertex / index data): the pages of [addr, addr + len) written since the mirror last
@@ -90,31 +147,22 @@ extern "C" int heap_mirror_take(u64 addr, u64 len, u64* offs, u64* lens, int max
     if (addr < g_heap_base || addr >= g_heap_base + g_heap_used) return -1;
     if (addr + len > g_heap_base + g_heap_used) len = g_heap_base + g_heap_used - addr;
     u64 a = addr & ~0xFFFull, e = (addr + len + 0xFFF) & ~0xFFFull;
-    u64 first = (a - g_heap_base) >> 12, npages = (e - a) >> 12;
-    std::lock_guard<std::mutex> l(g_ww_mtx);
-    if (g_page_epoch.size() < (g_heap_size >> 12)) g_page_epoch.resize(g_heap_size >> 12, 0);
-    if (g_mirror_epoch.size() < (g_heap_size >> 12)) g_mirror_epoch.resize(g_heap_size >> 12, 0);
-    static std::vector<void*> hits;
-    if (hits.size() < npages) hits.resize(npages);
-    ULONG_PTR count = npages;
-    DWORD gran = 0;
-    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void*)a, (SIZE_T)(e - a), hits.data(), &count, &gran) != 0) return -1;
-    if (count) {
-        ++g_ww_epoch;
-        for (ULONG_PTR i = 0; i < count; i++) g_page_epoch[((u64)hits[i] - g_heap_base) >> 12] = g_ww_epoch;
-    }
     int n = 0;
-    for (u64 i = 0; i < npages; i++) {
-        u64 p = first + i;
-        u32 m = g_mirror_epoch[p];
-        if (m && g_page_epoch[p] < m) continue;
-        g_mirror_epoch[p] = g_ww_epoch + 1;
-        u64 o = p << 12;
-        if (n && offs[n - 1] + lens[n - 1] == o) lens[n - 1] += 4096;
-        else if (n == max) lens[n - 1] = o + 4096 - offs[n - 1];
-        else { offs[n] = o; lens[n] = 4096; n++; }
-        *bytes += 4096;
-    }
+    u32 level = 0;
+    // (a page's copy mark is the epoch at its own step + 1: a later stamp of it is newer than that epoch, see ww_sweep)
+    ww_sweep(a, e, &level, [&](u64 first, u64 np) {
+        if (g_mirror_epoch.size() < (g_heap_size >> 12)) g_mirror_epoch.resize(g_heap_size >> 12, 0);
+        for (u64 p = first; p < first + np; p++) {
+            u32 m = g_mirror_epoch[p];
+            if (m && g_page_epoch[p] < m) continue;
+            g_mirror_epoch[p] = g_ww_epoch + 1;
+            u64 o = p << 12;
+            if (n && offs[n - 1] + lens[n - 1] == o) lens[n - 1] += 4096;
+            else if (n == max) lens[n - 1] = o + 4096 - offs[n - 1];
+            else { offs[n] = o; lens[n] = 4096; n++; }
+            *bytes += 4096;
+        }
+    });
     return n;
 }
 HLE_AS(os_SetMemoryHeapSize, "_ZN2nn2os17SetMemoryHeapSizeEm") {
@@ -166,6 +214,16 @@ HLE_AS(os_AllocateMemoryBlock, "_ZN2nn2os19AllocateMemoryBlockEPmm") {
     *(u64*)c->x[0] = a;
     printf("[os] AllocateMemoryBlock(%llx) -> %llx\n", size, a);
     c->x[0] = 0;
+#if !NXR_GAME_TOTK
+}
+HLE_AS(os_FreeMemoryBlock, "_ZN2nn2os15FreeMemoryBlockEmm") {
+    std::lock_guard<std::mutex> l(g_heap_mtx);
+    const u64 a = c->x[0], size = (c->x[1] + 0x1FFFFF) & ~0x1FFFFFull;
+    if (a < g_heap_base || a + size > g_heap_base + g_heap_used) { printf("[os] FreeMemoryBlock(%llx, %llx): not a block\n", a, c->x[1]); return; }
+    VirtualFree((void*)a, size, MEM_DECOMMIT);
+    if (a + size == g_heap_base + g_heap_used) g_heap_used -= size;
+    printf("[os] FreeMemoryBlock(%llx, %llx)\n", a, size);
+#endif
 }
 // ---- address regions: carved from ONE reserved range (the Switch "alias" region), lowest address first, like the
 // kernel does. Separate VirtualAlloc reservations scatter regions around the main heap; sead's PageHeap grows by many

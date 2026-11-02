@@ -7,6 +7,10 @@ The engine's own code names main by 1.0.0 offsets in three ways:
   - addresses: every one goes through totk_version.h (totk_main / totk_main_off / totk_global / decomp_bridge::rebase);
   - function names: hook_f_<off> / f_<off>_orig of the GEN_MAIN hooks and direct f_<off> calls;
   - GEN_MAIN's offset lists (--hook, --vlocal) in tools/engine/build.py.
+Struct fields (totk_field(Struct, 0x<1.0.0 offset>)) are not the porter's: --fields takes a hand-made map
+({"Actor": {"0x220": "0x228"}}, private like the table) and engine/runtime/totk_fields_v<NNN>.inc defines
+TF_<Struct>_<off> for every field the sources name and the map places. A field it does not place stays undefined, so
+the build stops at its use (--diagnostic: TOTK_FIELD_UNKNOWN instead).
 `collect` finds them in the sources: every hex constant in a main offset's range is a
 candidate, so nothing is missed by a pattern; constants that are not addresses simply find no place and are left out.
 `generate` runs the porter and writes engine/runtime/totk_main_v<NNN>.inc (the address table totk_version.h
@@ -36,6 +40,8 @@ MIN_OFFSET = 0x10000             # below this a hex constant is a size, a mask o
 HEX = re.compile(r'\b0x([0-9a-fA-F]+)(?:ull|ULL|u|U|ll|LL)?\b')
 GUEST_FN = re.compile(r'DECOMP_GUEST_FN\(\s*\w+\s*,\s*([0-9a-fA-F]+)\s*,')  # bare hex
 FNAME = re.compile(r'\b(?:hook_)?f_([0-9a-f]{5,8})(?:_orig)?\b')
+FIELD = re.compile(r'\btotk_field(?:_known)?\(\s*([A-Za-z_]\w*)\s*,\s*(0x[0-9a-f]+)\s*\)')   # totk_version.h
+FIELD_UNKNOWN = 0x7FFFFFF0   # totk_version.h TOTK_FIELD_UNKNOWN
 
 
 # What a build for another version may do when the porter cannot keep one of GEN_MAIN's hooks. Every GEN_MAIN hook
@@ -53,11 +59,24 @@ HOOK_FAIL = {
     0x1a85e4c: 'options row controller', 0x1a06840: "options: shown entries' count",
     0x1a068cc: 'options: the n-th shown entry',
 }
+# A beta build of another version (engine-map --beta, review 11-01) may ship without a REQUIRED hook only when the
+# hook belongs to one of these feature groups: the feature is then off by design (the key's beta_runtime_env), never
+# half on. A required hook outside them still fails the build.
+BETA_GROUPS = {
+    0x83e3f8: 'pc_menus', 0x1ccf894: 'pc_virtual_keys',
+    0xf6092c: 'options_screen', 0x1a862e4: 'options_screen', 0x1a86420: 'options_screen', 0x1a85b3c: 'options_screen',
+    0x1a8604c: 'options_screen', 0x1a85e4c: 'options_screen', 0x1a06840: 'options_screen', 0x1a068cc: 'options_screen',
+}
+BETA_ENV = {   # what turns each group's feature off (pc_input.cpp scheme, totk_menu_cursor.cpp, totk_options_menu.cpp)
+    'pc_menus': {'TOTK_CONTROLS': 'console', 'TOTK_MENU_CURSOR': '0'},
+    'pc_virtual_keys': {'TOTK_CONTROLS': 'console'},
+    'options_screen': {'TOTK_OPTIONS_MENU': '0'},
+}
 HOOK_CAP30 = {
     0x7a83e4: 'the frame-delta setter (the speed fix)', 0x8f689c: 'the present-interval minimum',
     0xf15364: 'map scroll', 0xf0fdec: "Hero's Path step", 0x16e4728: 'Walk stop delay', 0x1cd0260: 'stick spin',
     0x16e4610: 'struggle spin', 0x1aa3e44: 'get-item info delays', 0x16e4b80: 'Cucco glide ease',
-    0x1d23614: 'tumble-slide sound', 0xa5f010: 'lightning rolls', 0x1d97648: 'event waits', 0x1c17fb0: 'event waits',
+    0x1d23614: 'tumble-slide sound', 0xa5f010: 'lightning rolls', 0x1d97648: 'event waits', 0x1c17fb0: 'event waits', 0x10bc078: 'event waits', 0x13bd680: 'event waits',
     0x120ec94: 'Recall velocity step', 0x9d8d00: 'Autobuild settle', 0x1b3ebac: 'cooking pot settle',
     0x1a4f0ac: 'extra-stamina pause', 0x1c73fbc: 'tar Like Like spots', 0x1dbdcf0: "flying enemies' path probes",
     0x1aa6a94: 'horse gauge tween', 0x1b7ba58: "followers' ring", 0x212b740: "inventory Link's tab debounce",
@@ -71,7 +90,11 @@ HOOK_GROUPS = (
 HOOK_FREE = {0x704b7c: 'submesh cull (speed)', 0x27b6e64: 'load lap labels (diagnostic)',
              0x11276cc: 'loader thread count (A/B)',
              0x9c2ef0: 'aal flush hold: without it the runtime keeps its 180 fps hold (hle_vi audio_fps_max), under the '
-                       '200 where the jam watchdog cuts audio'}
+                       '200 where the jam watchdog cuts audio',
+             0x9c2b70: "aal jam watchdog in time: without it the game's own 300-call count runs (10 s at 30 fps); with "
+                       'the flush hold (or the 180 fps hold) no jam forms above 200',
+             0xabb518: 'ambient one-shot settle in game time: without it the game plays, short ambient one-shots just '
+                       'come closer together above 30 fps'}
 
 
 def hook_policy(kept, hooks):
@@ -104,7 +127,7 @@ def source_files(root=ROOT):
         else:
             for dirpath, _, names in os.walk(p):
                 for n in sorted(names):
-                    if n.endswith(SOURCE_EXT) and not n.startswith('totk_main_v'):
+                    if n.endswith(SOURCE_EXT) and not n.startswith(('totk_main_v', 'totk_fields_v')):
                         yield Path(dirpath) / n
 
 
@@ -120,8 +143,9 @@ def gen_main_lists():
 
 
 def collect(root=ROOT):
-    """{'offsets': main offsets named as hex constants, 'functions': offsets named by f_<off> symbols}."""
-    offsets, functions = set(), set()
+    """{'offsets': main offsets named as hex constants, 'functions': offsets named by f_<off> symbols,
+    'fields': (struct, 1.0.0 offset) pairs named by totk_field}."""
+    offsets, functions, fields = set(), set(), set()
     for p in source_files(root):
         text = p.read_text(encoding='utf-8', errors='replace')
         for m in [*HEX.finditer(text), *GUEST_FN.finditer(text)]:
@@ -132,7 +156,10 @@ def collect(root=ROOT):
                 offsets.add(v)
         for m in FNAME.finditer(text):
             functions.add(int(m.group(1), 16))
-    return dict(offsets=sorted(offsets), functions=sorted(functions))
+        if p.name != 'totk_version.h':   # (its comments name an example)
+            for m in FIELD.finditer(text):
+                fields.add((m.group(1), m.group(2)))
+    return dict(offsets=sorted(offsets), functions=sorted(functions), fields=sorted(fields))
 
 
 def version_number(version):
@@ -150,7 +177,28 @@ def table_inc(pairs, version):
     return '\n'.join(lines + ['};', ''])
 
 
-def generate(old_nso, new_nso, version):
+def fields_inc(fields, field_map, version, diagnostic=False):
+    """totk_fields_v<NNN>.inc: TF_<Struct>_<off> for each (struct, off) the sources name and field_map places;
+    returns (text, unplaced pairs)"""
+    lines = [f'// GENERATED by `python -m games.totk.patches engine-map` for TotK {version}: do not edit.',
+             "// TF_<Struct>_<1.0.0 offset> = the field's offset in this build (totk_version.h totk_field).",
+             '#pragma once']
+    unplaced = []
+    for st, off in fields:
+        new = (field_map.get(st) or {}).get(off)
+        if new is not None:
+            lines.append(f'#define TF_{st}_{off} {int(new, 16):#x}')
+            continue
+        unplaced.append((st, off))
+        if diagnostic:
+            lines.append(f'#define TF_{st}_{off} {FIELD_UNKNOWN:#x}u')
+    return '\n'.join(lines) + '\n', unplaced
+
+
+SENTINEL = 0xFFFFFFF0   # totk_version.h TOTK_MAIN_UNKNOWN: an offset a diagnostic build could not place
+
+
+def generate(old_nso, new_nso, version, diagnostic=False, beta=False):
     sys.path.insert(0, str(ROOT / 'tools'))
     import version_port as vp
     from .port import placeable
@@ -190,19 +238,59 @@ def generate(old_nso, new_nso, version):
                   vlocal=[hex(v) for v in sorted(vlocal)], giant_hot=sorted(giant_hot),
                   unplaced_hooks=[hex(o) for o in sorted(cannot) if o not in porter.fwd],
                   dropped_hooks=reasons)
+    if diagnostic or beta:   # every engine address and name it could not place gets the sentinel / a trap stub
+        for off in found['offsets']:
+            addrs.setdefault(off, SENTINEL)
+        placed = set(alias.values())
+        engine['stubs'] = [hex(o) for o in sorted(set(found['functions']) | set(gen_hooks)) if o not in placed]
+    if diagnostic:   # never shipped
+        engine['status'], engine['diagnostic'] = 'diagnostic', True
+    elif beta:       # shipped with the features of its dropped required hooks off (BETA_GROUPS); else it fails
+        lost = sorted(o for o in cannot if o in HOOK_FAIL)
+        stray = [hex(o) for o in lost if o not in BETA_GROUPS]
+        groups = sorted({BETA_GROUPS[o] for o in lost if o in BETA_GROUPS})
+        env = {}
+        for g in groups:
+            env.update(BETA_ENV[g])
+        engine.update(status='fail' if stray else 'beta', diagnostic=False, beta=True, off_features=groups,
+                      beta_runtime_env=env)
+        if stray:
+            engine['beta_refused'] = f'required hooks outside the beta groups: {", ".join(stray)}'
     return addrs, engine, report
 
 
+def stubs_inc(stubs, version):
+    """trap stubs for the 1.0.0 function names a diagnostic build could not place (totk_version.cpp includes it)"""
+    lines = [f'// GENERATED by `python -m games.totk.patches engine-map --diagnostic` for TotK {version}: do not edit.',
+             '// The engine names these 1.0.0 functions; this build has no place for them: a call stops with a message.']
+    for o in stubs:
+        x = int(o, 16)
+        lines += [f'void f_{x:x}(Ctx* __restrict c) {{ (void)c; totk_main_unmapped({x:#x}); }}',
+                  f'void f_{x:x}_orig(Ctx* __restrict c) {{ (void)c; totk_main_unmapped({x:#x}); }}']
+    return '\n'.join(lines) + '\n'
+
+
 def main_engine_map(args):
-    addrs, engine, report = generate(args.old, args.new, args.version)
+    addrs, engine, report = generate(args.old, args.new, args.version, getattr(args, 'diagnostic', False),
+                                     getattr(args, 'beta', False))
     n = version_number(args.version)
     inc = ROOT / 'engine' / 'runtime' / f'totk_main_v{n}.inc'
     js = ROOT / 'games' / 'totk' / 'patches' / f'v{n}.engine.json'
     inc.write_text(table_inc(addrs.items(), args.version), encoding='utf-8', newline='\n')
     js.write_text(json.dumps(engine, indent=1) + '\n', encoding='utf-8', newline='\n')
+    fmap = json.loads(Path(args.fields).read_text(encoding='utf-8')) if getattr(args, 'fields', None) else {}
+    ftext, funplaced = fields_inc(collect()['fields'], fmap, args.version, bool(engine.get('diagnostic') or engine.get('beta')))
+    finc = ROOT / 'engine' / 'runtime' / f'totk_fields_v{n}.inc'
+    finc.write_text(ftext, encoding='utf-8', newline='\n')
+    stubs = ROOT / 'engine' / 'runtime' / f'totk_main_v{n}_stubs.inc'
+    if engine.get('diagnostic') or engine.get('beta'):
+        stubs.write_text(stubs_inc(engine['stubs'], args.version), encoding='utf-8', newline='\n')
+    elif stubs.exists():
+        stubs.unlink()
     if args.report:
         Path(args.report).write_text(json.dumps(report, indent=1) + '\n', encoding='utf-8', newline='\n')
-    print(json.dumps(dict(status=engine['status'], safe_mode=engine['safe_mode'], wrote=[str(inc), str(js)],
+    print(json.dumps(dict(status=engine['status'], safe_mode=engine['safe_mode'], wrote=[str(inc), str(js), str(finc)],
+                          unplaced_fields=[f'{st}+{o}' for st, o in funplaced],
                           addresses=len(addrs), aliases=len(engine['alias']), hooks=len(engine['hook']),
                           dropped_hooks=engine['dropped_hooks'], unplaced_hooks=engine['unplaced_hooks'])))
-    return 0 if engine['status'] == 'pass' else 1
+    return 0 if engine['status'] in ('pass', 'diagnostic', 'beta') else 1

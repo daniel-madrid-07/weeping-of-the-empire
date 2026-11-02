@@ -54,6 +54,10 @@ std::atomic<bool> g_running{false};
 bool g_log = getenv("TOTK_AUDIO_LOG") && strcmp(getenv("TOTK_AUDIO_LOG"), "graph") != 0;
 bool g_graph = getenv("TOTK_AUDIO_LOG") && !strcmp(getenv("TOTK_AUDIO_LOG"), "graph");
 float g_master = getenv("TOTK_VOLUME") ? (float)atof(getenv("TOTK_VOLUME")) : 1.0f;
+// Voice out-status as on the Switch: the mixer's finished buffers and played sample count reach the game only at its
+// next RequestUpdateAudioRenderer (the DSP's out-status is copied back there), not the moment the mixer thread finishes
+// them. TOTK_AUDIO_RELEASE_SNAPSHOT=0: published straight from the mixer thread (the old behaviour).
+bool g_rel_snapshot = [] { const char* e = getenv("TOTK_AUDIO_RELEASE_SNAPSHOT"); return !e || strcmp(e, "0") != 0; }();
 // Silent while the window is out of focus: -1 reads TOTK_MUTE_UNFOCUSED at the first frame, the row sets it
 // live. g_gain eases to 0 / back over ~10 ms (no click).
 std::atomic<int> g_mute_unfocused{-1};
@@ -225,12 +229,14 @@ struct Voice {
     s16 coef[16] = {};
     struct { bool on; s16 num[3], den[2]; float s[kMaxVoiceCh][2]; } bq[2] = {};
     std::deque<WaveBuf> pending, released;
+    std::deque<WaveBuf> done;              // finished by the mixer, not yet published (g_rel_snapshot)
     s32 cur = -1;                          // sample cursor in pending.front() (-1: not started)
     s16 hist1 = 0, hist2 = 0;              // ADPCM history
     std::deque<float> look[kMaxVoiceCh];   // decoded but not yet consumed
     float prevs[kMaxVoiceCh] = {};          // sample before the current position
     double frac = 0;
-    u64 played = 0;
+    u64 played = 0;                        // the mixer's count
+    u64 played_pub = 0;                    // the count the game sees (g_rel_snapshot: as of its last update)
     bool started_once = false;
     u64 lr = 0;                            // AcquireVoiceSlot's caller (graph log: which game code owns the voice)
 };
@@ -270,7 +276,7 @@ bool next_sample(Voice& v, float* out) {
         if (w.loop && w.end > w.start) { v.cur = w.start; if (v.fmt == 6) adpcm_load_ctx(v, w); continue; }
         if (w.loop) return false;  // empty looping buffer: silence
         if (w.eos) v.played = 0;
-        v.released.push_back(w); v.pending.pop_front(); v.cur = -1; g_releases++;
+        (g_rel_snapshot ? v.done : v.released).push_back(w); v.pending.pop_front(); v.cur = -1; g_releases++;
     }
     return false;
 }
@@ -1070,6 +1076,8 @@ HLE_AS(audio_GetAudioRendererElapsedFrameCount, "_ZN2nn5audio33GetAudioRendererE
 HLE_AS(audio_RequestUpdateAudioRenderer, "_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE") {
     std::lock_guard<std::mutex> l(g_mtx);
     for (auto& [a, v] : g_voices) {
+        for (auto& w : v.done) v.released.push_back(w);   // the out-status of the frames rendered since the last update
+        v.done.clear(); v.played_pub = v.played;
         for (auto& w : v.pending) w.sent = true;
         if (v.pending_state != v.state) {
             // play-state log (user 2026-10-15: skipped cooking cutscene keeps its full audio -> which voices stop when)
@@ -1081,7 +1089,7 @@ HLE_AS(audio_RequestUpdateAudioRenderer, "_ZN2nn5audio26RequestUpdateAudioRender
                        v.pending.size(), (unsigned long long)v.played);
             if (v.pending_state == 1) {        // stop: every queued buffer comes back, playback state resets
                 for (auto& w : v.pending) { v.released.push_back(w); g_releases++; }
-                v.pending.clear(); v.cur = -1; v.played = 0; v.frac = 0; v.hist1 = v.hist2 = 0; v.started_once = false;
+                v.pending.clear(); v.cur = -1; v.played = v.played_pub = 0; v.frac = 0; v.hist1 = v.hist2 = 0; v.started_once = false;
                 for (int ch = 0; ch < kMaxVoiceCh; ch++) { v.look[ch].clear(); v.prevs[ch] = 0; }
             }
             v.state = v.pending_state;
@@ -1119,7 +1127,7 @@ HLE_AS(audio_IsVoiceDroppedFlagOn, "_ZN2nn5audio20IsVoiceDroppedFlagOnEPKNS0_9Vo
 HLE_AS(audio_AppendWaveBuffer, "_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE") {
     std::lock_guard<std::mutex> l(g_mtx);
     auto it = g_voices.find(c->x[0]);
-    if (it == g_voices.end() || it->second.pending.size() + it->second.released.size() >= 4) { c->x[0] = 0; return; }   // 4 per voice
+    if (it == g_voices.end() || it->second.pending.size() + it->second.done.size() + it->second.released.size() >= 4) { c->x[0] = 0; return; }   // 4 per voice
     u64 wb = c->x[1];
     WaveBuf w{wb, *(const u64*)wb, *(const u64*)(wb + 8), (s32)rd32(wb + 0x10), (s32)rd32(wb + 0x14), *(const u8*)(wb + 0x18) != 0,
               *(const u8*)(wb + 0x19) != 0, *(const u64*)(wb + 0x20), *(const u64*)(wb + 0x28), false};
@@ -1135,10 +1143,10 @@ HLE_AS(audio_GetReleasedWaveBuffer, "_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9V
     c->x[0] = it->second.released.front().guest; it->second.released.pop_front();
 }
 HLE_AS(audio_GetWaveBufferCount, "_ZN2nn5audio18GetWaveBufferCountEPKNS0_9VoiceTypeE") {
-    std::lock_guard<std::mutex> l(g_mtx); auto it = g_voices.find(c->x[0]); c->x[0] = it == g_voices.end() ? 0 : it->second.pending.size();
+    std::lock_guard<std::mutex> l(g_mtx); auto it = g_voices.find(c->x[0]); c->x[0] = it == g_voices.end() ? 0 : it->second.pending.size() + it->second.done.size();
 }
 HLE_AS(audio_GetVoicePlayedSampleCount, "_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE") {
-    std::lock_guard<std::mutex> l(g_mtx); auto it = g_voices.find(c->x[0]); c->x[0] = it == g_voices.end() ? 0 : it->second.played;
+    std::lock_guard<std::mutex> l(g_mtx); auto it = g_voices.find(c->x[0]); c->x[0] = it == g_voices.end() ? 0 : g_rel_snapshot ? it->second.played_pub : it->second.played;
 }
 HLE_AS(audio_SetVoiceVolume, "_ZN2nn5audio14SetVoiceVolumeEPNS0_9VoiceTypeEf") { static int n_vv = 0; if (n_vv++ < 40) ALOG("[audio] SetVoiceVolume %llx %.3f\n", (unsigned long long)c->x[0], F(c, 0)); std::lock_guard<std::mutex> l(g_mtx); auto it = g_voices.find(c->x[0]); if (it != g_voices.end()) it->second.volume = F(c, 0); }
 HLE_AS(audio_SetVoicePitch, "_ZN2nn5audio13SetVoicePitchEPNS0_9VoiceTypeEf") { std::lock_guard<std::mutex> l(g_mtx); auto it = g_voices.find(c->x[0]); if (it != g_voices.end()) it->second.pitch = F(c, 0); }

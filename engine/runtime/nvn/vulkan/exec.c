@@ -46,15 +46,36 @@ uint64_t renderer_present_count(void);
 // finish.
 #define BAKE_DEAD 64
 static const void *bake_dead[BAKE_DEAD];
-static bool bake_is_dead(const void *p) {
-    for (int i = 0; i < BAKE_DEAD; i++) if (bake_dead[i] == p) return true;
-    return false;
+static uint64_t bake_dead_t[BAKE_DEAD];   // (when it gave up, ns)
+static int bake_dead_at(const void *p) {
+    for (int i = 0; i < BAKE_DEAD; i++) if (bake_dead[i] == p) return i;
+    return -1;
+}
+static bool bake_is_dead(const void *p) { return bake_dead_at(p) >= 0; }
+// A draw whose program / pipeline gave up that way more than LARECOMP_HOLD_DEAD_S (10) seconds ago does not hold its
+// frame any more either, unless it is a fullscreen / tile pass (issue #9, RX 6800: one program "still building" for
+// minutes in the driver = 30 held frames, a forced one, again, for minutes: 1-2 frames shown a second; now the frames
+// are shown without that one draw until it is built). A slow build that ends within the 10 s still holds. Compute and
+// fullscreen passes still hold (a missing one can blank the frame). LARECOMP_HOLD_DEAD=1: hold as before.
+static bool bake_dead_holds(const void *p, bool full) {
+    static int v = -1;
+    static uint64_t after = 0;
+    if (v < 0) {
+        const char *e = getenv("LARECOMP_HOLD_DEAD");
+        v = e && *e == '1';
+        e = getenv("LARECOMP_HOLD_DEAD_S");
+        after = (uint64_t)((e ? atof(e) : 10.0) * 1e9);
+    }
+    if (v || full) return true;
+    const int i = bake_dead_at(p);
+    return i < 0 || SDL_GetTicksNS() - bake_dead_t[i] < after;
 }
 static void bake_timeout(const char *what, uint64_t key, const void *p) {
     bake_timeouts++;
-    if (!bake_is_dead(p)) { static int rr; bake_dead[rr++ & (BAKE_DEAD - 1)] = p; }
+    if (!bake_is_dead(p)) { static int rr; bake_dead_t[rr & (BAKE_DEAD - 1)] = SDL_GetTicksNS(); bake_dead[rr++ & (BAKE_DEAD - 1)] = p; }
     if (bake_timeouts <= 50 || !(bake_timeouts % 100))
-        LOG("[bake] timeout: %s %llx still building after 3 s, skipped; not waited for again (%llu so far, frame %llu)\n", what,
+        LOG("[bake] timeout: %s %llx still building after 3 s, skipped; not waited for again, and after 10 s more its "
+            "draws hold no frames unless fullscreen / compute (%llu so far, frame %llu)\n", what,
             (unsigned long long)key, (unsigned long long)bake_timeouts, (unsigned long long)renderer_present_count());
 }
 // What skipped draws / dispatches waited for, up to 8 distinct, for device.c's "[hold]" line: kind 'c' compute, 'f' a
@@ -254,7 +275,7 @@ static uint64_t chk_words, chk_clob;
 static bool gdev_chk_on(void);
 static VkBuffer chk_buf[2];
 static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write);
-static uint64_t gdev_stat_in, gdev_stat_regions, gdev_stat_snap, gdev_stat_host;  // (stats line)
+static uint64_t gdev_stat_in, gdev_stat_regions, gdev_stat_snap, gdev_stat_host, gdev_stat_grown;  // (stats line)
 static int gdev_n;
 
 uint64_t vk_completed_seq(void) {
@@ -408,12 +429,63 @@ static void begin_cb(VkCommandBuffer *cb, bool *begun) {
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...);
 static void dsub_begin(VkCommandBuffer cb);   // (the DRS clock's GPU busy time per submission, see dts_poll)
 static void dsub_end(VkCommandBuffer cb);
+// Submission markers (2026-10-31, so nothing said whether the stuck submission ever started): each submission's main
+// command buffer writes its number into a 2-word buffer in system memory (host-visible, coherent, never device-local: a
+// GPU reset cannot take it), word 0 at its start (no barrier: "the GPU reached its main commands") and word 1 at its end
+// after a full barrier (its signal waits for all of it anyway). The [hang] report reads them while the queue is stuck,
+// before the device is reported lost. LARECOMP_SUBMIT_MARKERS=0: off. What "started" covers: the submission's upload
+// buffer runs before its main one, and its wait semaphore (the swapchain acquire) holds only COLOR_ATTACHMENT_OUTPUT, so
+// neither the uploads nor the start fill wait for it: not started = still in its uploads or not run at all; started and
+// not finished = in its work, or (when it has a wait semaphore, from its HOP_SUBMIT record) at its first colour output
+// waiting for the acquire.
+static VkBuffer sm_buf;
+static VmaAllocation sm_mem;
+static volatile uint32_t *sm_ptr;
+static bool sm_ready(void) {
+    static int on = -1;
+    if (on >= 0) return on;
+    on = 0;
+    const char *e = getenv("LARECOMP_SUBMIT_MARKERS");
+    if (e && !strcmp(e, "0")) return false;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    uint32_t bits = 0;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        const VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            bits |= 1u << i;
+    }
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                  .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                  .memoryTypeBits = bits};
+    VmaAllocationInfo info;
+    if (!bits || vmaCreateBuffer(g_vk.vma, &bi, &ai, &sm_buf, &sm_mem, &info) != VK_SUCCESS || !info.pMappedData) {
+        LOG("[vk] submission markers: no system-memory host-visible type, off\n");
+        return false;
+    }
+    sm_ptr = info.pMappedData;
+    sm_ptr[0] = sm_ptr[1] = 0;
+    on = 1;
+    LOG("[vk] submission markers: on (started / finished per submission, system memory)\n");
+    return true;
+}
+static void sm_end(VkCommandBuffer cb, uint64_t seq) {   // (the submission's last commands: after all of its work)
+    if (!sm_ready()) return;
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                           .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    vkCmdFillBuffer(cb, sm_buf, 4, 4, (uint32_t)seq);
+}
 VkCommandBuffer vk_cmd(void) {
     Sub *s = sub();
     if (!s->main_begun) {
         begin_cb(&s->main, &s->main_begun);
         dsub_begin(s->main);
         gp_mark(s->main, "(submission start)");
+        if (sm_ready()) vkCmdFillBuffer(s->main, sm_buf, 0, 4, (uint32_t)(submit_seq + 1));   // (submission markers: started)
         if (prof && prof_qp) {
             vkCmdResetQueryPool(s->main, prof_qp, (uint32_t)cur_sub * 2, 2);
             vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, prof_qp, (uint32_t)cur_sub * 2);
@@ -577,6 +649,23 @@ static void hang_report(uint64_t hung) {
     uint64_t from = hang_n > HANG_OPS ? hang_n - HANG_OPS : 0, newest = submit_seq + 1;
     LOG("[hang] stuck on submission %llu; newest %llu (open), %llu operations recorded\n", (unsigned long long)hung,
         (unsigned long long)newest, (unsigned long long)hang_n);
+    if (sm_ptr) {   // (submission markers, read now while the queue is stuck: 32-bit values back to submission numbers)
+        const uint64_t base = newest & ~0xFFFFFFFFull;
+        uint64_t st = base | sm_ptr[0], fin = base | sm_ptr[1];
+        if (st > newest) st -= 1ull << 32;
+        if (fin > newest) fin -= 1ull << 32;
+        int waits = -1;   // (its wait semaphores, from its HOP_SUBMIT record; -1: not submitted or no longer in the ring)
+        for (uint64_t i = hang_n; i-- > from;) {
+            const HangOp *o = &hang_ops[i & (HANG_OPS - 1)];
+            if (o->kind == HOP_SUBMIT && o->a == hung) { waits = (int)o->x; break; }
+        }
+        LOG("[hang] submission markers: last started %llu, last finished %llu -> submission %llu %s%s\n", (unsigned long long)st,
+            (unsigned long long)fin, (unsigned long long)hung,
+            st < hung ? "never reached its main commands (still in its uploads, or the GPU did not run it; its acquire wait holds neither)"
+            : fin < hung ? "reached its main commands and did not finish" : "finished (the wait is elsewhere)",
+            st < hung || fin >= hung ? "" : waits > 0 ? " (it has a wait semaphore: it may be at its first colour output waiting for the acquire)"
+            : waits == 0 ? " (no wait semaphore: stuck in its own work)" : " (its submit record is not in the ring: wait semaphore unknown)");
+    }
     for (uint64_t s = hung; s <= newest && s < hung + 6; s++) {
         unsigned nd = 0, nc = 0, np = 0, ncp = 0, nfs = 0, nall = 0, nlive = 0, nself = 0, nselfp = 0;
         uint64_t big = 0, bigpos = 0, fs[24], selfpos[4];
@@ -842,6 +931,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     gp_mark(s->main, "(after the submission: GPU idle + the next one's uploads, until its start)");
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
     dsub_end(s->main);
+    sm_end(s->main, this_seq);   // (submission markers: finished)
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
     VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
@@ -1349,9 +1439,200 @@ static int jq_hurry(JobQ *q, const void *arg) {
     return j ? pos : -1;
 }
 
+// Slow builds (issue #9, 2026-11-01: an RX 6800's first start held frames for minutes on one program "still building
+// after 3 s" while our commit climbed 11 -> 34 GB with no other compile under way): every GLSL -> SPIR-V compile and
+// every driver compile (GPL library, monolithic pipeline, compute pipeline) registers in its thread's slot, and a
+// watchdog thread names any running past LARECOMP_SLOWBUILD_S (default 5; 0 = off): "[slowbuild] <stage> <shader>:
+// running N s, process commit X GB (+Y since it started)", again at 15 / 30 / 60 / 120... s, and saves its GLSL once to
+// cache/slow/<shader>_<stage>.glsl (the input that took the compiler there, for a report). One past it logs its time
+// when it ends. (The commit at its start is the watchdog's first sample, at most 1 s late.)
+typedef struct {
+    pthread_mutex_t mu;
+    uint64_t t0, seen_t0, commit0, next_s;   // (t0 0 = idle)
+    const char *what, *glsl;
+    char name[24];
+} SlowSlot;
+static SlowSlot g_slow[64];
+static _Atomic int g_slow_n;
+static __thread int tl_slow = -1;
+static double slow_thresh_s(void) {
+    static double v = -1;
+    if (v < 0) { const char *e = getenv("LARECOMP_SLOWBUILD_S"); v = e ? atof(e) : 5.0; if (v < 0) v = 0; }
+    return v;
+}
+static uint64_t proc_commit(void) {
+#ifdef _WIN32
+    extern uint64_t shim_proc_commit(void);
+    return shim_proc_commit();
+#else
+    return 0;
+#endif
+}
+static void *slow_watch(void *arg) {
+    (void)arg;
+    cpu_place_thread(CPU_HELPER);
+#ifndef _WIN32
+    { extern int pthread_setname_np(pthread_t, const char *); pthread_setname_np(pthread_self(), "vk-slowbuild"); }
+#endif
+    const double th = slow_thresh_s();
+    int nlog = 0;
+    for (;;) {
+        SDL_Delay(1000);
+        const int n = atomic_load(&g_slow_n) < 64 ? atomic_load(&g_slow_n) : 64;
+        uint64_t now = SDL_GetTicksNS(), c = 0;
+        for (int i = 0; i < n; i++) {
+            SlowSlot *s = &g_slow[i];
+            pthread_mutex_lock(&s->mu);
+            if (s->t0 && s->seen_t0 != s->t0) {   // (first sample of this build: its commit "at the start")
+                s->seen_t0 = s->t0;
+                s->commit0 = c ? c : (c = proc_commit());
+                s->next_s = 0;
+            }
+            const double age = s->t0 ? (now - s->t0) / 1e9 : 0;
+            if (s->t0 && age >= th && age >= (double)s->next_s) {
+                if (!c) c = proc_commit();
+                if (nlog++ < 300)
+                    LOG("[slowbuild] %s %s: running %.0f s, process commit %.1f GB (%+.1f since it started)\n", s->what, s->name, age,
+                        c / 1073741824.0, ((double)c - (double)s->commit0) / 1073741824.0);
+                if (!s->next_s && s->glsl) {   // (once per build: its GLSL)
+                    char path[96];
+                    mkdir("cache", 0755);
+                    mkdir("cache/slow", 0755);
+                    snprintf(path, sizeof path, "cache/slow/%s_%s.glsl", s->name, s->what);
+                    for (char *q = path + 11; *q; q++) if (*q == ' ') *q = '_';
+                    FILE *f = fopen(path, "wb");
+                    if (f) { fputs(s->glsl, f); fclose(f); }
+                }
+                s->next_s = s->next_s < 15 ? 15 : s->next_s * 2;
+            }
+            pthread_mutex_unlock(&s->mu);
+        }
+    }
+    return NULL;
+}
+// Around one compile on this thread; glsl (may be NULL) must stay valid until slow_end.
+static void slow_begin(const char *what, const char *name, const char *glsl) {
+    if (slow_thresh_s() <= 0) return;
+    if (tl_slow == -1) {
+        tl_slow = atomic_fetch_add(&g_slow_n, 1);
+        if (tl_slow >= 64) tl_slow = -2;
+        else if (tl_slow == 0) { pthread_t t; if (!pthread_create(&t, NULL, slow_watch, NULL)) pthread_detach(t); }
+    }
+    if (tl_slow < 0) return;
+    SlowSlot *s = &g_slow[tl_slow];
+    pthread_mutex_lock(&s->mu);
+    s->what = what;
+    s->glsl = glsl;
+    snprintf(s->name, sizeof s->name, "%s", name ? name : "?");
+    s->t0 = SDL_GetTicksNS();
+    pthread_mutex_unlock(&s->mu);
+}
+static void slow_end(void) {
+    if (tl_slow < 0) return;
+    SlowSlot *s = &g_slow[tl_slow];
+    pthread_mutex_lock(&s->mu);
+    const double age = s->t0 ? (SDL_GetTicksNS() - s->t0) / 1e9 : 0;
+    if (age >= slow_thresh_s()) {
+        uint64_t c = proc_commit();
+        LOG("[slowbuild] %s %s: done after %.1f s, process commit %.1f GB (%+.1f since it started)\n", s->what, s->name, age,
+            c / 1073741824.0, s->seen_t0 == s->t0 ? ((double)c - (double)s->commit0) / 1073741824.0 : 0.0);
+    }
+    s->t0 = 0;
+    s->glsl = NULL;
+    pthread_mutex_unlock(&s->mu);
+}
+// Compile gate (issue #9: an RX 6800 with 32 GB ran its commit to the limit during the first start's compile backlog,
+// RAM full, 1 fps, and the next launch could not create a thread). The pool threads' compiles (GLSL -> SPIR-V and the
+// driver's) pass this gate: while the system is short of memory (commit headroom under max(2 GB, 1/20 of the limit), or
+// free RAM under max(1 GB, 1/25 of it)), the workers' builds run one at a time and the background ones (the precompile,
+// the archive warm-up) wait up to 2 s each, then go one at a time like the workers' (never an unbounded wait: the
+// precompile publishes a pipeline before it builds it, and a draw that finds it at state 0 holds frames until it is
+// built); the installer's prepare keeps one going too. The drawing thread and the translators (translations only) are
+// never gated. A compile already running is never stopped. "[vk] compile gate:..." lines on each change.
+// LARECOMP_COMPILE_GATE=0: off.
+enum { GATE_NONE, GATE_GAME, GATE_BACKGROUND, GATE_PREPARE };
+static __thread int tl_gate;      // (set by each pool thread at its start)
+static __thread bool tl_in_gate;
+static _Atomic int g_gate_inflight;
+static _Atomic uint64_t g_gate_t;   // (last check, ns)
+static _Atomic int g_gate_low;
+static bool gate_low(void) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("LARECOMP_COMPILE_GATE"); off = e && *e == '0'; }
+    if (off) return false;
+    uint64_t now = SDL_GetTicksNS(), t = atomic_load_explicit(&g_gate_t, memory_order_relaxed);
+    if (now - t < 250000000ull || !atomic_compare_exchange_strong(&g_gate_t, &t, now))
+        return atomic_load_explicit(&g_gate_low, memory_order_relaxed);
+#ifdef _WIN32
+    extern void shim_mem_room(uint64_t *commit_avail, uint64_t *commit_limit, uint64_t *ram_avail, uint64_t *ram_total);
+    uint64_t ca = 0, cl = 0, ra = 0, rt = 0;
+    shim_mem_room(&ca, &cl, &ra, &rt);
+    const uint64_t cmin = cl / 20 > (2ull << 30) ? cl / 20 : 2ull << 30, rmin = rt / 25 > (1ull << 30) ? rt / 25 : 1ull << 30;
+    const int low = cl && (ca < cmin || ra < rmin);
+#else
+    const int low = 0;
+    uint64_t ca = 0, cl = 0, ra = 0, rt = 0;
+#endif
+    if (atomic_exchange(&g_gate_low, low) != low) {
+        static _Atomic int nlog;
+        if (atomic_fetch_add(&nlog, 1) < 200)
+            LOG("[vk] compile gate: %s (commit headroom %.1f of %.1f GB, free RAM %.1f of %.1f GB, %d compiles running)\n",
+                low ? "memory short: one build at a time, background builds wait up to 2 s first" : "lifted", ca / 1073741824.0,
+                cl / 1073741824.0, ra / 1073741824.0, rt / 1073741824.0, atomic_load(&g_gate_inflight));
+    }
+    return low;
+}
+static void gate_enter(void) {
+    if (tl_gate == GATE_NONE || tl_in_gate) return;
+    uint64_t wait0 = 0;
+    for (;;) {
+        int cur = atomic_load(&g_gate_inflight);
+        if (!gate_low()) {
+            if (atomic_compare_exchange_weak(&g_gate_inflight, &cur, cur + 1)) break;
+            continue;
+        }
+        if (!wait0) wait0 = SDL_GetTicksNS();
+        const int cap = tl_gate == GATE_BACKGROUND && SDL_GetTicksNS() - wait0 < 2000000000ull ? 0 : 1;
+        if (cur < cap && atomic_compare_exchange_weak(&g_gate_inflight, &cur, cur + 1)) break;
+        SDL_Delay(20);
+    }
+    tl_in_gate = true;
+}
+static void gate_exit(void) {
+    if (!tl_in_gate) return;
+    atomic_fetch_sub(&g_gate_inflight, 1);
+    tl_in_gate = false;
+}
+// One compile on this thread: the gate, then the slow-build watch.
+static void build_begin(const char *what, const char *name, const char *glsl) {
+    gate_enter();
+    slow_begin(what, name, glsl);
+}
+static void build_end(void) {
+    slow_end();
+    gate_exit();
+}
+
+// TOTK_HELPER_PRIO=below: the pipeline workers and the translators at THREAD_PRIORITY_BELOW_NORMAL (default: normal, as
+// before). A stutter A/B arm: the game's job threads yield (nn::os::YieldThread) and a ready helper on that CPU takes
+// the rest of their slice; below them it no longer can. Draws wait for these threads, so the arm can hold more frames:
+// measure both.
+#ifdef _WIN32
+__declspec(dllimport) void *__stdcall GetCurrentThread(void);
+__declspec(dllimport) int __stdcall SetThreadPriority(void *thread, int priority);
+#endif
+static void helper_prio(void) {
+#ifdef _WIN32
+    static int below = -1;
+    if (below < 0) { const char *e = getenv("TOTK_HELPER_PRIO"); below = e && !strcmp(e, "below"); }
+    if (below) SetThreadPriority(GetCurrentThread(), -1);   // (THREAD_PRIORITY_BELOW_NORMAL)
+#endif
+}
 static void *worker(void *a) {
     (void)a;
     cpu_place_thread(CPU_ANY);   // (draws wait for these: every core, cpu_place.h)
+    tl_gate = GATE_GAME;
+    helper_prio();
 #ifndef _WIN32
     { extern int pthread_setname_np(pthread_t, const char *); pthread_setname_np(pthread_self(), "vk-pipeline"); }   // ([cpu] line)
 #endif
@@ -1371,12 +1652,228 @@ static bool sync_shaders(void) {
 static pthread_mutex_t translate_lock = PTHREAD_MUTEX_INITIALIZER;  // (compute shaders translate on the game thread)
 // maxwell_translate (under translate_lock) with the stage's compiler constants (c1, csize bytes after the code) in view:
 // translate.c reads BRX jump tables from them. csize 0 (archive programs have only their code): every slot a possible target.
+// Translator cache (stutter brief 11-01, 5-plan Fix 5; the rival keeps its translator output on disk too, gfx_shader.c): a
+// stage's translation (ShaderInfo + GLSL) in cache/glsl/<config>/<key>.tgz (XPRESS-compressed, spvz.h; raw.tgl where there is
+// no codec), so a known program costs a file read instead of a translation (1-3 ms each, the precompile replays ~3,700 at
+// every start, and the game's own first sightings). The key covers everything the output depends on: the code and compiler
+// constants, stage, ShaderKey, the heap base / size and device window the translator bakes in; <config> (tc_env) the device
+// choices (wave-safe forms, soft FP64, point size, NVIDIA forms, shared memory, heap windows), the translator build
+// (maxwell_build_stamp: translate.c's compile time) and the variables translate.c reads (tc_env_vars: exactly its getenv
+// list, checked by maxwell/test_tcache_env.py; the fps cap / resolution variables the settings write are not among them, so
+// changing those keeps the cache). The newest two <config> folders are kept, older ones removed in the background. Every
+// entry carries a checksum of its payload. Debug translations (the LARECOMP_DEBUG_SHADER / SOLID / VS forms and the other
+// per-translation flags translate_stage checks, the upscale program's window-dependent form) are never cached.
+// LARECOMP_GLSL_CACHE=0: off.
+static uint64_t hash_words(uint64_t h, const void *p, size_t n);
+extern MAXWELL_TLS bool maxwell_nodiscard_next, maxwell_solid_next, maxwell_ssfetch_next, maxwell_vtrace_next;
+// (every getenv of maxwell/translate.c; maxwell/test_tcache_env.py fails when the two lists differ)
+static const char *const tc_env_vars[] = {
+    "LARECOMP_D16_REF", "LARECOMP_FS_ZERO_UNWRITTEN", "LARECOMP_GMEM_COHERENT", "LARECOMP_GUARD_LIMIT", "LARECOMP_GUARD_STAGE",
+    "LARECOMP_GUARD_VIS", "LARECOMP_IPA_MUL_FOLD", "LARECOMP_KIL_DISCARD", "LARECOMP_LAYER_CLAMP", "LARECOMP_NATIVE_MINMAX",
+    "LARECOMP_NO_DAG_GUARD", "LARECOMP_NO_DISCARD", "LARECOMP_NO_FLAT", "LARECOMP_NO_FS_STG", "LARECOMP_NO_IMAP", "LARECOMP_NO_MINPC",
+    "LARECOMP_NO_RED", "LARECOMP_RSC_OWN", "LARECOMP_SAVE_MSL", "LARECOMP_TXD_HWGRAD", "LARECOMP_VP_EXACT", "LARECOMP_YDIR_POS",
+    "LARECOMP_BRX_C1_ALL", "TOTK_SOFT_SHADOWS", "TOTK_SOFT_SHADOWS_MAX",
+};
+static uint64_t tc_env;   // (hash of the translator's configuration; 0 = cache off)
+static char tc_dir[48];   // cache/glsl/<tc_env>
+#ifdef _WIN32
+#include <direct.h>   // (_rmdir)
+#include <io.h>       // (_findfirst)
+__declspec(dllimport) void *__stdcall GetCurrentThread(void);
+__declspec(dllimport) int __stdcall SetThreadPriority(void *thread, int priority);
+#else
+#include <dirent.h>   // (opendir)
+#include <unistd.h>   // (rmdir)
+#endif
+static void *tc_prune(void *arg);
+static void tc_init_once(void) {
+    const char *e = getenv("LARECOMP_GLSL_CACHE");
+    if (e && *e == '0') { LOG("[shader] translator cache off (LARECOMP_GLSL_CACHE=0)\n"); return; }
+    uint64_t h = hash_words(0x7c3a9e1d5b2f4c68ull, maxwell_build_stamp, strlen(maxwell_build_stamp));
+    for (size_t i = 0; i < sizeof tc_env_vars / sizeof *tc_env_vars; i++) {
+        const char *v = getenv(tc_env_vars[i]);
+        uint64_t one = hash_words(0x1d8e4e27c47d124full + i, v ? v : "\x01", v ? strlen(v) : 1);   // (unset != empty)
+        h = hash_words(h, &one, sizeof one);
+    }
+    extern bool maxwell_wave_safe, maxwell_soft_f64, maxwell_vs_pointsize, maxwell_nvidia;
+    extern uint32_t maxwell_smem_bytes;
+    extern uint64_t maxwell_gmem_window;
+    const uint64_t dev[6] = {maxwell_wave_safe, maxwell_soft_f64, maxwell_vs_pointsize, maxwell_nvidia, maxwell_smem_bytes, maxwell_gmem_window};
+    h = hash_words(h, dev, sizeof dev);
+    tc_env = h ? h : 1;
+    mkdir("cache", 0755);
+    mkdir("cache/glsl", 0755);
+    snprintf(tc_dir, sizeof tc_dir, "cache/glsl/%016llx", (unsigned long long)tc_env);
+    mkdir(tc_dir, 0755);
+    pthread_t t;   // (older configurations' folders: removed at idle priority, a file at a time)
+    if (!pthread_create(&t, NULL, tc_prune, NULL)) pthread_detach(t);
+}
+// Keeps the two most recently used <config> folders, removes the rest (and the flat entries of the first, folder-less
+// layout). cache/glsl/configs.txt lists the folders, most recent first; this start's goes to the top.
+static void tc_rm_files(const char *dir, int *n) {   // (the files of one folder; nothing waits on it)
+#ifdef _WIN32
+    char pat[96], f[160];
+    snprintf(pat, sizeof pat, "%s/*", dir);
+    struct _finddata_t fd;
+    intptr_t h = _findfirst(pat, &fd);
+    if (h == -1) return;
+    do {
+        if (fd.attrib & _A_SUBDIR) continue;
+        snprintf(f, sizeof f, "%s/%s", dir, fd.name);
+        if (!strcmp(dir, "cache/glsl") && !strstr(fd.name, ".tg")) continue;   // (top level: only the old flat entries)
+        if (remove(f) == 0 && (++*n & 63) == 0) SDL_Delay(5);
+    } while (_findnext(h, &fd) == 0);
+    _findclose(h);
+#else
+    char f[160];
+    DIR *dp = opendir(dir);
+    if (!dp) return;
+    for (struct dirent *de; (de = readdir(dp));) {
+        if (de->d_name[0] == '.') continue;
+        if (!strcmp(dir, "cache/glsl") && !strstr(de->d_name, ".tg")) continue;   // (top level: only the old flat entries)
+        snprintf(f, sizeof f, "%s/%s", dir, de->d_name);
+        struct stat sb;
+        if (stat(f, &sb) || !S_ISREG(sb.st_mode)) continue;
+        if (remove(f) == 0 && (++*n & 63) == 0) SDL_Delay(5);
+    }
+    closedir(dp);
+#endif
+}
+static void *tc_prune(void *arg) {
+    (void)arg;
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), -15);   // (THREAD_PRIORITY_IDLE)
+#endif
+    char list[32][17], line[64];
+    int nl = 0;
+    snprintf(list[nl++], sizeof list[0], "%s", tc_dir + 11);
+    FILE *f = fopen("cache/glsl/configs.txt", "rb");
+    while (f && nl < 32 && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (strlen(line) != 16 || strspn(line, "0123456789abcdef") != 16) continue;
+        bool dup = false;
+        for (int i = 0; i < nl && !dup; i++) dup = !strcmp(list[i], line);
+        if (!dup) snprintf(list[nl++], sizeof list[0], "%s", line);
+    }
+    if (f) fclose(f);
+    if ((f = fopen("cache/glsl/configs.txt.tmp", "wb"))) {
+        for (int i = 0; i < nl && i < 2; i++) fprintf(f, "%s\n", list[i]);
+        fclose(f);
+        remove("cache/glsl/configs.txt");
+        rename("cache/glsl/configs.txt.tmp", "cache/glsl/configs.txt");
+    }
+    int n = 0;
+    for (int i = 2; i < nl; i++) {
+        char dir[48];
+        snprintf(dir, sizeof dir, "cache/glsl/%s", list[i]);
+        int before = n;
+        tc_rm_files(dir, &n);
+#ifdef _WIN32
+        _rmdir(dir);
+#else
+        rmdir(dir);
+#endif
+        LOG("[shader] translator cache: an older configuration's folder removed (%s, %d entries)\n", list[i], n - before);
+    }
+    tc_rm_files("cache/glsl", &n);
+    return NULL;
+}
+static void tc_init(void) {   // (once, from any translating thread)
+    static _Atomic int ready;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    if (atomic_load_explicit(&ready, memory_order_acquire)) return;
+    pthread_mutex_lock(&mu);
+    if (!atomic_load_explicit(&ready, memory_order_relaxed)) { tc_init_once(); atomic_store_explicit(&ready, 1, memory_order_release); }
+    pthread_mutex_unlock(&mu);
+}
+static uint64_t tc_key(uint64_t code, uint64_t cmax, uint64_t csize, int stage, const ShaderKey *key) {
+    const uint64_t hdr[5] = {(uint64_t)stage, maxwell_gmem_base, maxwell_gmem_size, maxwell_gdev_size, cmax | csize << 32};
+    uint64_t h = hash_words(tc_env, hdr, sizeof hdr);
+    h = hash_words(h, key, sizeof *key);
+    h = hash_words(h, (const void *)(uintptr_t)code, (size_t)(cmax + csize));   // (code, then the compiler constants after it)
+    return h ? h : 1;
+}
+static uint64_t tc_hits, tc_stores, tc_bad;   // (log lines; races only lose a count)
+// entry: {'TKG2', sizeof(ShaderInfo), GLSL bytes, 0, checksum of what follows (u64)} + ShaderInfo (msl NULL) + GLSL
+enum { TC_MAGIC = 0x32474B54u };
+typedef struct { uint32_t magic, si_size, gl, pad; uint64_t sum; } TcHdr;
+static ShaderInfo *tc_load(uint64_t k) {
+    char path[80];
+    snprintf(path, sizeof path, "%s/%016llx.tgz", tc_dir, (unsigned long long)k);
+    FILE *f = fopen(path, "rb");
+    if (!f) { snprintf(path, sizeof path, "%s/%016llx.tgl", tc_dir, (unsigned long long)k); f = fopen(path, "rb"); }
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *d = n > (long)sizeof(TcHdr) ? malloc((size_t)n) : NULL;
+    if (d && fread(d, 1, (size_t)n, f) != (size_t)n) { free(d); d = NULL; }
+    fclose(f);
+    if (!d) return NULL;
+    size_t len = (size_t)n;
+    if (len >= 4 && *(const uint32_t *)d == SPVZ_MAGIC) {
+        size_t raw = 0;
+        uint8_t *w = (uint8_t *)spvz_unpack_as(d, len, &raw, TC_MAGIC);   // (not SPIR-V: spvz_unpack refused every entry)
+        free(d);
+        if (!w) { remove(path); tc_bad++; return NULL; }
+        d = w, len = raw;
+    }
+    TcHdr h = {0};
+    ShaderInfo *si = NULL;
+    if (len >= sizeof h) memcpy(&h, d, sizeof h);
+    const size_t body = sizeof(ShaderInfo) + (size_t)h.gl;
+    if (len >= sizeof h && h.magic == TC_MAGIC && h.si_size == sizeof(ShaderInfo) && sizeof h + body <= len &&
+        hash_words(0x2545f4914f6cdd1dull, d + sizeof h, body) == h.sum && (si = malloc(sizeof *si))) {
+        memcpy(si, d + sizeof h, sizeof *si);
+        si->msl = malloc((size_t)h.gl + 1);
+        if (si->msl) { memcpy(si->msl, d + sizeof h + sizeof *si, h.gl); si->msl[h.gl] = 0; }
+        else { free(si); si = NULL; }
+    } else if (len >= sizeof h && h.magic == TC_MAGIC) { remove(path); tc_bad++; }   // (torn or corrupt: translated again, stored anew)
+    free(d);
+    if (si) tc_hits++;
+    return si;
+}
+static void tc_store(uint64_t k, const ShaderInfo *si) {
+    const size_t gl = strlen(si->msl), body = sizeof *si + gl, n = (sizeof(TcHdr) + body + 3) & ~(size_t)3;
+    uint8_t *b = calloc(1, n);
+    if (!b) return;
+    ShaderInfo c = *si;
+    c.msl = NULL;
+    memcpy(b + sizeof(TcHdr), &c, sizeof c);
+    memcpy(b + sizeof(TcHdr) + sizeof c, si->msl, gl);
+    const TcHdr h = {TC_MAGIC, (uint32_t)sizeof(ShaderInfo), (uint32_t)gl, 0, hash_words(0x2545f4914f6cdd1dull, b + sizeof(TcHdr), body)};
+    memcpy(b, &h, sizeof h);
+    size_t zn = n;
+    uint8_t *z = spvz_pack((const uint32_t *)b, n, &zn);   // (NULL: raw)
+    char path[80], tmp[112];
+    snprintf(path, sizeof path, "%s/%016llx.%s", tc_dir, (unsigned long long)k, z ? "tgz" : "tgl");
+    snprintf(tmp, sizeof tmp, "%s.%llx", path, (unsigned long long)(uintptr_t)b);
+    FILE *f = fopen(tmp, "wb");
+    bool ok = f && fwrite(z ? (const void *)z : (const void *)b, 1, z ? zn : n, f) == (z ? zn : n);
+    if (f) fclose(f);
+    if (!ok || rename(tmp, path) != 0) remove(tmp);   // (another thread may have stored it first)
+    else tc_stores++;
+    free(z);
+    free(b);
+}
 static ShaderInfo *translate_stage(uint64_t code, uint64_t cmax, uint64_t csize, int stage, const ShaderKey *key) {
+    tc_init();
+    // (debug forms of this one translation: never from / into the cache)
+    const bool dbg = maxwell_trace_next || maxwell_nodiscard_next || maxwell_solid_next || maxwell_ssfetch_next || maxwell_vtrace_next ||
+                     maxwell_dbg_code || maxwell_dbg_vs;
+    const uint64_t k = tc_env && !dbg && code ? tc_key(code, cmax, csize, stage, key) : 0;
+    ShaderInfo *si = k ? tc_load(k) : NULL;
+    if (si) return si;
     maxwell_const_data = csize ? (const uint8_t *)(uintptr_t)(code + cmax) : NULL;
     maxwell_const_size = (size_t)csize;
-    ShaderInfo *si = maxwell_translate((const uint8_t *)(uintptr_t)code, (size_t)cmax, stage, key);
+    char snm[24];
+    snprintf(snm, sizeof snm, "code_%llx", (unsigned long long)code);
+    slow_begin("translate", snm, NULL);
+    si = maxwell_translate((const uint8_t *)(uintptr_t)code, (size_t)cmax, stage, key);
+    slow_end();
     maxwell_const_data = NULL;
     maxwell_const_size = 0;
+    if (k && si && si->msl) tc_store(k, si);
     return si;
 }
 // no translate_lock on this thread: pa_job with LARECOMP_PARALLEL_TRANSLATE=1, the translators with TOTK_TRANSLATE_THREADS > 1,
@@ -1403,6 +1900,7 @@ static int translate_threads(void) {
 static void *translator(void *a) {
     (void)a;
     cpu_place_thread(CPU_ANY);   // (draws wait for these: every core, cpu_place.h)
+    helper_prio();
 #ifndef _WIN32
     { extern int pthread_setname_np(pthread_t, const char *); pthread_setname_np(pthread_self(), "vk-translate"); }   // ([cpu] line)
 #endif
@@ -1500,6 +1998,7 @@ static struct {
 
 // ---- capture / replay of the binding state (capture.h): st with its host pointers as ids and back
 #include "capture.h"
+#include "contact.h"   // (TOTK_CONTACT_SHADOWS: contact_pass_hook below)
 size_t exec_state_size(void) { return sizeof st; }
 void exec_state_save(void *out, uint64_t (*id_of)(int kind, const void *p)) {
     __typeof__(st) c = st;
@@ -1663,16 +2162,16 @@ const char *renderer_stats(void) {
         LOG("\n");
     }
     snprintf(stats_text, sizeof stats_text,
-             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, fbcopy %llu (live barriers %llu, depth WAR %llu, self-write %llu, alias %llu), upload %.1fMB (u %.0f c0 %.0f c1 %.0f z %.0f v %.0f i %.0f t %.0f o %.0f), gdev %d regions %.1fMB in (snapshot %.1f, host fallbacks %llu)",
+             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, fbcopy %llu (live barriers %llu, depth WAR %llu, self-write %llu, alias %llu), upload %.1fMB (u %.0f c0 %.0f c1 %.0f z %.0f v %.0f i %.0f t %.0f o %.0f), gdev %d regions %.1fMB in (snapshot %.1f, host fallbacks %llu), grown %llu",
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
              atomic_exchange(&stat_compiles, 0), (unsigned long long)stat_feedback_copies, (unsigned long long)stat_feedback_live, (unsigned long long)stat_depth_war, (unsigned long long)stat_fb_selfw, (unsigned long long)stat_fb_alias, (double)stat_upload_bytes / 1048576.0, stat_up_kind[1] / 1048576.0, stat_up_kind[5] / 1048576.0, stat_up_kind[6] / 1048576.0,
              stat_up_kind[7] / 1048576.0, stat_up_kind[2] / 1048576.0, stat_up_kind[3] / 1048576.0,
              stat_up_kind[4] / 1048576.0, stat_up_kind[0] / 1048576.0,
-             gdev_n, (double)gdev_stat_in / 1048576.0, (double)gdev_stat_snap / 1048576.0, (unsigned long long)gdev_stat_host);
+             gdev_n, (double)gdev_stat_in / 1048576.0, (double)gdev_stat_snap / 1048576.0, (unsigned long long)gdev_stat_host, (unsigned long long)gdev_stat_grown);
     stat_feedback_copies = stat_feedback_live = stat_depth_war = stat_fb_selfw = stat_fb_alias = stat_upload_bytes = 0;
     memset(stat_up_kind, 0, sizeof stat_up_kind);
-    gdev_stat_in = gdev_stat_snap = gdev_stat_host = 0;
+    gdev_stat_in = gdev_stat_snap = gdev_stat_host = gdev_stat_grown = 0;
     {
         size_t n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, ", pass barriers %llu (skipped %llu; game barriers %llu, %llu mid-pass breaks; feedback elided %llu; hazard barriers %llu; elided small %llu, after a full one %llu)",
@@ -1884,6 +2383,7 @@ const char *renderer_stats(void) {
             prof_vxp_dup = prof_vxp_same = prof_vxp_new = 0;
         }
         extern uint64_t prof_alias_syncs, prof_alias_bytes, prof_alias_ranges, prof_alias_ns, prof_hm_syncs, prof_hm_bytes, prof_hm_ranges, prof_hm_ns, prof_hm_vol;
+        extern uint64_t prof_hm_snap, prof_hm_used;
         n = strlen(stats_text);
         extern uint64_t prof_ww_calls, prof_ww_batched;
         snprintf(stats_text + n, sizeof stats_text - n, " | alias mirror syncs %llu, %.1f MB in %llu ranges, %.1f ms; mirror write-watch queries %llu, chunk syncs from a batch %llu",
@@ -1893,10 +2393,11 @@ const char *renderer_stats(void) {
         prof_alias_syncs = prof_alias_bytes = prof_alias_ranges = prof_alias_ns = 0;
         if (prof_hm_syncs) {
             n = strlen(stats_text);
-            snprintf(stats_text + n, sizeof stats_text - n, " | heap mirror syncs %llu, %.1f MB in %llu ranges, %.1f ms, %llu pages rewritten within a submission",
+            snprintf(stats_text + n, sizeof stats_text - n, " | heap mirror syncs %llu, %.1f MB in %llu ranges, %.1f ms, %llu pages rewritten within a submission; "
+                     "snapshotted %.1f MB, of it bound in the same list %.1f MB",
                      (unsigned long long)prof_hm_syncs, prof_hm_bytes / 1e6, (unsigned long long)prof_hm_ranges, prof_hm_ns / 1e6,
-                     (unsigned long long)prof_hm_vol);
-            prof_hm_syncs = prof_hm_bytes = prof_hm_ranges = prof_hm_ns = prof_hm_vol = 0;
+                     (unsigned long long)prof_hm_vol, prof_hm_snap / 1e6, prof_hm_used / 1e6);
+            prof_hm_syncs = prof_hm_bytes = prof_hm_ranges = prof_hm_ns = prof_hm_vol = prof_hm_snap = prof_hm_used = 0;
         }
         n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, " | pipeline waits: built inline %llu, waited %llu, %.1f ms",
@@ -2254,10 +2755,30 @@ typedef struct { uint64_t *o16, *o0, *o1, seq, h16, h0, h1; double k; uint32_t q
 #define DTS_PEND 1024
 static DTsPending dts_pend[DTS_PEND];
 static unsigned dts_ph, dts_pt;
-static uint64_t *dts_o16, *dts_o0, dts_h16, dts_h0;   // the open layer's type-16 / start slots and their host values
-static bool dts_have16, dts_have_start;
-static uint32_t dts_q0;
-static uint64_t dts_seq0;
+// The open layers, by address. Pass 209 kept one type-16 slot and assumed 0x18 spacing: a world frame has ~69 type-16
+// reports and ~3 type-0, and no start ever met its own type 16, so every layer took host time. A layer's reports are
+// 16-byte slots side by side: type 16 at X, its start at X + 0x10, its end at X + 0x20 (measured; gc-drs.md 6:
+// layerStartEndPerf_ writes type 16 and type 0 at the start, type 0 at the end, always into entry 0, so the slots are
+// fixed and rewritten every frame). Only a KNOWN layer waits: one whose type-16 and start addresses completed before; from
+// then on its three slots are written together by the poll, so GPUStressChecker never sees a new type 16 next to an old
+// pair. Every other report is written at once: the ~69 other type-16 reports a frame, and starts that never end (the
+// framework's GPU timestamp pair, setGpuTimeStamp_: a type 16 at Y and a type 0 at Y + 0x10, looks like a start). A start
+// is timed whether known or not, so a new layer completes in its first frame: its start is written at once (its host
+// value), its end by the poll (that value + the GPU time). Once a frame, entries older than 2 frames are dropped (held
+// slots get their host values, queries are parked for the poll), and known layers not completed for 60 frames are
+// forgotten.
+#define DTS_OPEN 64    // (open starts)
+#define DTS_OPEN16 256 // (type-16 slots: ~69 a frame in the world, kept 2 frames)
+#define DTS_KNOWN 16
+typedef struct { uint64_t *o16; uint64_t h16, frame; bool defer; } DTs16;
+typedef struct { uint64_t *o16, *o0; uint64_t h16, h0, seq0, frame; uint32_t q0; bool d16, d0; } DTsStart;
+typedef struct { uint64_t *o16, *o0; uint64_t frame; } DTsKnown;   // (frame: its last completion)
+static DTs16 dts_t16[DTS_OPEN16];
+static DTsStart dts_st[DTS_OPEN];
+static DTsKnown dts_known[DTS_KNOWN];
+static int dts_n16, dts_nst, dts_nknown;
+static uint64_t dts_age_frame = ~0ull;
+static uint64_t dts_n_start, dts_n_kstart, dts_n_end, dts_n_ok, dts_n_bad, dts_busy_ns, dts_raw_ns;   // (LARECOMP_DTS_STATS)
 // GPU busy time per submission: each main command buffer gets a timestamp at its start and its end, and a layer's GPU time
 // is the sum of its submissions' busy spans clipped to [start, end]. A span not known (out of the 64-entry window): the
 // plain interval.
@@ -2335,7 +2856,12 @@ static void dts_poll(void) {
                         vkGetQueryPoolResults(g_vk.dev, dts_pool, p->q1, 1, sizeof t1, &t1, sizeof t1, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t1 >= t0;
         if (p->o16) p->o16[1] = p->h16;
         if (p->o0) p->o0[1] = p->h0;
-        if (p->o1) p->o1[1] = ok ? p->h0 + (uint64_t)((double)dsub_busy(p->seq0, p->seq, t0, t1) * per * p->k) : p->h1;   // (no result: the host end)
+        const uint64_t busy = ok ? dsub_busy(p->seq0, p->seq, t0, t1) : 0;
+        if (p->o1) p->o1[1] = ok ? p->h0 + (uint64_t)((double)busy * per * p->k) : p->h1;   // (no result: the host end)
+        if (p->o1) {
+            if (ok) dts_n_ok++, dts_busy_ns += (uint64_t)(busy * per), dts_raw_ns += (uint64_t)((t1 - t0) * per);
+            else dts_n_bad++;
+        }
         dts_free(p->q0); dts_free(p->q1);
         dts_ph++;
     }
@@ -2348,46 +2874,151 @@ static bool dts_take(uint32_t *q) {   // a free timestamp query (and room for it
     vkCmdWriteTimestamp2(vk_cmd(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, dts_pool, *q);
     return true;
 }
-static void dts_flush_open(void) {   // an unfinished layer: its slots get their host values now, its query is released later
-    if (dts_have16 && dts_o16) dts_o16[1] = dts_h16;
-    if (dts_have_start) {
-        if (dts_o16) dts_o16[1] = dts_h16;
-        if (dts_o0) dts_o0[1] = dts_h0;
-        // (the query is in the open submission: released by the poll once it completed, with no slot to write)
-        dts_pend[dts_pt++ % DTS_PEND] = (DTsPending){NULL, NULL, NULL, vk_pending_seq(), 0, 0, 0, 1, dts_q0, dts_q0, };
+static int dts_known_find(const uint64_t *o16, const uint64_t *o0) {   // (o16 / o0: NULL = any)
+    for (int i = 0; i < dts_nknown; i++)
+        if ((!o16 || dts_known[i].o16 == o16) && (!o0 || dts_known[i].o0 == o0)) return i;
+    return -1;
+}
+static void dts_known_add(uint64_t *o16, uint64_t *o0, uint64_t frame) {
+    int i = dts_known_find(o16, o0);
+    if (i < 0) {
+        if (dts_nknown < DTS_KNOWN) i = dts_nknown++;
+        else { i = 0; for (int j = 1; j < dts_nknown; j++) if (dts_known[j].frame < dts_known[i].frame) i = j; }
     }
-    dts_have16 = dts_have_start = false;
+    dts_known[i] = (DTsKnown){o16, o0, frame};
+}
+static void dts_t16_drop(int i) {   // a type 16 no start came for: its slot, if held, gets its host value
+    if (dts_t16[i].defer) dts_t16[i].o16[1] = dts_t16[i].h16;
+    dts_t16[i] = dts_t16[--dts_n16];
+}
+static void dts_st_drop(int i) {   // an open start that will not complete: held slots get their host values, its query is parked
+    DTsStart *s = &dts_st[i];
+    if (s->d16) s->o16[1] = s->h16;
+    if (s->d0) s->o0[1] = s->h0;
+    // (the query is in an open or completed submission: released by the poll once that completed, with no slot to write)
+    dts_pend[dts_pt++ % DTS_PEND] = (DTsPending){NULL, NULL, NULL, vk_pending_seq(), 0, 0, 0, 1, s->q0, s->q0, };
+    dts_st[i] = dts_st[--dts_nst];
+}
+static void dts_age(uint64_t frame) {   // (once a frame: entries more than 2 frames old; known layers idle for 60 frames)
+    if (frame == dts_age_frame) return;
+    dts_age_frame = frame;
+    for (int i = 0; i < dts_n16;) if (dts_t16[i].frame + 2 < frame) dts_t16_drop(i); else i++;
+    for (int i = 0; i < dts_nst;) if (dts_st[i].frame + 2 < frame) dts_st_drop(i); else i++;
+    for (int i = 0; i < dts_nknown;) if (dts_known[i].frame + 60 < frame) dts_known[i] = dts_known[--dts_nknown]; else i++;
+}
+static int dts_oldest16(void) {   // (a full table: the entry seen in the earliest frame)
+    int o = 0;
+    for (int i = 1; i < dts_n16; i++) if (dts_t16[i].frame < dts_t16[o].frame) o = i;
+    return o;
+}
+static int dts_oldest_st(void) {
+    int o = 0;
+    for (int i = 1; i < dts_nst; i++) if (dts_st[i].frame < dts_st[o].frame) o = i;
+    return o;
+}
+static void dts_flush_open(void) {   // every open layer: held slots get their host values now, queries are released later
+    while (dts_nst) dts_st_drop(dts_nst - 1);
+    while (dts_n16) dts_t16_drop(dts_n16 - 1);
+}
+static void dts_trace(const uint64_t *out, const char *what) {
+    static int on = -1;
+    static uint64_t from, n0;
+    if (on < 0) { const char *e = getenv("LARECOMP_DTS_STATS"); on = e && *e == '2'; }
+    if (!on) return;
+    const uint64_t frame = vk_frame_counter();
+    if (!from) { if (++n0 < 5400) return; from = frame; }   // (~30 s of 3 type-0 reports a frame at 60)
+    if (frame >= from + 5) return;
+    uintptr_t best = 0;
+    for (int i = 0; i < dts_n16; i++) {
+        const uintptr_t a = (uintptr_t)dts_t16[i].o16, d = (uintptr_t)out - a;
+        if (a < (uintptr_t)out && d <= 0x100 && (!best || d < best)) best = d;
+    }
+    if (best) LOG("[dts] frame %llu type 0 at %p: %s; nearest kept type 16 below: -0x%llx\n", (unsigned long long)frame,
+                  (const void *)out, what, (unsigned long long)best);
+    else LOG("[dts] frame %llu type 0 at %p: %s; no kept type 16 within 0x100 below\n", (unsigned long long)frame, (const void *)out, what);
 }
 // CMD_REPORT_COUNTER with the live clock, before the record-time write: true = this report's slot is written here or
 // later by the poll (the caller then leaves out[1] alone); `host` is the value the caller would write
 static bool dts_claim(uint32_t type, uint64_t *out, uint64_t host, double k) {
+    {   // LARECOMP_DTS_STATS=1: "[dts]" every 2 s: the reports, the layers paired / completed, and a completed layer's GPU
+        // time (its submissions' busy spans clipped to its interval, what the game reads) against its plain interval
+        static int st = -1;
+        static uint64_t calls[3], t_last;
+        if (st < 0) { const char *e = getenv("LARECOMP_DTS_STATS"); st = e && (*e == '1' || *e == '2'); }
+        if (st) {
+            calls[type == 16 ? 0 : type == 0 ? 1 : 2]++;
+            const uint64_t now = SDL_GetTicksNS();
+            if (!t_last) t_last = now;
+            if (now - t_last >= 2000000000ull) {
+                LOG("[dts] %.1f s: reports type 16 %llu, type 0 %llu, other %llu; layers started %llu (known %llu), ended %llu, "
+                    "completed %llu (no result %llu); GPU %.3f ms a layer (plain interval %.3f); open %d / %d, known %d\n",
+                    (now - t_last) / 1e9, (unsigned long long)calls[0], (unsigned long long)calls[1], (unsigned long long)calls[2],
+                    (unsigned long long)dts_n_start, (unsigned long long)dts_n_kstart, (unsigned long long)dts_n_end,
+                    (unsigned long long)dts_n_ok, (unsigned long long)dts_n_bad, dts_n_ok ? dts_busy_ns / 1e6 / dts_n_ok : 0.0,
+                    dts_n_ok ? dts_raw_ns / 1e6 / dts_n_ok : 0.0, dts_n16, dts_nst, dts_nknown);
+                calls[0] = calls[1] = calls[2] = 0;
+                dts_n_start = dts_n_kstart = dts_n_end = dts_n_ok = dts_n_bad = dts_busy_ns = dts_raw_ns = 0;
+                t_last = now;
+            }
+        }
+    }
     if (dts_on() != 1 || !out) return false;
     dts_poll();
-    if (type == 16) {   // a layer begins
-        dts_flush_open();
-        dts_o16 = out; dts_h16 = host; dts_have16 = true;
-        return true;
+    const uint64_t frame = vk_frame_counter();
+    dts_age(frame);
+    if (type == 16) {   // kept by address for its start; a known layer's waits for its pair (the poll), any other is written now
+        int i = 0;
+        while (i < dts_n16 && dts_t16[i].o16 != out) i++;
+        if (i < dts_n16) dts_t16_drop(i);   // (this slot's last report, which no start took)
+        if (dts_n16 == DTS_OPEN16) dts_t16_drop(dts_oldest16());
+        const bool defer = dts_known_find(out, NULL) >= 0;
+        dts_t16[dts_n16++] = (DTs16){out, host, frame, defer};
+        return defer;
     }
     if (type != 0) return false;
-    // (paired by address, not order: a layer's record holds type 16 at +0x10, its start at +0x28, its end at +0x40, so
-    // interleaved layers cannot pair one's start with another's end)
-    if (dts_have16 && out == dts_o16 + 3) {   // the layer's start
-        dts_have16 = false;
-        if (!dts_take(&dts_q0)) { dts_o16[1] = dts_h16; return false; }
-        dts_o0 = out; dts_h0 = host; dts_have_start = true; dts_seq0 = vk_pending_seq();
+    // (paired by address, not order: a layer's reports are 16-byte slots side by side, type 16 at X, its start at X + 0x10,
+    // its end at X + 0x20 (measured: every type 0 sits 0x10 or 0x20 above the nearest type 16, an end 0x10 above its
+    // start), so interleaved or nested layers pair each start with its own type 16 and each end with its own start)
+    for (int i = 0; i < dts_n16; i++) {
+        if (dts_t16[i].o16 != out - 2) continue;   // the layer's start
+        const DTs16 t = dts_t16[i];
+        dts_t16[i] = dts_t16[--dts_n16];
+        for (int j = 0; j < dts_nst; j++) if (dts_st[j].o0 == out) { dts_st_drop(j); break; }   // (last frame's, never ended)
+        if (dts_nst == DTS_OPEN) dts_st_drop(dts_oldest_st());
+        uint32_t q0;
+        if (!dts_take(&q0)) {   // (no query: host time at once, its type 16 too if held)
+            if (t.defer) t.o16[1] = t.h16;
+            dts_trace(out, "a start, no query free: host time");
+            return false;
+        }
+        const bool d0 = t.defer && dts_known_find(t.o16, out) >= 0;   // (a known layer's start waits for its end)
+        dts_st[dts_nst++] = (DTsStart){t.o16, out, t.h16, host, vk_pending_seq(), frame, q0, t.defer, d0};
+        dts_n_start++;
+        dts_n_kstart += d0;
+        dts_trace(out, d0 ? "a known layer's start (held)" : "a start (written now, timed)");
+        return d0;
+    }
+    for (int j = 0; j < dts_nst; j++) {
+        if (dts_st[j].o0 != out - 2) continue;   // the layer's end
+        const DTsStart s = dts_st[j];
+        uint32_t q1;
+        if (!dts_take(&q1)) { dts_st_drop(j); dts_trace(out, "an end, no query free: host time"); return false; }
+        dts_st[j] = dts_st[--dts_nst];
+        dts_pend[dts_pt++ % DTS_PEND] = (DTsPending){s.d16 ? s.o16 : NULL, s.d0 ? s.o0 : NULL, out, vk_pending_seq(), s.h16,
+                                                     s.h0, host, k, s.q0, q1, s.seq0};
+        dts_known_add(s.o16, s.o0, frame);
+        dts_n_end++;
+        dts_trace(out, "an end (held for the GPU time)");
         return true;
     }
-    if (!dts_have_start || out != dts_o0 + 3) return false;   // (a type 0 outside a layer: host time at once)
-    uint32_t q1;
-    if (!dts_take(&q1)) { dts_flush_open(); return false; }
-    dts_pend[dts_pt++ % DTS_PEND] = (DTsPending){dts_o16, dts_o0, out, vk_pending_seq(), dts_h16, dts_h0, host, k, dts_q0, q1, dts_seq0};
-    dts_have_start = false;
-    return true;
+    dts_trace(out, "outside a layer: host time");
+    return false;   // (a type 0 outside a layer: host time at once)
 }
 static void dts_device_reset(void) {
     dts_pool = VK_NULL_HANDLE; dts_mode = -1; memset(dts_busy, 0, sizeof dts_busy); dts_next = 0; dts_ph = dts_pt = 0;
     dsub_pool = VK_NULL_HANDLE; memset(dsub_rec, 0, sizeof dsub_rec); memset(dsub_seq, 0, sizeof dsub_seq); dsub_done = 0; dsub_live = false;
-    dts_have16 = dts_have_start = false;
+    dts_n16 = dts_nst = dts_nknown = 0;
+    dts_age_frame = ~0ull;
 }
 
 static void vk_end_pass_at(int line);
@@ -2840,6 +3471,27 @@ static void e1_report(void) {
     }
     e1_n = 0; e1_armed = 0;
 }
+// contact.c (TOTK_CONTACT_SHADOWS): each pass just before it begins rendering (its targets' images made and promoted, so
+// the backends remembered are the ones drawn into); a march still pending from the lighting composite runs here, outside
+// any pass (also before dispatches and copies: contact_flush there)
+static void contact_run(VkCommandBuffer cb) {
+    if (contact_flush(cb)) { snap_ndgen++; snap_nd_why = "contact-shadow march"; }   // (an image written outside any draw)
+}
+static void contact_pass_hook(VkCommandBuffer cb) {
+    ContactPass p = {0};
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++) {
+        NvnTexture *t = st.rt.color[i];
+        if (!t) continue;
+        p.color[i] = vk_render_backend(t);
+        p.color_nvn[i] = t->format;
+    }
+    p.ncolor = st.rt.ncolor;
+    p.depth_nvn = st.rt.depth ? st.rt.depth->format : 0;
+    if (p.color[0]) p.w = p.color[0]->width, p.h = p.color[0]->height;
+    p.c4_addr = st.ubuf[1][1].addr, p.c4_size = st.ubuf[1][1].size;
+    if (contact_pass_begin(&p)) contact_run(cb);
+}
+
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     uint64_t bp_t0 = prof ? prof_now() : 0, bp_tv = 0;
@@ -3077,6 +3729,7 @@ static void begin_pass(void) {
             }
         }
     }
+    if (contact_strength()) contact_pass_hook(cb);
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = 1,
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
@@ -3495,6 +4148,8 @@ static __thread uint64_t pa_tm[8];
 static _Atomic uint64_t pa_tm_sum[8], pa_tm_n;
 _Atomic int stat_gpl_links;
 _Atomic uint64_t stat_gpl_link_ns;
+static uint64_t prog_code_hash(const Prog *p, int i);
+static __thread const char *tl_slow_name, *tl_slow_glsl;   // (gpl_program_libs: the program gpl_create builds for)
 static VkPipeline gpl_create(VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelineLibraryFlagsEXT what) {
     VkGraphicsPipelineLibraryCreateInfoEXT li = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
                                                  .pNext = pi->pNext, .flags = what};
@@ -3505,7 +4160,9 @@ static VkPipeline gpl_create(VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelin
     if (pa_tm_on) pi->pNext = &fci;
     pi->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
     VkPipeline p = VK_NULL_HANDLE;
+    build_begin(what == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT ? "library vs" : "library fs", tl_slow_name, tl_slow_glsl);
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, gpl_driver_cache ? VK_NULL_HANDLE : g_vk.pcache, 1, pi, NULL, &p);
+    build_end();
     if (pa_tm_on && r == VK_SUCCESS) {
         pa_tm[7]++;
         if ((fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
@@ -3545,6 +4202,10 @@ static void gpl_program_libs(Prog *p) {
     VkGraphicsPipelineCreateInfo a = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 1, .pStages = &vs,
                                       .pViewportState = &vp, .pRasterizationState = &rs, .pDynamicState = &dyp,
                                       .layout = p->lib_layout[0] ? p->lib_layout[0] : p->layout};
+    char nm[24];
+    snprintf(nm, sizeof nm, "fs_%016llx", (unsigned long long)prog_code_hash(p, 1));
+    tl_slow_name = nm;
+    tl_slow_glsl = p->vi && p->vi->msl ? p->vi->msl : NULL;
     p->lib_pre = gpl_create(&a, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT);
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
@@ -3552,7 +4213,9 @@ static void gpl_program_libs(Prog *p) {
     VkGraphicsPipelineCreateInfo b = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 1, .pStages = &fs,
                                       .pMultisampleState = &ms, .pDepthStencilState = &ds, .pDynamicState = &dy,
                                       .layout = p->lib_layout[1] ? p->lib_layout[1] : p->layout};
+    tl_slow_glsl = p->fi && p->fi->msl ? p->fi->msl : NULL;
     p->lib_frag = p->lib_pre ? gpl_create(&b, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) : VK_NULL_HANDLE;
+    tl_slow_name = tl_slow_glsl = NULL;
     atomic_store(&p->lib_state, p->lib_pre && p->lib_frag ? 2 : 3);
 }
 
@@ -3602,8 +4265,27 @@ static void glsl_swap(char **msl, const char *fs, const char *stage) {
     LOG("[shader] fs %s: %s GLSL swapped (LARECOMP_GLSL_SWAP)\n", fs, stage);
 }
 static void full_est_feed(uint64_t dt);
+static bool pa_full;   // (archive section below)
 static void compile_program(void *arg) {
     Prog *p = arg;
+    // Archive warm-up (pa_job: pa_tm_on) on a driver other than NVIDIA's: a program whose GLSL is a pc loop of more than
+    // TOTK_WARM_MAX_CASES (300) cases is not compiled. Issue #9 probes on the RDNA2 iGPU: the pack's three 55 KB vertex
+    // shaders (422 loop cases each) took AMD's driver over a minute and ~2.5 GB each, 8.8 GB for the three at once; every
+    // other stage of the pack is under 100 cases. The game's own build still makes one if it is ever drawn. 0: no limit.
+    static long max_cases = -1;
+    if (max_cases < 0) { const char *e = getenv("TOTK_WARM_MAX_CASES"); max_cases = e ? atol(e) : 300; }
+    // (not with TOTK_PRECOMPILE_ARCHIVE=full: there the program is claimed by its content key first, and a state 2 would
+    // be what the game's own lookup gets)
+    if (pa_tm_on && !pa_full && !maxwell_nvidia && max_cases > 0 &&
+        ((p->vi && p->vi->pc_cases > (uint32_t)max_cases) || (p->fi && p->fi->pc_cases > (uint32_t)max_cases))) {
+        static _Atomic int nlog;
+        if (atomic_fetch_add(&nlog, 1) < 20)
+            LOG("[precompile] warm-up: fs_%016llx not compiled: pc loop of %u / %u cases (TOTK_WARM_MAX_CASES %ld; this driver "
+                "can take minutes and GBs on it; built if the game draws it)\n", (unsigned long long)prog_code_hash(p, 1),
+                p->vi ? p->vi->pc_cases : 0, p->fi ? p->fi->pc_cases : 0, max_cases);
+        atomic_store(&p->state, 2);
+        return;
+    }
     uint64_t t0 = SDL_GetTicksNS();
     if (pa_tm_on) pa_tm[5] += vk_spirv_cached(p->vi->msl, STAGE_VERTEX) + vk_spirv_cached(p->fi->msl, STAGE_FRAGMENT);
     size_t nv = 0, nf = 0;
@@ -3612,8 +4294,12 @@ static void compile_program(void *arg) {
     snprintf(nf_, sizeof nf_, "fs_%016llx", (unsigned long long)prog_code_hash(p, 1));
     glsl_swap(&p->vi->msl, nf_ + 3, "vs");
     glsl_swap(&p->fi->msl, nf_ + 3, "fs");
+    build_begin("GLSL->SPIR-V vs", nf_, p->vi->msl);
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, nv_, &nv);
+    build_end();
+    build_begin("GLSL->SPIR-V fs", nf_, p->fi->msl);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, nf_, &nf) : NULL;
+    build_end();
     if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); return; }
     uint64_t t1 = SDL_GetTicksNS();
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
@@ -3762,8 +4448,19 @@ static bool prog_sync_ok(void) {
     if (per_frame < 0) { const char *e = getenv("LARECOMP_PROG_SYNC_PER_FRAME"); per_frame = !e || strcmp(e, "0"); }
     if (per_frame) {
         uint64_t f = renderer_present_count();
-        if (f != g_psync_win_t) { g_psync_win_t = f; g_psync_win_ns = 0; }
-        return g_psync_win_ns < (uint64_t)budget_ms * 1000000ull;
+        // (by the expected cost of one more, the running mean g_prog_est, not only what is spent: 5-plan Fix 5; a frame's
+        // first inline build no longer starts when one costs more than the whole budget. The mean is fed only by inline
+        // builds, so while it is over the budget it decays by 1/16 a frame: after ~15 frames (from 2.5x the budget) one
+        // inline build runs again and measures; without it a few heavy builds would stop inline builds for good, every new
+        // program then held. LARECOMP_PROG_SYNC_EST=0: old)
+        static int est = -1;
+        if (est < 0) { const char *e2 = getenv("LARECOMP_PROG_SYNC_EST"); est = !(e2 && *e2 == '0'); }
+        if (f != g_psync_win_t) {
+            g_psync_win_t = f;
+            g_psync_win_ns = 0;
+            if (est && g_prog_est > (uint64_t)budget_ms * 1000000ull) g_prog_est -= g_prog_est / 16;
+        }
+        return g_psync_win_ns + (est ? g_prog_est : 0) <= (uint64_t)budget_ms * 1000000ull && (est || g_psync_win_ns < (uint64_t)budget_ms * 1000000ull);
     }
     uint64_t now = SDL_GetTicksNS();
     if (now - g_psync_win_t > 50000000ull) { g_psync_win_t = now; g_psync_win_ns = 0; }
@@ -3969,6 +4666,10 @@ static void translate_program(void *arg) {
     uint64_t t0 = SDL_GetTicksNS();
     if (!translate_unlocked) pthread_mutex_lock(&translate_lock);
     uint64_t tl = SDL_GetTicksNS();
+    if (p->sync_try && tl - t0 > 20000000ull) {   // (the drawing thread waited for translate_lock: said, a few times)
+        static int nlog;
+        if (nlog++ < 16) LOG("[newprog] the drawing thread waited %.0f ms for translate_lock\n", (tl - t0) / 1e6);
+    }
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     maxwell_gdev_size = gdev_window_size();
@@ -4691,7 +5392,11 @@ static void build_pipeline_body(Pipe *pp) {
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
     if (k->fbl & VK_IMAGE_ASPECT_COLOR_BIT) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;   // (g_vk.fbl_layout)
+    char snm[24];
+    snprintf(snm, sizeof snm, "fs_%016llx", (unsigned long long)prog_code_hash(k->prog, 1));
+    build_begin("pipeline", snm, NULL);
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
+    build_end();
     for (int s = 0; s < 2; s++) if (tmp[s]) vkDestroyShaderModule(g_vk.dev, tmp[s], NULL);
     if (r != VK_SUCCESS) {
         static int n;
@@ -4822,6 +5527,8 @@ static uint64_t pc_ckey(const uint64_t code_hash[2], const ShaderKey *vkey, cons
         uint32_t f[4] = {ks[i]->depth_minus_one, ks[i]->flip_y, i == 0 ? ks[i]->vs_out_mask : 0, ks[i]->glsl};
         h = hash_words(h, f, 16);
     }
+    // Keys without it are unchanged.
+    if (fkey->a2c_dither) { const uint32_t d = 0xA2C0D17Bu; h = hash_words(h, &d, 4); }
     return h ? h : 1;
 }
 static Prog *pc_claim_prog(uint64_t ckey, Prog *fresh) {   // the program already under this key, or `fresh` (now registered)
@@ -5379,6 +6086,9 @@ void vk_archive_warm_commit(uint32_t n) {
 static _Atomic int pa_busy;
 static void pa_work_begin(void) { atomic_fetch_add(&pa_busy, 1); }
 static void pa_work_end(void) { atomic_fetch_add(&pa_busy, -1); }
+// (prepare mode: no game ran, so the device's window origin and depth mode are still unset; the keys take the
+// recorded programs' values instead, else every warmed key would miss the game's own: vk_prepare)
+static int pa_flip_y = -1, pa_depth_m1 = -1;
 static void pa_job(int i) {
     const uint8_t *r = pa_prog + (size_t)i * PA_PROG;
     uint32_t ix[2];
@@ -5387,8 +6097,8 @@ static void pa_job(int i) {
     ShaderKey vkey = {0}, fkey = {0};   // as draw_() builds them
     memcpy(vkey.attr_kind, r + 8, 32);
     vkey.glsl = fkey.glsl = 1;
-    vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
-    vkey.depth_minus_one = nvn_depth_mode() == 0;
+    vkey.flip_y = fkey.flip_y = pa_flip_y >= 0 ? pa_flip_y : nvn_window_origin() == 0;
+    vkey.depth_minus_one = pa_depth_m1 >= 0 ? pa_depth_m1 : nvn_depth_mode() == 0;
     const uint8_t *code[2];
     uint64_t cmax[2], csize[2], chash[2];
     for (int s = 0; s < 2; s++) {   // (as pc_prog_key: the code up to the constants' offset; the constants after it)
@@ -5706,6 +6416,7 @@ static void *pc_worker(void *arg) {
     // (ahead of the game, nothing waits on it: the E-cores / the other CCD, cpu_place.h; the first-start pass's extra
     // workers on every core, they exist to use them)
     cpu_place_thread(widx < pc_nthreads_normal ? CPU_HELPER : CPU_ANY);
+    tl_gate = GATE_BACKGROUND;   // (compile gate: waits while memory is short)
 #ifndef _WIN32
     { extern int pthread_setname_np(pthread_t, const char *); pthread_setname_np(pthread_self(), "vk-precompile"); }   // ([cpu] line)
 #endif
@@ -5743,7 +6454,7 @@ static void *pc_worker(void *arg) {
         if (ok && pc_claim_prog(r->ckey, p) == p) {
             memset(pa_tm, 0, sizeof pa_tm);
             pa_tm_on = true;
-            translate_unlocked = pc_unlocked && atomic_load(&pc_cold_running);   // (the first-start pass only)
+            translate_unlocked = pc_unlocked;   // (TOTK_PRECOMPILE_UNLOCKED=0: under translate_lock)
             translate_program(p);
             translate_unlocked = false;
             pa_tm_on = false;
@@ -5785,6 +6496,8 @@ extra_out:;
     if (atomic_fetch_add(&phase1_done, 1) == pc_nthreads - 1) {
         LOG("[precompile] done: %d programs, %d pipelines in %.1f s; %d recorded stages from the pack (no code file)\n",
             pc_nprogs, pc_npipes, (SDL_GetTicksNS() - pc_t0) / 1e9, atomic_load(&pa_served));
+        LOG("[shader] translator cache: %llu stages read, %llu stored, %llu bad entries dropped (%s)\n", (unsigned long long)tc_hits,
+            (unsigned long long)tc_stores, (unsigned long long)tc_bad, tc_dir[0] ? tc_dir : "off");
         pc_tm_log();
         pa_t0 = SDL_GetTicksNS();
         if (pc_cold) pc_cold_done();
@@ -5914,8 +6627,11 @@ static void pc_cold_decide(void) {   // (pc_cold_key: declared with the archive 
     const bool changed = strcmp(have, pc_cold_key) != 0;
     pc_cold = e && *e ? strcmp(e, "0") != 0 : changed;
     const char *u = getenv("TOTK_PRECOMPILE_UNLOCKED");
-    pc_unlocked = pc_cold && !(u && !strcmp(u, "0"));
-    if (pc_unlocked) LOG("[precompile] first-start pass: translating without translate_lock (TOTK_PRECOMPILE_UNLOCKED=0: with it)\n");
+    // (every start, not only the first-start pass, 2026-11-01: on a warm start the workers translated under the lock - 15
+    // threads at the title - and the drawing thread's own translations waited behind them, frame 177: 1949 ms with 99 new
+    // programs, 'translate 1286 ms' of it, which counts translate_lock waits)
+    pc_unlocked = !(u && !strcmp(u, "0"));
+    if (pc_unlocked) LOG("[precompile] workers translate without translate_lock (TOTK_PRECOMPILE_UNLOCKED=0: with it)\n");
     LOG("[precompile] first-start pass %s (GPU / driver / engine build %s; pipeline cache %s%s)\n", pc_cold ? "on" : "off",
         changed ? "new" : "as when it last ran", g_vk_pcache_loaded ? "loaded" : "empty", e && *e ? "; TOTK_PRECOMPILE_COLD" : "");
 }
@@ -5932,6 +6648,76 @@ static void pc_cold_done(void) {   // (every recorded program and pipeline built
         rename("cache/precompile_cold.key.tmp", "cache/precompile_cold.key");
     }
     atomic_store(&pc_cold_running, 0);
+}
+static bool a2c_dither_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_A2C_DITHER");
+        v = e ? strcmp(e, "0") != 0 : !maxwell_nvidia;
+        if (v) LOG("[vk] alpha to coverage at one sample dithered in the shader, as Maxwell (%s)\n",
+                   e ? "TOTK_A2C_DITHER" : "default on drivers other than NVIDIA's");
+    }
+    return v;
+}
+// The records the precompile and prepare build come from NVIDIA: their A2C draws have a2c_dither 0. Where the dither is
+// on, each recorded one-sample pipeline with A2C gets its dithered twin too (the program with fkey.a2c_dither = 1 under
+// its own content key, the pipeline with A2C off), so an AMD first play finds the foliage it draws already built instead
+// of compiling it on first sight. After every pc_load_file of the start (the loads' capacities are theirs; nothing loads
+// after this).
+static void pc_derive_a2c(void) {
+    if (!a2c_dither_on() || !pc_npipes) return;
+    const int np0 = pc_nprogs, nl0 = pc_npipes;
+    PcProg2 *ap = NULL;
+    PcPipe *al = NULL;
+    int nap = 0, nal = 0, cap = 0;
+    for (int i = 0; i < nl0; i++) {
+        const PcPipe *r = &pc_pipes[i];
+        if (!r->k.a2c || r->k.samples > 1) continue;
+        int pi = -1;
+        for (int j = 0; j < np0 && pi < 0; j++) if (pc_progs[j].p.ckey == r->ckey) pi = j;
+        if (pi < 0 || pc_progs[pi].p.fkey.a2c_dither) continue;
+        PcProg2 v = pc_progs[pi];
+        v.p.fkey.a2c_dither = 1;
+        v.p.ckey = pc_ckey(v.p.code_hash, &v.p.vkey, &v.p.fkey);
+        PcPipe q = *r;
+        q.ckey = v.p.ckey;
+        q.k.a2c = 0;
+        if (nap == cap || nal == cap) {
+            cap = cap ? cap * 2 : 256;
+            ap = realloc(ap, cap * sizeof *ap);
+            al = realloc(al, cap * sizeof *al);
+        }
+        if (pc_seen_add(v.p.ckey)) { pc_seen_add(v.p.ckey ^ PC_SEEN_C1); ap[nap++] = v; }
+        const uint64_t rk = hash_words(q.ckey, &q.k, sizeof(PipeKey));
+        if (pc_seen_add(rk ^ 0x5bd1e995ull)) al[nal++] = q;
+    }
+    if (nap || nal) {
+        pc_progs = realloc(pc_progs, (size_t)(np0 + nap) * sizeof *pc_progs);
+        pc_pipes = realloc(pc_pipes, (size_t)(nl0 + nal) * sizeof *pc_pipes);
+        memcpy(pc_progs + np0, ap, (size_t)nap * sizeof *ap);
+        memcpy(pc_pipes + nl0, al, (size_t)nal * sizeof *al);
+        pc_nprogs = np0 + nap;
+        pc_npipes = nl0 + nal;
+        LOG("[precompile] A2C dither on: +%d programs, +%d pipelines (the recorded A2C draws' dithered twins)\n", nap, nal);
+    }
+    free(ap);
+    free(al);
+}
+// The workers build in array order, and the player's own records loaded first: but a record the seed has is never
+// recorded again, so the own file holds only what the seed lacks (the player's world), and the boot's programs sit in the
+// seed, behind all of it. Each file is in first-use order, so the two are merged by position (record i of n goes at i /
+// n): both files' starts come first. TOTK_PRECOMPILE_ORDER=files: the old order (own file, then the seed).
+static void pc_interleave(void *base, size_t esz, int na, int n) {   // ([0, na) and [na, n) merged by position)
+    const int nb = n - na;
+    if (na <= 0 || nb <= 0) return;
+    uint8_t *src = malloc((size_t)n * esz), *dst = base;
+    if (!src) return;
+    memcpy(src, base, (size_t)n * esz);
+    for (int a = 0, b = 0, o = 0; o < n; o++) {   // (a / na <= b / nb: the own record first on a tie)
+        const bool take_a = b >= nb || (a < na && (int64_t)a * nb <= (int64_t)b * na);
+        memcpy(dst + (size_t)o * esz, src + (size_t)(take_a ? a++ : na + b++) * esz, esz);
+    }
+    free(src);
 }
 // Loads cache/precompile.bin (first program request: the heap base the translator bakes in is known by then) and
 // starts the workers. A file written for another heap base / gdev window / record layout is set aside as .old.
@@ -5955,7 +6741,15 @@ static void pc_start(void) {
         int r = pc_load_file(path);
         LOG("[precompile] seed %s: %s, +%d programs, +%d pipelines, +%d compute programs\n", path,
             r < 0 ? "missing" : r ? "loaded" : "another heap base / layout, ignored", pc_nprogs - np, pc_npipes - nl, pc_ncomps - nc);
+        const char *e = getenv("TOTK_PRECOMPILE_ORDER");
+        if (np && pc_nprogs > np && !(e && !strcmp(e, "files"))) {
+            pc_interleave(pc_progs, sizeof *pc_progs, np, pc_nprogs);
+            pc_interleave(pc_pipes, sizeof *pc_pipes, nl, pc_npipes);
+            LOG("[precompile] own and seed records merged by position (the seed's boot programs early; "
+                "TOTK_PRECOMPILE_ORDER=files: own first)\n");
+        }
     }
+    pc_derive_a2c();
     pc_start_workers();
 }
 // one precompile.bin into pc_progs / pc_pipes / pc_comps (records seen before are skipped): 1 loaded, 0 written for
@@ -6650,10 +7444,15 @@ static void resolve_feedback(Prog *pr) {
                                     !renderer_format_is_depth(t0->format) && src->samples == 1 &&
                                     host_texel_bytes(afmt) && host_texel_bytes(afmt) == host_texel_bytes(src->format);
             const VkFormat vfmt = alias_snap ? afmt : src->format;   // (the snapshot view's format)
-            // g_vk.fbl_layout (the layout extension alone, AMD): a colour, single-sample, own-format read is live too, with
-            // the image in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL for the pass (fbl_move) and the pass's pipelines flagged; a draw
-            // that also writes what it samples keeps SELFCOPY's snapshot, depth keeps its copy
-            const bool fbl_live = g_vk.fbl_layout && !alias && !fcopy && !ccopy && !(selfcopy && self_write_c) && src->samples == 1 &&
+            // g_vk.fbl_layout (the layout extension alone, AMD): a colour, single-sample, own-format read is live too, with the
+            // image in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL for the pass (fbl_move) and the pass's pipelines flagged; a draw that
+            // also writes what it samples keeps SELFCOPY's snapshot, depth keeps its copy. A same-format alias too: it samples
+            // the writer's own image (textures.c alias_writer), and texture_info_'s descriptor layout follows that image's
+            // (vb->fbl_in); TotK's G-buffer reads through second objects are nearly all same-format (replays: kak 76 of 77
+            // alias objects), each a snapshot copy here before. LARECOMP_FBL_ALIAS=0: copies.
+            static int fbl_alias = -1;
+            if (fbl_alias < 0) { const char *e = getenv("LARECOMP_FBL_ALIAS"); fbl_alias = !(e && *e == '0'); }
+            const bool fbl_live = g_vk.fbl_layout && (!alias || (fbl_alias && !alias_fmt)) && !fcopy && !ccopy && !(selfcopy && self_write_c) && src->samples == 1 &&
                                   !(src->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) &&
                                   src->base_type != VK_IMAGE_VIEW_TYPE_3D && (src->fbl_in || n_fbl < 9) &&
                                   // (the bound image itself, made with the feedback-loop usage: a block-compressed target renders into its
@@ -7370,11 +8169,12 @@ static VkDescriptorBufferInfo gmem_win_info(int k) {
 // and the end of the submission copies it back (gdev_writeback), so CPU reads after the fence and CPU writes before
 // submit both hold.
 #define GDEV_REGION_MAX (16ull << 20)
-typedef struct { uint64_t addr, size, off, seq, up; } GdevRegion;  // seq: the submission it was copied in for (or
-// carried into, chunked submission); up: the submission whose upload buffer copied it in
+typedef struct { uint64_t addr, size, off, seq, up, cap; } GdevRegion;  // seq: the submission it was copied in for (or
+// carried into, chunked submission); up: the submission whose upload buffer copied it in; cap: the bytes from addr its
+// window slot reserves (size <= cap: a later binding of the same start may grow into it, gdev_map)
 static GdevRegion gdev_reg[256];
 static int gdev_n;
-static uint64_t gdev_top, gdev_upload_seq, gdev_stat_in, gdev_stat_regions, gdev_stat_snap, gdev_stat_host;
+static uint64_t gdev_top, gdev_upload_seq, gdev_stat_in, gdev_stat_regions, gdev_stat_snap, gdev_stat_host, gdev_stat_grown;
 static int gdev_half;               // the window half new regions go into
 static uint64_t gdev_half_seq[2];   // per half: the last submission that copied a region into it
 static VkBuffer gdev_buf;
@@ -7630,6 +8430,35 @@ static bool live_pages(void) {
     if (on < 0) on = getenv("LARECOMP_LIVE_PAGES") != NULL;
     return on;
 }
+// host -> window copy of the region's bytes [lo, hi) in the open submission's upload buffer
+static void gdev_upload(GdevRegion *r, uint64_t lo, uint64_t hi, bool write, uint64_t cur) {
+    VkCommandBuffer up = vk_upload_cmd();
+    if (gdev_upload_seq != cur) { vk_full_barrier(up); gdev_upload_seq = cur; }
+    const uint64_t a = r->addr + lo, n = hi - lo;
+    VkBufferCopy bc = {a - HEAP_BASE, r->off + lo, n};
+    // Read-only use: snapshot the CPU's data now, as the vertex mirror does (copied on the GPU timeline it can already
+    // hold the game's next frame: SyncWait lets the game run one fence ahead of the GPU). Pages a shader wrote in a
+    // submission still in flight reach host memory by its copy-back on the GPU timeline: those stay GPU copies.
+    bool snap = !write;
+    static int snap_all = -1;  // LARECOMP_GDEV_SNAP_ALL=1 (diagnostic, can drop in-flight GPU writes): snapshot every read-only use
+    if (snap_all < 0) snap_all = getenv("LARECOMP_GDEV_SNAP_ALL") != NULL;
+    uint64_t done = snap ? (snap_all ? ~0ull : vk_completed_seq()) : 0;
+    for (uint64_t b = (a - HEAP_BASE) >> GDEV_SH, be = (a + n - 1 - HEAP_BASE) >> GDEV_SH; snap && b <= be && b < GDEV_BLKS; b++)
+        if (gdev_blk[b] > done) snap = false;
+    if (snap) {
+        int k0 = vk_up_kind;
+        vk_up_kind = 2;
+        VkSpan sp = vk_transient(n, 256);
+        vk_up_kind = k0;
+        memcpy(sp.ptr, (const void *)(uintptr_t)a, n);
+        bc.srcOffset = sp.off;
+        vkCmdCopyBuffer(up, sp.buf, gdev_buf, 1, &bc);
+        gdev_stat_snap += n;
+    } else
+        vkCmdCopyBuffer(up, gmem_buf, gdev_buf, 1, &bc);
+    if (gdev_chk_on()) vkCmdCopyBuffer(up, gmem_buf, chk_buf[0], 1, &bc);  // (LARECOMP_GDEV_CHECK: host at the upload)
+    gdev_stat_in += n;
+}
 static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
     if (write && addr >= HEAP_BASE && size) {
         static uint64_t la, ls, lseq;
@@ -7642,9 +8471,43 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
     }
     if (!addr || !size || addr < HEAP_BASE || addr + size > HEAP_BASE + gmem_size || !gdev_ready()) return addr;
     if (gdev_host_rule(addr, size)) return addr;
-    uint64_t cur = submit_seq + 1;
     GdevRegion *r = gdev_find(addr, size);
     const uint64_t half = GDEV_SIZE / 2;
+    // A new region's window slot reserves the bytes up to the next 256 of the guest address (cap): slots start 256-aligned,
+    // so they cost no window space. The region itself stays exact (size): only a binding of the SAME start grows it, its
+    // new bytes uploaded now from fresh host data. Any other address in the reserved tail is not contained and takes the
+    // normal path: served from the region's earlier upload it would read a ring-buffer slice from before the CPU wrote it.
+    // LARECOMP_GDEV_EXACT=1: no reserve (old).
+    static int exact = -1;
+    if (exact < 0) exact = getenv("LARECOMP_GDEV_EXACT") != NULL;
+    uint64_t cur = submit_seq + 1;
+    if (!r && !exact)
+        for (int i = 0; i < gdev_n; i++) {
+            GdevRegion *g = &gdev_reg[i];
+            if (g->addr != addr || size <= g->size || size > g->cap) continue;
+            // (not into another region's bytes; not a carried region: its shadow is its first upload's, and the diff
+            // copy-back would take the new bytes for GPU writes)
+            bool clash = g->seq == cur && g->up != cur;
+            for (int j = 0; j < gdev_n && !clash; j++)
+                clash = j != i && addr < gdev_reg[j].addr + gdev_reg[j].size && gdev_reg[j].addr < addr + size;
+            if (!clash) {
+                if (g->seq == cur) {   // (in use: the new bytes now; earlier draws of this submission read only the old ones)
+                    gdev_upload(g, g->size, size, write, cur);
+                    for (int k = 0; k < gdev_lv_n; k++)
+                        if (gdev_lv_seq == cur && gdev_lv[k].addr == g->addr && gdev_lv[k].off == g->off) gdev_lv[k].size = size;
+                    gdev_stat_grown++;
+                }
+                g->size = size;
+                gdev_gen++;
+                r = g;
+            }
+            break;
+        }
+    uint64_t rsize = size;
+    if (!exact) {   // (the reserve, for a new region below)
+        const uint64_t heap_end = HEAP_BASE + gmem_size, end = (addr + size + 255) & ~255ull;
+        rsize = (end < heap_end ? end : heap_end) - addr;
+    }
     static int oldfull = -1;   // LARECOMP_GDEV_OLDFULL=1: the old window-full rule (A/B)
     if (oldfull < 0) oldfull = getenv("LARECOMP_GDEV_OLDFULL") != NULL;
     // an older region in the other half is re-made in this one: a half is then only pinned by submissions that copied into it
@@ -7658,6 +8521,8 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
         static int reads = -1;
         if (reads < 0) { const char *e = getenv("LARECOMP_GDEV_READS"); reads = !(e && *e == '0') && wb_init(); }   // (needs the diff copy-back)
         if ((!write && !reads) || size > GDEV_REGION_MAX) return addr;
+        for (int i = 0; i < gdev_n; i++)   // (the reserve stops short of any region starting in it)
+            if (gdev_reg[i].addr >= addr + size && gdev_reg[i].addr < addr + rsize) rsize = gdev_reg[i].addr - addr;
         for (int i = 0; i < gdev_n; i++)
             if (addr < gdev_reg[i].addr + gdev_reg[i].size && gdev_reg[i].addr < addr + size) {
                 if (gdev_reg[i].seq == cur && !write) {  // read-only use: its own snapshot copy is safe unless a shader of
@@ -7687,13 +8552,13 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
             gdev_gen++;
         }
         uint64_t off = (gdev_top + 255) & ~255ull;
-        if (oldfull && (off + size > GDEV_SIZE || gdev_n == 256)) {
+        if (oldfull && (off + rsize > GDEV_SIZE || gdev_n == 256)) {
             for (int i = 0; i < gdev_n; i++) if (gdev_reg[i].seq == cur) { gdev_stat_host++; return addr; }
             vk_wait_seq(submit_seq);
             gdev_n = 0;
             gdev_gen++;
             off = 0;
-        } else if (off + size > (uint64_t)(gdev_half + 1) * half) {  // this half is full: switch to the other one
+        } else if (off + rsize > (uint64_t)(gdev_half + 1) * half) {  // this half is full: switch to the other one
             int h = !gdev_half;
             if (gdev_half_seq[h] == cur) off = ~0ull;   // (one submission filled both halves)
             else {
@@ -7704,7 +8569,7 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
                 off = (uint64_t)h * half;
             }
         }
-        if (off == ~0ull || gdev_n == 256 || size > half) {   // (rare: counted in the stats line)
+        if (off == ~0ull || gdev_n == 256 || rsize > half) {   // (rare: counted in the stats line)
             static int nlog;
             if (nlog++ < 8) LOG("[vk] device window: %llx +%llx left in host memory (%d regions, half %d)\n", (unsigned long long)addr,
                                 (unsigned long long)size, gdev_n, gdev_half);
@@ -7712,43 +8577,19 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
             return addr;
         }
         r = &gdev_reg[gdev_n++];
-        *r = (GdevRegion){addr, size, off, 0, 0};
+        *r = (GdevRegion){addr, size, off, 0, 0, rsize};
         gdev_gen++;
-        gdev_top = off + size;
+        gdev_top = off + rsize;
         gdev_stat_regions++;
     }
     if (r->seq != cur) {  // first use in this submission: host -> VRAM, after the previous submission's copy-back
-        VkCommandBuffer up = vk_upload_cmd();
-        if (gdev_upload_seq != cur) { vk_full_barrier(up); gdev_upload_seq = cur; }
-        VkBufferCopy bc = {r->addr - HEAP_BASE, r->off, r->size};
-        // Read-only use: snapshot the CPU's data now, as the vertex mirror does (copied on the GPU timeline it can already
-        // hold the game's next frame: SyncWait lets the game run one fence ahead of the GPU). Pages a shader wrote in a
-        // submission still in flight reach host memory by its copy-back on the GPU timeline: those stay GPU copies.
-        bool snap = !write;
-        static int snap_all = -1;  // LARECOMP_GDEV_SNAP_ALL=1 (diagnostic, can drop in-flight GPU writes): snapshot every read-only use
-        if (snap_all < 0) snap_all = getenv("LARECOMP_GDEV_SNAP_ALL") != NULL;
-        uint64_t done = snap ? (snap_all ? ~0ull : vk_completed_seq()) : 0;
-        for (uint64_t b = (r->addr - HEAP_BASE) >> GDEV_SH, be = (r->addr + r->size - 1 - HEAP_BASE) >> GDEV_SH; snap && b <= be && b < GDEV_BLKS; b++)
-            if (gdev_blk[b] > done) snap = false;
-        if (snap) {
-            int k0 = vk_up_kind;
-            vk_up_kind = 2;
-            VkSpan sp = vk_transient(r->size, 256);
-            vk_up_kind = k0;
-            memcpy(sp.ptr, (const void *)(uintptr_t)r->addr, r->size);
-            bc.srcOffset = sp.off;
-            vkCmdCopyBuffer(up, sp.buf, gdev_buf, 1, &bc);
-            gdev_stat_snap += r->size;
-        } else
-            vkCmdCopyBuffer(up, gmem_buf, gdev_buf, 1, &bc);
-        if (gdev_chk_on()) vkCmdCopyBuffer(up, gmem_buf, chk_buf[0], 1, &bc);  // (LARECOMP_GDEV_CHECK: host at the upload)
+        gdev_upload(r, 0, r->size, write, cur);
         wb_init();  // (first use: the copy-back pipeline + shadow; gdev_shadow_sync fills the shadow at the end of the upload buffer)
         r->seq = cur;
         r->up = cur;
         gdev_half_seq[r->off >= GDEV_SIZE / 2] = cur;
         if (gdev_lv_seq != cur) { gdev_lv_seq = cur; gdev_lv_n = 0; }
         if (gdev_lv_n < 256) { gdev_lv[gdev_lv_n].addr = r->addr; gdev_lv[gdev_lv_n].size = r->size; gdev_lv[gdev_lv_n].off = r->off; gdev_lv_n++; }
-        gdev_stat_in += r->size;
     }
     return HEAP_BASE + HEAP_MAX + r->off + (addr - r->addr);
 }
@@ -8274,6 +9115,10 @@ static bool alias_mirror_bind(uint64_t addr, uint64_t size, VkBuffer *buf, VkDev
 // pages a shader wrote since (gdev_blk GPU writes skip the write watch).
 extern int heap_mirror_take(uint64_t addr, uint64_t len, uint64_t *offs, uint64_t *lens, int max, uint64_t *bytes);
 uint64_t prof_hm_syncs, prof_hm_bytes, prof_hm_ranges, prof_hm_ns;
+// (VK_PROF) bytes the chunk syncs snapshotted, and of those the pages a bind of the same command list then used: how much
+// of the whole-chunk snapshot a bound-pages-only sync would keep (stutter sprint 11-01)
+uint64_t prof_hm_snap, prof_hm_used;
+static uint64_t *hm_pg_snapkey;   // (VK_PROF) per page: the list key it was snapshotted in (bit 63: its use counted)
 static int hm_state;  // 0 untried, 1 on, -1 off
 static VkBuffer *hm_blk;   // 16 MB blocks made on first use (see mirror_block)
 static VmaAllocation *hm_blk_mem;
@@ -8306,6 +9151,7 @@ static bool heap_mirror(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSiz
                 hm_chunk_key = calloc(nch, 8); hm_chunk_vol = calloc(nch, 8); hm_chunk_full = calloc(nch, 1);
                 hm_pg_sub = calloc(npg, 8); hm_pg_vol = calloc(npg, 8); hm_pg_stale = calloc(npg, 1);
                 if (getenv("LARECOMP_RACECHECK")) hm_pg_gpu = calloc(npg, 8);
+                if (getenv("LARECOMP_VK_PROF")) hm_pg_snapkey = calloc(npg, 8);
                 hm_state = hm_chunk_key && hm_chunk_vol && hm_chunk_full && hm_pg_sub && hm_pg_vol && hm_pg_stale ? 1 : -1;
             }
         }
@@ -8394,6 +9240,7 @@ static bool heap_mirror(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSiz
                 continue;
             }
             memcpy((uint8_t *)sp.ptr + so, (const void *)(uintptr_t)(HEAP_BASE + o), l);
+            if (hm_pg_snapkey) { hm_pg_snapkey[o >> 12] = key; prof_hm_snap += l; }
             if (ns && sc[ns - 1].dstOffset + sc[ns - 1].size == o - cbase) sc[ns - 1].size += l;
             else sc[ns++] = (VkBufferCopy){sp.off + so, o - cbase, l};
             so += l;
@@ -8441,6 +9288,8 @@ static bool heap_mirror(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSiz
     }
     for (uint64_t q = (addr - HEAP_BASE) >> 12, qe = (addr - HEAP_BASE + (size ? size - 1 : 0)) >> 12; hm_pg_gpu && q <= qe; q++)
         if (hm_pg_gpu[q] == cur) { rc_record(3, addr, size); break; }   // (read from host memory at GPU time)
+    for (uint64_t q = (addr - HEAP_BASE) >> 12, qe = (addr - HEAP_BASE + (size ? size - 1 : 0)) >> 12; hm_pg_snapkey && q <= qe; q++)
+        if (hm_pg_snapkey[q] == key) { hm_pg_snapkey[q] = key | (1ull << 63); prof_hm_used += 4096; }
     if (he != hb) {
         VkSpan s = mirror_straddle(hm_blk, addr - HEAP_BASE, size, key);
         *buf = s.buf;
@@ -8773,6 +9622,14 @@ void vk_exec_reset(void) {
 static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[3], uint32_t wh[2]);
 // Feedback / pause-capture substitutions bypass it.
 uint64_t prof_tic_hit, prof_tic_miss, prof_tic_wmiss;   // (VK_PROF "[prof] G5 caches" line; wmiss: dropped by a writer change)
+// A depth-compare slot holding no image a compare can read (a colour format with no twin format, or nothing): Vulkan leaves
+// that compare undefined (VUID-vkCmdDispatch-None-06479); the 1x1 D32 dummy at 0.0 instead (dep's 6 06479 gone).
+// LARECOMP_DREF_DUMMY=0: off.
+static int dref_dummy_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_DREF_DUMMY"); on = !e || *e != '0'; }
+    return on;
+}
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[3], uint32_t wh[2]) {
     static int mode = -1;
     if (mode < 0) { const char *e = getenv("LARECOMP_TEXINFO_CACHE"); mode = e ? atoi(e) : 1; if (mode != 1) LOG("[vk] texture_info cache %d\n", mode); }
@@ -8787,12 +9644,13 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     // re-checked against it when vk_alias_gen moved. No list epoch: texture_info_'s view memo and upload check are per frame.)
     extern uint32_t vk_view_gen, vk_alias_gen;
     extern NvnTexture *renderer_texture_alias_writer(NvnTexture *t);
-    static struct { uint64_t h, frame; void *tp, *sp; NvnTexture *tex, *w; uint32_t gen, agen, pool_gen; uint8_t type, valid; VkDescriptorImageInfo ii; float sc[3]; uint32_t wh[2]; } c[4096];
+    // (shadow is in the key: a shadow binding gets the depth twin view and the compare sampler, a plain one neither)
+    static struct { uint64_t h, frame; void *tp, *sp; NvnTexture *tex, *w; uint32_t gen, agen, pool_gen; uint8_t type, shadow, valid; VkDescriptorImageInfo ii; float sc[3]; uint32_t wh[2]; } c[4096];
     uint64_t frame = vk_frame_counter();
     uint32_t gen = vk_view_gen, pg = __atomic_load_n(&g_pool_gen, __ATOMIC_RELAXED), tic = (uint32_t)(h & 0xFFFFF);
-    uint64_t k = (h * 0x9E3779B97F4A7C15ull) ^ ((uintptr_t)st.tpool >> 4) ^ ((uintptr_t)st.spool << 7) ^ st_->type;
+    uint64_t k = (h * 0x9E3779B97F4A7C15ull) ^ ((uintptr_t)st.tpool >> 4) ^ ((uintptr_t)st.spool << 7) ^ st_->type ^ (uint64_t)st_->shadow << 8;
     typeof(c[0]) *e = &c[(k ^ k >> 29) & 4095];
-    bool hit = e->valid && e->h == h && e->type == st_->type && e->tp == (void *)st.tpool && e->sp == (void *)st.spool &&
+    bool hit = e->valid && e->h == h && e->type == st_->type && e->shadow == st_->shadow && e->tp == (void *)st.tpool && e->sp == (void *)st.spool &&
                e->frame == frame && e->gen == gen && e->pool_gen == pg;
     if (hit && e->agen != vk_alias_gen) {   // an alias writer changed somewhere: still this texture's?
         NvnTexture *tex = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
@@ -8818,7 +9676,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     // (a resolve can itself destroy a view or change the pool's generation: stored only when the key still holds)
     if (vk_view_gen != gen || __atomic_load_n(&g_pool_gen, __ATOMIC_RELAXED) != pg) { e->valid = 0; return; }
     NvnTexture *tex = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
-    e->h = h; e->type = (uint8_t)st_->type; e->tp = (void *)st.tpool; e->sp = (void *)st.spool; e->frame = frame;
+    e->h = h; e->type = (uint8_t)st_->type; e->shadow = st_->shadow; e->tp = (void *)st.tpool; e->sp = (void *)st.spool; e->frame = frame;
     e->tex = tex; e->w = tex ? renderer_texture_alias_writer(tex) : NULL; e->agen = vk_alias_gen;
     e->gen = gen; e->pool_gen = pg; e->ii = *out; e->sc[0] = sc[0]; e->sc[1] = sc[1]; e->sc[2] = sc[2]; e->wh[0] = wh[0]; e->wh[1] = wh[1]; e->valid = 1;
 }
@@ -8899,10 +9757,24 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
                 VkImageView tv = sb && !subst ? vk_depth_twin_view(sb, &e->view, e->has_view, st_->type) : VK_NULL_HANDLE;
                 if (tv) view = tv, vb = NULL;
                 if (sb && (sb->format == VK_FORMAT_D16_UNORM || (tv && sb->format == VK_FORMAT_R16_UNORM))) sc[2] = 1;   // (a D16 image / twin)
+                // (a colour format no compare can read: the depth dummy. R32F / R16 keep their colour view, which NVIDIA
+                // compares, until their twin is filled.)
+                if (!tv && !subst && sb && !(sb->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !vk_depth_twin_format(sb->format) && dref_dummy_on()) {
+                    VkImageView dv = vk_dummy_depth_view(st_->type);
+                    if (dv) view = dv, vb = NULL;
+                }
             }
         }
     }
-    if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
+    if (st_->shadow && !view && dref_dummy_on()) view = vk_dummy_depth_view(st_->type), vb = NULL;   // (an unbound one too)
+    if (h && st.spool && tsc < (uint32_t)st.spool->count) {
+        // (a compare sampler where the shader samples without a reference: its twin without the compare, textures.c
+        // vk_sampler_plain; LARECOMP_PLAIN_SAMPLER=0: the compare sampler as before)
+        static int plain = -1;
+        if (plain < 0) { const char *ev = getenv("LARECOMP_PLAIN_SAMPLER"); plain = !ev || *ev != '0'; }
+        NvnSamplerDesc *sd = &((NvnSamplerDesc *)st.spool->entries)[tsc];
+        smp = plain && !st_->shadow ? vk_sampler_plain(sd) : vk_sampler(sd);
+    }
     if (!view) view = vk_dummy_view(st_->type), vb = NULL;
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, vb && vb->fbl_in ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT : VK_IMAGE_LAYOUT_GENERAL};
@@ -9421,7 +10293,11 @@ static void build_compute(void *arg) {
                                                 .pNext = (uint64_t)cp->local[0] * cp->local[1] * cp->local[2] <= (uint64_t)g_vk.max_wg_subgroups * 32
                                                          ? sg_pin(cp->si, VK_SHADER_STAGE_COMPUTE_BIT) : NULL},
                                       .layout = cp->p.layout};
+    char snm[24];
+    snprintf(snm, sizeof snm, "cs_%llx", (unsigned long long)cp->p.code[0]);
+    build_begin("compute", snm, cp->si && cp->si->msl ? cp->si->msl : NULL);
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    build_end();
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
     if (r != VK_SUCCESS) LOG("[compute] pipeline failed: %d\n", r);
@@ -9593,6 +10469,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     }
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
+    if (contact_strength()) contact_run(cb);
     hang_op(cb, HOP_DISPATCH, st.program->stages[5].code_addr, threads, gx, gy, gz);
     vk_full_barrier(cb);
     gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u)", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2]);
@@ -9715,9 +10592,12 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(rt_view_format(i));
     // Vulkan's A2C at 1x keeps only alpha >= 0.5, which bared the far trees. Multisampled targets keep the pipeline's
-    // A2C.
-    static int a2cd = -1;
-    if (a2cd < 0) { const char *e = getenv("TOTK_A2C_DITHER"); a2cd = e && strcmp(e, "0"); if (a2cd) LOG("[vk] TOTK_A2C_DITHER: alpha to coverage dithered in the shader with one sample\n"); }
+    // A2C. Default: on for drivers other than NVIDIA's (public issue #16, RX 6800: Link vanished at once on a teleport
+    // instead of dissolving, and alpha-tested foliage edges shimmered in bright halos with the camera: the dissolve and
+    // the leaves are A2C at one sample, which AMD's driver resolves its own way; the rival turns its dynamic A2C off on
+    // AMD RDNA 2 and older for an A2C driver bug of the same family) NVIDIA's driver keeps the pipeline's A2C, as before.
+    // TOTK_A2C_DITHER=0 / 1 forces it. (a2c_dither_on; the precompile derives the variants too, pc_derive_a2c)
+    const bool a2cd = a2c_dither_on();
     bool a2c_dither = false;
     if (a2cd && st.ms[0xC] && st.ms[0xD]) {
         bool msaa = st.rt.depth && st.rt.depth->samples > 1;
@@ -9779,7 +10659,7 @@ static void draw_(CmdRec *r, bool indexed) {
     uint64_t pz1 = PROFD ? prof_now() : 0;
     if (!pr || atomic_load(&pr->state) != 1) {
         stat_skipped++; stat_skip_why[1]++;
-        if (pr && atomic_load(&pr->state) == 0) {
+        if (pr && atomic_load(&pr->state) == 0 && bake_dead_holds(pr, r->x[2] <= 6)) {
             g_skip_prog_frame++; g_skip_prog_full += r->x[2] <= 6;
             hold_key_note(r->x[2] <= 6 ? 'f' : 'p', pr->ckey ? pr->ckey : pr->code[1]);
             if (r->x[2] <= 6) prog_hurry(pr, "program fs", build_log() ? prog_code_hash(pr, 1) : 0);
@@ -10332,7 +11212,7 @@ pipe_known:;
     }
     if (atomic_load(&pp->state) != 1) {
         stat_skipped++; stat_skip_why[4]++;
-        if (atomic_load(&pp->state) == 0) {
+        if (atomic_load(&pp->state) == 0 && bake_dead_holds(pp, r->x[2] <= 6)) {
             g_skip_pipe_frame++; g_skip_full_frame += r->x[2] <= 6;
             if (r->x[2] <= 6 && hurry_on() && pp->hurry_f != renderer_present_count()) {
                 pp->hurry_f = renderer_present_count();
@@ -11363,11 +12243,80 @@ static void copy_region_dims(NvnTexture *t, const TexRefRec *ref, const FormatIn
     *img = st.copy_image_stride ? st.copy_image_stride : *row * hb;
 }
 
+// A buffer copied into a scaled texture (public #24 / #13, 2026-11-02): the opening movie's 1920x1080 luma plane is a
+// canvas-scale texture (textures.c tex_scale_kind: every 1920x1080 2D target) that the game fills each frame with
+// nvnCommandBufferCopyBufferToTexture from the decoder's buffer. Copied unscaled, the frame filled the top-left
+// 1/scale of the image (a quarter at 4K, x2) while its unscaled 960x540 chroma plane covered the screen: the movie
+// in a corner, its colour as orange smoke everywhere else. The guest-sized texels now go to a staging image of the
+// region's size and are blitted (filtered) onto the region's host rectangle, rounded outward as copy_texture's. 2D
+// colour, uncompressed, one layer; anything else keeps the old copy (logged). LARECOMP_BUF2TEX_SCALE=0: off (old).
+static struct { VkImage img; VmaAllocation mem; VkFormat fmt; uint32_t w, h; } g_b2t_stage[4];
+static int g_b2t_next;
+static bool buf2tex_scaled(NvnTexture *t, TexBackend *b, VkCommandBuffer cb, const VkSpan *s, const VkBufferImageCopy *c,
+                           const FormatInfo *fi, int level, const int32_t rg[6], uint32_t nz, bool array) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_BUF2TEX_SCALE"); on = !(e && *e == '0'); }
+    if (!on || array || nz != 1 || b->layers > 1 || b->depth > 1 || b->samples > 1 || b->aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
+        fi->bw != 1 || fi->bh != 1 || (uint32_t)level >= b->levels || rg[3] <= 0 || rg[4] <= 0)
+        return false;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);
+    const VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    if ((fp.optimalTilingFeatures & blit) != blit) return false;
+    const bool lin = !rt_kind(t->format) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+    // the host rectangle: the level's own ratio, both ends rounded outward, a region reaching the guest edge reaches the host's
+    const uint32_t glw = level_extent(t->width, level), glh = level_extent(t->height, level);
+    const uint32_t hlw = level_extent(b->width, level), hlh = level_extent(b->height, level);
+    const float sx = (float)hlw / (float)glw, sy = (float)hlh / (float)glh;
+    int x0 = (int)floorf((float)rg[0] * sx + 1e-3f), y0 = (int)floorf((float)rg[1] * sy + 1e-3f);
+    int x1 = (uint32_t)(rg[0] + rg[3]) >= glw ? (int)hlw : (int)ceilf((float)(rg[0] + rg[3]) * sx - 1e-3f);
+    int y1 = (uint32_t)(rg[1] + rg[4]) >= glh ? (int)hlh : (int)ceilf((float)(rg[1] + rg[4]) * sy - 1e-3f);
+    if (x1 > (int)hlw) x1 = (int)hlw;
+    if (y1 > (int)hlh) y1 = (int)hlh;
+    if (x0 >= x1 || y0 >= y1) return false;
+    // staging of the region's size (4 kept: the movie copies one plane every frame; the barrier each copy starts with
+    // orders a reuse after the previous blit's read)
+    const uint32_t w = (uint32_t)rg[3], h = (uint32_t)rg[4];
+    int k = 0;
+    while (k < 4 && !(g_b2t_stage[k].img && g_b2t_stage[k].fmt == b->format && g_b2t_stage[k].w == w && g_b2t_stage[k].h == h)) k++;
+    if (k == 4) {
+        k = g_b2t_next++ & 3;
+        if (g_b2t_stage[k].img) vk_defer_image(g_b2t_stage[k].img, g_b2t_stage[k].mem);
+        g_b2t_stage[k].img = VK_NULL_HANDLE;
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = b->format,
+                                .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(g_vk.vma, &ci, &ai, &g_b2t_stage[k].img, &g_b2t_stage[k].mem, NULL) != VK_SUCCESS) {
+            g_b2t_stage[k].img = VK_NULL_HANDLE;
+            return false;
+        }
+        g_b2t_stage[k].fmt = b->format; g_b2t_stage[k].w = w; g_b2t_stage[k].h = h;
+        vk_image_init_layout(cb, g_b2t_stage[k].img, VK_IMAGE_ASPECT_COLOR_BIT);
+        static int nlog;
+        if (nlog++ < 8)
+            LOG("[vk] buffer -> scaled texture copy: addr %llx %ux%u f%#x level %d region %d,%d %dx%d -> host %d,%d %dx%d (%s)\n",
+                (unsigned long long)t->addr, t->width, t->height, t->format, level, rg[0], rg[1], rg[3], rg[4], x0, y0, x1 - x0, y1 - y0,
+                lin ? "linear" : "nearest");
+    }
+    VkBufferImageCopy sc = *c;
+    sc.imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    sc.imageOffset = (VkOffset3D){0, 0, 0};
+    sc.imageExtent = (VkExtent3D){w, h, 1};
+    vkCmdCopyBufferToImage(cb, s->buf, g_b2t_stage[k].img, VK_IMAGE_LAYOUT_GENERAL, 1, &sc);
+    vk_full_barrier(cb);
+    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
+                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)level, 0, 1}, .dstOffsets = {{x0, y0, 0}, {x1, y1, 1}}};
+    vkCmdBlitImage(cb, g_b2t_stage[k].img, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
+                   lin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    return true;
+}
+
 static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     snap_reason = "buf2tex"; snapshots_invalidate(NULL);
     NvnTexture *t = (NvnTexture *)(uintptr_t)dst->tex;
     if (!t || !src) return;
-    vk_end_pass();
+    vk_end_pass(); if (contact_strength()) contact_run(vk_cmd());
     const FormatInfo *fi;
     int32_t rg[6];
     int level;
@@ -11408,11 +12357,12 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
                                                 (uint32_t)level, array ? (uint32_t)rg[2] : 0, array ? nz : 1},
                            .imageOffset = {rg[0], rg[1], array ? 0 : rg[2]},
                            .imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], array ? 1 : nz}};
-    {   // (a scaled target gets the guest-size upload unscaled, in its top-left corner: not known to happen; this says if it does)
-        float usx, usy;
-        renderer_texture_scale(t, &usx, &usy);
+    float usx, usy;
+    renderer_texture_scale(t, &usx, &usy);
+    if ((usx != 1 || usy != 1) && buf2tex_scaled(t, b, cb, &s, &c, fi, level, rg, nz, array)) return;
+    if (usx != 1 || usy != 1) {   // (depth, block-compressed, array / 3D or LARECOMP_BUF2TEX_SCALE=0: top-left, unscaled)
         static int nscaled;
-        if ((usx != 1 || usy != 1) && nscaled++ < 8)
+        if (nscaled++ < 8)
             LOG("[vk] buffer -> SCALED texture copy (unscaled at host): addr %llx %ux%u f%#x scale %.3f %.3f level %d region %d,%d %dx%d\n",
                 (unsigned long long)t->addr, t->width, t->height, t->format, usx, usy, level, rg[0], rg[1], rg[3], rg[4]);
     }
@@ -11447,7 +12397,7 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     NvnTexture *t = (NvnTexture *)(uintptr_t)src->tex;
     if (!t || !dst || dst < HEAP_BASE) return;
     if (g_debug_frame) LOG("[readback] tex %ux%u f%#x -> %llx\n", t->width, t->height, t->format, (unsigned long long)dst);
-    vk_end_pass();
+    vk_end_pass(); if (contact_strength()) contact_run(vk_cmd());
     const FormatInfo *fi;
     int32_t rg[6];
     int level;
@@ -11522,7 +12472,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
             st_->width, st_->height, st_->depth, (unsigned long long)dt->addr, dt->width, dt->height, dt->depth,
             src->has_view && (src->view.setmask & 1) ? src->view.base_level : 0, dst->has_view && (dst->view.setmask & 1) ? dst->view.base_level : 0,
             dst->region[2], dst->region[5]);
-    vk_end_pass();
+    vk_end_pass(); if (contact_strength()) contact_run(vk_cmd());
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each copy its own submission, waited on)
     gp_mark(vk_cmd(), "copy texture %ux%u -> %ux%u", st_->width, st_->height, dt->width, dt->height);
     dl_note("copy texture %ux%u f%#x -> %ux%u f%#x (%p -> %p)", st_->width, st_->height, st_->format, dt->width, dt->height,
@@ -12601,7 +13551,7 @@ static void exec_list(uint64_t handle, int depth) {
             const uint64_t now_ns = SDL_GetTicksNS();
             const uint64_t host_v = hold ? frame_ts : cbase + (uint64_t)((double)(now_ns - cbase) * k);
             // (dynamic resolution wanted: a layer's three reports are written together once its GPU interval is known)
-            if ((type == 0 || type == 16) && hold && dts_mode == 1 && (dts_have16 || dts_have_start || dts_ph != dts_pt)) {
+            if ((type == 0 || type == 16) && hold && dts_mode == 1 && (dts_n16 || dts_nst || dts_ph != dts_pt)) {
                 // (the floor went back to 100 %: no stale layer, and no pending completion writing over the held values)
                 dts_flush_open();
                 for (unsigned i = dts_ph; i != dts_pt; i++) dts_pend[i % DTS_PEND].o16 = dts_pend[i % DTS_PEND].o0 = dts_pend[i % DTS_PEND].o1 = NULL;
@@ -13105,9 +14055,12 @@ int vk_compile_bench(int threads, const char *csv) {
 // seed held 347 frames on the first play, ~32 with the developer seed.
 static _Atomic int prep_next_comp, prep_next_prog, prep_next_pipe, prep_comps, prep_progs, prep_pipes, prep_progs_seen;
 static _Atomic int prep_nocode, prep_failed, prep_pipes_ok, prep_pipes_skipped, prep_pipes_failed;
+static _Atomic int prep_exited, prep_cut;
+static uint64_t prep_deadline = UINT64_MAX;   // (no archive job is taken after it: vk_prepare)
 static void *prep_worker(void *arg) {
     (void)arg;
     SetThreadPriority(GetCurrentThread(), -1);   // (below normal: the player's PC stays usable while Setup runs)
+    tl_gate = GATE_PREPARE;   // (compile gate: one at a time while memory is short)
     const char *u = getenv("TOTK_PRECOMPILE_UNLOCKED");   // (as the first-start pass: translations without translate_lock)
     for (;;) {
         int i = atomic_fetch_add(&prep_next_comp, 1);
@@ -13164,6 +14117,14 @@ static void *prep_worker(void *arg) {
         } else atomic_fetch_add(&prep_pipes_skipped, 1);   // (its program had no code, or failed)
         atomic_fetch_add(&prep_pipes, 1);
     }
+    for (;;) {   // the archive's other programs, warmed as play's warm-up does (pa_job), here unthrottled
+        if (SDL_GetTicksNS() >= prep_deadline) { atomic_store(&prep_cut, 1); break; }   // (the rest warm up in play)
+        int i = atomic_fetch_add(&pa_next, 1);
+        if (i >= (int)pa_nprogs) break;
+        pa_job(i);
+        atomic_fetch_add(&pa_done, 1);
+    }
+    atomic_fetch_add(&prep_exited, 1);
     return NULL;
 }
 int vk_prepare(void) {
@@ -13180,24 +14141,64 @@ int vk_prepare(void) {
         int r = pc_load_file(path);
         LOG("[prepare] seed %s: %s\n", path, r < 0 ? "missing" : r ? "loaded" : "another heap base / layout, ignored");
     }
-    pa_load();   // (the player's pack: the records-only seed's code and the archive's compute programs)
-    const int total = pc_ncomps + pc_nprogs + pc_npipes;
+    pc_derive_a2c();   // (off NVIDIA: the recorded A2C draws' dithered twins)
+    pa_load_all();   // (the player's pack: the records-only seed's code, the archive's compute programs and its warm-up record)
     if (!pc_nprogs && !pc_ncomps) { printf("[prepare] done in 0 s: nothing to build (no recorded shaders)\n"); return 2; }
+    // The archive's other programs too (default TOTK_PREPARE_ARCHIVE=0: the recorded ones only): play's warm-up, which
+    // paces them at one worker and up to 50 % duty over hours, done here on every worker. Each program's SPIR-V goes to
+    // cache/spirv and its pipeline libraries to the driver's own cache, and cache/archive_warm.bin records it, cold
+    // cache): all 14 held runs (33 frames) waited for programs outside the 2,432 recorded ones (431 at once entering
+    // the world).
+    const char *pe = getenv("TOTK_PREPARE_ARCHIVE");
+    if (pe && *pe == '0') pa_nprogs = 0;
+    else if (pa_nprogs && pc_nprogs) {
+        pa_flip_y = pc_progs[0].p.vkey.flip_y;   // (the keys the game draws with)
+        pa_depth_m1 = pc_progs[0].p.vkey.depth_minus_one;
+    } else pa_nprogs = 0;  // (no recorded program to take the keys from: no archive phase)
+    // Setup kills a prepare at its cap: the recorded phase's results are saved as soon as it ends (pc_cold_done below, while the
+    // archive runs), the warm-up record every 30 s, and no archive job is taken once TOTK_PREPARE_ARCHIVE_MAX_S (default 1200; 0 = no
+    // limit) have passed since the start: a slow PC exits 0 with what it warmed, and play's warm-up does the rest.
+    const char *pm = getenv("TOTK_PREPARE_ARCHIVE_MAX_S");
+    const int max_s = pm && *pm ? atoi(pm) : 1200;
+    if (pa_nprogs && max_s > 0) prep_deadline = pc_t0 + (uint64_t)max_s * 1000000000ull;
+    const int nrec = pc_ncomps + pc_nprogs + pc_npipes, total = nrec + (int)pa_nprogs;
     int ncpu = SDL_GetNumLogicalCPUCores(), nt = ncpu > 2 ? ncpu - 1 : 1;
     if (nt > 64) nt = 64;
     pc_nthreads = nt;
     LOG("[prepare] %d compute programs, %d programs, %d pipelines; %d threads\n", pc_ncomps, pc_nprogs, pc_npipes, nt);
     pthread_t th[64];
     for (int i = 0; i < nt; i++) pthread_create(&th[i], NULL, prep_worker, NULL);
+    bool cold_done = false;
+    uint64_t last_commit = SDL_GetTicksNS();
     for (int last = -1;;) {   // (progress for Setup, about once a second)
-        int done = atomic_load(&prep_comps) + atomic_load(&prep_progs) + atomic_load(&prep_pipes);
+        const int rec = atomic_load(&prep_comps) + atomic_load(&prep_progs) + atomic_load(&prep_pipes);
+        int done = rec + atomic_load(&pa_done);
+        if (!cold_done && rec >= nrec) {   // (the recorded phase is over: its pipelines and the cold key are on disk now)
+            pc_cold_done();
+            cold_done = true;
+        }
+        if (cold_done && pa_nprogs && pa_own_record() && SDL_GetTicksNS() - last_commit > 30000000000ull) {
+            vk_archive_warm_commit(vk_archive_warm_snapshot());
+            last_commit = SDL_GetTicksNS();
+        }
+        if (atomic_load(&prep_exited) == nt) done = total;   // (every worker out: the archive's time limit cut it)
         if (done != last) { printf("[prepare] progress %d/%d\n", done, total); fflush(stdout); last = done; }
         if (done >= total) break;
         SDL_Delay(1000);
     }
     for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
     const int nocode = atomic_load(&prep_nocode), failed = atomic_load(&prep_failed) + atomic_load(&prep_pipes_failed);
-    pc_cold_done();   // (saves the pipeline cache and stamps cache/precompile_cold.key)
+    if (!cold_done) pc_cold_done();   // (saves the pipeline cache and stamps cache/precompile_cold.key)
+    if (pa_nprogs) {   // (an archive program that does not translate is not a failed Setup: the game skips it as well)
+        extern void vk_pipeline_cache_save(void);
+        vk_pipeline_cache_save();   // (the archive's part, where it goes to our cache: =pcache; commits the record too)
+        if (pa_own_record()) vk_archive_warm_commit(vk_archive_warm_snapshot());
+        LOG("[prepare] archive: %d of %u programs in %.1f s%s: %d warmed, %d warm already, %d recorded (built above), %d failed\n",
+            atomic_load(&pa_done), pa_nprogs, (SDL_GetTicksNS() - pc_t0) / 1e9,
+            atomic_load(&prep_cut) && atomic_load(&pa_done) < (int)pa_nprogs ? " (TOTK_PREPARE_ARCHIVE_MAX_S reached: the rest warm up in play)" : "",
+            atomic_load(&pa_compiled), atomic_load(&pa_cached), atomic_load(&pa_recorded), atomic_load(&pa_failed));
+        pa_tm_log();
+    }
     // (the installer's Setup shows this line as it is)
     printf("[prepare] done in %.0f s: programs %d of %d, pipelines %d of %d, compute %d; skipped %d programs and %d pipelines "
            "(not in the player's archive)%s\n", (SDL_GetTicksNS() - pc_t0) / 1e9, pc_nprogs - nocode - atomic_load(&prep_failed),

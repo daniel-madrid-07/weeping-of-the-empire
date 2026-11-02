@@ -90,11 +90,13 @@ GEN_CODEGEN = ['--simd', '--nanrun', '--vdirect', '--lso-abi', 'auto']
 # followers' ring sampled at 30 Hz of game time. 212b740 SelectorPouchPlayer's update: the inventory Link's tab debounce in game time. 1f61d6c QueryControllerGetStick's worker: the UI stick scaled to 30 Hz of game time for the AI
 # programs. 2833b60 ExecuteBlackboardSetToBase::updateImpl_: listed AI-program integrators step per 30 Hz of AI time. 200f61c 200f8b0 20147f4 27dcb98 the ChaseF32 / ChaseVec3f / LerpF32 / AddF32 calcs: listed easers / adders of
 # drawn values scaled by the step. 27b6e64 SeqOneShotPrintLoadLapTimeForPatrol's oneShot: the game's load lap labels logged with TOTK_LOAD_LAPS=1. 11276cc ares::System::initializeThreads: the resource loader thread count,
-# TOTK_LOADER_THREADS=<n> for the A/B. 9c2ef0 aal's per-frame command-list flush: a full game -> audio ring keeps the frame's commands instead of dropping them above 200 fps. --vlocal: V registers in locals in these functions
-# (stages 1-2; verified only on top of --vdirect; not `all`: the giant functions grow 20-60% in x86)
+# TOTK_LOADER_THREADS=<n> for the A/B. 9c2ef0 aal's per-frame command-list flush: a full game -> audio ring keeps the frame's commands instead of dropping them above 200 fps. 9c2b70 the watchdog step AudioRendererController::calc
+# tail-calls: aal's jam watchdog fires after 10 s of jam, not 300 calls (1.25 s at 240 fps). 10bc078 game::event::Actor::initialize: the cutscene actors' 600-frame equipment fallback in game time. 13bd680
+# game::event::EventContext::isLoadFinished: the 61-frame 'surroundings stable' count before a cutscene starts in game time. abb518 the EnvSound one-shot emitter step: the 200-frame settle between two ambient one-shots in game
+# time. --vlocal: V registers in locals in these functions (stages 1-2; verified only on top of --vdirect; not `all`: the giant functions grow 20-60% in x86)
 GEN_MAIN = ['--hook', '7a83e4,f6092c,1a862e4,1a86420,1a85b3c,1a8604c,1a85e4c,83e3f8,1ccf894,'
             'b6afc8,75718c,18fb7d0,18fbf18,18fbf68,18fc0ac,279a77c,2798a1c,f15364,16e4728,8f689c,1cd0260,16e4610,f0fdec,1aa3e44,16e4b80,1d23614,a5f010,1d97648,1c17fb0,120ec94,9d8d00,212b740,1b7ba58,1aa6a94,1f61d6c,2833b60,200f61c,200f8b0,20147f4,27dcb98,1b3ebac,1a4f0ac,1c73fbc,1dbdcf0,'
-            '1a06840,1a068cc,704b7c,27b6e64,11276cc,9c2ef0', *GEN_CODEGEN,
+            '1a06840,1a068cc,704b7c,27b6e64,11276cc,9c2ef0,9c2b70,abb518,10bc078,13bd680', *GEN_CODEGEN,
             '--vlocal', '260a970,317040,704b7c,10cfecc']
 GEN_SDK = ['--base', '0x7180000000', '--prefix', 's', '--plt-all', *GEN_CODEGEN]
 GEN_EXTRA = []         # --gen-args: gen.py flags added for both modules (e.g. --fz); join the key, game-var/
@@ -122,11 +124,20 @@ COLD_OPT = '-O1'
 GIANT_LINES = 18000    # --giant-lines N; 0 = off
 GIANT_POOL = 3
 GIANT_COMMIT_GB = 30
-if os.environ.get('NXR_SOLO_PC') and not os.path.isdir(os.environ.get('NXR_FLEET_LOCKS') or
-                                                       r'C:\nxrecomp-work\locks'):
+SOLO = bool(os.environ.get('NXR_SOLO_PC')) and not os.path.isdir(os.environ.get('NXR_FLEET_LOCKS') or
+                                                                  r'C:\nxrecomp-work\locks')
+if SOLO:
     GIANT_COMMIT_GB = 10  # one person's PC (tools/builder: heavy.py SOLO)
 GIANT_PEAK_GB = 2.2
 GIANT_HOT = {'f_4d9ba0'}   # cx5 world profiles: rank 38-47, 0.4-0.6% of guest samples; the other giants absent
+
+
+def giant_pool(jobs):
+    """giants at once. setup-speed, 2026-11-01 (cold key 2b7c4cb2, a player's PC, --jobs 16): at 3 the last ~200 s ran
+    three giant chains alone (objects 903 s); a replay of that ninja log gives 727 s, the CPU floor, from 4 at --jobs
+    16 (6 at 24). So on one person's PC a quarter of --jobs, never under GIANT_POOL; each giant still starts only with
+    GIANT_COMMIT_GB of free commit, which holds them back on a small-memory PC."""
+    return max(GIANT_POOL, int(jobs) // 4) if SOLO else GIANT_POOL
 
 # Game version. Unset / 1.0.0: everything above as it is. TOTK_GAME_VERSION=1.4.3 builds the update from
 # <work>/extracted/v143 (python -m pipeline.extract... --update) with games/totk/patches/v143.toml (python -m
@@ -138,6 +149,10 @@ VERSION_DIR = 'v' + GAME_VERSION.replace('.', '')
 PATCH_TABLE = os.path.join(REPO, 'games', 'totk', 'patches', f'{VERSION_DIR}.toml')
 HOOKED_V100 = None     # another version: the 1.0.0 names of the functions hooked there (patch sets name hooks so)
 SAFE_MODE = []         # another version: what its dropped hooks force (engine_map.py: 'cap30' = no fps60 patch)
+BETA = {}              # a beta engine map's build (TOTK_VERSION_BETA=1, engine-map --beta): {off_features,
+                       # beta_runtime_env} into its key manifest; the packagers ship it, its features off by design
+DIAGNOSTIC = False     # a diagnostic engine map's build (TOTK_VERSION_DIAGNOSTIC=1): its key manifest says so and
+                       # the packagers refuse it
 if GAME_VERSION != '1.0.0':
     import tomllib
     EXEFS = os.path.join(WORK, 'extracted', VERSION_DIR, 'exefs')
@@ -147,13 +162,26 @@ if GAME_VERSION != '1.0.0':
         sys.exit(f'TOTK_GAME_VERSION={GAME_VERSION}: {PATCH_TABLE} or {_eng_path} is missing '
                  '(python -m games.totk.patches port / engine-map, docs/engine-versions.md)')
     with open(PATCH_TABLE, 'rb') as _f:
-        BUILD_ID = tomllib.load(_f)['game']['build_id'][:16].upper()
+        _game = tomllib.load(_f)['game']
+    BUILD_ID, BUILD_SPAN = _game['build_id'][:16].upper(), _game['span']   # (span: totk_engine.c's data page)
     _eng = json.load(open(_eng_path, encoding='utf-8'))
-    if _eng['unplaced_hooks']:
+    _diag = _eng.get('diagnostic') and os.environ.get('TOTK_VERSION_DIAGNOSTIC') == '1'   # (never shipped)
+    if _eng.get('diagnostic') and not _diag:
+        sys.exit(f'{_eng_path} is a diagnostic engine map (engine-map --diagnostic): TOTK_VERSION_DIAGNOSTIC=1 to '
+                 'build it, never for a player')
+    _beta = _eng.get('beta') and os.environ.get('TOTK_VERSION_BETA') == '1'
+    if _eng.get('beta') and not _beta:
+        sys.exit(f'{_eng_path} is a beta engine map (engine-map --beta): TOTK_VERSION_BETA=1 to build it')
+    if _beta and _eng['status'] != 'beta':
+        sys.exit(f"{_eng_path}: status {_eng['status']}: {_eng.get('beta_refused', 'not a beta')}")
+    if _beta:
+        BETA = dict(off_features=list(_eng.get('off_features', [])), beta_runtime_env=dict(_eng.get('beta_runtime_env', {})))
+    if _eng['unplaced_hooks'] and not (_diag or _beta):
         sys.exit(f"{_eng_path}: hooks with no place in {GAME_VERSION}: {', '.join(_eng['unplaced_hooks'])}")
-    if _eng['status'] != 'pass':   # a required hook was dropped: a build without it would play wrong
+    if _eng['status'] != 'pass' and not (_diag or _beta):   # a required hook was dropped: a build without it would play wrong
         sys.exit(f"{_eng_path}: status {_eng['status']}: " + '; '.join(f'{k} {v}' for k, v in _eng['dropped_hooks'].items()))
     SAFE_MODE = list(_eng['safe_mode'])
+    DIAGNOSTIC = bool(_diag)
     _alias = {int(k, 16): int(v, 16) for k, v in _eng['alias'].items()}
     HOOKED_V100 = {f'{_alias[int(h, 16)]:x}' for h in _eng['hook']}
     _lists = {'--hook': _eng['hook'], '--vlocal': _eng['vlocal']}
@@ -169,6 +197,37 @@ if GAME_VERSION != '1.0.0':
             _gm.append(_a)
     GEN_MAIN = _gm + ['--fn-prefix', _eng['fn_prefix'], '--alias', ','.join(f'{n:x}={o:x}' for n, o in _alias.items())]
     GIANT_HOT = set(_eng.get('giant_hot', []))
+# Game. Unset / NXR_GAME=totk: everything above as it is (TotK's build is byte for byte the one before this axis).
+# Another game: its facts from games/<game>/game.py in the repo, else <work>/games/<game>/game.py (private: a game
+# whose names may not ship), which sets EXEFS / ROMFS (under <work>), BUILD_ID, GAME_ID (nxr_game.h) and optionally
+# GEN_MAIN_HOOKS (gen.py --hook offsets; none: no hooks), GEN_SDK, RUNTIME_ENV. Its runtime leaves out TotK's
+# sources and links runtime/game/none.cpp (mkninja_win.py --rt-exclude / --rt-extra / --define NXR_GAME_ID).
+# TOTK_GAME_VERSION is TotK's axis and refused for another game.
+GAME = os.environ.get('NXR_GAME') or 'totk'
+RT_ARGS = []           # mkninja_win.py's runtime options for the game (TotK: none, its build.ninja unchanged)
+RT_TOTK_ONLY = 'totk_*,dbatch_probe.cpp,pc_gameplay.cpp,nvn/totk_game_patches.c'   # (runtime-relative globs)
+GAME_RUNTIME_ENV = {}  # another game: env its exe needs (e.g. TOTK_LIFT, rt_main.cpp's lifted sdk namespaces)
+if GAME != 'totk':
+    import importlib.util
+    if os.environ.get('TOTK_GAME_VERSION'):
+        sys.exit(f'NXR_GAME={GAME}: TOTK_GAME_VERSION is the TotK version axis, unset it')
+    _gp = next((p for p in (os.path.join(REPO, 'games', GAME, 'game.py'), os.path.join(WORK, 'games', GAME, 'game.py'))
+                if os.path.isfile(p)), None)
+    if not _gp:
+        sys.exit(f'NXR_GAME={GAME}: no games/{GAME}/game.py in the repo or in {WORK}')
+    _spec = importlib.util.spec_from_file_location(f'nxr_game_{GAME}', _gp)
+    _g = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_g)
+    EXEFS, ROMFS = os.path.join(WORK, _g.EXEFS), os.path.join(WORK, _g.ROMFS)
+    BUILD_ID = _g.BUILD_ID[:16].upper()
+    _hooks = getattr(_g, 'GEN_MAIN_HOOKS', '')
+    GEN_MAIN = (['--hook', _hooks] if _hooks else []) + list(GEN_CODEGEN)
+    GEN_SDK = list(getattr(_g, 'GEN_SDK', GEN_SDK))
+    GIANT_HOT = set(getattr(_g, 'GIANT_HOT', ()))
+    SNAPSHOT_PATHS = ('engine',)
+    PATCH_TABLE = None
+    GAME_RUNTIME_ENV = dict(getattr(_g, 'RUNTIME_ENV', {}))
+    RT_ARGS = ['--rt-exclude', RT_TOTK_ONLY, '--rt-extra', 'game/none.cpp', '--define', f'NXR_GAME_ID={int(_g.GAME_ID)}']
 GAME_JOBS_MAX = 8      # game-object compiles at once, whatever --jobs says (env NXR_GAME_JOBS_MAX for a measurement)
 GAME_JOBS_MIN = 3
 TU_COMMIT_GB = 0.5
@@ -187,6 +246,15 @@ NOLINES = False        # --no-line-tables: game objects without -gline-tables-on
                        # compile time; the same code: tu_050's disassembly, relocations and symbols are identical)
 GEN_SHARES = {'main': 5, 'sdk': 1}  # with --split: gen.py processes per module (6 at once
                                          # sdk alone, ~40 s, still ends before main's shares)
+GEN_WORKER_GB = 1.0    # a gen.py share's commit, rounded up (6 shares + tusplit ~1 GB in all on main, build.py _gen)
+
+
+def gen_shares(mod):
+    """gen.py processes for a module. The split output does not depend on the shares."""
+    if not SOLO or mod != 'main':
+        return GEN_SHARES[mod]
+    fit = int((heavy_mod().free_commit_gb() - ABI_MARGIN_GB) / GEN_WORKER_GB)
+    return max(1, min((os.cpu_count() or 1) - GEN_SHARES['sdk'], fit))
 CACHE = os.path.join(SIG, 'objcache')   # --cache: game objects by content (TU text + compile rule + toolchain), any key
 VENV = os.path.join(SIG, 'venv')
 PY = os.path.join(VENV, 'Scripts', 'python.exe')
@@ -248,12 +316,14 @@ def stale_features(pset: dict) -> list:
     # compared by offset alone); a copy of a word onto itself is a checked guard, not a change (not in the export).
     feats = set(pset.get('features', []))
     want, have = {}, {}
-    for r in table['patch']:
+    for r in table.get('patch', []):
         if r['feature'] in feats and r.get('copy_of', -1) != r['offset']:
             want.setdefault(r['feature'], set()).add((r['offset'], r['new'].lower() if 'new' in r else 'copy'))
-    copies = {(r['feature'], r['offset']) for r in table['patch'] if 'copy_of' in r}
+    copies = {(r['feature'], r['offset']) for r in table.get('patch', []) if 'copy_of' in r}
     for p in pset['patches']:
         name, off = p.get('name', '?'), int(str(p['offset']), 0)
+        if name.startswith('mod:'):   # (a player's mod patch, tools/engine/mods_exefs.py: not in the table)
+            continue
         have.setdefault(name, set()).add((off, 'copy' if (name, off) in copies else p['bytes'].lower()))
     out = []
     for name in sorted(set(want) | set(have)):
@@ -483,7 +553,9 @@ def abi_jobs(mod):
     if mod != 'main':
         return min(ABI_SDK_JOBS, cores)
     fit = int((heavy_mod().free_commit_gb() - ABI_MARGIN_GB - ABI_SDK_JOBS * ABI_WORKER_GB) / ABI_WORKER_GB)
-    return max(1, min(ABI_MAIN_JOBS, cores, fit))
+    # (one person's PC: every thread sdk leaves; the keep file does not depend on the processes, abi_scan.py's shares
+    #  join in the one-process order)
+    return max(1, min(max(ABI_MAIN_JOBS, cores - ABI_SDK_JOBS) if SOLO else ABI_MAIN_JOBS, cores, fit))
 
 
 def lso_abi_auto(args, mod, fj, img):
@@ -690,7 +762,7 @@ def gen(img, kdir):
                 run([PY, '-I', tool, os.path.join(img, mod), fj, tmp] + args, stdout=lf)
         else:
             # shares of the functions at once (genshard.py; the split output does not depend on the shares)
-            n = GEN_SHARES[mod]
+            n = gen_shares(mod)
             shares = [f'{tmp}.{i}' for i in range(n)]
 
             def share(i):
@@ -824,7 +896,9 @@ def variant_rule(rule, hot):
     return rule
 
 
-FUNC_DEF = re.compile(rb'void ([fs]_[0-9a-f]+)\(Ctx\* __restrict cx\) \{')
+# any gen.py name prefix: f_ / s_ and the --fn-prefix ones (another game's or version's main: m_ ...); with [fs]_ only,
+# such a build's giants compiled at -O2 in the normal pool, ungated (a 228k-line function: 94 s, outside the giant pool)
+FUNC_DEF = re.compile(rb'void ([a-z][a-z0-9]*_[0-9a-f]+)\(Ctx\* __restrict cx\) \{')
 
 
 def giant_of(src):
@@ -906,7 +980,7 @@ def objects(kdir, jobs, prio, cache):
                 os.remove(p)
     ng = sum(1 for t in todo if t[0] in giants)
     log(f'game objects: {len(edges)} TUs, {hits} from the cache, {len(todo)} to compile '
-        f'({sum(1 for t in todo if t[2] == "gen_cold")} at {COLD_OPT}; {ng} giants, {GIANT_POOL} at a time, each '
+        f'({sum(1 for t in todo if t[2] == "gen_cold")} at {COLD_OPT}; {ng} giants, {giant_pool(jobs)} at a time, each '
         f'with free commit >= {GIANT_COMMIT_GB:g} GB)')
     t0 = time.time()
     rc = 0
@@ -932,9 +1006,9 @@ def objects(kdir, jobs, prio, cache):
         head = re.sub(r'^pool gen\n  depth = \d+$', f'pool gen\n  depth = {jobs}', head, count=1, flags=re.M)
         with open(os.path.join(kdir, 'objs.ninja'), 'w', newline='\n') as f:
             f.write(head + ''.join(t for r, t in rules.items() if r != 'gen'))   # (`rule gen` is in head)
-            f.write(''.join(grules.values()) + f'pool giant\n  depth = {GIANT_POOL}\n')
+            f.write(''.join(grules.values()) + f'pool giant\n  depth = {giant_pool(jobs)}\n')
             # the slowest first: ninja starts edges in file order, and the big TUs set the tail; giants (largest
-            # function first) ahead of the rest, so they start early and never more than GIANT_POOL at once
+            # function first) ahead of the rest, so they start early and never more than giant_pool() at once
             for obj, src, rule, _ in sorted(todo, key=lambda t: (-giants.get(t[0], 0),
                                                                  -os.path.getsize(os.path.join(kdir, t[1])))):
                 f.write(f'build {obj}: {rule}_giant {src}\n  pool = giant\n' if obj in giants else
@@ -1034,7 +1108,10 @@ def cmd_game(a):
                     # through heavy.py: 6 gen.py shares + tusplit (~1 GB on main) at once
                     run([sys.executable, HEAVY, '--prio', a.prio, '--', sys.executable, os.path.abspath(__file__), '_gen',
                          img, kdir, TOOLS, str(SPLIT), HOT or '', ' '.join(GEN_EXTRA)])
-                man.update(key=key, parts=parts, img=img, patches=a.patches, src=TOOLS, gen_done=True)
+                man.update(key=key, parts=parts, img=img, patches=a.patches, src=TOOLS, gen_done=True,
+                           game_version=GAME_VERSION, diagnostic=DIAGNOSTIC, **({'beta': True, **BETA} if BETA else {}))
+                if GAME != 'totk':   # (TotK's manifest as before) the game and the env its exe needs
+                    man.update(game=GAME, game_runtime_env=GAME_RUNTIME_ENV)
                 write_json(mpath, man)
             run([PY, '-I', os.path.join(TOOLS, 'tools', 'recomp', 'mkninja_win.py'), '--game-only', '--root', TOOLS,
                  '--rt-include', rt_include(TOOLS),
@@ -1047,7 +1124,8 @@ def cmd_game(a):
                     prune_cache()
             else:
                 run([sys.executable, HEAVY, '--prio', a.prio, '--', sys.executable, os.path.abspath(__file__), '_ninja', kdir, str(a.jobs)])
-            man.update(objs_done=True, objs_built=time.strftime('%Y-%m-%d %H:%M'), objs_minutes=round((time.time() - t0) / 60, 1))
+            man.update(objs_done=True, objs_built=time.strftime('%Y-%m-%d %H:%M'), objs_minutes=round((time.time() - t0) / 60, 1),
+                       game_version=GAME_VERSION, diagnostic=DIAGNOSTIC, **({'beta': True, **BETA} if BETA else {}))
             write_json(mpath, man)
         log('game objects ready')
     if not a.no_exe:
@@ -1102,6 +1180,7 @@ def small_link(out, pdb, mapfile, variant={}, rt_lto=False, root=None):
     if not m or ' -Wl,/DEBUG' not in m.group(0) or ' -Wl,/MAP:$out.map' not in m.group(0):
         sys.exit(f'{p}: no `rule link` with /DEBUG and /MAP to make small (mkninja_win.py changed?)')
     rule = m.group(0)
+    run_from = None   # (returned: the directory ninja must run this file from, None for <out>)
     if not pdb:
         rule = rule.replace(' -Wl,/DEBUG', ' -Wl,/OPT:NOREF -Wl,/OPT:NOICF')
     if not mapfile:
@@ -1134,6 +1213,20 @@ def small_link(out, pdb, mapfile, variant={}, rt_lto=False, root=None):
             if not mv:
                 sys.exit(f'{p}: no {name} line for the runtime PGO flags')
             text = text[:mv.end()] + f' {use} {PGO_NAMES}' + text[mv.end():]
+        # each runtime source by its path below the root, and ninja run from there (runtime_build): clang names a C++
+        # anonymous namespace after the path it is given (?A0x<hash>), so with absolute paths the training's snapshot, a
+        # package tree and a Setup install named those functions apart and the profile missed them. Outputs, depfiles
+        # and logs stay in <out>
+        base = os.path.normcase(os.path.abspath(root or ENGINE)).replace('\\', '/').rstrip('/') + '/'
+
+        def below(mb):
+            src = mb.group(3).replace('$:', ':').replace('$ ', ' ')   # (ninja's escapes: a drive's colon, a space)
+            if not os.path.normcase(src).replace('\\', '/').startswith(base):
+                return mb.group(0)
+            return f'build {mb.group(1)}: {mb.group(2)} ' + src[len(base):].replace(' ', '$ ')
+        text = re.sub(r'^build ((?:\$[ :]|[^\s:])+): (cxx|c|cvk) ((?:\$ |\S)+)$', below, text, flags=re.M)
+        text = f"builddir = {os.path.abspath(out).replace(os.sep, '/').replace('$', '$$')}\n" + text
+        run_from = root or ENGINE
         m = re.search(r'^rule link\n  command = .*$', text, re.M)
     if rt_lto:   # --rt-lto: ThinLTO across the runtime's TUs only (the game objects stay COFF: a short link)
         for name in ('cxxflags', 'cflags'):
@@ -1147,8 +1240,11 @@ def small_link(out, pdb, mapfile, variant={}, rt_lto=False, root=None):
             mv = re.search(rf'^{name} = .*$', text, re.M)
             if not mv:
                 sys.exit(f'{p}: no {name} line for -DTOTK_GAME_VERSION')
-            text = text[:mv.end()] + f" -DTOTK_GAME_VERSION={VERSION_DIR[1:]}" + (
-                ' -DTOTK_CAP30' if 'cap30' in SAFE_MODE else '') + text[mv.end():]   # (hle_vi.cpp: nothing above 30)
+            text = text[:mv.end()] + f" -DTOTK_GAME_VERSION={VERSION_DIR[1:]} -DTOTK_MAIN_SPAN={BUILD_SPAN:#x}ull" + (
+                ' -DTOTK_CAP30' if 'cap30' in SAFE_MODE else '') + ''.join(   # (hle_vi.cpp: nothing above 30)
+                f' -DTOTK_BETA_OFF_{g.upper()}' for g in BETA.get('off_features', [])) + text[mv.end():]   # (a beta's
+                # features off in the exe itself, whatever env / settings.ini say: pc_input.cpp, totk_menu_cursor.cpp,
+                # totk_options_menu.cpp)
         m = re.search(r'^rule link\n  command = .*$', text, re.M)
     if variant.get('march'):   # the runtime at the key's level too: a v2 exe must not carry v3 runtime code
         for name in ('cxxflags', 'cflags'):
@@ -1176,6 +1272,7 @@ def small_link(out, pdb, mapfile, variant={}, rt_lto=False, root=None):
     for fn, keep in (('totk.pdb', pdb), ('totk.exe.map', mapfile)):
         if not keep and os.path.exists(os.path.join(out, fn)):
             os.remove(os.path.join(out, fn))
+    return run_from
 
 
 def write_json(path: str, obj) -> None:
@@ -1221,12 +1318,13 @@ def runtime_build(root, out, kdir, jobs, pdb=False, mapfile=False, rt_lto=False)
         print(f'WARNING: {stale}', file=sys.stderr, flush=True)
     os.makedirs(out, exist_ok=True)
     run([PY, '-I', os.path.join(root, 'tools', 'recomp', 'mkninja_win.py'), '--prebuilt-gen', '--root', root,
-         '--gen', os.path.join(kdir, 'gen', 'main'), '--obj', os.path.join(kdir, 'obj'), '--out', out, '--vcpkg', VCPKG])
-    small_link(out, pdb, mapfile, json.loads(man['parts'].get('variant', '{}')), rt_lto, root)
+         '--gen', os.path.join(kdir, 'gen', 'main'), '--obj', os.path.join(kdir, 'obj'), '--out', out, '--vcpkg', VCPKG, *RT_ARGS])
+    run_from = small_link(out, pdb, mapfile, json.loads(man['parts'].get('variant', '{}')), rt_lto, root)
     t0 = time.time()
     # through heavy.py: 6 runtime compiles (~0.6 GB each) and lld (~1.2 GB)
     run([sys.executable, HEAVY, '--prio', os.environ.get('NXR_HEAVY_PRIO', 'normal'), '--', sys.executable,
-         os.path.abspath(__file__), '_ninja', out, str(jobs), 'build.ninja', 'stop'])
+         os.path.abspath(__file__), '_ninja', run_from or out, str(jobs),
+         os.path.join(os.path.abspath(out), 'build.ninja') if run_from else 'build.ninja', 'stop'])
     log(f'runtime + link: {time.time() - t0:.0f} s -> {os.path.join(out, "totk.exe")}')
     # what this exe was built from, next to it: the key manifest's src is the snapshot its game objects were generated
     # from and stays so (canary_engine.py reads that rt.h); a runtime-only relink from a newer tree would otherwise be

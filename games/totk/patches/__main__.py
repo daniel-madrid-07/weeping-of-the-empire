@@ -61,6 +61,8 @@ def main(argv=None):
     o.add_argument('--version', required=True, help='its display version, e.g. 1.4.3')
     o.add_argument('--out', required=True, type=Path)
     o.add_argument('--report', type=Path, help="the porter's placement of every 1.0.0 site (JSON)")
+    o.add_argument('--diagnostic', action='store_true', help='never shipped: write the build\'s facts with no '
+                   'patch word (a first boot with --features none)')
     d = sub.add_parser('diff', help="where a table's features differ between two images (a refusal's detail: the "
                                     "offsets whose words differ from the reference build's)")
     d.add_argument('--image', required=True, type=Path, help='the image apply refused (flat image or NSO)')
@@ -72,6 +74,14 @@ def main(argv=None):
     e.add_argument('--new', required=True, type=Path, help="the other build's exefs/main (NSO)")
     e.add_argument('--version', required=True, help='its display version, e.g. 1.4.3')
     e.add_argument('--report', type=Path, help='every address and function with its placement (JSON)')
+    e.add_argument('--fields', type=Path, help='struct field map {"Struct": {"0x<1.0.0 off>": "0x<off>"}} (JSON, '
+                   'private like the table): totk_fields_v<NNN>.inc')
+    e.add_argument('--diagnostic', action='store_true', help='never shipped: unplaced addresses get the '
+                   'sentinel, unplaced names trap stubs, lost required hooks are only reported '
+                   '(build.py: TOTK_VERSION_DIAGNOSTIC=1)')
+    e.add_argument('--beta', action='store_true', help='a shippable beta: as --diagnostic for the addresses and names it '
+                   'cannot place, but a lost REQUIRED hook turns its feature off (engine_map BETA_GROUPS, the key beta_runtime_env) '
+                   'and one outside those groups fails (build.py: TOTK_VERSION_BETA=1)')
     args = p.parse_args(argv)
 
     try:
@@ -123,7 +133,7 @@ def main(argv=None):
         elif args.cmd in ('engine', 'sigma'):
             from . import engine
             table = read_table(args.table)
-            features = resolve_features(engine.engine_spec(args.features), table)
+            features = resolve_features(engine.engine_spec(args.features, {f['name'] for f in table['feature']}), table)
             try:
                 safe = engine.safe_mode(args.table, table)
             except engine.EngineError as e:

@@ -40,6 +40,7 @@ int pc_ctx(void);                   // the context at the last pad read (any thr
 int pc_ui_sub(void);  // the sub at the last decide (the pause menu's tab,...); -1 none
 const char *pc_ctx_name(int ctx);
 bool pc_ctx_is_ui(int ctx);         // title, menus, dialogue, choices
+void pc_input_toggle_set(int which, const char *v);   // toggle sprint (0) / lock-on (1): the settings rows, "1" on
 // controls.gameplay's live apply (pc_gameplay.cpp's F10 row): pc / on / 1 = pc_scheme_gameplay.inc's rows in the gameplay
 // contexts, else the console layout there; the table rebuilds at the next read
 void pc_input_gameplay_set(const char *value);
@@ -215,6 +216,10 @@ int pc_bind_get(int scope, const char *action, int *inputs, int max, unsigned *f
 int pc_bind_reset(int scope, const char *action, struct PcBindChange *out, int max);
 // The actions reachable at a scope (F10's pages), each with its PCB_F_* flags. Returns the count or a PcBindErr.
 int pc_bind_actions(int scope, void (*fn)(const char *action, unsigned flags, void *user), void *user);
+// The keys action's settings gave it that the last table build refused: in some context another action had the key
+// already (a hand-edited settings.ini; pc_bind_set swaps instead, so it never makes one). Up to max, each with the
+// action that has it (holders: the scheme's static names). Returns the count.
+int pc_bind_refused(const char *action, int *inputs, const char **holders, int max);
 // Capture: the next key down (WM_KEYDOWN / WM_SYSKEYDOWN, so Alt is captured and the window menu does not take it;
 // Shift / Ctrl / Alt on press), mouse button down, or wheel notch (PCC_WHEEL) becomes the result, swallowed: the
 // overlay never gets it and the router holds it dead until released, so neither the game nor a menu sees the press or

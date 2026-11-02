@@ -2,12 +2,15 @@
 that ships with Windows (.NET Framework 4.x).
 
     py tools/builder/gui/make_setup.py --tag v1.0.0 [--repo OWNER/NAME] [--product NAME] [--out DIR]
-        -> <out>/<Product>-Setup-<tag>.exe: builds the repository at that tag on the player's PC. It carries, from this
-           PC (the release's versions, checked):
-             llvm.zip        the part of LLVM the build runs (clang, lld-link, llvm-lib, llvm-profdata, llvm-rc, clang's
-                             headers and runtime libraries; Apache-2.0 WITH LLVM-exception, its license goes with it)
-             vulkan-sdk.zip  the Vulkan headers and libraries the build links (vulkan-1.lib, shaderc_combined.lib)
-           so a player's PC downloads only Python, MinGit, the Python packages and, without Visual Studio,
+        -> <out>/<Product>-Setup-<tag>.exe: builds the repository at that tag on the player's PC, and next to it the
+           release assets it downloads, as tools/builder/assets.json pins them (name, the release that carries it,
+           sha256: made from this PC's tools, the release's versions, checked; the same tools make the same bytes, and
+           a zip that differs from its pin stops here unless --repin pins it to this tag):
+             setup-llvm.zip        the part of LLVM the build runs (clang, lld-link, llvm-lib, llvm-profdata, llvm-rc,
+                                   clang's headers and runtime libraries; Apache-2.0 WITH LLVM-exception, its license
+                                   goes with it)
+             setup-vulkan-sdk.zip  the Vulkan headers and libraries the build links (vulkan-1.lib, shaderc_combined.lib)
+           Besides those a player's PC downloads Python, MinGit, the Python packages and, without Visual Studio,
            Microsoft's C++ libraries
     py tools/builder/gui/make_setup.py --builder
         -> Builder.exe in the repository root (builds the clone it sits in with the PC's own tools)
@@ -16,7 +19,9 @@ The tag must exist on the public repository before the exe is handed out: Setup 
 """
 import argparse
 import hashlib
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,6 +33,10 @@ sys.path.insert(0, os.path.dirname(HERE))
 from builder import RELEASE_TOOLS  # noqa: E402
 
 PUBLIC_REPO = 'daniel-madrid-07/weeping-of-the-empire'
+# the Setup's release assets: pinned in tools/builder/assets.json (used_by 'setup:<Key>', the one list of every pinned
+# asset; installer's release_publish.py checks a draft against it), baked into Release.cs as <Key>Asset / Tag / Sha256
+ASSETS_JSON = os.path.join(os.path.dirname(HERE), 'assets.json')
+SETUP_ASSETS = ('Vulkan', 'Llvm')
 PRODUCT = 'Weeping of the Empire'
 CSC = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe')
 # what the engine build takes from the Vulkan SDK (engine/tools/recomp/mkninja_win.py: -I<sdk>/Include,
@@ -131,34 +140,69 @@ def main():
     ap.add_argument('--repo', default=PUBLIC_REPO)
     ap.add_argument('--product', default=PRODUCT)
     ap.add_argument('--out', default=REPO)
+    ap.add_argument('--repin', action='store_true',
+                    help='the zips differ from assets.json (a new toolset): pin them there to this tag (commit it, then tag)')
     a = ap.parse_args()
+    pins = {key: dict(name='', tag='', sha256='') for key in SETUP_ASSETS}
+    built = []
     with tempfile.TemporaryDirectory(prefix='make_setup_') as tmp:
-        res, shas = [], {'Vulkan': '', 'Llvm': ''}
         if a.tag:
-            for key, name, make in (('Vulkan', 'vulkan-sdk.zip', vulkan_zip), ('Llvm', 'llvm.zip', llvm_zip)):
-                p = os.path.join(tmp, name)
-                shas[key] = make(p)
-                res.append(f'/resource:{p},{name}')
+            # release assets next to the exe (the exe pins them and downloads them from the release that carries them; a
+            # copy next to it is used instead): not resources, 89 MB of compressed data in the exe's code section is what
+            # antivirus heuristics read as packed (issue #14). The same tools make the same bytes, so the zip built here
+            # must be the one assets.json pins (the release that first carried it keeps serving it)
+            os.makedirs(a.out, exist_ok=True)
+            doc = json.load(open(ASSETS_JSON, encoding='utf-8'))
+            for key, make in (('Vulkan', vulkan_zip), ('Llvm', llvm_zip)):
+                x = next(x for x in doc['assets'] if x['used_by'] == 'setup:' + key)
+                p = os.path.join(a.out, x['name'])
+                sha, size = make(p), os.path.getsize(p)
+                if sha != x['sha256'] or size != x['size']:
+                    if not a.repin:
+                        sys.exit(f'{x["name"]} built here (sha256 {sha[:12]}) is not the one assets.json pins to {x["tag"]} '
+                                 f'({x["sha256"][:12]}): another toolset. Run with --repin to pin it to {a.tag}, commit '
+                                 'tools/builder/assets.json, then tag (that release must carry it)')
+                    x.update(tag=a.tag, sha256=sha, size=size)
+                    print(f'repinned {x["name"]} to {a.tag} ({sha[:12]}): commit tools/builder/assets.json')
+                pins[key] = dict(name=x['name'], tag=x['tag'], sha256=x['sha256'])
+                built.append((x['name'], size, x['tag']))
+            if a.repin:
+                with open(ASSETS_JSON, 'w', encoding='utf-8', newline='\n') as f:
+                    json.dump(doc, f, indent=1)
+                    f.write('\n')
             exe = os.path.join(a.out, f'{a.product.replace(" ", "-")}-Setup-{a.tag}.exe')
         else:
             exe = os.path.join(REPO, 'Builder.exe')
         rel = os.path.join(tmp, 'Release.cs')
+        # the exe's Details (Windows' version resource, csc writes it from these): an exe with none, unsigned, that
+        # downloads and starts programs, is what antivirus heuristics flag (public issue #14)
+        nums = re.findall(r'\d+', a.tag or '')
+        ver = '.'.join((nums + ['0'] * 4)[:4]) if re.fullmatch(r'v?\d+(\.\d+){1,3}', a.tag or '') else '0.0.0.0'
+        what = 'Setup' if a.tag else 'Builder'
+        attrs = {'AssemblyTitle': f'{a.product} {what}', 'AssemblyProduct': a.product,
+                 'AssemblyCompany': f'{a.product} project (open source)',
+                 'AssemblyCopyright': f'Open source: github.com/{a.repo}', 'AssemblyVersion': ver,
+                 'AssemblyFileVersion': ver, 'AssemblyInformationalVersion': a.tag or 'main'}
         with open(rel, 'w', encoding='utf-8') as f:
-            f.write('// written by make_setup.py\nstatic class Release\n{\n'
+            f.write('// written by make_setup.py\n'
+                    + ''.join(f'[assembly: System.Reflection.{k}({cs_string(v)})]\n' for k, v in attrs.items())
+                    + 'static class Release\n{\n'
                     f'    public const string Product = {cs_string(a.product)};\n'
                     f'    public const string Tag = {cs_string(a.tag or "main")};\n'
                     f'    public const string Repo = {cs_string(a.repo)};\n'
                     f'    public const string LlvmVersion = {cs_string(RELEASE_TOOLS["clang"])};\n'
-                    + ''.join(f'    public const string {k}Sha256 = {cs_string(v)};\n' for k, v in shas.items()) + '}\n')
+                    + ''.join(f'    public const string {k}Sha256 = {cs_string(v["sha256"])};\n'
+                              f'    public const string {k}Asset = {cs_string(v["name"])};\n'
+                              f'    public const string {k}Tag = {cs_string(v["tag"])};\n' for k, v in pins.items()) + '}\n')
         cmd = [CSC, '/nologo', '/target:winexe', '/optimize+', f'/out:{exe}', '/r:System.Windows.Forms.dll',
-               '/r:System.Drawing.dll', '/r:System.IO.Compression.dll', '/r:System.IO.Compression.FileSystem.dll', *res,
+               '/r:System.Drawing.dll', '/r:System.IO.Compression.dll', '/r:System.IO.Compression.FileSystem.dll',
                os.path.join(HERE, 'Builder.cs'), rel]
         r = subprocess.run(cmd, capture_output=True, text=True)
         sys.stdout.write(r.stdout + r.stderr)
         if r.returncode:
             sys.exit(f'csc failed ({r.returncode})')
     print(f'{exe} ({os.path.getsize(exe) / 2**20:.1f} MB)' +
-          ''.join(f', {k} {v[:12]}' for k, v in shas.items() if v))
+          ''.join(f', {name} {size / 2**20:.1f} MB (release {tag})' for name, size, tag in built))
 
 
 if __name__ == '__main__':

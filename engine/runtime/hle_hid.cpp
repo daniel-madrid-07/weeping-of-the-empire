@@ -3,6 +3,7 @@
 // Input = host pads (XInput: Xbox; raw HID: DualSense, DualShock 4, Pro Controller, Joy-Cons) | keyboard (while the game window has focus) |
 // TOTK_PRESS script; see host_input().
 #include "hle.h"
+#include "nxr_game.h"   // (NXR_GAME_TOTK: forms TotK's build leaves out)
 #include "totk_version.h"
 #include "pc_input.h"      // the PC scheme: context and routing table (pc_input.cpp)
 #include "pc_overlay.h"
@@ -1749,16 +1750,21 @@ static pckh::Hold g_key_hold;   // input thread (keyboard_read)
 // on a read). Behind a mouse at 4000-8000 Hz, whose raw input holds win32k's lock that often, each call waited, game
 // threads 'other' 150-350 ms a frame, with Razer's software closed (the mouse at its own rate; 60 fps with it open), as
 // the r/decomps reporter's. Now the reads only look at the snapshot; the sampler alone waits on win32k. The mouse
-// buttons stay the window's messages (pc_mouse_buttons). TOTK_KEYSNAP=0: each read asks Windows itself, as before (A/B).
+// buttons stay the window's messages (pc_mouse_buttons). The snapshot is taken at the keyboard's raw input events
+// (keysnap_raw_thread: a message-only window of its own): each press or release makes one sweep of GetAsyncKeyState, no
+// polling (the should on d5daee58: polling asked 254 keys a millisecond, ~250k calls a second in front, against the same
+// lock). Swept too at each return to the front and once a second there (the in-front check runs every 10-16 ms).
+// TOTK_KEYSNAP=poll: the 1 ms polling sampler TOTK_KEYSNAP=0: each read asks Windows itself, as before (A/B).
 static std::atomic<u64> g_keysnap[4];
 static std::atomic<bool> g_keysnap_front{false};
-static bool keysnap_on() {
-    static const bool on = [] {
+static int keysnap_mode() {   // 0 off (each read asks), 1 the polling sampler, 2 raw input
+    static const int m = [] {
         const char* e = getenv("TOTK_KEYSNAP");
-        return !(e && !strcmp(e, "0"));
+        return e && !strcmp(e, "0") ? 0 : e && !strcmp(e, "poll") ? 1 : 2;
     }();
-    return on;
+    return m;
 }
+static bool keysnap_on() { return keysnap_mode() != 0; }
 // TOTK_KEYS_FRONT=1 (tests): the keys are read as if the game were in front, the cost an A/B of TOTK_KEYSNAP needs to
 // see (behind other windows a read asks nothing)
 static bool game_in_front() {
@@ -1768,7 +1774,65 @@ static bool game_in_front() {
     HWND fg = GetForegroundWindow();
     return fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
 }
+// Every key's state now (the mouse's left / right / middle left out: the window's messages), as GetAsyncKeyState says
+static void keysnap_sweep(u64 w[4]) {
+    w[0] = w[1] = w[2] = w[3] = 0;
+    for (int vk = 1; vk < 255; vk++) {
+        if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) continue;
+        if (GetAsyncKeyState(vk) & 0x8000) w[vk >> 6] |= 1ull << (vk & 63);
+    }
+}
+static void keysnap_store(const u64 w[4]) {
+    for (int i = 0; i < 4; i++) g_keysnap[i].store(w[i], std::memory_order_relaxed);
+}
+static LRESULT CALLBACK keysnap_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_INPUT) {
+        RAWINPUT ri;
+        UINT size = sizeof ri;
+        // A key event is the trigger, GetAsyncKeyState the truth: the raw event's VKey is not always the key the bindings
+        // read (the numpad with NumLock on reports the navigation keys, Pause comes with a fake Ctrl, a layout can remap),
+        // so a bit set from it could stay held after its release (the must on 55353833). The async state is updated before
+        // WM_INPUT reaches this thread; ~10 key events a second make ~2.5k calls, not polling's 250k.
+        u64 snap[4];
+        if (g_keysnap_front.load(std::memory_order_relaxed) &&
+            GetRawInputData((HRAWINPUT)l, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+            ri.header.dwType == RIM_TYPEKEYBOARD)
+            keysnap_sweep(snap), keysnap_store(snap);
+    } else if (m == WM_TIMER) {   // (SetTimer's 4 ms is 10-16 ms in practice) in front or not; a sweep at the return to
+        static ULONGLONG swept;   // the front and once a second
+        const bool front = game_in_front(), was = g_keysnap_front.load(std::memory_order_relaxed);
+        u64 snap[4] = {};
+        const ULONGLONG now = GetTickCount64();
+        if (front && (!was || now - swept >= 1000)) keysnap_sweep(snap), keysnap_store(snap), swept = now;
+        else if (!front && was) keysnap_store(snap);   // (behind other windows: nothing held)
+        g_keysnap_front.store(front, std::memory_order_release);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void keysnap_poll_thread();
+static void keysnap_raw_thread() {
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = keysnap_proc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"TotKRecompKeys";
+    RegisterClassW(&wc);
+    HWND h = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    // (INPUTSINK: a message-only window is never in front; the keys count only while the game is, keysnap_proc)
+    RAWINPUTDEVICE d = {0x01, 0x06, RIDEV_INPUTSINK, h};
+    if (!h || !RegisterRawInputDevices(&d, 1, sizeof d) || !SetTimer(h, 1, 4, nullptr)) {
+        printf("[hid] keyboard raw input unavailable (%lu): the 1 ms polling sampler instead\n", GetLastError());
+        return keysnap_poll_thread();
+    }
+    printf("[hid] keyboard from raw input (no polling; a check each second in front); TOTK_KEYSNAP=poll / 0: as before\n");
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) DispatchMessageW(&msg);
+}
 static void keysnap_thread() {
+    if (keysnap_mode() == 2) return keysnap_raw_thread();
+    keysnap_poll_thread();
+}
+static void keysnap_poll_thread() {
     HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     printf("[hid] keyboard sampled every 1 ms on its own thread (%s timer); TOTK_KEYSNAP=0: in each input read\n",
            t ? "high-resolution" : "Sleep");
@@ -1787,12 +1851,8 @@ static void keysnap_thread() {
         const auto s0 = std::chrono::steady_clock::now();
         const bool front = game_in_front();
         u64 w[4] = {};
-        if (front)
-            for (int vk = 1; vk < 255; vk++) {
-                if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) continue;   // (the window's messages)
-                if (GetAsyncKeyState(vk) & 0x8000) w[vk >> 6] |= 1ull << (vk & 63);
-            }
-        for (int i = 0; i < 4; i++) g_keysnap[i].store(w[i], std::memory_order_relaxed);
+        if (front) keysnap_sweep(w);
+        keysnap_store(w);
         g_keysnap_front.store(front, std::memory_order_release);
         const auto s1 = std::chrono::steady_clock::now();
         const double us = std::chrono::duration<double, std::micro>(s1 - s0).count();
@@ -2019,6 +2079,8 @@ CTL_APPLY(ap_gyro_scale, "TOTK_GYRO_SCALE", gyro_scale_set(v))
 CTL_APPLY(ap_dead_zone_l, "TOTK_STICK_DEADZONE_L", g_dead_zone[0] = dead_zone_units(v))
 CTL_APPLY(ap_dead_zone_r, "TOTK_STICK_DEADZONE_R", g_dead_zone[1] = dead_zone_units(v))
 CTL_APPLY(ap_key_hold, "TOTK_KEY_MIN_HOLD_MS", (void)0)
+CTL_APPLY(ap_sprint_toggle, "TOTK_SPRINT_TOGGLE", pc_input_toggle_set(0, v))
+CTL_APPLY(ap_lock_toggle, "TOTK_LOCK_TOGGLE", pc_input_toggle_set(1, v))
 static void kbm_custom() {
     const char* l = pc_settings_get("controls.keyboard_layout");
     if (!l || strcmp(l, "custom")) pc_settings_set("controls.keyboard_layout", "custom");
@@ -2059,6 +2121,12 @@ static const pc_setting k_ctl_rows[] = {
     {"controls.key_min_hold_ms", "Controls", KM, "Minimum movement key press", "Milliseconds a quick tap of a movement "
      "key (WASD) keeps Link moving, so he takes a step instead of sliding with his legs still. 0 = off (a tap as short as "
      "the key press).", "150", nullptr, nullptr, 0.0f, 250.0f, 10.0f, 0, "TOTK_KEY_MIN_HOLD_MS", nullptr, ap_key_hold, nullptr},
+    {"controls.sprint_toggle", "Controls", KM, "Sprint toggle", "A press of the sprint key starts sprinting and the next "
+     "one stops it; it also stops when Link stops moving or a menu opens. Off: hold it, as on the Switch.", "", kCtlOffV,
+     kCtlOffN, 0, 0, 0, 0, "TOTK_SPRINT_TOGGLE", nullptr, ap_sprint_toggle, nullptr},
+    {"controls.lock_toggle", "Controls", KM, "Shield and target toggle", "A press of the shield / target key raises the "
+     "shield and targets, the next press lowers it; a menu lets it go too. Off: hold it, as on the Switch.", "", kCtlOffV,
+     kCtlOffN, 0, 0, 0, 0, "TOTK_LOCK_TOGGLE", nullptr, ap_lock_toggle, nullptr},
     {"controls.mouse_camera_scale", "Controls", KM, "Mouse camera", "The mouse turns the camera (click the window to "
      "capture the pointer; Esc, F10 or Alt+Tab frees it). 0 = off; above 1 turns faster.", "1", nullptr, nullptr, 0.0f, 4.0f,
      0.1f, 0, "TOTK_MOUSE_CAMERA", nullptr, ap_camera, nullptr},
@@ -3055,7 +3123,13 @@ extern "C" uint64_t hid_game_buttons(void) { return g_cheat_keys.load(); }
 
 HLE_AS(hid_InitializeNpad, "_ZN2nn3hid14InitializeNpadEv") { }
 HLE_AS(hid_SetSupportedNpadIdType, "_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm") { }
+#if NXR_GAME_TOTK
 HLE_AS(hid_SetSupportedNpadStyleSet, "_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE") { }
+#else
+static std::atomic<u32> g_supported_styles{0};   // (SetSupportedNpadStyleSet's, for GetSupportedNpadStyleSet)
+HLE_AS(hid_SetSupportedNpadStyleSet, "_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE") { g_supported_styles = (u32)c->x[0]; }
+HLE_AS(hid_GetSupportedNpadStyleSet, "_ZN2nn3hid24GetSupportedNpadStyleSetEv") { c->x[0] = g_supported_styles.load(); }
+#endif
 HLE_AS(hid_SetNpadJoyHoldType, "_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE") { }
 HLE_AS(hid_DisconnectNpad, "_ZN2nn3hid14DisconnectNpadERKj") { }
 HLE_AS(hid_GetNpadStyleSet, "_ZN2nn3hid15GetNpadStyleSetERKj") {
@@ -3104,6 +3178,7 @@ static void jump_option_poll(Ctx* c) {
 #ifdef _WIN32
     // no UI hook: the main thread's own pad read, when the game makes one
     if ((unsigned long)GetCurrentThreadId() != os_main_thread_tid() || busy.exchange(true)) return;
+    if (!totk_main_known(0x1a3e83c)) { busy = false; return; }   // (a diagnostic build of another version)
     Ctx saved = *c;
     guest_call(c, totk_main(0x1a3e83c));
     const int v = (c->x[0] & 1) ? 1 : 0;
@@ -3134,6 +3209,22 @@ NPAD_STATES(hid_GetNpadStatesJoyDual, "_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyD
 NPAD_STATES(hid_GetNpadStatesJoyLeft, "_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", 0)
 NPAD_STATES(hid_GetNpadStatesJoyRight, "_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", 0)
 NPAD_STATES(hid_GetNpadStatesHandheld, "_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", StyleHandheld)
+#if !NXR_GAME_TOTK
+// GetNpadState(State* out, const u32& id): the latest state only (SDK 11.4). Same fill as GetNpadStates, without
+// TotK's game hooks (menu cursor, the Jump option read)
+#define NPAD_STATE(name, mangled, style) \
+    HLE_AS(name, mangled) { npad_fill((NpadState*)c->x[0], *(u32*)c->x[1], (style) == StyleFullKey); }
+NPAD_STATE(hid_GetNpadStateFullKey, "_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", StyleFullKey)
+NPAD_STATE(hid_GetNpadStateJoyDual, "_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", StyleJoyDual)
+NPAD_STATE(hid_GetNpadStateJoyLeft, "_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", 0)
+NPAD_STATE(hid_GetNpadStateJoyRight, "_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", 0)
+NPAD_STATE(hid_GetNpadStateHandheld, "_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", StyleHandheld)
+// Touch screen (no touch input on the PC yet): TouchScreenState<16> = sampling number, count 0, 16 TouchState (0x28 each)
+HLE_AS(hid_GetTouchScreenState16, "_ZN2nn3hid19GetTouchScreenStateILm16EEEvPNS0_16TouchScreenStateIXT_EEE") {
+    memset((void*)c->x[0], 0, 0x10 + 16 * 0x28);
+    *(s64*)c->x[0] = (s64)g_sample++;
+}
+#endif
 
 // handles: u32 {type, npad id, device idx} packed; any stable non-zero value works for our own getters
 HLE_AS(hid_GetSixAxisSensorHandles, "_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE") {
@@ -3677,6 +3768,14 @@ HLE_AS(hid_GetSixAxisSensorStates, "_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18Si
     c->x[0] = (u64)k;
 }
 
+#if !NXR_GAME_TOTK
+// GetSixAxisSensorState(out, const handle&): GetSixAxisSensorStates' latest entry (SDK 11.4)
+HLE_AS(hid_GetSixAxisSensorState, "_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE") {
+    c->x[2] = c->x[1]; c->x[1] = 1;
+    hle_hid_GetSixAxisSensorStates(c);
+}
+HLE_AS(hid_IsSixAxisSensorAtRest, "_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE") { c->x[0] = 1; }
+#endif
 HLE_AS(hid_InitializeMouse, "_ZN2nn3hid15InitializeMouseEv") { }
 HLE_AS(hid_InitializeKeyboard, "_ZN2nn3hid18InitializeKeyboardEv") { }
 HLE_AS(hid_GetMouseStates, "_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi") {   // -> int

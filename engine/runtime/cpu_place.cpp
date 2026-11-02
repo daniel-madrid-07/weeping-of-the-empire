@@ -16,7 +16,7 @@
 namespace {
 
 std::vector<uint32_t> g_hot, g_helper, g_all, g_render;
-int g_total = 0;
+int g_total = 0, g_smt = -1;
 bool g_on = false;
 
 // distinct physical cores among the logical processors of class eff (and cache llc, or any: -1); core / llc are the
@@ -226,6 +226,18 @@ extern "C" void cpu_place_init(void) {
             }
     }
     g_total = (int)lps.size();
+    {   // SMT: two logical processors of the fastest class on one physical core
+        int top = 0;
+        for (const cpu_lp &l : lps) top = l.eff > top ? l.eff : top;
+        std::vector<uint32_t> seen;
+        g_smt = lps.empty() ? -1 : 0;
+        for (const cpu_lp &l : lps) {
+            if (l.eff != top) continue;
+            const uint32_t k = (uint32_t)l.group << 16 | l.core;
+            for (uint32_t s : seen) g_smt |= s == k;
+            seen.push_back(k);
+        }
+    }
     g_hot.resize(lps.size());
     g_helper.resize(lps.size());
     cpu_plan plan;
@@ -242,9 +254,10 @@ extern "C" void cpu_place_init(void) {
     const char *rp = getenv("LARECOMP_RENDER_PIN");
     const bool render_thread = backend_async_on();   // (exec.c: whether there is a render thread at all)
     const bool r_off = rp && !strcmp(rp, "0"), r_auto = rp && !strcmp(rp, "auto"), manual = rp && *rp && !r_off && !r_auto;
-    // (>= 6 SMT cores by default; =auto from 4: a 4c/8t gives 2 of its 8 logical processors to one thread while its game
-    // threads are near the wall too, unmeasured)
-    const int min_smt = r_auto ? 4 : 6;
+    // (>= 4 SMT cores since v0.1.8: on 4c/8t the render thread is the cap, ~90 % of the frame with the GPU half idle and
+    // the game's threads blocked ~2/3 of their time (db_lc4_prof, t3_fight_t4b stacks), and next to a busy sibling it ran
+    // 18 % slower a frame (pin_kak_t4); =auto is the same now, =0 the old 4-5 core behaviour (none))
+    const int min_smt = 4;
     uint32_t rids[4];
     int nr = 0;
     if (spd && render_thread && !r_off) {
@@ -278,17 +291,16 @@ extern "C" void cpu_place_init(void) {
     }
     printf("[cpu] render thread: %s\n",
            !g_render.empty() ? (manual ? "alone on the core of LARECOMP_RENDER_PIN's logical processor"
-                         : r_auto ? "alone on the last SMT core of hot (LARECOMP_RENDER_PIN=auto: from 4 SMT cores)"
                                   : "alone on the last SMT core of hot (LARECOMP_RENDER_PIN=0: off)")
            : r_off           ? "not placed (LARECOMP_RENDER_PIN=0)"
            : !render_thread  ? "none (synchronous execute)"
            : !spd            ? "not placed (no CPU Sets)"
            : manual          ? "not placed (LARECOMP_RENDER_PIN: no such logical processor)"
-                             : r_auto ? "not placed (fewer than 4 SMT cores in hot)"
-                                      : "not placed (fewer than 6 SMT cores in hot; LARECOMP_RENDER_PIN=auto: from 4)");
+                             : "not placed (fewer than 4 SMT cores in hot)");
     printf("[cpu] counts: hot %d, any %d, helper %d of %d logical processors in the process affinity (%d outside it)%s\n",
            cpu_place_count(CPU_HOT), cpu_place_count(CPU_ANY), cpu_place_count(CPU_HELPER), g_total, outside,
            cpu_place_active() ? "" : "; helpers not separated");
+    printf("[cpu] SMT: %s\n", g_smt > 0 ? "yes (the fastest cores have siblings)" : g_smt == 0 ? "no (one logical processor a core)" : "unknown");
     if ((g_on || !g_render.empty()) && !g_hot.empty()) {
         if (!spd(GetCurrentProcess(), (const ULONG *)g_hot.data(), (ULONG)g_hot.size()))
             printf("[cpu] SetProcessDefaultCpuSets failed (%lu)\n", GetLastError());
@@ -299,6 +311,8 @@ extern "C" void cpu_place_init(void) {
             sts(GetCurrentThread(), (const ULONG *)g_hot.data(), (ULONG)g_hot.size());
     }
 }
+
+extern "C" int cpu_place_smt(void) { return g_smt; }
 
 extern "C" int cpu_place_hot(uint32_t *ids, int n) {
     if (!g_on || g_hot.empty()) return 0;
@@ -351,5 +365,6 @@ extern "C" void cpu_place_init(void) {}
 extern "C" void cpu_place_thread(int) {}
 extern "C" bool cpu_place_active(void) { return false; }
 extern "C" int cpu_place_hot(uint32_t *, int) { return 0; }
+extern "C" int cpu_place_smt(void) { return -1; }
 extern "C" int cpu_place_count(int) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }
 #endif

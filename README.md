@@ -35,8 +35,8 @@ and send how it runs on your hardware, with the log, as a
 ## Install in 3 steps
 
 1. **Download** the Setup exe from the [latest release](https://github.com/daniel-madrid-07/weeping-of-the-empire/releases/latest) and run it (no administrator rights needed). Setup is not code-signed, so Windows SmartScreen may warn the first time. Its SHA-256 is in the release notes.
-2. **Drop in your files:** your dump of the game, version 1.0.0 (`.nsp` or `.xci`), and your `prod.keys`. Pick a folder on an NTFS drive with about 75 GB free and press **Install**.
-3. **Wait once, then play.** Setup downloads the tools it needs, an optimisation profile (made by running the game on the developer's PC: function names and how often their branches ran) and a list of the shaders the game used there (hashes and render states; see [LEGAL.md](LEGAL.md) for both), decrypts and recompiles the game on your PC, and puts a shortcut on your desktop. Setup's own estimate is 30 to 60 minutes. One full install of an earlier version took about 33 minutes on a 16-thread CPU with 62 GB of RAM while other work was running, and its folder peaked at about 39 GB (Setup asks for 75 GB to be safe). Internet is needed during the install. If it stops, press Install again and it continues where it stopped.
+2. **Drop in your files:** your dump of the game, version 1.0.0 (`.nsp` or `.xci`), and your `prod.keys`. Pick a folder on an NTFS drive with about 30 GB free and press **Install**.
+3. **Wait once, then play.** Setup downloads the tools it needs, an optimisation profile (made by running the game on the developer's PC: function names and how often their branches ran) and a list of the shaders the game used there (hashes and render states; see [LEGAL.md](LEGAL.md) for both), decrypts and recompiles the game on your PC, and puts a shortcut on your desktop. Setup's own estimate is 30 to 60 minutes. One full install of an earlier version took about 33 minutes on a 16-thread CPU with 62 GB of RAM while other work was running, and its folder peaked at about 39 GB. Installs now keep the game data as one 17 GB file instead of also unpacking a second 17 GB copy, so Setup asks for about 30 GB. Internet is needed during the install. If it stops, press Install again and it continues where it stopped.
 
 Optional: your console's firmware, for its own Korean and Chinese fonts. Without it, Korean and Chinese text uses a
 Windows font for that language, or English on a Windows that has none.
@@ -86,6 +86,7 @@ numbers are welcome: use the
 | **Upscaling** | NVIDIA DLSS super resolution on RTX cards and DLSS frame generation on RTX 40 / 50 series (both optional), FSR 1, SMAA |
 | **Controls** | Keyboard and mouse made for a PC, with keyboard and mouse glyphs in the game's prompts; Xbox, PlayStation and Switch controllers |
 | **Settings** | In-game settings window (F10): graphics, controls, audio and the game's options |
+| **Mods** | RomFS mods made for emulators or the Switch, in a `mods` folder next to the game (see the FAQ); order and on / off in F10 > Mods; ExeFS code patches (.ips / .pchtxt) and Atmosphere cheats (F10 > Cheats) |
 | **Saves** | Import from an emulator or a console backup; automatic backups. A save from a later game version may not load |
 | **Updates** | Run a newer release's Setup on the same folder: it rebuilds only what changed and keeps saves and settings |
 
@@ -102,8 +103,8 @@ generation) are options.
   `logs\totk-*.log` in a [bug report](https://github.com/daniel-madrid-07/weeping-of-the-empire/issues/new?template=bug_report.yml).
 - Some visual differences from the Switch remain, among them lighting in parts of the Depths. Known problems are in
   [Issues](https://github.com/daniel-madrid-07/weeping-of-the-empire/issues).
-- PC settings live in the F10 window. Showing them in the game's own Options screen too is experimental: add
-  `env.TOTK_OPTIONS_MENU=1` to the game folder's `player.txt`.
+- PC settings live in the F10 window and, by section, in the game's own Options screen (System > Options). To hide
+  them there, add `env.TOTK_OPTIONS_MENU=0` to the game folder's `player.txt`.
 - Setup is not code-signed, so Windows SmartScreen may warn the first time.
 
 ## Requirements
@@ -112,10 +113,10 @@ generation) are options.
   optionally your console's firmware, for its Korean and Chinese fonts.
 - **CPU** with AVX2 (Intel Haswell / AMD Zen or newer) for the build we have tested. Processors with SSE4.2 but
   without AVX2 (Intel Sandy / Ivy Bridge, AMD FX, many Pentium / Celeron) get a compatible build that the Builder picks
-  by itself; it is untested on such a processor: we have only seen it start on our own AVX2 PC, and its speed is
-  unknown. Reports welcome. Setup refuses processors without SSE4.2. **GPU** with a current Vulkan 1.3 driver.
+  by itself; a player confirmed it on a Pentium G4600 (no AVX); expect low fps on such processors.
+  Reports welcome. Setup refuses processors without SSE4.2. **GPU** with a current Vulkan 1.3 driver.
 - **8 GB of RAM** (16 GB recommended: the build runs fewer compiles at once on less).
-- **About 75 GB free** on an NTFS drive, and an internet connection during the install.
+- **About 40 GB free** on an NTFS drive, and an internet connection during the install.
 
 ## FAQ
 
@@ -140,6 +141,26 @@ being worked on; there is no date.
 whole build runs on your PC.
 
 **Where are my saves?** `%APPDATA%\nxrecomp\TotK-engine`. Setup keeps them across updates.
+
+**How do I install mods?** Put each mod in a folder of its own inside the `mods` folder next to the game (the game
+folder; `%APPDATA%\nxrecomp\TotK-engine\mods` works too), laid out as emulators take them: `<mod>\romfs\...`,
+the SD card's `atmosphere\contents\0100F2C0115B6000\romfs\...`, or TKMM's merged output. A whole emulator mods
+folder can be copied in as it is (yuzu's `load\0100F2C0115B6000`, Ryujinx's `mods\contents\0100f2c0115b6000`):
+each mod in it is listed on its own. In the game, F10 > Mods
+shows them in load order (the top one wins a file two mods change), switches each one on or off, and says why a mod
+cannot be used; changes apply at the next start. The resource size table is adjusted by itself, so mods with bigger
+files do not need their own. Mods must be for version 1.0.0; the port's own files (PC button prompts, fixes) stay
+over a mod's. No mods ship with the port.
+
+**Do code patches (.ips, .pchtxt) and cheats work?** Yes, for version 1.0.0: a mod's `exefs` folder (or the SD card's
+`atmosphere\exefs_patches\<name>`) and its `cheats\082CE09B06E33A12.txt` (Atmosphere format; a folder holding only
+that file is a cheats mod too). The game is recompiled
+ahead of time, so a patch that changes code needs the game built again with it: when the mods' code patches change,
+the game closes, rebuilds itself with Setup's tools (about 3 minutes; only the changed parts compile again) and starts
+again. A patch that changes only data applies at once. A patch that changes code the port already changes (the frame
+rate, resolution and other F10 settings) is left out and F10 > Mods says so; use the setting instead. Cheats are
+switched one by one in F10 > Cheats (off at first); a cheat that changes values works at once, one that changes the
+game's code applies after the rebuild, and one that changes code only while a button is held is not supported yet.
 
 ## Build from a clone
 

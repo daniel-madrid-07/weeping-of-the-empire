@@ -33,8 +33,9 @@ F10 opens the PC settings window, also in the middle of a game (with a controlle
 - Audio: volume.
 - Game: skip the intro, pause when the window loses focus, saves, screenshots (F12) and crash reports.
 Changes are saved at once. Some need a restart of the game (the window says so).
-Experimental: the same PC settings as rows at the end of the game's own Options screen (System > Options), with
-sections and the keys: add the line env.TOTK_OPTIONS_MENU=1 at the end of player.txt.
+The game's own Options screen (System > Options) shows the main PC settings too, in sections (Display: window mode and
+resolution, fullscreen resolution, frame rate, the FPS counter; Graphics: render resolution...). To show only the
+game's own options, add the line env.TOTK_OPTIONS_MENU=0 at the end of player.txt.
 
 The frame rate starts at 120 (the original runs at 30). In F10 > Graphics you can choose 30, 60, 90, 120 or
 "Unlocked": no limit, up to your monitor's refresh rate, 240 fps at most, with the game running at its right

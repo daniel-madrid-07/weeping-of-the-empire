@@ -24,6 +24,8 @@ static _Atomic uint32_t live_count;  // all live vkAllocateMemory allocations
 uint32_t vma_shim_live(void) { return live_count; }
 static _Atomic uint32_t sub_count;    // live resources carved from blocks (in heap_count, not in live_count)
 uint32_t vma_shim_sub(void) { return sub_count; }
+static uint64_t spare_made, spare_used, spare_dropped;   // (blocks the helper made, taken by an allocation, given back short)
+void vma_shim_spares(uint64_t *made, uint64_t *used) { *made = spare_made; *used = spare_used; }
 uint32_t vma_shim_heaps(VmaAllocator a, uint64_t *bytes, uint32_t *count, uint64_t *size, uint32_t *flags) {
     for (uint32_t h = 0; h < a->mp.memoryHeapCount; h++) {
         bytes[h] = heap_bytes[h]; count[h] = heap_count[h];
@@ -65,14 +67,106 @@ VkResult vmaCreateAllocator(const VmaAllocatorCreateInfo *ci, VmaAllocator *out)
 // its type and kind. Host-visible blocks stay mapped. On by default since 2026-10-25 (LARECOMP_VMA_SUB=0: one allocation
 // per resource), a 12-min Kakariko soak 95-129 live, ~2,100-2,250 resources in blocks, no growth, no errors.
 enum { SUB_BLOCK = 32 << 20, SUB_MAX = 4 << 20 };
+// Big class (stutter sprint, 2026-11-01): optimal images of 4-64 MB (render targets, large arrays) were each their own
+// vkAllocateMemory on the render thread: 8-19 ms a block in the rival's numbers. They are carved from 256 MB blocks now
+// (kind 2: their own blocks), and a helper thread keeps one empty block per device-local image class ready
+// (spare_main), so the render thread does not allocate device memory for them in play. While residency is short
+// (vk_residency_tight) no spare is made, the spares go, an empty big block goes at once, and no new big block is made:
+// a 4-64 MB image freed from a big block returns nothing to the driver until the whole block is empty, so evictions
+// would stop lowering the usage residency reads and it would evict and re-create more; a big-class image that fits no
+// existing block gets its own allocation then. LARECOMP_VMA_BIG=0: dedicated allocations above 4 MB again
+// LARECOMP_VMA_SPARE=0: no helper.
+enum { BIG_BLOCK = 256 << 20, BIG_MAX = 64 << 20 };
+static VkDeviceSize block_size(uint32_t kind) { return kind == 2 ? BIG_BLOCK : SUB_BLOCK; }
+bool vk_residency_tight(void);   // (textures.c: short of the VRAM budget / commit floor now or within the last 2 s)
 struct SubBlock {
     SubBlock *next;
     VkDeviceMemory mem;
     uint8_t *mapped;
     uint32_t type, kind, nfree, capfree, nlive;
+    VkDeviceSize live_bytes;
     struct { VkDeviceSize off, size; } *fr;   // free ranges, by offset
 };
 static pthread_mutex_t sub_mu = PTHREAD_MUTEX_INITIALIZER;
+static bool big_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_VMA_BIG"); on = !(e && *e == '0'); }
+    return on;
+}
+// spare[t][kind]: an empty block of memory type t made off the render thread (kinds 1 and 2, device-local types only)
+static struct { VkDeviceMemory mem; bool want; } spare[VK_MAX_MEMORY_TYPES][3];
+static pthread_cond_t spare_cv = PTHREAD_COND_INITIALIZER;
+static VmaAllocator spare_a;
+static bool spare_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_VMA_SPARE"); on = !(e && *e == '0'); }
+    return on;
+}
+static void *spare_main(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&sub_mu);
+    for (;;) {
+        int wt = -1, wk = 0;
+        for (int t = 0; t < VK_MAX_MEMORY_TYPES && wt < 0; t++)
+            for (int k = 1; k < 3; k++)
+                if (spare[t][k].want && !spare[t][k].mem) { wt = t; wk = k; break; }
+        if (wt < 0) { pthread_cond_wait(&spare_cv, &sub_mu); continue; }
+        spare[wt][wk].want = false;
+        if (vk_residency_tight()) continue;   // (short of memory: hold nothing spare)
+        pthread_mutex_unlock(&sub_mu);
+        VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = block_size((uint32_t)wk),
+                                   .memoryTypeIndex = (uint32_t)wt};
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        VkResult r = vkAllocateMemory(spare_a->dev, &mi, NULL, &mem);
+        pthread_mutex_lock(&sub_mu);
+        if (r != VK_SUCCESS) continue;
+        if (vk_residency_tight()) { vkFreeMemory(spare_a->dev, mem, NULL); continue; }   // (became short meanwhile)
+        spare[wt][wk].mem = mem;
+        live_count++;
+        spare_made++;
+    }
+    return NULL;
+}
+// textures.c vk_residency_tick, when short: the idle spares go back to the driver
+void vma_shim_drop_spares(void) {
+    pthread_mutex_lock(&sub_mu);
+    for (int t = 0; t < VK_MAX_MEMORY_TYPES; t++)
+        for (int k = 1; k < 3; k++)
+            if (spare[t][k].mem) {
+                vkFreeMemory(spare_a->dev, spare[t][k].mem, NULL);
+                spare[t][k].mem = VK_NULL_HANDLE;
+                live_count--;
+                spare_dropped++;
+            }
+    pthread_mutex_unlock(&sub_mu);
+}
+// big blocks (kind 2) for the [vram] line: how many, their bytes, the bytes live in them; spares held and dropped
+void vma_shim_big(VmaAllocator a, uint32_t *n, uint64_t *bytes, uint64_t *live, uint64_t *spare_bytes, uint64_t *dropped) {
+    *n = 0; *bytes = *live = *spare_bytes = 0;
+    pthread_mutex_lock(&sub_mu);
+    for (SubBlock *b = a->blocks; b; b = b->next)
+        if (b->kind == 2) { ++*n; *bytes += BIG_BLOCK; *live += b->live_bytes; }
+    for (int t = 0; t < VK_MAX_MEMORY_TYPES; t++)
+        for (int k = 1; k < 3; k++)
+            if (spare[t][k].mem) *spare_bytes += block_size((uint32_t)k);
+    *dropped = spare_dropped;
+    pthread_mutex_unlock(&sub_mu);
+}
+static void spare_ask(VmaAllocator a, uint32_t t, uint32_t kind) {   // (sub_mu held)
+    static bool started;
+    if (kind < 1 || !spare_on() || (a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+        !(a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        return;
+    if (!started) {
+        started = true;
+        spare_a = a;
+        pthread_t th;
+        if (pthread_create(&th, NULL, spare_main, NULL)) return;
+        pthread_detach(th);
+    }
+    spare[t][kind].want = true;
+    pthread_cond_signal(&spare_cv);
+}
 static bool sub_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("LARECOMP_VMA_SUB"); on = !(e && *e == '0'); }
@@ -126,26 +220,31 @@ static VmaAllocation sub_alloc(VmaAllocator a, uint32_t t, uint32_t kind, VkMemo
     SubBlock *b = a->blocks;
     for (; b; b = b->next)
         if (b->type == t && b->kind == kind && sub_take(b, req.size, align, &off)) break;
-    if (!b) {
-        VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = SUB_BLOCK, .memoryTypeIndex = t};
-        VkDeviceMemory mem;
+    if (!b && !(kind == 2 && vk_residency_tight())) {   // (short: no new big block, the caller allocates it alone)
+        const VkDeviceSize bs = block_size(kind);
+        VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = bs, .memoryTypeIndex = t};
+        VkDeviceMemory mem = VK_NULL_HANDLE;
         void *mapped = NULL;
-        if (vkAllocateMemory(a->dev, &mi, NULL, &mem) == VK_SUCCESS) {
+        const bool from_spare = kind < 3 && spare[t][kind].mem;   // (made by spare_main: no allocation here)
+        if (from_spare) { mem = spare[t][kind].mem; spare[t][kind].mem = VK_NULL_HANDLE; live_count--; spare_used++; }
+        if (from_spare || vkAllocateMemory(a->dev, &mi, NULL, &mem) == VK_SUCCESS) {
             if ((a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
                 vkMapMemory(a->dev, mem, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
                 vkFreeMemory(a->dev, mem, NULL);
             else {
                 b = calloc(1, sizeof *b);
                 b->mem = mem; b->mapped = mapped; b->type = t; b->kind = kind;
-                sub_give(b, 0, SUB_BLOCK);
+                sub_give(b, 0, bs);
                 b->next = a->blocks; a->blocks = b;
                 live_count++;
-                sub_take(b, req.size, align, &off);   // (fits: req.size <= SUB_MAX, alignments are far below the block)
+                sub_take(b, req.size, align, &off);   // (fits: req.size <= SUB_MAX / BIG_MAX, alignments far below the block)
             }
         }
+        spare_ask(a, t, kind);   // (the next block of this class: made off this thread)
     }
     if (b) {
         b->nlive++;
+        b->live_bytes += req.size;
         sub_count++;
         al = calloc(1, sizeof *al);
         al->mem = b->mem; al->offset = off; al->sub = b;
@@ -158,10 +257,11 @@ static void sub_free(VmaAllocator a, VmaAllocation al) {
     pthread_mutex_lock(&sub_mu);
     SubBlock *b = al->sub, *o;
     sub_give(b, al->offset, al->size);
+    b->live_bytes -= al->size;
     sub_count--;
-    if (!--b->nlive) {   // (empty: freed while another block of its type and kind remains)
+    if (!--b->nlive) {   // (empty: freed while another block of its type and kind remains; a big one under pressure too)
         for (o = a->blocks; o && (o == b || o->type != b->type || o->kind != b->kind); o = o->next) {}
-        if (o) {
+        if (o || (b->kind == 2 && vk_residency_tight())) {
             SubBlock **pp = &a->blocks;
             while (*pp != b) pp = &(*pp)->next;
             *pp = b->next;
@@ -215,7 +315,8 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
     VkResult r;
     VmaAllocation al = NULL;
     int t;
-    if (sub_on() && req.size <= SUB_MAX && !(ai->flags & VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT)) {
+    if (kind == 1 && req.size > SUB_MAX && req.size <= BIG_MAX && req.alignment <= (1u << 20) && big_on()) kind = 2;
+    if (sub_on() && (req.size <= SUB_MAX || kind == 2) && !(ai->flags & VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT)) {
         t = pick_type(a, bits, need, want);   // (the loop's first choice; a full heap goes on to the loop's retries)
         if (t < 0 && host) t = pick_type(a, bits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, want);
         if (t < 0) t = pick_type(a, bits, 0, want);

@@ -51,6 +51,19 @@ def log(*a):
     print('[package]', *a, flush=True)
 
 
+SUPPORTED_VERSIONS = ('1.0.0', '1.4.3')   # game versions a release may be (1.4.3: built from the player's own update)
+
+
+def shippable(key, man):
+    """None, or why the key is never packaged: a diagnostic build (sentinel addresses, trap stubs: tools/engine/
+    build.py DIAGNOSTIC) or a game version the releases do not support"""
+    if man.get('diagnostic'):
+        return f'key {key} is a diagnostic build of TotK {man.get("game_version", "?")}: never packaged'
+    if man.get('game_version', '1.0.0') not in SUPPORTED_VERSIONS:
+        return f'key {key} is TotK {man["game_version"]}: the releases are {" / ".join(SUPPORTED_VERSIONS)}'
+    return None
+
+
 def newest_key():
     best = None
     for k in os.listdir(os.path.join(ENG, 'game')):
@@ -59,7 +72,7 @@ def newest_key():
         if not (os.path.exists(m) and os.path.exists(exe)):
             continue
         man = json.load(open(m))
-        if man.get('objs_done') and (best is None or man.get('objs_built', '') > best[1].get('objs_built', '')):
+        if man.get('objs_done') and not shippable(k, man) and (best is None or man.get('objs_built', '') > best[1].get('objs_built', '')):
             best = (k, man)
     if not best:
         sys.exit(f'no built key with an exe under {ENG}\\game')
@@ -139,6 +152,9 @@ def main():
     ap.add_argument('--key'); ap.add_argument('--out', default=os.path.join(WORK, 'release'))
     ap.add_argument('--exe', help='a runtime relinked against the key (build.py runtime --key), instead of the exe built with the key')
     ap.add_argument('--commit', help='the commit --exe was built from (player.txt, folder name)')
+    ap.add_argument('--release', help='the release tag this source is (player.txt release=: the launcher\'s '
+                    'automatic update compares it with GitHub\'s latest; none = this build never updates itself)')
+    ap.add_argument('--release-repo', help='owner/repo on GitHub the release comes from (player.txt release_repo=)')
     ap.add_argument('--env', action='append', default=[], help='K=V added to player.txt (env.K=V)')
     ap.add_argument('--no-patch-sets', action='store_true',
                     help='leave TOTK_PATCH_SETS out of player.txt (the six game-patch restart rows stay hidden)')
@@ -146,7 +162,6 @@ def main():
                     help='the romfs overlay player.txt points at (default: the shared one; e.g. a copy with a set such as '
                          'mals merged by engine_dir, before the shared one is rebuilt)')
     a = ap.parse_args()
-    overlay = os.path.abspath(a.overlay)
     floor = 2 if os.environ.get('NXR_BUILDER_PACKAGE') else 45
     if shutil.disk_usage(WORK).free / 2**30 < floor:
         sys.exit(f'under {floor} GB free on the work drive: not writing a release (disk rule)')
@@ -154,15 +169,35 @@ def main():
         key, man = a.key, json.load(open(os.path.join(key_dir(a.key), 'manifest.json')))
     else:
         key, man = newest_key()
+    if shippable(key, man):
+        sys.exit(shippable(key, man))
+    # Another game version (1.4.3): its own extraction, no overlay (ours is built from 1.0.0's files), no 1.0.0 game-patch
+    # sets, shader seed or shader archive (all made from 1.0.0), version= for the launcher (its own save folder) and
+    # -v<digits> in the folder's name. 1.0.0: every line as before.
+    global ROMFS
+    version = man.get('game_version', '1.0.0')
+    vtag = 'v' + version.replace('.', '')
+    if version != '1.0.0':
+        ROMFS = os.path.join(WORK, 'extracted', vtag, 'romfs')
+        if a.overlay == OVERLAY:
+            a.overlay = os.path.join(ENG, 'overlay', f'empty-{vtag}')
+            os.makedirs(a.overlay, exist_ok=True)
+        a.no_patch_sets = True
+    overlay = os.path.abspath(a.overlay)
     # the key's own exe carries the runtime of the tree the key was built from; a newer runtime relinks against it
     exe = os.path.abspath(a.exe) if a.exe else os.path.join(key_dir(key), 'exe', 'totk.exe')
     commit = commit_of(exe, man, a.commit)
     dirty = dirty_of(exe)
+    if not os.path.isdir(ROMFS) and romfs_image(ROMFS):
+        # an extraction without the unpacked folder (the Builder's --no-unpack): romfs.bin serves every file; the folder
+        # stays the game's (empty) mount root, which romfs= names and the launcher checks
+        os.makedirs(ROMFS)
     for p, what in ((exe, 'exe'), (man['img'], 'NSO images'), (ROMFS, 'RomFS'), (overlay, 'romfs overlay')) + \
             (() if a.no_patch_sets else ((PATCH_SETS, 'game-patch sets (TOTK_PATCH_SETS; --no-patch-sets to ship without)'),)):
         if not os.path.exists(p):
             sys.exit(f'missing {what}: {p}')
-    name = f'TotK-PC-{datetime.datetime.now():%Y%m%d-%H%M}-{commit[:9]}' + ('-dirty' if dirty else '')
+    beta = bool(man.get('beta'))   # (a beta of another version: build.py TOTK_VERSION_BETA, features off by design)
+    name = f'TotK-PC-{datetime.datetime.now():%Y%m%d-%H%M}-{commit[:9]}' + ('-dirty' if dirty else '') +         ('' if version == '1.0.0' else f'-{vtag}') + ('-beta' if beta else '')
     dst = os.path.join(a.out, name)
     tmp = dst + '.tmp'
     if os.path.exists(tmp):
@@ -173,7 +208,7 @@ def main():
         if os.path.exists(os.path.join(tmp, junk)):
             os.remove(os.path.join(tmp, junk))
     shutil.copy2(exe, os.path.join(tmp, 'totk.exe'))
-    if os.path.exists(os.path.join(SEED, 'precompile.bin')):   # the launcher points TOTK_PRECOMPILE_SEED at it
+    if version == '1.0.0' and os.path.exists(os.path.join(SEED, 'precompile.bin')):   # the launcher points TOTK_PRECOMPILE_SEED at it
         shutil.copytree(SEED, os.path.join(tmp, 'cache-seed'))
     else:
         log(f'no shader seed at {SEED}: first sight of each shader will hitch')
@@ -184,6 +219,7 @@ def main():
     # runtime's speed fix); the 21:03 package missed it
     if man.get('patches') and os.path.exists(man['patches']):
         env.update(json.load(open(man['patches'], encoding='utf-8')).get('runtime_env') or {})
+    env.update(man.get('beta_runtime_env') or {})   # (a beta's features off: also compiled in, build.py)
     # the console's shared system fonts (only Korean / Chinese text needs them; the runtime falls back to English
     # without): the six <type>-<name>.bfttf the extraction made from the firmware, when it was given
     fonts = os.path.join(os.path.dirname(ROMFS), 'fonts')
@@ -193,12 +229,12 @@ def main():
         env['TOTK_ROMFS_PACK'] = romfs_image(ROMFS)
     if os.path.isfile(os.path.join(DLSS, 'nvngx_dlss.dll')):   # NVIDIA's DLSS DLLs, fetched by tools/engine/build.py
         env['TOTK_DLSS_DIR'] = DLSS
-    if archive_pack():   # (--env TOTK_PRECOMPILE_ARCHIVE=0 turns the warm-up off)
+    if version == '1.0.0' and archive_pack():   # (--env TOTK_PRECOMPILE_ARCHIVE=0 turns the warm-up off)
         env['TOTK_ARCHIVE_SHADERS'] = ARCHIVE
     env.update(kv.split('=', 1) for kv in a.env)
     lines = [f'img={man["img"]}', f'romfs={ROMFS}', f'overlay={overlay}', f'commit={commit}', f'key={key}',
              f'build={build_name(man)}', f'patches={man.get("patches") or "none"}', f'packaged={datetime.datetime.now().isoformat(timespec="seconds")}',
-             'settings=settings.ini'] + (['dirty=1'] if dirty else []) + cpu_line(man) + ([f'import={IMPORT}'] if os.path.isdir(IMPORT) else []) + [f'env.{k}={v}' for k, v in env.items()]
+             'settings=settings.ini'] + ([] if version == '1.0.0' else [f'version={version}']) + (['beta=1'] if beta else []) + (['dirty=1'] if dirty else []) + ([f'release={a.release}'] if a.release else []) + ([f'release_repo={a.release_repo}'] if a.release_repo else []) + cpu_line(man) + ([f'import={IMPORT}'] if os.path.isdir(IMPORT) else []) + [f'env.{k}={v}' for k, v in env.items()]
     open(os.path.join(tmp, 'player.txt'), 'w', encoding='utf-8', newline='\r\n').write('\n'.join(lines) + '\n')
     open(os.path.join(tmp, 'settings.ini'), 'w', encoding='utf-8', newline='\r\n').write(SETTINGS)
     guide_file = guide_name()

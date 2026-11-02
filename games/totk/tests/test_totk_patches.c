@@ -80,6 +80,13 @@ int main(void) {
     _putenv("TOTK_FOV=3");
     CHECK(totk_settings_from_env(&e) != NULL, "TOTK_FOV out of range refused");
     _putenv("TOTK_FOV=");
+    _putenv("TOTK_SHADOW_FIXED=on");
+    CHECK(totk_settings_from_env(&e) == NULL && e.shadow_fixed == 1.0f, "TOTK_SHADOW_FIXED=on");
+    _putenv("TOTK_SHADOW_FIXED=0");
+    CHECK(totk_settings_from_env(&e) == NULL && e.shadow_fixed == 0.0f, "TOTK_SHADOW_FIXED=0 is the game's own");
+    _putenv("TOTK_SHADOW_FIXED=2");
+    CHECK(totk_settings_from_env(&e) != NULL, "TOTK_SHADOW_FIXED=2 refused");
+    _putenv("TOTK_SHADOW_FIXED=");
 
     /* init: 1440p swapchain, starting at 1080p */
     s.max_w = 2560, s.max_h = 1440;
@@ -93,6 +100,7 @@ int main(void) {
     CHECK(f32_at(page, TOTK_DP_ASPECT) == 0.0f, "16:9 output keeps the game's aspect");
     CHECK(f32_at(page, TOTK_DP_RES_FLOOR) == 1.0f, "dynamic resolution floor 1 (fixed)");
     CHECK(f32_at(page, TOTK_DP_FOV_SCALE) == 0.0f, "field of view: the game's own");
+    CHECK(f32_at(page, TOTK_DP_SHADOW_FIXED) == 0.0f, "shadow map size: the game's own");
     CHECK(f32_at(page, TOTK_DP_MOUSE_SCALE) == 1.0f && f32_at(page, TOTK_DP_MOUSE_RATE) == TOTK_MOUSE_RATE_DEFAULT,
           "mouse multiplier 1, rate default");
     CHECK(f32_at(page, TOTK_DP_ACTOR_LOD) == 0.0f && u32_at(page, TOTK_DP_CAMERA) == 0, "actor LOD: the game's own; no camera yet");
@@ -242,9 +250,11 @@ int main(void) {
     totk_lod_set(0.0f);
     unsigned nrows;
     const TotkSettingRow *rows = totk_setting_rows(&nrows);
-    CHECK(nrows == 8 && rows[0].slot == TOTK_DP_RES_FLOOR && rows[0].def == 1.0 && rows[5].slot == TOTK_DP_TERRAIN_LOD &&
-          rows[6].slot == TOTK_DP_SIM_RADIUS && rows[7].slot == TOTK_DP_MOUSE_SCALE, "settings table");
+    CHECK(nrows == 9 && rows[0].slot == TOTK_DP_RES_FLOOR && rows[0].def == 1.0 && rows[6].slot == TOTK_DP_TERRAIN_LOD &&
+          rows[7].slot == TOTK_DP_SIM_RADIUS && rows[8].slot == TOTK_DP_MOUSE_SCALE, "settings table");
     CHECK(rows[2].slot == TOTK_DP_SHADOW_SCALE && rows[2].max == 2.0, "shadow resolution row capped at 2");
+    CHECK(rows[3].slot == TOTK_DP_SHADOW_FIXED && rows[3].def == 0.0 && rows[3].max == 1.0 && rows[3].step == 1.0,
+          "sun shadow map size row: the game's own by default, fixed = 1");
 
     /* realtime off: the shipping step from the present interval */
     TotkSettings off = s;

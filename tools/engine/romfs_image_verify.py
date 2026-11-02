@@ -4,7 +4,11 @@ compared byte for byte with the extracted folder, and the folder holds no file t
 <image>.verified.json (size, mtime), which boot.py and package.py require before they serve the image
 (TOTK_ROMFS_PACK). 8 threads (a first open of a loose file costs Defender's scan). Disk-heavy (2 x 17 GB): run it
 outside the measurement windows.
-Run: python tools/engine/romfs_image_verify.py [--image romfs.bin] [--index romfs-index.json] [--romfs DIR]"""
+--from-report: an extraction without a folder (pipeline --no-unpack, the Builder's: a player's install keeps no 17 GB
+copy): nothing to compare, so the record is written from the extraction's own proof instead: romfs-report.json passed
+(all six IVFC levels verified while romfs.bin was written, its sha256 the pinned version's), romfs.bin still that size,
+every indexed file inside it. Seconds; the runtime serves the image through its own index (test_romfs_image.py).
+Run: python tools/engine/romfs_image_verify.py [--image romfs.bin] [--index romfs-index.json] [--romfs DIR] [--from-report]"""
 import argparse
 import json
 import os
@@ -34,14 +38,51 @@ def romfs_image(romfs_dir):
         return None
 
 
+def write_record(a, files, nbytes, **extra):
+    st = os.stat(a.image)
+    json.dump(dict({'image': a.image, 'size': st.st_size, 'mtime_ns': st.st_mtime_ns, 'romfs': a.romfs, 'files': files,
+                    'bytes': nbytes, 'checked': time.strftime('%Y-%m-%d %H:%M:%S')}, **extra),
+              open(a.image + '.verified.json', 'w', encoding='utf-8'), indent=1)
+
+
+def from_report(a, files):
+    try:
+        rep = json.load(open(os.path.join(os.path.dirname(a.image), 'romfs-report.json'), encoding='utf-8'))
+        size = os.path.getsize(a.image)
+    except (OSError, ValueError) as e:
+        print(f'romfs_image_verify: FAIL (no extraction report or image: {e})')
+        return 1
+    bad = [m for m, ok in (
+        ('the extraction did not pass', rep.get('status') == 'pass'),
+        ('its sha256 was not checked against the pinned version', rep.get('expected_match')),
+        (f'romfs.bin is {size} bytes, the extraction wrote {rep.get("romfs_size")}', rep.get('romfs_size') == size),
+        (f'the index lists {len(files)} files, the extraction {rep.get("file_count")}', rep.get('file_count') == len(files)),
+        ('an indexed file lies outside romfs.bin', all(0 <= f['offset'] and f['offset'] + f['size'] <= size
+                                                        for f in files))) if not ok]
+    if os.path.isdir(a.romfs) and any(True for _ in os.scandir(a.romfs)):
+        bad.append(f'{a.romfs} holds files: compare them (run without --from-report)')
+    for m in bad:
+        print('  ' + m)
+    if bad:
+        print('romfs_image_verify: FAIL')
+        return 1
+    write_record(a, len(files), sum(f['size'] for f in files), proof='extraction report: IVFC levels 0-5, pinned '
+                 'sha256 ' + rep['romfs_sha256'][:16])
+    print(f'romfs_image_verify: pass from the extraction report ({len(files)} files; {a.image}.verified.json written)')
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--image', default=os.path.join(V100, 'romfs.bin'))
     ap.add_argument('--index', default=os.path.join(V100, 'romfs-index.json'))
     ap.add_argument('--romfs', default=os.path.join(V100, 'romfs'))
     ap.add_argument('--threads', type=int, default=8)
+    ap.add_argument('--from-report', action='store_true', help='no folder: record the image from the extraction report')
     a = ap.parse_args()
     files = json.load(open(a.index, encoding='utf-8'))['files']
+    if a.from_report:
+        return from_report(a, files)
     local = threading.local()
     bad, done, lock = [], [0, 0], threading.Lock()
 
@@ -89,10 +130,7 @@ def main():
         print('  ' + r)
     ok = not bad and not extra and done[0] == len(files)
     if ok:   # boot.py and package.py serve the image only with this record of it (same size and mtime)
-        st = os.stat(a.image)
-        json.dump({'image': a.image, 'size': st.st_size, 'mtime_ns': st.st_mtime_ns, 'romfs': a.romfs, 'files': done[0],
-                   'bytes': done[1], 'checked': time.strftime('%Y-%m-%d %H:%M:%S')},
-                  open(a.image + '.verified.json', 'w', encoding='utf-8'), indent=1)
+        write_record(a, done[0], done[1])
     print('romfs_image_verify: %s' % ('pass (%s.verified.json written)' % a.image if ok else 'FAIL'))
     return 0 if ok else 1
 

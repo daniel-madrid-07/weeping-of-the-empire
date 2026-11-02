@@ -59,6 +59,10 @@ void apply(void *arg, bool ran) {
                (unsigned long long)mgr, (unsigned long long)pouch);
         return;
     }
+    if (!totk_field_known(PouchMgr, 0x1e64)) {   // (totk_version.h: another version's diagnostic build)
+        printf("[ability] %s: PouchMgr's field has no place in this build, dropped\n", kAbilityName[n]);
+        return;
+    }
     if (!unlocked(n)) {
         printf("[ability] %s: not unlocked yet (CheckIsGet %#x), refused\n", kAbilityName[n], kUnlockFlag[n]);
         return;
@@ -73,7 +77,7 @@ void apply(void *arg, bool ran) {
     SetStructEnum(mgr, kAbilityHash[n], s, 0xe32721fdu);
     SetStructBool(mgr, true, s, 0x1a1a4e5fu);
     SetBool(mgr, false, 0x2f03cd3eu);
-    st8(pouch + 0x1e64, ld8(pouch + 0x1e64) | 4);
+    st8(pouch + totk_field(PouchMgr, 0x1e64), ld8(pouch + totk_field(PouchMgr, 0x1e64)) | 4);
     SetBool(mgr, false, 0x16fe5c99u);
     c->sp = sp;
     printf("[ability] selected %s (%d)\n", kAbilityName[n], n);

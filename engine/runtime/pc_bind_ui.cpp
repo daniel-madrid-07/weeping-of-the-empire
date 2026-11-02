@@ -2,8 +2,11 @@
 // in the file's order, its page a section; PC_PAGE_FIXED lines are not shown. A row shows the keys pc_bind_get gives
 // at the entry's scope; "Change" captures the next key, wheel notch or mouse button for slot 0 (the prompt's key),
 // "Add" for the next free slot, "Default" drops the scope's override (pc_bind_reset). A write that swaps another
-// action's key, or that pc_bind_set refuses, says so on the row for a few seconds. "Restore defaults" resets every scope
-// the entries use. Present thread only (ImGui), like the rest of the window.
+// action's key, or that pc_bind_set refuses, says so on the row for a few seconds; the row whose key a swap changed
+// keeps a mark until the window closes, and a key the settings gave an action that another one of the same context
+// already has (a hand-edited settings.ini: pc_bind_refused) shows in red on its row (GAPS-zelda-on-pc 3: conflicts
+// highlighted). "Restore defaults" resets every scope the entries use. Present thread only (ImGui), like the rest of
+// the window.
 #include "pc_bind_ui.h"
 
 #include "pc_input.h"
@@ -77,6 +80,8 @@ int g_note = -1;     // the entry showing a note (a refusal, the swaps), until g
 bool g_note_err = false;
 double g_note_until = 0;
 std::string g_note_text;
+// The actions a swap gave another key since the window opened: (action, the action whose bind took its key)
+std::vector<std::pair<std::string, std::string>> g_swapped;
 
 void note(int i, bool err, std::string text) {
     g_note = i;
@@ -102,6 +107,9 @@ void bind(int i, int slot, int input) {
     for (int k = 1; k < n && k < 8; k++) {
         swapped += swapped.empty() ? pc_tr("Swapped with ") : ", ";
         swapped += label_of(ch[k].scope, ch[k].action);
+        bool have = false;
+        for (auto &w : g_swapped) have |= w.first == ch[k].action;
+        if (!have) g_swapped.push_back({ch[k].action, e.action});
     }
     if (!swapped.empty()) note(i, false, swapped);
 }
@@ -115,6 +123,12 @@ void poll() {
     g_cap = -1;
     if (r > 0) bind(i, g_cap_slot, r);  // (r < 0: Esc or the focus went: nothing changes)
     else printf("[pc-keys] %s: capture cancelled\n", kEntries[i].action);
+}
+
+const char *swapped_by(const char *action) {
+    for (auto &w : g_swapped)
+        if (w.first == action) return w.second.c_str();
+    return nullptr;
 }
 
 void row(int i) {
@@ -163,8 +177,22 @@ void row(int i) {
     if (g_note == i && ImGui::GetTime() < g_note_until) {
         if (g_note_err) ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f), "%s", g_note_text.c_str());
         else ImGui::TextDisabled("%s", g_note_text.c_str());
+    } else if (const char *by = swapped_by(e.action)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.3f, 1.0f), "%s %s", pc_tr("Key moved by"), label_of(e.scope, by));
     } else if (flags & PCB_F_OVERRIDDEN) {
-        ImGui::TextDisabled("changed");
+        ImGui::TextDisabled("%s", pc_tr("changed"));
+    }
+    int refused[4];
+    const char *holder[4];
+    const int nr = pc_bind_refused(e.action, refused, holder, 4);
+    for (int k = 0; k < nr; k++) {   // (a settings.ini key the build refused: the other action has it)
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f), "%s: %s %s", input_name(refused[k]).c_str(),
+                           pc_tr("in use by"), label_of(e.scope, holder[k]));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", pc_tr("settings.ini gives this key to both; it works for the other one. Change one of them."));
     }
     ImGui::PopID();
 }
@@ -194,6 +222,7 @@ bool pc_bind_keys_available() {
 }
 
 void pc_bind_keys_closed() {
+    g_swapped.clear();
     if (g_cap < 0) return;
     g_cap = -1;
     pc_input_capture_cancel();
@@ -225,6 +254,7 @@ void pc_bind_keys_tab() {
     ImGui::Spacing();
     ImGui::BeginDisabled(g_cap >= 0);
     if (ImGui::Button(pc_tr("Restore defaults"))) {  // every scope the entries use, once
+        g_swapped.clear();
         std::vector<int> done;
         for (const PcPageEntry &e : kEntries) {
             bool seen = false;

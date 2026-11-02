@@ -114,6 +114,22 @@ PC_ES("Minimum movement key press",
       "Pulsación mínima de movimiento (teclado)")
 PC_ES("Milliseconds a quick tap of a movement key (WASD) keeps Link moving, so he takes a step instead of sliding with his legs still. 0 = off (a tap as short as the key press).",
       "Milisegundos que un toque rápido de una tecla de movimiento (WASD) mantiene a Link en marcha, para que dé un paso en vez de deslizarse con las piernas quietas. 0 = desactivado (el toque dura lo que la pulsación).")
+PC_ES("Sprint toggle",
+      "Correr con un toque")
+PC_ES("A press of the sprint key starts sprinting and the next one stops it; it also stops when Link stops moving or a menu opens. Off: hold it, as on the Switch.",
+      "Una pulsación de la tecla de correr empieza a correr y la siguiente lo para; también para cuando Link deja de moverse o se abre un menú. Desactivado: se mantiene pulsada, como en la Switch.")
+PC_ES("Shield and target toggle",
+      "Escudo y fijar con un toque")
+PC_ES("A press of the shield / target key raises the shield and targets, the next press lowers it; a menu lets it go too. Off: hold it, as on the Switch.",
+      "Una pulsación de la tecla de escudo / fijar sube el escudo y fija el objetivo, la siguiente lo baja; abrir un menú también lo suelta. Desactivado: se mantiene pulsada, como en la Switch.")
+PC_ES("Key moved by",
+      "Tecla cambiada por")
+PC_ES("changed",
+      "cambiada")
+PC_ES("in use by",
+      "la usa")
+PC_ES("settings.ini gives this key to both; it works for the other one. Change one of them.",
+      "settings.ini da esta tecla a las dos; funciona para la otra. Cambia una de ellas.")
 PC_ES("Aiming sensitivity (bow)",
       "Sensibilidad al apuntar (arco)")
 PC_ES("With the bow drawn: the mouse's turn times this (1 = as when not aiming), with or without the mouse as motion aim. A pad's motion sensitivity is separate.",
@@ -738,12 +754,44 @@ PC_ES("Fps, 1% low and the frame-time graph.",
       "FPS, 1% mínimo y la gráfica de tiempo de fotograma.")
 PC_ES("Fps readout (F3)",
       "Contador de FPS (F3)")
-PC_ES("TOTK_FPS_OVERLAY. F3 toggles it in game.",
-      "TOTK_FPS_OVERLAY. F3 lo activa o desactiva durante el juego.")
-PC_ES("In fullscreen (default)",
-      "En pantalla completa (por defecto)")
-PC_ES("Never",
-      "Nunca")
+PC_ES("TOTK_FPS_OVERLAY. F3 shows or hides it in game.",
+      "TOTK_FPS_OVERLAY. F3 lo muestra u oculta durante el juego.")
+PC_ES("Off (default; F3 shows it)",
+      "Desactivado (por defecto; F3 lo muestra)")
+PC_ES("Minimal: fps",
+      "Mínimo: FPS")
+PC_ES("Detailed: fps, frame time, 1% low, worst",
+      "Detallado: FPS, tiempo de fotograma, 1% mínimo, peor")
+PC_ES("Fps readout corner",
+      "Esquina del contador de FPS")
+PC_ES("Top right keeps clear of the hearts and the map.",
+      "Arriba a la derecha no tapa los corazones ni el mapa.")
+PC_ES("Top right (default)",
+      "Arriba a la derecha (por defecto)")
+PC_ES("Top left",
+      "Arriba a la izquierda")
+PC_ES("Bottom right",
+      "Abajo a la derecha")
+PC_ES("Bottom left",
+      "Abajo a la izquierda")
+PC_ES("Fps readout size",
+      "Tamaño del contador de FPS")
+PC_ES("Follows the window height (1080p to 4K).",
+      "Sigue la altura de la ventana (de 1080p a 4K).")
+PC_ES("Small (default)",
+      "Pequeño (por defecto)")
+PC_ES("Medium size",
+      "Tamaño medio")
+PC_ES("Large size",
+      "Tamaño grande")
+PC_ES("fps",
+      "FPS")
+PC_ES("frame",
+      "fotograma")
+PC_ES("1%% low",
+      "1%% mín.")
+PC_ES("worst",
+      "peor")
 PC_ES("Render resolution",
       "Resolución de render")
 PC_ES("TOTK_RES_SCALE, of the game's 1600 x 900.",
@@ -814,6 +862,26 @@ PC_ES("1x (Switch)",
       "1x (Switch)")
 PC_ES("2x (default)",
       "2x (por defecto)")
+PC_ES("Soft shadows",
+      "Sombras suaves")
+PC_ES("TOTK_SOFT_SHADOWS: the sun's shadow edges widen with the distance to what casts them (contact-hardening, PCSS) instead of keeping one width. Off is the game's look; the first start with it on compiles the shadowed shaders again.",
+      "TOTK_SOFT_SHADOWS: los bordes de las sombras del sol se ensanchan con la distancia a lo que las proyecta (endurecimiento por contacto, PCSS) en vez de mantener un ancho fijo. Desactivado es el aspecto del juego; el primer inicio con ello activado vuelve a compilar los shaders con sombras.")
+PC_ES("Off (the game's)",
+      "Desactivado (el del juego)")
+PC_ES("Soft",
+      "Suaves")
+PC_ES("Softer",
+      "Más suaves")
+PC_ES("Softest",
+      "Lo más suaves")
+PC_ES("Contact shadows",
+      "Sombras de contacto")
+PC_ES("TOTK_CONTACT_SHADOWS: small sun shadows at feet, under stones and in grass, which the shadow maps are too coarse for (a short march toward the sun through the scene's depth, up to 80 m). Off is the game's look; costs some GPU.",
+      "TOTK_CONTACT_SHADOWS: pequeñas sombras del sol a los pies, bajo las piedras y en la hierba, demasiado finas para los mapas de sombras (un trazado corto hacia el sol por la profundidad de la escena, hasta 80 m). Desactivado es el aspecto del juego; cuesta algo de GPU.")
+PC_ES("Subtle",
+      "Sutiles")
+PC_ES("Strong",
+      "Fuertes")
 PC_ES("Volume",
       "Volumen")
 PC_ES("TOTK_VOLUME, master gain.",
@@ -926,6 +994,12 @@ PC_ES("Crash reports",
       "Informes de errores")
 PC_ES("TOTK_PC_CRASH: a report and a minidump per crash.",
       "TOTK_PC_CRASH: un informe y un minidump por cada cierre inesperado.")
+PC_ES("Automatic updates",
+      "Actualizaciones automáticas")
+PC_ES("Checks GitHub for a newer version when the game starts (at most once a day); asks first if the update rebuilds "
+      "the game.",
+      "Al iniciar el juego (como mucho una vez al día), busca en GitHub una versión más reciente; pregunta antes si la "
+      "actualización tiene que reconstruir el juego.")
 PC_ES("Key bindings (Custom layout)",
       "Asignación de teclas (esquema personalizado)")
 PC_ES("A",
@@ -1116,6 +1190,14 @@ PC_ES("Shadow resolution",
       "Resolución de sombras")
 PC_ES("Multiplier of the shadow map's width and height (2 = sharper, 4x the memory).",
       "Multiplicador del ancho y el alto del mapa de sombras (2 = más nítidas, 4x la memoria).")
+PC_ES("Sun shadow map size",
+      "Tamaño del mapa de sombras del sol")
+PC_ES("The game's: the sun's shadow map shrinks and grows with the area its cascades cover, so near the ground foliage shadows turn coarse, and every size change moves the shadow texels (leaf shadows jump instead of sliding). Fixed: always the largest size the game picks (times the shadow resolution), steady and sharper; costs some GPU.",
+      "El del juego: el mapa de sombras del sol se encoge y crece con la zona que cubren sus cascadas, así que cerca del suelo las sombras de la vegetación se vuelven toscas, y cada cambio de tamaño mueve los texels de sombra (las sombras de las hojas saltan en vez de deslizarse). Fijo: siempre el tamaño más grande que elige el juego (por la resolución de sombras), estable y más nítido; cuesta algo de GPU.")
+PC_ES("Fixed (steady)",
+      "Fijo (estable)")
+PC_ES("The game's (changes)",
+      "El del juego (cambia)")
 PC_ES("Detail distance",
       "Distancia de detalle")
 PC_ES("Multiplier of the distance at which models switch to lower detail (2 = full detail twice as far).",
@@ -1162,3 +1244,76 @@ PC_ES("Fast-travel speed",
       "Velocidad del viaje rápido")
 PC_ES("Fast: Link's departure when travelling is about 2.5 s shorter (its long waits halved, his dissolve as on the Switch); Normal is the game's own. Needs the game patches' RomFS sets (TOTK_PATCH_SETS).",
       "Rápida: la partida de Link al viajar dura unos 2,5 s menos (sus esperas largas, a la mitad; su desvanecimiento, como en Switch); Normal es la del propio juego. Requiere los conjuntos RomFS de los parches del juego (TOTK_PATCH_SETS).")
+PC_ES("Mods",
+      "Mods")
+PC_ES("This folder has no romfs, exefs or cheats files.",
+      "Esta carpeta no tiene archivos de romfs, exefs ni cheats.")
+PC_ES("The folder name contains |, which the mod list uses between names. Rename the folder.",
+      "El nombre de la carpeta lleva |, que la lista de mods usa para separar nombres. Cámbiale el nombre.")
+PC_ES("It is made for another game (title %s).",
+      "Está hecho para otro juego (título %s).")
+PC_ES("An earlier mods folder has a mod with this name; this one is left out.",
+      "Otra carpeta de mods anterior tiene un mod con este nombre; este se queda fuera.")
+PC_ES("It has code modules (subsdk or main), which the port cannot load, so the whole mod stays off.",
+      "Tiene módulos de código (subsdk o main), que el port no puede cargar, así que el mod entero se queda desactivado.")
+PC_ES("It only has code patches (exefs) or cheats, which this version cannot use yet.",
+      "Solo tiene parches de código (exefs) o trucos, que esta versión aún no puede usar.")
+PC_ES("Mods load at the next start. The top mod wins a file two mods change; the port's own files (PC button prompts, fixes) stay over a mod's.",
+      "Los mods se cargan al volver a empezar. Si dos mods cambian el mismo archivo, gana el de arriba; los archivos propios del port (botones de PC, arreglos) quedan por encima de los de un mod.")
+PC_ES("The launcher chose these mods.",
+      "El lanzador ha elegido estos mods.")
+PC_ES("Open mods folder",
+      "Abrir la carpeta de mods")
+PC_ES("No mods yet. Put each mod in a folder of its own in the mods folder (its romfs, exefs and cheats folders as emulators take them), then start the game again.",
+      "Aún no hay mods. Pon cada mod en su propia carpeta dentro de la carpeta de mods (con sus carpetas romfs, exefs y cheats, como en los emuladores) y vuelve a empezar el juego.")
+PC_ES("Ctrl+Up / Ctrl+Down (pad: Y / X) move the mod in focus.",
+      "Ctrl+Arriba / Ctrl+Abajo (mando: Y / X) mueven el mod seleccionado.")
+PC_ES("%d files replaced, %d added",
+      "%d archivos reemplazados, %d añadidos")
+PC_ES("; %d left to the port's own files",
+      "; %d cedidos a los archivos del port")
+PC_ES("; %d left to %s, higher in the list",
+      "; %d cedidos a %s, más arriba en la lista")
+PC_ES("; %d for another game version, not used",
+      "; %d de otra versión del juego, sin usar")
+// mods_exefs.cpp / pc_cheats_ui.cpp: the mods' ExeFS patches and cheats (mods-exefs)
+PC_ES("%d ExeFS patches in use",
+      "%d parches ExeFS en uso")
+PC_ES("%d code patches need the game built on this PC (Builder install), not used",
+      "%d parches de código necesitan el juego compilado en este PC (instalación con Builder); sin usar")
+PC_ES("the build with its code patches failed (see exefs/%s/build.log next to totk.exe), not used",
+      "la compilación con sus parches de código ha fallado (mira exefs/%s/build.log junto a totk.exe); sin usar")
+PC_ES("%d code patches: the game is rebuilt with them at this start",
+      "%d parches de código: el juego se vuelve a compilar con ellos en este inicio")
+PC_ES("%d ExeFS patches for another game version, not used",
+      "%d parches ExeFS de otra versión del juego, sin usar")
+PC_ES("left out: %s",
+      "descartado: %s")
+PC_ES("%d cheats (F10 Cheats tab)",
+      "%d trucos (pestaña Trucos de F10)")
+PC_ES("no cheat file for this game version (%s.txt)",
+      "no hay archivo de trucos para esta versión del juego (%s.txt)")
+PC_ES("It cannot be read (%s).",
+      "No se puede leer (%s).")
+PC_ES("It changes the game's code: the game is rebuilt with it at the next start.",
+      "Cambia el código del juego: el juego se vuelve a compilar con él en el próximo inicio.")
+PC_ES("It writes the NSO header.",
+      "Escribe en la cabecera NSO.")
+PC_ES("It writes past main's image (bss).",
+      "Escribe más allá de la imagen de main (bss).")
+PC_ES("It changes code the port already patches (%s).",
+      "Cambia código que el port ya parchea (%s).")
+PC_ES("It overlaps %s, higher in the list.",
+      "Se solapa con %s, más arriba en la lista.")
+PC_ES("It is cut short at word %s.",
+      "Está cortado en la palabra %s.")
+PC_ES("It has an opcode the cheat engine does not know (%s).",
+      "Tiene un código de operación que el motor de trucos no conoce (%s).")
+PC_ES("It uses the alias or ASLR memory region, which the port does not have.",
+      "Usa la región de memoria alias o ASLR, que el port no tiene.")
+PC_ES("It changes the game's code only under a condition (a button, a value), which the port cannot do yet.",
+      "Cambia el código del juego solo bajo una condición (un botón, un valor), algo que el port aún no puede hacer.")
+PC_ES("Cheats",
+      "Trucos")
+PC_ES("Cheats from your mods' cheats folders (Atmosphere format). A cheat that changes values works at once; one that changes the game's code applies when the game starts again. Cheats can break a save: keep a copy.",
+      "Trucos de las carpetas cheats de tus mods (formato Atmosphere). Un truco que cambia valores funciona al momento; uno que cambia el código del juego se aplica al volver a empezar el juego. Los trucos pueden estropear una partida: guarda una copia.")

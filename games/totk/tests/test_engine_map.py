@@ -1,5 +1,6 @@
 """games/totk/patches/engine_map.py's hook policy: every GEN_MAIN hook is classified exactly once, a required drop
-fails, a frame-time drop forces 30 fps, a memo's group goes all or none.
+fails, a frame-time drop forces 30 fps, a memo's group goes all or none; the struct field table
+(totk_fields_v<N>.inc) defines only what its map places.
 
     python -m games.totk.tests.test_engine_map
 """
@@ -33,6 +34,32 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual([g for g in group if g in kept], [])
         self.assertEqual(status, 'pass')
         self.assertIn('its group', why[hex(0xb6afc8)])
+
+
+class BetaTest(unittest.TestCase):
+    def test_beta_groups_cover_known_required_hooks_and_have_env(self):
+        # a beta may drop only required hooks with a feature group; every group says how its feature is turned off
+        self.assertTrue(set(em.BETA_GROUPS) <= set(em.HOOK_FAIL))
+        self.assertTrue(set(em.BETA_GROUPS.values()) <= set(em.BETA_ENV))
+        for g, env in em.BETA_ENV.items():
+            self.assertTrue(env, g)
+
+
+class FieldTest(unittest.TestCase):
+    def test_pattern(self):
+        src = 'ld64(a + totk_field(Actor, 0x220)); if (totk_field_known( Player ,0x10d8 )) x = 1; totk_field(B, 0X1F);'
+        self.assertEqual([m.groups() for m in em.FIELD.finditer(src)], [('Actor', '0x220'), ('Player', '0x10d8')])
+
+    def test_fields_inc(self):
+        fields = [('Actor', '0x220'), ('Player', '0x10d8')]
+        text, unplaced = em.fields_inc(fields, {'Actor': {'0x220': '0x228'}}, '1.4.2')
+        self.assertIn('#define TF_Actor_0x220 0x228\n', text)
+        self.assertNotIn('TF_Player', text)                 # unplaced: undefined, the build stops at its use
+        self.assertEqual(unplaced, [('Player', '0x10d8')])
+        text, unplaced = em.fields_inc(fields, {'Actor': {'0x220': '0x228'}}, '1.4.2', diagnostic=True)
+        self.assertIn('#define TF_Player_0x10d8 0x7ffffff0u\n', text)
+        self.assertIn('#define TF_Actor_0x220 0x228\n', text)
+        self.assertEqual(unplaced, [('Player', '0x10d8')])
 
 
 class SafeModeTest(unittest.TestCase):

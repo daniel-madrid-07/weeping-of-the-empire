@@ -14,6 +14,9 @@ uint8_t *spvz_pack(const uint32_t *spv, size_t bytes, size_t *out_bytes);
 // A compressed entry file[n] -> its SPIR-V words (malloc'd, *bytes); NULL when it is not a well-formed entry or there is
 // no codec. Any thread.
 uint32_t *spvz_unpack(const uint8_t *file, size_t n, size_t *bytes);
+// The same for an entry whose payload is not SPIR-V: its first word must be first (the translator cache's 'TKG2' entries,
+// exec.c tc_load; spvz_unpack is this with the SPIR-V magic, which every other payload failed: 11-02, 0 hits).
+uint32_t *spvz_unpack_as(const uint8_t *file, size_t n, size_t *bytes, uint32_t first);
 // The raw entries (<hash>.spv) an older build left in dir (cache/spirv) compressed to <hash>.spz and removed, once
 // (dir/compact2.done after a whole pass; compact.done was db866e6d's, before the.spz name), a file at a time with a 5 ms
 // pause, in Windows' background mode (low I/O priority): for an idle thread (exec.c, the precompile's last worker). One

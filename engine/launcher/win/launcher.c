@@ -1,4 +1,4 @@
-/* "Zelda TotK (PC)" launcher for the engine (totk-recomp, engine/). Upstream's launcher/launcher.cpp is a Steam Deck setup app
+/* The "Tears of the Kingdom" launcher for the engine (totk-recomp, engine/). Upstream's launcher/launcher.cpp is a Steam Deck setup app
  * (fork/exec, popen, /proc, SDL3 + ImGui); this one is plain Win32, and settings live in the game's own F10 menu, not here.
  *
  * Packages: next to the launcher, packages\<name>\ (one installed build each) with current.txt (the newest) and
@@ -15,7 +15,7 @@
  *     TOTK_USERDATA = %APPDATA%\nxrecomp\TotK-engine\userdata    (save\ inside; the settings file sits next to it)
  *     TOTK_IMG, TOTK_ROMFS, TOTK_OVERLAY from player.txt;  TOTK_PRIORITY=normal (the game lowers itself to idle else)
  *     TOTK_CRASH_DIR = %LOCALAPPDATA%\nxrecomp\TotK-engine\crashes
- *     TOTK_USER_MODS = the RomFS mods in %APPDATA%\nxrecomp\TotK-engine\mods (mods_env)
+ *     TOTK_MODS_DIR = <launcher folder>\mods, then %APPDATA%\nxrecomp\TotK-engine\mods (mods_env)
  * and runs in %LOCALAPPDATA%\nxrecomp\TotK-engine\run with stdout/stderr in ...\logs\totk-<time>.log (newest 8 kept).
  * After a failed exit it points at the crash report the game wrote, or at its log.
  *
@@ -48,11 +48,15 @@
 #include <wchar.h>
 #include <cpuid.h>
 
+#include <time.h>
+#include <wctype.h>
+
 #include "saves.h"
+#include "autoupdate.h"
 
 enum { EARLY_MS = 20000, LOG_MAX = 256 * 1024, KEEP_AUTO_BACKUPS = 10, KEEP_GAME_LOGS = 8, MAX_CANDIDATES = 16 };
 static DWORD g_early_ms = EARLY_MS;   /* (test_launcher.c shortens it) */
-static const wchar_t TITLE[] = L"Zelda TotK (PC)";
+static const wchar_t TITLE[] = L"Tears of the Kingdom";   /* (its message boxes: the game window's title)*/
 
 static wchar_t g_dir[MAX_PATH];    /* the launcher's folder */
 static wchar_t g_exe[MAX_PATH];    /* the launcher's own file name ("TotK Launcher.exe") */
@@ -78,6 +82,17 @@ static void message(UINT icon, const wchar_t *fmt, ...) {
     MessageBoxW(NULL, text, TITLE, MB_OK | MB_SETFOREGROUND | icon);
 }
 static int exists(const wchar_t *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
+/* a folder holding anything besides . and .. */
+static int dir_has_files(const wchar_t *dir) {
+    wchar_t pat[MAX_PATH]; swprintf(pat, MAX_PATH, L"%ls\\*", dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int any = 0;
+    do any = wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L".."); while (!any && FindNextFileW(h, &fd));
+    FindClose(h);
+    return any;
+}
 static void mkdirs(const wchar_t *path) {
     wchar_t p[MAX_PATH]; swprintf(p, MAX_PATH, L"%ls", path);
     for (wchar_t *q = p; *q; q++)
@@ -665,6 +680,349 @@ static int offer_newer_release(void) {
     return 0;
 }
 
+/* ---------------------------------------------------------------- automatic updates*/
+
+/* At start, at most once a day (NXR_UPDATE_FORCE=1: every start): the latest release on GitHub (autoupdate.c). A newer one
+ * than this build's player.txt release= is taken by downloading its Setup, checking it against GitHub's own sha256 digest of
+ * the asset (an immutable release only), and running it headless on the same install folder; then the new build's launcher
+ * starts and this one exits. An update that recompiles the whole game (update.json, autoupdate.h) asks first: now / next time
+ * / skip this version. F10's "Automatic updates" (settings.ini launcher.auto_update = 0) turns the check off. Anything that
+ * goes wrong is one log line and the installed build starts: [update]
+ * result=<ok|current|off|throttled|norelease|offline|timeout|ratelimit|notfound|http|badjson|draft|mutable|
+ * nosetup|nodigest|badsha|short|skipped|declined|cancelled|setup_failed|nolauncher> tag=<tag> ms=<ms> Tests:
+ * NXR_UPDATE_API=<base url> (http only for 127.0.0.1 / localhost) instead of https://api.github.com; NXR_UPDATE_NOUI=1 no
+ * progress window. NXR_UPDATE_DISABLE=1: no check at all.*/
+
+enum { UPD_API_MS = 4000, UPD_DL_MS = 30000, UPD_DAY_S = 20 * 3600 };
+static const wchar_t UPD_DEFAULT_REPO[] = L"daniel-madrid-07/weeping-of-the-empire";
+static const wchar_t UPD_SETUP_KEY[] = L"Software\\Weeping of the Empire";   /* (Setup's choices: InstallDir) */
+
+static void upd_result(const char *result, const char *tag, DWORD t0, const wchar_t *detail) {
+    say(L"[update] result=%hs tag=%hs ms=%lu%ls%ls", result, tag && tag[0] ? tag : "-", GetTickCount() - t0,
+        detail && detail[0] ? L" " : L"", detail ? detail : L"");
+}
+
+/* settings.ini's launcher.auto_update: 0 = off (F10 "Automatic updates"); absent = on */
+static int upd_enabled(void) {
+    wchar_t p[MAX_PATH], line[512];
+    swprintf(p, MAX_PATH, L"%ls\\settings.ini", g_base);
+    FILE *f = _wfopen(p, L"r, ccs=UTF-8");
+    if (!f) return 1;
+    int on = 1;
+    while (fgetws(line, 512, f)) {
+        wchar_t *h = wcschr(line, L'#'); if (h) *h = 0;
+        wchar_t *eq = wcschr(line, L'=');
+        if (!eq) continue;
+        *eq = 0;
+        wchar_t *k = line; while (iswspace(*k)) k++;
+        size_t kl = wcslen(k); while (kl && iswspace(k[kl - 1])) k[--kl] = 0;
+        if (wcscmp(k, L"launcher.auto_update")) continue;
+        wchar_t *v = eq + 1; while (iswspace(*v)) v++;
+        on = !(v[0] == L'0' || !_wcsnicmp(v, L"off", 3) || !_wcsnicmp(v, L"false", 5));
+    }
+    fclose(f);
+    return on;
+}
+
+/* once a day: <local>\update-check.txt holds the last check's time (seconds since 1970) */
+static int upd_due(void) {
+    wchar_t p[MAX_PATH]; swprintf(p, MAX_PATH, L"%ls\\update-check.txt", g_local);
+    FILE *f = _wfopen(p, L"r");
+    long long last = 0;
+    if (f) { if (fscanf(f, "%lld", &last) != 1) last = 0; fclose(f); }
+    return _time64(NULL) - last >= UPD_DAY_S;
+}
+static void upd_checked(void) {
+    wchar_t p[MAX_PATH]; swprintf(p, MAX_PATH, L"%ls\\update-check.txt", g_local);
+    FILE *f = _wfopen(p, L"w");
+    if (f) { fprintf(f, "%lld\n", (long long)_time64(NULL)); fclose(f); }
+}
+
+static int upd_skipped(const char *tag) {
+    wchar_t p[MAX_PATH]; char s[64] = "";
+    swprintf(p, MAX_PATH, L"%ls\\update-skip.txt", g_base);
+    FILE *f = _wfopen(p, L"r");
+    if (f) { if (fgets(s, sizeof s, f)) s[strcspn(s, "\r\n")] = 0; fclose(f); }
+    return s[0] && !au_version_cmp(s, tag);
+}
+static void upd_skip(const char *tag) {
+    wchar_t p[MAX_PATH]; swprintf(p, MAX_PATH, L"%ls\\update-skip.txt", g_base);
+    FILE *f = _wfopen(p, L"w");
+    if (f) { fprintf(f, "%s\n", tag); fclose(f); }
+}
+
+/* the install folder Setup put this build in: its remembered InstallDir when this launcher's folder is inside its game\,
+ * else this folder's grandparent (<install>\game\TotK-PC-...) */
+static void upd_install_root(wchar_t *out, size_t n) {
+    wchar_t dir[MAX_PATH] = L""; DWORD sz = sizeof dir;
+    swprintf(out, n, L"%ls", g_dir);
+    for (int i = 0; i < 2; i++) { wchar_t *s = wcsrchr(out, L'\\'); if (s) *s = 0; }
+    if (RegGetValueW(HKEY_CURRENT_USER, UPD_SETUP_KEY, L"InstallDir", RRF_RT_REG_SZ, NULL, dir, &sz) == ERROR_SUCCESS && dir[0]) {
+        wchar_t game[MAX_PATH]; swprintf(game, MAX_PATH, L"%ls\\game", dir);
+        if (exists(game)) swprintf(out, n, L"%ls", dir);
+    }
+}
+
+/* the dialog for an update that recompiles the whole game */
+enum { UPD_NOW = 1101, UPD_LATER, UPD_SKIP };
+static int upd_ask(const char *tag) {
+    wchar_t main[128], content[1024], now[256];
+    swprintf(main, 128, ES_EN(L"Hay una versión nueva: %hs", L"A new version is out: %hs"), tag);
+    swprintf(content, 1024, ES_EN(L"Esta actualización vuelve a compilar el juego en tu PC: tarda de 15 a 45 minutos, y mientras tanto "
+                                  L"no se puede jugar. Tu partida y tus ajustes se conservan.",
+                                  L"This update compiles the game again on your PC: it takes 15 to 45 minutes, and you can't play "
+                                  L"meanwhile. Your save and your settings are kept."));
+    swprintf(now, 256, ES_EN(L"Actualizar ahora\nEl juego se abre solo al terminar.", L"Update now\nThe game opens by itself when it's done."));
+    const TASKDIALOG_BUTTON b[] = {{UPD_NOW, now},
+                                   {UPD_LATER, ES_EN(L"La próxima vez\nJuego con la versión instalada.", L"Next time\nPlay the installed version.")},
+                                   {UPD_SKIP, ES_EN(L"Saltar esta versión\nNo volveré a preguntar por ella.",
+                                                    L"Skip this version\nI won't ask about it again.")}};
+    return task(main, content, b, 3, NULL, 0, NULL, 0, TD_INFORMATION_ICON);
+}
+static int (*g_upd_ask)(const char *tag) = upd_ask;   /* (test_launcher.c answers instead) */
+
+/* The download and the Setup run, on a worker thread while the progress window shows */
+typedef struct Upd {
+    wchar_t setup_url[512], setup_path[MAX_PATH], root[MAX_PATH], log[MAX_PATH];
+    char tag[48], sha256[65];
+    volatile LONG pct, cancel, done;   /* done: 1 when the worker ended */
+    volatile LONG result;              /* 0 ok, else an index into upd_codes */
+    wchar_t status[256], detail[512];
+    HANDLE setup;
+    CRITICAL_SECTION cs;
+} Upd;
+enum { U_OK, U_SHORT, U_BADSHA, U_CANCELLED, U_SETUP_FAILED };
+static const char *const upd_codes[] = {"ok", "short", "badsha", "cancelled", "setup_failed"};
+
+static void upd_status(Upd *u, const wchar_t *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    EnterCriticalSection(&u->cs);
+    vswprintf(u->status, 256, fmt, ap);
+    LeaveCriticalSection(&u->cs);
+    va_end(ap);
+}
+
+static int upd_progress(long long done, long long total, void *ctx) {
+    Upd *u = ctx;
+    if (total > 0) InterlockedExchange(&u->pct, (LONG)(done * 40 / total));   /* (the download: the first 40 %) */
+    upd_status(u, ES_EN(L"Descargando el instalador: %lld de %lld MB", L"Downloading the installer: %lld of %lld MB"),
+               done >> 20, total > 0 ? total >> 20 : 0);
+    return u->cancel != 0;
+}
+
+/* Setup's log: its 'step N/M name' and 'NN% (' lines move the window (the last 60 %) */
+static void upd_follow_log(Upd *u, long long *pos) {
+    FILE *f = _wfopen(u->log, L"rb");
+    if (!f) return;
+    _fseeki64(f, *pos, SEEK_SET);
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        if (!strchr(line, '\n')) break;   /* (a line still being written: read it next time) */
+        *pos = _ftelli64(f);
+        int i, n; char name[32];
+        const char *s = strstr(line, "step ");
+        if (s && sscanf(s, "step %d/%d %31[a-z]", &i, &n, name) == 3 && n > 0) {
+            InterlockedExchange(&u->pct, 40 + 60 * i / (n + 1));
+            wchar_t w[32]; MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 32);
+            upd_status(u, ES_EN(L"Instalando: paso %d de %d (%ls)", L"Installing: step %d of %d (%ls)"), i, n, w);
+        }
+    }
+    fclose(f);
+}
+
+static DWORD WINAPI upd_worker(void *arg) {
+    Upd *u = arg;
+    wchar_t err[256] = L"";
+    int st = au_http_download(u->setup_url, u->setup_path, UPD_DL_MS, upd_progress, u, err, 256);
+    if (st != 200) {
+        u->result = st == -1 ? U_CANCELLED : U_SHORT;
+        swprintf(u->detail, 512, L"%ls", err);
+        InterlockedExchange(&u->done, 1);
+        return 0;
+    }
+    char hex[65] = "";
+    /* locked from the hash until Setup has started: the folder is the player's, nothing may swap the file between */
+    HANDLE lock = au_lock_file(u->setup_path);
+    if (!au_sha256_handle(lock, hex) || _stricmp(hex, u->sha256)) {
+        if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
+        DeleteFileW(u->setup_path);
+        u->result = U_BADSHA;
+        swprintf(u->detail, 512, L"downloaded %hs, GitHub's digest %hs", hex, u->sha256);
+        InterlockedExchange(&u->done, 1);
+        return 0;
+    }
+    /* Setup headless on the same folder (its remembered dump, keys and choices): --auto presses Install, --hidden has no
+       window and exits 0 / 1 at the end. Its setup.log is followed for the window. No --accept-terms: Setup takes the
+       player's earlier acceptance only for the same terms (its TermsVersion), else it shows them.*/
+    swprintf(u->log, MAX_PATH, L"%ls\\setup.log", u->root);
+    long long pos = 0;
+    { FILE *f = _wfopen(u->log, L"rb"); if (f) { _fseeki64(f, 0, SEEK_END); pos = _ftelli64(f); fclose(f); } }
+    wchar_t cmd[MAX_PATH * 3];
+    swprintf(cmd, MAX_PATH * 3, L"\"%ls\" --install-to=\"%ls\" --auto --hidden", u->setup_path, u->root);
+    STARTUPINFOW si = {0}; si.cb = sizeof si;
+    PROCESS_INFORMATION pi;
+    BOOL started = CreateProcessW(u->setup_path, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, u->root, &si, &pi);
+    DWORD start_err = GetLastError();
+    CloseHandle(lock);
+    if (!started) {
+        SetLastError(start_err);
+        u->result = U_SETUP_FAILED;
+        swprintf(u->detail, 512, L"could not start Setup (error %lu)", GetLastError());
+        InterlockedExchange(&u->done, 1);
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    u->setup = pi.hProcess;
+    upd_status(u, ES_EN(L"Instalando...", L"Installing..."));
+    while (WaitForSingleObject(pi.hProcess, 1000) == WAIT_TIMEOUT) {
+        upd_follow_log(u, &pos);
+        if (u->cancel) TerminateProcess(pi.hProcess, 1);   /* (Setup's job ends its build; Install again resumes it) */
+    }
+    DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
+    if (code) {
+        u->result = u->cancel ? U_CANCELLED : U_SETUP_FAILED;
+        swprintf(u->detail, 512, L"Setup exit %lu, see %ls", code, u->log);
+    } else {
+        u->result = U_OK;
+        InterlockedExchange(&u->pct, 100);
+    }
+    InterlockedExchange(&u->done, 1);
+    return 0;
+}
+
+static HRESULT CALLBACK upd_dialog_cb(HWND h, UINT msg, WPARAM w, LPARAM l, LONG_PTR ref) {
+    Upd *u = (Upd *)ref;
+    (void)l;
+    if (msg == TDN_CREATED) SendMessageW(h, TDM_SET_PROGRESS_BAR_RANGE, 0, MAKELPARAM(0, 100));
+    if (msg == TDN_TIMER) {
+        wchar_t s[256];
+        EnterCriticalSection(&u->cs); swprintf(s, 256, L"%ls", u->status); LeaveCriticalSection(&u->cs);
+        SendMessageW(h, TDM_SET_PROGRESS_BAR_POS, (WPARAM)u->pct, 0);
+        SendMessageW(h, TDM_SET_ELEMENT_TEXT, TDE_CONTENT, (LPARAM)s);
+        if (u->done) SendMessageW(h, TDM_CLICK_BUTTON, IDOK, 0);
+    }
+    if (msg == TDN_BUTTON_CLICKED && w == IDCANCEL && !u->done) {
+        InterlockedExchange(&u->cancel, 1);
+        upd_status(u, ES_EN(L"Cancelando...", L"Cancelling..."));
+        return S_FALSE;   /* (stays open until the worker has stopped) */
+    }
+    return S_OK;
+}
+
+/* 1 = the updated build's launcher was started (this one exits); 0 = play the installed build */
+static int auto_update(void) {
+    DWORD t0 = GetTickCount();
+    wchar_t rel[48] = L"", key[64] = L"", repo[128] = L"", api[512] = L"", url[1024], err[256] = L"";
+    char tag[48] = "", installed[48] = "";
+    package_value(g_dir, L"release", 0, rel, 48);
+    package_value(g_dir, L"key", 0, key, 64);
+    package_value(g_dir, L"release_repo", 0, repo, 128);
+    if (!rel[0]) { upd_result("norelease", NULL, t0, L"(a build Setup did not make: no automatic update)"); return 0; }
+    WideCharToMultiByte(CP_UTF8, 0, rel, -1, installed, sizeof installed, NULL, NULL);
+    if (!upd_enabled()) { upd_result("off", NULL, t0, L"(F10: Automatic updates off)"); return 0; }
+    if (GetEnvironmentVariableW(L"NXR_UPDATE_DISABLE", url, 8) && url[0] == L'1') {   
+        upd_result("off", NULL, t0, L"(NXR_UPDATE_DISABLE=1)");
+        return 0;
+    }
+    int force = GetEnvironmentVariableW(L"NXR_UPDATE_FORCE", url, 8) && url[0] == L'1';
+    if (!force && !upd_due()) { upd_result("throttled", NULL, t0, L"(checked in the last 20 h)"); return 0; }
+    if (!GetEnvironmentVariableW(L"NXR_UPDATE_API", api, 512) || !api[0]) wcscpy(api, L"https://api.github.com");
+    size_t al = wcslen(api); while (al && api[al - 1] == L'/') api[--al] = 0;
+    swprintf(url, 1024, L"%ls/repos/%ls/releases/latest", api, repo[0] ? repo : UPD_DEFAULT_REPO);
+    char *body = NULL; size_t len = 0;
+    int st = au_http_get(url, UPD_API_MS, &body, &len, err, 256);
+    if (st) upd_checked();   /* (an answer, any: no second ask within the day) */
+    if (!st) { upd_result(wcsstr(err, L"timed out") ? "timeout" : "offline", NULL, t0, err); return 0; }
+    if (st == 403 || st == 429) { upd_result("ratelimit", NULL, t0, NULL); free(body); return 0; }
+    if (st == 404) { upd_result("notfound", NULL, t0, NULL); free(body); return 0; }
+    if (st != 200) { swprintf(err, 256, L"HTTP %d", st); upd_result("http", NULL, t0, err); free(body); return 0; }
+    static AuRelease r;
+    int ok = au_parse_release(body, len, &r);
+    free(body);
+    if (!ok) { upd_result("badjson", NULL, t0, NULL); return 0; }
+    strcpy(tag, r.tag);
+    if (r.draft || r.prerelease) { upd_result("draft", tag, t0, NULL); return 0; }
+    if (au_version_cmp(tag, installed) <= 0) { upd_result("current", tag, t0, rel); return 0; }
+    if (upd_skipped(tag)) { upd_result("skipped", tag, t0, L"(the player skipped this version)"); return 0; }
+    if (!r.immutable) { upd_result("mutable", tag, t0, L"(not an immutable release: not taken)"); return 0; }
+    char suffix[80]; snprintf(suffix, sizeof suffix, "-Setup-%s.exe", tag);
+    const AuAsset *setup = au_find_asset(&r, NULL, suffix);
+    if (!setup) { upd_result("nosetup", tag, t0, NULL); return 0; }
+    if (!setup->sha256[0]) { upd_result("nodigest", tag, t0, NULL); return 0; }
+    /* the rebuild question: update.json's same_key_as (missing / unreadable = a rebuild, asked) */
+    AuUpdateJson uj; int have_uj = 0;
+    const AuAsset *ua = au_find_asset(&r, "update.json", NULL);
+    if (ua) {
+        wchar_t uurl[512]; MultiByteToWideChar(CP_UTF8, 0, ua->url, -1, uurl, 512);
+        char *ub = NULL; size_t ul = 0;
+        if (au_http_get(uurl, UPD_API_MS, &ub, &ul, err, 256) == 200) have_uj = au_parse_update_json(ub, ul, &uj);
+        free(ub);
+    }
+    int rebuild = au_needs_rebuild(&uj, have_uj, installed);
+    say(L"update: %hs is out (installed %ls, key %ls): %ls", tag, rel, key[0] ? key : L"?",
+        rebuild ? L"it recompiles the game: asking" : L"same game key: taken now");
+    if (rebuild) {
+        int a = g_upd_ask(tag);
+        if (a == UPD_SKIP) { upd_skip(tag); upd_result("skipped", tag, t0, L"(the player skipped it)"); return 0; }
+        if (a != UPD_NOW) { upd_result("declined", tag, t0, L"(next time)"); return 0; }
+    }
+    static Upd u;
+    memset(&u, 0, sizeof u);
+    InitializeCriticalSection(&u.cs);
+    strcpy(u.tag, tag);
+    strcpy(u.sha256, setup->sha256);
+    MultiByteToWideChar(CP_UTF8, 0, setup->url, -1, u.setup_url, 512);
+    upd_install_root(u.root, MAX_PATH);
+    wchar_t dl[MAX_PATH], wname[128];
+    MultiByteToWideChar(CP_UTF8, 0, setup->name, -1, wname, 128);
+    swprintf(dl, MAX_PATH, L"%ls\\updates", g_local);
+    mkdirs(dl);
+    swprintf(u.setup_path, MAX_PATH, L"%ls\\%ls", dl, wname);
+    upd_status(&u, ES_EN(L"Preparando...", L"Getting ready..."));
+    say(L"update: %hs -> %ls, then Setup on %ls", tag, u.setup_path, u.root);
+    HANDLE th = CreateThread(NULL, 0, upd_worker, &u, 0, NULL);
+    wchar_t main[128]; swprintf(main, 128, ES_EN(L"Actualizando a %hs", L"Updating to %hs"), tag);
+    if (GetEnvironmentVariableW(L"NXR_UPDATE_NOUI", err, 8) && err[0] == L'1') {
+        WaitForSingleObject(th, INFINITE);   /* (tests: no window) */
+    } else {
+        TASKDIALOGCONFIG c = {0};
+        c.cbSize = sizeof c;
+        c.dwFlags = TDF_SHOW_PROGRESS_BAR | TDF_CALLBACK_TIMER | TDF_SIZE_TO_CONTENT;
+        c.pszWindowTitle = TITLE;
+        c.pszMainIcon = TD_INFORMATION_ICON;
+        c.pszMainInstruction = main;
+        c.pszContent = u.status;
+        c.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+        c.pfCallback = upd_dialog_cb;
+        c.lpCallbackData = (LONG_PTR)&u;
+        TaskDialogIndirect(&c, NULL, NULL, NULL);
+        WaitForSingleObject(th, INFINITE);
+    }
+    CloseHandle(th);
+    if (u.setup) CloseHandle(u.setup);
+    if (u.result != U_OK) {
+        upd_result(upd_codes[u.result], tag, t0, u.detail);
+        if (u.result != U_CANCELLED)
+            message(MB_ICONWARNING, ES_EN(L"No se pudo actualizar a %hs; se abre la versión instalada.\n\n%ls",
+                                          L"Couldn't update to %hs; the installed version opens.\n\n%ls"), tag, u.detail);
+        return 0;
+    }
+    DeleteFileW(u.setup_path);
+    wchar_t dir[MAX_PATH], launcher[MAX_PATH];
+    if (!newer_release(dir, launcher, MAX_PATH)) { upd_result("nolauncher", tag, t0, L"(Setup ended without a newer folder)"); return 0; }
+    wchar_t cmd[MAX_PATH + 4]; swprintf(cmd, MAX_PATH + 4, L"\"%ls\"", launcher);
+    STARTUPINFOW si = {0}; si.cb = sizeof si;
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessW(launcher, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
+        swprintf(err, 256, L"could not start %ls (error %lu)", launcher, GetLastError());
+        upd_result("nolauncher", tag, t0, err);
+        return 0;
+    }
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    upd_result("ok", tag, t0, dir);
+    return 1;
+}
+
 /* ---------------------------------------------------------------- the CPU */
 
 /* totk.exe is built for x86-64-v3 (mkninja_win.py -march=x86-64-v3): on a CPU without one of these it dies on its first
@@ -689,6 +1047,54 @@ static void cpu_missing(wchar_t *out, size_t n, int level) {
     out[0] = 0;
     for (size_t i = 0; i < (level >= 3 ? sizeof need / sizeof need[0] : 3); i++)   /* (v2: the first three) */
         if (!need[i].ok && len + 40 < n) len += swprintf(out + len, n - len, L"%ls%ls", len ? L", " : L"", need[i].name);
+}
+
+/* The game's cutscene movies are VP9. Windows decodes them through the Store's "VP9 Video Extensions" (a Media Foundation
+ * MFT, on the GPU where it can); installs without the Store (LTSC, N, offline images) lack it, and the game then decodes
+ * them with its built-in libvpx on the CPU (engine/runtime/movie_core.h; issues #22, #25). 1 = the MFT is there, 0 = no
+ * VP9 MFT, -1 = no Media Foundation at all (an N edition without the Media Feature Pack). */
+static int vp9_mft_present(void) {
+    HMODULE mf = LoadLibraryExW(L"mfplat.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!mf) return -1;
+    typedef struct { GUID major, sub; } TypeInfo;   /* MFT_REGISTER_TYPE_INFO */
+    typedef HRESULT(WINAPI * EnumEx)(GUID, UINT32, const TypeInfo *, const TypeInfo *, IUnknown ***, UINT32 *);
+    EnumEx enum_ex = (EnumEx)(void (*)(void))GetProcAddress(mf, "MFTEnumEx");
+    int r = -1;
+    if (enum_ex) {
+        static const GUID video_decoder = {0xd6c02d4b, 0x6833, 0x45b4, {0x97, 0x1a, 0x05, 0xa4, 0xb0, 0x4b, 0xab, 0x91}};
+        const TypeInfo in = {{0x73646976, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}},   /* MFMediaType_Video */
+                             {0x30395056, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}}};  /* MFVideoFormat_VP90 */
+        IUnknown **acts = NULL; UINT32 n = 0;
+        /* SYNCMFT | LOCALMFT | SORTANDFILTER | UNTRUSTED_STOREMFT: the flags the game's decoder enumerates with */
+        r = SUCCEEDED(enum_ex(video_decoder, 0x1 | 0x8 | 0x40 | 0x400, &in, NULL, &acts, &n)) && n > 0;
+        for (UINT32 i = 0; i < n; i++) IUnknown_Release(acts[i]);
+        if (acts) CoTaskMemFree(acts);
+    }
+    FreeLibrary(mf);
+    return r;
+}
+static int (*g_vp9_probe)(void) = vp9_mft_present;   /* (test_launcher.c answers instead) */
+
+/* Logged at every start; said once (<local>\vp9-notice.txt), since the movies play either way. */
+static void vp9_notice(void) {
+    int r = g_vp9_probe();
+    say(L"vp9: %ls", r > 0 ? L"Media Foundation decoder found" : r == 0 ? L"no VP9 MFT (the game decodes movies with libvpx)"
+                                                                       : L"no Media Foundation (the game decodes movies with libvpx)");
+    if (r > 0) return;
+    wchar_t mark[MAX_PATH]; swprintf(mark, MAX_PATH, L"%ls\\vp9-notice.txt", g_local);
+    if (exists(mark)) return;
+    message(MB_ICONINFORMATION,
+            ES_EN(L"Este Windows no tiene las «Extensiones de vídeo VP9» de Microsoft Store%ls.\n\n"
+                  L"Las cinemáticas se ven igual: el juego trae su propio decodificador de vídeo (libvpx) y las decodifica con el "
+                  L"procesador en vez de con la tarjeta gráfica. Si quieres que use la tarjeta gráfica, instala «Extensiones de "
+                  L"vídeo VP9» desde Microsoft Store.\n\nEste aviso solo sale una vez.",
+                  L"This Windows doesn't have the Microsoft Store's \"VP9 Video Extensions\"%ls.\n\n"
+                  L"Cutscenes look the same: the game brings its own video decoder (libvpx) and decodes them on the processor "
+                  L"instead of the graphics card. If you want the graphics card to do it, install \"VP9 Video Extensions\" "
+                  L"from the Microsoft Store.\n\nThis notice only shows once."),
+            r < 0 ? ES_EN(L" (ni Media Foundation: una edición N sin el Media Feature Pack)", L" (nor Media Foundation: an N edition without the Media Feature Pack)") : L"");
+    FILE *f = _wfopen(mark, L"w");
+    if (f) { fputs("shown\n", f); fclose(f); }
 }
 
 /* ---------------------------------------------------------------- the game */
@@ -725,77 +1131,52 @@ static void restart_env_apply(void) {
     fclose(f);
     DeleteFileW(g_restart_file);
 }
-/* Mods: every folder in <g_base>\mods is a RomFS mod laid out as emulators take them (<name>\romfs\..., or the RomFS tree
- * itself). Their RomFS folders go to the game in TOTK_USER_MODS, sorted by name (hle_fs.cpp: replacement files only, no new
- * files and no RSTB merge; the first mod by name wins a file two of them replace; our sets, glyphs and overlay win). A name
- * starting with '_' or '.' is switched off. An ExeFS-only mod (exefs\ and no romfs\) is skipped: code patches are not
- * supported. The folder is per user like the save, so mods carry over to every new build. Returns the mods passed. */
-enum { MAX_MODS = 64 };
-/* A mod with its own resource size table (System\Resource\ResourceSizeTable*): hle_fs merges it into the port's, each
- * entry at the larger size; logged here so a player's log shows it.*/
-static void rstb_note(const wchar_t *name, const wchar_t *romfs) {
+/* Mods: every folder in <g_dir>\mods (beside the launcher, in the game folder: where players look, as other ports
+ * keep it; Setup updates that folder in place) and in <g_base>\mods (per user like the save) is a mod laid out as
+ * emulators and the Switch take them (<name>\romfs, atmosphere\contents\<title>\romfs, ...;
+ * engine/runtime/mods_scan.h). The game scans them (engine/runtime/mods.cpp): order and switches are the F10 Mods
+ * tab's (settings.ini mods.order / mods.off), the top mod wins a file two of them change, the port's own files win
+ * over a mod's, the resource size table is merged and computed for the mods' files (hle_fs.cpp rstb_merged). A name
+ * starting with '_' or '.' is left out; a name in both folders is used from the game folder's.
+ * Sets TOTK_MODS_DIR (the game folder's first: F10's "Open mods folder" opens it); returns how many folders exist. */
+static void mods_readme(const wchar_t *dir) {   /* (rewritten each start: an older one described the replace-only folder) */
     wchar_t p[MAX_PATH];
-    swprintf(p, MAX_PATH, L"%ls\\System\\Resource\\ResourceSizeTable*", romfs);
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(p, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    FindClose(h);
-    say(L"mods: %ls brings its own resource size table (%ls): the game merges it into the port's", name, fd.cFileName);
-}
-static int cmp_names(const void *a, const void *b) { return _wcsicmp((const wchar_t *)a, (const wchar_t *)b); }
-static int mods_env(void) {
-    static wchar_t names[MAX_MODS][MAX_PATH], value[32767];
-    wchar_t dir[MAX_PATH], p[MAX_PATH];
-    swprintf(dir, MAX_PATH, L"%ls\\mods", g_base);
-    mkdirs(dir);
     swprintf(p, MAX_PATH, L"%ls\\LEEME-README.txt", dir);
-    if (!exists(p)) {
-        FILE *f = _wfopen(p, L"w, ccs=UTF-8");
-        if (f) {
-            fputws(L"Mods de RomFS: una carpeta por mod (<nombre>\\romfs\\... como en los emuladores). Gana el primero por nombre.\n"
-                   L"Un nombre que empieza por _ lo desactiva. Solo se reemplazan archivos (sin archivos nuevos ni mods de exefs).\n\n"
-                   L"RomFS mods: one folder per mod (<name>\\romfs\\... as emulators use). The first by name wins.\n"
-                   L"A name starting with _ turns it off. Files are only replaced (no new files, no exefs mods).\n", f);
-            fclose(f);
-        }
-    }
-    int n = 0;
-    swprintf(p, MAX_PATH, L"%ls\\*", dir);
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(p, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.' || fd.cFileName[0] == L'_') continue;
-            if (n == MAX_MODS) { say(L"mods: more than %d folders, the rest ignored", MAX_MODS); break; }
-            swprintf(names[n++], MAX_PATH, L"%ls", fd.cFileName);
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    }
-    qsort(names, (size_t)n, sizeof names[0], cmp_names);
-    size_t len = 0;
-    int used = 0;
+    FILE *f = _wfopen(p, L"w, ccs=UTF-8");
+    if (!f) return;
+    fputws(L"Mods: una carpeta por mod, como en los emuladores (<nombre>\\romfs, <nombre>\\exefs, <nombre>\\cheats, o\n"
+           L"atmosphere\\contents\\0100F2C0115B6000\\romfs de la tarjeta SD; la salida de TKMM también vale).\n"
+           L"Orden y activación en el juego: F10 > Mods (gana el de arriba); se aplican al volver a empezar.\n"
+           L"Un nombre que empieza por _ lo deja fuera. La tabla de tamaños (RSTB) se ajusta sola.\n"
+           L"Sirven esta carpeta (junto al juego) y %APPDATA%\\nxrecomp\\TotK-engine\\mods.\n\n"
+           L"Mods: one folder per mod, as emulators take them (<name>\\romfs, <name>\\exefs, <name>\\cheats, or the SD\n"
+           L"card's atmosphere\\contents\\0100F2C0115B6000\\romfs; TKMM's merged output works too).\n"
+           L"Order and switches in the game: F10 > Mods (the top one wins); they apply at the next start.\n"
+           L"A name starting with _ leaves it out. The resource size table (RSTB) is adjusted by itself.\n"
+           L"This folder (beside the game) and %APPDATA%\\nxrecomp\\TotK-engine\\mods both work.\n", f);
+    fclose(f);
+}
+static int mods_env(void) {
+    static wchar_t value[2 * MAX_PATH + 2];
+    wchar_t local[MAX_PATH], user[MAX_PATH];
+    swprintf(local, MAX_PATH, L"%ls\\mods", g_dir);
+    swprintf(user, MAX_PATH, L"%ls\\mods", g_base);
+    mkdirs(local);
+    mkdirs(user);
     value[0] = 0;
-    for (int i = 0; i < n; i++) {
-        wchar_t romfs[MAX_PATH], exefs[MAX_PATH], *use = romfs;
-        swprintf(romfs, MAX_PATH, L"%ls\\%ls\\romfs", dir, names[i]);
-        swprintf(exefs, MAX_PATH, L"%ls\\%ls\\exefs", dir, names[i]);
-        if (!exists(romfs)) {
-            if (exists(exefs)) { say(L"mods: %ls skipped (exefs only: code patches are not supported)", names[i]); continue; }
-            swprintf(romfs, MAX_PATH, L"%ls\\%ls", dir, names[i]);   /* the folder is the RomFS tree itself */
-        } else if (exists(exefs)) {
-            say(L"mods: %ls: its exefs folder is not used (code patches are not supported), only its romfs", names[i]);
-        }
-        rstb_note(names[i], use);
-        size_t k = wcslen(use);
-        if (len + k + 2 > sizeof value / sizeof *value) { say(L"mods: list too long, %ls and later ignored", names[i]); break; }
-        if (len) value[len++] = L';';
-        wcscpy(value + len, use);
-        len += k;
-        used++;
-        say(L"mods: %ls", use);
+    int n = 0;
+    const wchar_t *dirs[2] = {local, user};
+    for (int i = 0; i < 2; i++) {
+        if (!exists(dirs[i]) || (i && !_wcsicmp(local, user))) continue;
+        mods_readme(dirs[i]);
+        size_t len = wcslen(value);
+        swprintf(value + len, sizeof value / sizeof *value - len, L"%ls%ls", len ? L";" : L"", dirs[i]);
+        n++;
     }
-    SetEnvironmentVariableW(L"TOTK_USER_MODS", used ? value : NULL);
-    return used;
+    SetEnvironmentVariableW(L"TOTK_MODS_DIR", n ? value : NULL);
+    SetEnvironmentVariableW(L"TOTK_USER_MODS", NULL);
+    say(L"mods: TOTK_MODS_DIR=%ls", value);
+    return n;
 }
 
 static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, size_t whyn, HANDLE *game, FILETIME *started) {
@@ -831,6 +1212,54 @@ static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, si
 
     wchar_t userdata[MAX_PATH], run[MAX_PATH], crashes[MAX_PATH], logs[MAX_PATH], logp[MAX_PATH];
     swprintf(userdata, MAX_PATH, L"%ls\\userdata", g_base);
+    {   /* another game version (package.py's version=, e.g. 1.4.3; none = 1.0.0, the folder as before) keeps its own
+           saves in userdata-v<digits>: a save that version writes does not load in 1.0.0. On its first start it gets a
+           copy of the 1.0.0 saves (the game upgrades them as it loads them); the 1.0.0 folder is never touched. */
+        wchar_t ver[32], tag[32], src[MAX_PATH], dst[MAX_PATH];
+        package_value(pkg, L"version", 0, ver, 32);
+        if (ver[0] && wcscmp(ver, L"1.0.0")) {
+            int n = 0;
+            for (const wchar_t *c = ver; *c && n < 30; c++) if (*c >= L'0' && *c <= L'9') tag[n++] = *c;
+            tag[n] = 0;
+            swprintf(userdata, MAX_PATH, L"%ls\\userdata-v%ls", g_base, tag);
+            swprintf(src, MAX_PATH, L"%ls\\userdata\\save", g_base);
+            swprintf(dst, MAX_PATH, L"%ls\\save", userdata);
+            if (!exists(dst) && exists(src)) {
+                mkdirs(userdata);
+                int rc = saves_copy_tree(src, dst);
+                say(L"%ls: version %ls, its own saves in %ls; the 1.0.0 saves copied there (%ls)", name, ver, userdata,
+                    rc ? L"FAILED" : L"ok");
+                if (!rc) {   /* (the beta notice mentions the copy only when it happened) */
+                    wchar_t mk[MAX_PATH]; swprintf(mk, MAX_PATH, L"%ls\\saves-copied-from-1.0.0", userdata);
+                    FILE *cf = _wfopen(mk, L"w"); if (cf) fclose(cf);
+                }
+            } else {
+                say(L"%ls: version %ls, its own saves in %ls", name, ver, userdata);
+            }
+            wchar_t beta[8], seen[MAX_PATH];
+            package_value(pkg, L"beta", 0, beta, 8);
+            swprintf(seen, MAX_PATH, L"%ls\\beta-notice-shown", userdata);
+            if (!wcscmp(beta, L"1") && !exists(seen)) {   /* once per version folder: what this beta lacks */
+                wchar_t mk[MAX_PATH], copied[512] = L"";
+                swprintf(mk, MAX_PATH, L"%ls\\saves-copied-from-1.0.0", userdata);
+                if (exists(mk))   /* (only when the 1.0.0 saves were really copied)*/
+                    swprintf(copied, 512, ES_EN(L" Tus partidas de 1.0.0 se han copiado una vez a esta versión: lo que "
+                                                L"juegues después en 1.0.0 no aparecerá aquí, y las partidas de %ls no "
+                                                L"vuelven a 1.0.0.",
+                                                L" Your 1.0.0 saves were copied to this version once: what you play later "
+                                                L"in 1.0.0 will not show up here, and %ls saves do not go back to 1.0.0."), ver);
+                message(MB_ICONINFORMATION, ES_EN(
+                    L"TotK %ls (beta). Esta versión juega a 30 fps, con los controles como un mando (el teclado y el ratón "
+                    L"hacen de botones de Switch) y sin la pantalla de opciones de PC dentro del juego (los ajustes están "
+                    L"en F10).%ls",
+                    L"TotK %ls (beta). This version plays at 30 fps, with the controls as a pad (keyboard and mouse act as "
+                    L"Switch buttons) and without the in-game PC options screen (settings are in F10).%ls"), ver, copied);
+                mkdirs(userdata);
+                FILE *mf = _wfopen(seen, L"w");
+                if (mf) fclose(mf);
+            }
+        }
+    }
     swprintf(run, MAX_PATH, L"%ls\\run", g_local);
     swprintf(crashes, MAX_PATH, L"%ls\\crashes", g_local);
     swprintf(logs, MAX_PATH, L"%ls\\logs", g_local);
@@ -1013,10 +1442,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show) {
     }
     int menu = (args && wcsstr(args, L"--saves")) || (GetAsyncKeyState(VK_SHIFT) & 0x8000);
     if (menu) say(L"update check: skipped (saves menu)");   /* the player asked for this folder's menu */
+    else if (auto_update()) return 0;                        /* the updated build's launcher does the rest */
     else if (offer_newer_release()) return 0;                /* its launcher does the rest (backups, import offer) */
     saves_recover(g_base);   /* an import cut short (power loss) leaves a complete save in place */
     if (menu) { if (!saves_menu()) return 0; }
     else offer_import();
+    vp9_notice();
 
     /* builds: packages\<current>, packages\<lastgood>; or totk.exe in the launcher's own folder */
     wchar_t names[2][MAX_PATH], pkgs[2][MAX_PATH];
@@ -1053,6 +1484,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show) {
         if (romfs[0] && !exists(romfs)) {   /* shared by every build: no fallback helps */
             message(MB_ICONWARNING, ES_EN(L"No encuentro los datos del juego (RomFS extraída) en:\n%ls",
                                           L"Can't find the game data (extracted RomFS) in:\n%ls"), romfs);
+            return 1;
+        }
+        /* a Builder install keeps the data only in romfs.bin (TOTK_ROMFS_PACK; the romfs= folder is an empty mount
+           root): gone, nothing serves the game's files */
+        wchar_t pack[MAX_PATH];
+        package_value(pkgs[i], L"env.TOTK_ROMFS_PACK", 1, pack, MAX_PATH);
+        if (pack[0] && !exists(pack) && !dir_has_files(romfs)) {
+            message(MB_ICONWARNING, ES_EN(L"No encuentro los datos del juego (romfs.bin) en:\n%ls\n\nVuelve a instalar con Setup.",
+                                          L"Can't find the game data (romfs.bin) in:\n%ls\n\nInstall again with Setup."), pack);
             return 1;
         }
         int r = play_package(pkgs[i], names[i], why[i], 768);

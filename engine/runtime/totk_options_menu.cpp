@@ -89,6 +89,13 @@ const char *const kGyro[] = {"0.25", "0.5", "0.75", "1", "1.25", "1.5", "1.75", 
 const char *const kFov[] = {"0.8", "0.9", "1", "1.1", "1.2", "1.3", "1.4", "1.5", nullptr};  // of a 0.5 .. 2 slider
 const char *const kWide[] = {"16:9", "window", nullptr};      // the game's (default), the window's shape
 const char *const kWindowMode[] = {"windowed", "borderless", "exclusive", nullptr};  // borderless: the default
+// The volumes: 0 .. 100 % in 5 % steps of a 0 .. 1 slider (audio.volume / music / effects; the default 1)
+const char *const kVolume[] = {"0", "0.05", "0.1", "0.15", "0.2", "0.25", "0.3", "0.35", "0.4", "0.45", "0.5", "0.55",
+                               "0.6", "0.65", "0.7", "0.75", "0.8", "0.85", "0.9", "0.95", "1", nullptr};
+const char *const kFollow[] = {"1", "0", nullptr};          // On (default), Off
+const char *const kFpsReadout[] = {"0", "minimal", "detailed", nullptr};   // Off (default), Minimal, Detailed
+const char *const kFpsCorner[] = {"top_right", "top_left", "bottom_right", "bottom_left", nullptr};
+const char *const kFpsSize[] = {"small", "medium", "large", nullptr};
 // A row whose choices are its setting's own values / names (pc_window.cpp builds them from the hardware in its static
 // initializer, before any game code, and never changes them). Only choice 0 ("" Remember / the desktop's) has overlay
 // texts; every other choice shows the setting's name (show_dynamic).
@@ -96,10 +103,14 @@ const char *const kDynamic[] = {"", nullptr};
 // Must match ENTRIES in games/totk/overlays/options_menu.py (types and values); the screen shows them in this order
 const PcRow kRows[] = {
     {108, "display.window_mode", kWindowMode},  // live
+    {124, "display.window_size", kDynamic},  // live: the windowed size
     {109, "display.monitor", kDynamic},            // live: the monitors at start, "Monitor 2: <model>, 2560 x 1440"
     {110, "display.exclusive_size", kDynamic},     // live: the start monitor's modes
     {111, "display.exclusive_refresh", kDynamic},  // live: its refresh rates
     {50, "display.fps_cap", kFps},              // live (pc_settings.cpp fps_apply -> hle_vi.cpp, present d998930a)
+    {125, "display.fps_readout", kFpsReadout},   // live (pc_overlay.cpp fps_readout, pc-ui; F3 too)
+    {126, "display.fps_position", kFpsCorner},   // live
+    {127, "display.fps_size", kFpsSize},         // live
     {51, "graphics.preset", kPreset},           // live: sets its members (some of them restart)
     {52, "graphics.render_scale", kScale},      // restart
     {64, "graphics.dlss", kOffYes},  // restart
@@ -121,6 +132,11 @@ const PcRow kRows[] = {
     {63, "display.hdr_paper", kHdrPaper},       // live (present)
     {114, "game.pause_unfocused", kOffYes},  // live
     {115, "audio.mute_unfocused", kOffOn},  // live
+    // the PC audio rows F10 had alone (GAPS-zelda-on-pc 7), all live
+    {120, "audio.volume", kVolume},             // pc_settings.cpp: the master gain
+    {121, "audio.music", kVolume},              // hle_audio.cpp: the music sub mix
+    {122, "audio.effects", kVolume},            // hle_audio.cpp: the effects sub mix
+    {123, "audio.follow_device", kFollow},      // hle_audio.cpp: a new or lost Windows device followed
     {66, "controls.gameplay", kGameplay},  // live: the key block's first row
 };
 constexpr s32 kKeyBlockType = 66;  // a separator goes in front of it
@@ -190,13 +206,14 @@ struct ZoneRow {
 const ZoneRow kZoneRows[] = {
     // General: amiibo (game 0), fast travel, pause when the window loses focus
     {0, Z_GENERAL}, {55, Z_GENERAL}, {114, Z_GENERAL},
-    // Display: the window, the monitor, frame rate and sync, HDR, the picture's shape
-    {108, Z_DISPLAY}, {109, Z_DISPLAY}, {110, Z_DISPLAY}, {111, Z_DISPLAY}, {50, Z_DISPLAY}, {57, Z_DISPLAY},
-    {58, Z_DISPLAY}, {61, Z_DISPLAY}, {62, Z_DISPLAY}, {63, Z_DISPLAY}, {68, Z_DISPLAY},
+    // Display: the window and its resolution, the monitor, frame rate, the FPS counter, sync, HDR, the picture's shape
+    {108, Z_DISPLAY}, {124, Z_DISPLAY}, {109, Z_DISPLAY}, {110, Z_DISPLAY}, {111, Z_DISPLAY}, {50, Z_DISPLAY},
+    {125, Z_DISPLAY}, {126, Z_DISPLAY}, {127, Z_DISPLAY}, {57, Z_DISPLAY}, {58, Z_DISPLAY}, {61, Z_DISPLAY},
+    {62, Z_DISPLAY}, {63, Z_DISPLAY}, {68, Z_DISPLAY},
     // Graphics
     {51, Z_GRAPHICS}, {52, Z_GRAPHICS}, {117, Z_GRAPHICS}, {64, Z_GRAPHICS}, {65, Z_GRAPHICS}, {67, Z_GRAPHICS},
-    // Audio: voice language (game 11), muted when the window loses focus
-    {11, Z_AUDIO}, {115, Z_AUDIO},
+    // Audio: the volumes, voice language (game 11), the Windows device, muted when the window loses focus
+    {120, Z_AUDIO}, {121, Z_AUDIO}, {122, Z_AUDIO}, {11, Z_AUDIO}, {123, Z_AUDIO}, {115, Z_AUDIO},
     // Controls: the scheme, the mouse, the game's camera / gyro / jump / Ultrahand rows (1 2 3 4 5 12 13)
     {66, Z_CONTROLS}, {53, Z_CONTROLS}, {116, Z_CONTROLS}, {119, Z_CONTROLS}, {56, Z_CONTROLS}, {1, Z_CONTROLS},
     {2, Z_CONTROLS}, {3, Z_CONTROLS}, {4, Z_CONTROLS}, {60, Z_CONTROLS}, {5, Z_CONTROLS}, {12, Z_CONTROLS},
@@ -250,7 +267,10 @@ enum KeyStatus {
 };
 
 bool enabled() {
-    static const bool on = getenv("TOTK_OPTIONS_MENU") && strcmp(getenv("TOTK_OPTIONS_MENU"), "0") != 0;
+#ifdef TOTK_BETA_OFF_OPTIONS_SCREEN
+    return false;   // (a beta of another game version without the options screen's hooks)
+#endif
+    static const bool on = !getenv("TOTK_OPTIONS_MENU") || strcmp(getenv("TOTK_OPTIONS_MENU"), "0") != 0;
     return on;
 }
 
@@ -384,7 +404,7 @@ std::atomic<s32> g_pending{-1};        // the section the next one shows (-1: th
 // The screen's creation (0x1ad7a78) asks for the count first, its call returning to 0x1ad7af4: a pending section
 // becomes the shown one there and only there, so a screen still closing (its update reads the count / index too)
 // never sees its rows change under it, whatever eui does with a closed screen
-constexpr u64 kCreateCountReturn = guest_bridge::kEngineMain + 0x1ad7af4;
+constexpr u64 kCreateCountReturn = totk_main(0x1ad7af4);
 OptionsMgr g_view[Z_COUNT];
 const OptionEntry *g_src;  // the real list the views were made from
 u32 g_src_n;

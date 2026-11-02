@@ -5,9 +5,15 @@ cache-seed/archive_shaders.bin).
   python tools/shader_pack.py --romfs <romfs> --out <file> [--jobs N] [--check <cache dir> ...]
 
 Programs come from the BNSH program variations (the vertex and fragment shader the game binds together): the material,
-terrain, grass, cave, ... archives (Shader/*.bfsha) and every effect (Effect/*.esetb). Each stage is stored as the bytes
-the game hands the GPU (code up to the compiler constants' offset, then the constants), so the warm-up computes the
-same code hashes and content keys (pc_prog_key) as the game's own draws, and translates with the constants (BRX tables).
+terrain, grass, cave,... archives (Shader/*.bfsha), every effect (Effect/*.esetb) and the UI layouts' shaders
+(UI/LayoutArchive/*.blarc 'bgsh': 2026-11-01, +261 programs, 2,225 = 91.5 %). agl's own shader packages (Lib/:.sharcb,
+BAHS) hold the title, fade and post stages of the remaining recorded programs, without the game's pairing: their vertex
+and fragment stages go in as loose blobs (no program; a records-only seed's programs find them by code hash, exec.c
+pa_code_copy) and their compute shaders into the compute table. The game's main module (exefs/main, NSO) carries 40 more
+stages in its.data segment (15 recorded programs): decoded with lz4 when the module is there, else a pure-Python LZ4
+block decoder (Setup's Python may lack it). Each stage is stored as the bytes the game hands the GPU (code up to the
+compiler constants' offset, then the constants), so the warm-up computes the same code hashes and content keys
+(pc_prog_key) as the game's own draws, and translates with the constants (BRX tables).
 
 The shader key: the vertex attribute kinds come from the vertex shader's program header (input map). In the material
 archives attributes 6 and 7, when the shader reads them, are integer (skinning indices); everything else is float, as
@@ -35,9 +41,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'xlate'))
 import prepare_seed as ps   # (containers: zstd with the game's dictionaries, SARC, BNSH)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'engine' / 'tools'))
+from romfs_src import RomFS   # (the folder, or romfs.bin beside it: a player's install unpacks none)
 
 M64 = (1 << 64) - 1
-SCAN_DIRS = ('Shader', 'Effect')
+SCAN_DIRS = ('Shader', 'Effect', 'UI/LayoutArchive', 'Lib')   # (not all of UI/: 15k textures to decompress for no shader)
 
 
 def hash_words(h, b):
@@ -94,6 +102,76 @@ def bnsh_programs(data):
             yield 'g', vs, fs
 
 
+def sharcb_stages(data):
+    """('s', blob) for every vertex / fragment stage of one agl shader package (.sharcb), ('c', blob, workgroup size)
+    for every compute one: the stage as the game binds it (stage_blob's bounds, from the record's control section)"""
+    for _, stage, control, code in ps.sharcb_shaders(data):
+        if len(control) < 0x7cc or not ps.plausible(stage, control, code):
+            continue
+        c1, csize = struct.unpack_from('<I', control, 0x700)[0], min(struct.unpack_from('<I', control, 0x6fc)[0], 0x10000)
+        if c1 < 0x80 or c1 + csize > len(code):
+            continue
+        blob = c1, csize, bytes(code[:c1 + csize])
+        if stage == 'cs':
+            yield 'c', blob, tuple(max(1, v) for v in struct.unpack_from('<3I', control, 0x748))
+        else:
+            yield 's', blob, None
+
+
+def lz4_block(src, size):
+    """one LZ4 block (an NSO segment); the lz4 module when present, else plain Python"""
+    try:
+        import lz4.block
+        return lz4.block.decompress(src, uncompressed_size=size)
+    except ImportError:
+        pass
+    dst, i, n = bytearray(), 0, len(src)
+    while i < n:
+        tok = src[i]
+        i += 1
+        lit = tok >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        dst += src[i:i + lit]
+        i += lit
+        if i >= n:
+            break
+        off = src[i] | src[i + 1] << 8
+        i += 2
+        ml = tok & 15
+        if ml == 15:
+            while True:
+                b = src[i]
+                i += 1
+                ml += b
+                if b != 255:
+                    break
+        ml += 4
+        if not 0 < off <= len(dst):
+            raise ValueError('LZ4 match outside the output')
+        start = len(dst) - off
+        dst += dst[start:start + ml] if off >= ml else (dst[start:] * (ml // off + 1))[:ml]
+    if len(dst) != size:
+        raise ValueError(f'LZ4 block: {len(dst)} bytes, want {size}')
+    return bytes(dst)
+
+
+def nso_data(raw):
+    """an NSO module's .data segment (where the game's main module keeps its embedded BNSH), decompressed"""
+    if raw[:4] != b'NSO0':
+        return b''
+    flags = struct.unpack_from('<I', raw, 0x0c)[0]
+    file_off, _, size, _ = struct.unpack_from('<4I', raw, 0x30)
+    csize = struct.unpack_from('<I', raw, 0x68)[0]
+    seg = raw[file_off:file_off + (csize if flags >> 2 & 1 else size)]
+    return lz4_block(seg, size) if flags >> 2 & 1 else bytes(seg)
+
+
 def found_blob(found, blob):   # (a worker's blobs, deduplicated: effects repeat the same stages many times)
     k = (blob[0], ps.sha(blob[2]))
     found.blobs.setdefault(k, blob)
@@ -107,6 +185,10 @@ class Found(list):
 
 
 def visit(name, data, found, decode, depth=0):
+    if data[:4] == b'BAHS':
+        for kind, a, b in sharcb_stages(data):
+            found.append((kind, name, found_blob(found, a), b if kind == 'c' else None))
+        return
     if data[:4] == b'SARC':
         if depth <= 4:
             for member, raw in ps.sarc(data).items():
@@ -120,16 +202,27 @@ def visit(name, data, found, decode, depth=0):
         pos += max(size, 8)
 
 
+_ROMS = {}
+
+
+def _rom(romfs):
+    """one RomFS per worker process (its index: 300k entries)"""
+    if romfs not in _ROMS:
+        _ROMS[romfs] = RomFS(romfs)
+    return _ROMS[romfs]
+
+
 def scan(args):
     """worker: (romfs, [relative paths]) -> ([(kind, source, blob key, blob key or workgroup size)], blobs, errors)"""
     romfs, names = args
     ps.set_priority()
-    decode = ps._decoder(romfs)
+    rom = _rom(romfs)
+    decode = ps._decoder(romfs, rom.read)
     found, errors = Found(), []
     for name in names:
         try:
-            raw = (Path(romfs) / name).read_bytes()
-            if raw[:4] not in (ps.ZSTD, b'SARC', b'BNSH', b'FSHA') and b'BNSH\0\0\0\0' not in raw:
+            raw = rom.read(name)
+            if raw[:4] not in (ps.ZSTD, b'SARC', b'BNSH', b'FSHA', b'BAHS') and b'BNSH\0\0\0\0' not in raw:
                 continue
             visit(name, decode(raw), found, decode)
         except Exception as e:   # (one bad file must not hide the others)
@@ -155,7 +248,7 @@ def source_rank(source):
 
 
 def build(found, all_blobs):
-    """deduplicated blobs + programs (Shader/material first) + compute programs"""
+    """deduplicated blobs + programs (Shader/material first) + compute programs; loose stages ('s') only as blobs"""
     blobs, blob_ix, progs, seen, sources, source_ix, comps = [], {}, [], set(), [], {}, []
 
     def blob(k):
@@ -164,6 +257,9 @@ def build(found, all_blobs):
             blobs.append(all_blobs[k])
         return blob_ix[k]
     for kind, source, vk, fk in sorted(found, key=lambda f: source_rank(f[1])):
+        if kind == 's':
+            blob(vk)
+            continue
         if kind == 'c':
             c = (blob(vk), fk)
             if c not in seen:
@@ -211,13 +307,14 @@ def check(blobs, progs, comps, caches):
     for vs, fs, kinds, _ in progs:
         pairs.setdefault((h[vs], h[fs]), set()).add(kinds)
     cs = {(h[b], local) for b, local in comps}
+    hs = set(h)
     for c in caches:
         pb = os.path.join(c, 'precompile.bin')
         if not os.path.exists(pb):
             print(f'{c}: no precompile.bin')
             continue
         d = open(pb, 'rb').read()
-        o, n, have, same, nc, hc = 0, 0, 0, 0, 0, 0
+        o, n, have, same, nc, hc, served = 0, 0, 0, 0, 0, 0, 0
         done = set()
         while o + 16 <= len(d):
             magic, kind, size, _ = struct.unpack_from('<4I', d, o)
@@ -228,6 +325,7 @@ def check(blobs, progs, comps, caches):
                 if ck not in done:
                     done.add(ck)
                     n += 1
+                    served += h0 in hs and h1 in hs
                     if (h0, h1) in pairs:
                         have += 1
                         same += d[o + 16 + 40:o + 16 + 72] in pairs[(h0, h1)]
@@ -236,24 +334,25 @@ def check(blobs, progs, comps, caches):
                 if ck not in done:
                     done.add(ck)
                     nc += 1
-                    hc += (ch, (lx, ly, lz)) in cs
+                    hc += (ch, (lx, ly, lz)) in cs or ch in hs
             o += 16 + size
         print(f'{c}: {n} recorded programs: {have} in the pack ({100 * have / max(1, n):.1f} %), '
-              f'{same} with the recorded attribute kinds; {nc} recorded compute programs: {hc} in the pack')
+              f'{same} with the recorded attribute kinds; both stages in the pack (a records-only seed is served): '
+              f'{served} ({100 * served / max(1, n):.1f} %); {nc} recorded compute programs: {hc} in the pack')
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--romfs', type=Path, default=ps.WORK / 'extracted' / 'v100' / 'romfs')
     ap.add_argument('--out', type=Path, required=True)
+    ap.add_argument('--exefs', type=Path, help='the exefs folder (default: next to the romfs)')
     ap.add_argument('--jobs', type=int, default=6)
     ap.add_argument('--check', nargs='*', default=[], metavar='CACHE', help='compare with recorded caches (precompile.bin)')
     a = ap.parse_args()
-    names = []
-    for d in SCAN_DIRS:
-        for root, _, files in os.walk(a.romfs / d):
-            names += [os.path.relpath(os.path.join(root, f), a.romfs).replace('\\', '/') for f in files]
-    names.sort()
+    rom = RomFS(a.romfs)
+    names = sorted(n for d in SCAN_DIRS for n in rom.names(d))
+    if not names:   # (an empty archive would turn the warm-up off without a word)
+        sys.exit(f'shader_pack: no files under {", ".join(SCAN_DIRS)} in {rom.where()}')
     t0 = time.monotonic()
     chunks = [names[i::a.jobs * 8] for i in range(a.jobs * 8)]
     found, all_blobs, errors = [], {}, []
@@ -263,6 +362,16 @@ def main():
             for k, v in b.items():
                 all_blobs.setdefault(k, v)
             errors += e
+    main_nso = (a.exefs or a.romfs.parent / 'exefs') / 'main'
+    if main_nso.is_file():
+        try:
+            fm = Found()
+            visit('exefs/main', nso_data(main_nso.read_bytes()), fm, lambda d: d)
+            found += list(fm)
+            for k, v in fm.blobs.items():
+                all_blobs.setdefault(k, v)
+        except Exception as e:
+            errors.append(f'exefs/main: {type(e).__name__}: {e}')
     blobs, progs, sources, comps = build(found, all_blobs)
     write(a.out, blobs, progs, sources, comps)
     print(f'{len(names)} files, {len(found)} program variations -> {len(progs)} programs, {len(comps)} compute, {len(blobs)} stage blobs '

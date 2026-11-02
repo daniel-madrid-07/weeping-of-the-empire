@@ -7,6 +7,8 @@
 #include "pc_overlay.h"
 #include "pc_bind_ui.h"
 #include "pc_display_caps.h"
+#include "pc_mods_ui.h"
+#include "pc_cheats_ui.h"
 #include "pc_settings.h"
 #include "pc_restart.h"
 #include "pc_text.h"
@@ -15,12 +17,18 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <float.h>
 #include <intrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// the fps readout (fps_readout below)
+extern "C" int shim_fps_overlay_mode(void);                 // shim_win.c: 0 off, 1 minimal, 2 detailed
+extern "C" uint64_t vk_fps_readout_stats(float out[4]);     // device.c: fps, frame ms, 1% low fps, worst ms
+bool pc_ui_font(const char *name, std::vector<uint8_t> *otf);   // pc_ui_font.cpp
 
 namespace {
 
@@ -315,6 +323,118 @@ void perf_window() {
     ImGui::End();
 }
 
+// ---- The fps readout (F3, display.fps_readout / fps_position / fps_size) In the game's HUD language: the game's own
+// UI font (Rodin NTLG, read from the player's RomFS by pc_ui_font.cpp, never shipped; the overlay's font if it cannot
+// be), a dark slab with a teal hairline, the number in the Zonai mint with a soft teal glow. Drawn over the image only
+// while on (pc_overlay_build: nothing at all when off). Minimal: "60 fps". Detailed: and the frame time, the 1% low and
+// the worst gap (device.c vk_fps_readout_stats).
+
+namespace fps_ui {   // tokens
+constexpr ImU32 kSlab = IM_COL32(10, 22, 24, 150);      // near-black, the teal's cast
+constexpr ImU32 kHair = IM_COL32(34, 117, 129, 190);    // the ring's shadow teal (app icon)
+constexpr ImU32 kMint = IM_COL32(128, 236, 196, 255);   // the Zonai mint, lifted for text on the slab
+constexpr ImU32 kGlow = IM_COL32(52, 170, 160, 40);     // one tap of the number's glow
+constexpr ImU32 kBone = IM_COL32(222, 226, 214, 235);   // values, the unit
+constexpr ImU32 kMuted = IM_COL32(140, 168, 162, 255);  // labels
+constexpr float kNumber[3] = {22, 30, 40};              // the number's size at 1080p: small, medium, large
+constexpr float kUnit = 0.55f, kRow = 0.5f, kLead = 1.35f;   // of the number's size
+constexpr float kPadX = 0.5f, kPadY = 0.32f, kGap = 0.18f, kRadius = 0.28f, kMargin = 18;
+}  // namespace fps_ui
+
+std::vector<uint8_t> g_font_b, g_font_m;   // the game's Rodin NTLG bold / medium (kept: the atlas reads them)
+std::atomic<int> g_font_state{0};          // 0 not asked, 1 reading, 2 read, 3 none (the overlay's font)
+ImFont *g_fps_bold, *g_fps_medium;
+
+void fps_fonts() {   // before NewFrame: read the first time the readout shows, off the present thread
+    int st = g_font_state.load();
+    if (st == 0 && g_font_state.compare_exchange_strong(st, 1))
+        std::thread([] {
+            const bool ok = pc_ui_font("ninP_RodinNTLG-B_DH_003_subset", &g_font_b) &&
+                            pc_ui_font("ninP_RodinNTLG-M_DH_003_subset", &g_font_m);
+            printf("[pc-overlay] fps readout font: %s\n", ok ? "the game's (Rodin NTLG)" : "not in the RomFS, the overlay's");
+            g_font_state.store(ok ? 2 : 3);
+        }).detach();
+    if (g_font_state.load() == 2 && !g_fps_bold) {
+        ImFontConfig c;
+        c.FontDataOwnedByAtlas = false;
+        snprintf(c.Name, sizeof c.Name, "Rodin NTLG B");
+        g_fps_bold = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(g_font_b.data(), (int)g_font_b.size(), 0.0f, &c);
+        snprintf(c.Name, sizeof c.Name, "Rodin NTLG M");
+        g_fps_medium = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(g_font_m.data(), (int)g_font_m.size(), 0.0f, &c);
+        if (!g_fps_bold || !g_fps_medium) {
+            g_fps_bold = g_fps_medium = nullptr;
+            g_font_state.store(3);
+        }
+    }
+}
+
+void fps_readout(uint32_t w, uint32_t h) {
+    using namespace fps_ui;
+    const int mode = shim_fps_overlay_mode();
+    if (!mode || g_font_state.load() < 2) return;   // (the first frames while the font is read: nothing yet)
+    static float st[4];
+    static uint64_t seen = ~0ull;
+    static int corner, size;   // the settings, read again with each new set of numbers (every 0.5 s)
+    const uint64_t n = vk_fps_readout_stats(st);
+    if (n != seen) {
+        seen = n;
+        const char *c = pc_settings_get("display.fps_position"), *z = pc_settings_get("display.fps_size");
+        corner = !c ? 0 : !strcmp(c, "top_left") ? 1 : !strcmp(c, "bottom_right") ? 2 : !strcmp(c, "bottom_left") ? 3 : 0;
+        size = !z ? 0 : !strcmp(z, "medium") ? 1 : !strcmp(z, "large") ? 2 : 0;
+    }
+    if (!n) return;   // (no numbers yet: the first half second)
+    ImFont *fb = g_fps_bold ? g_fps_bold : ImGui::GetFont(), *fm = g_fps_medium ? g_fps_medium : ImGui::GetFont();
+    float k = h / 1080.0f;
+    k = k < 0.75f ? 0.75f : k > 3.0f ? 3.0f : k;
+    const float N = kNumber[size] * k, U = N * kUnit, R = N * kRow;
+    char num[16], unit[16], rows[3][2][32];
+    snprintf(num, sizeof num, "%.0f", st[0]);
+    snprintf(unit, sizeof unit, "%s", pc_tr("fps"));
+    const int nrows = mode == 2 ? 3 : 0;
+    if (nrows) {
+        snprintf(rows[0][0], 32, "%s", pc_tr("frame"));
+        snprintf(rows[0][1], 32, "%.1f ms", st[1]);
+        snprintf(rows[1][0], 32, pc_tr("1%% low"));
+        if (st[2] > 0) snprintf(rows[1][1], 32, "%.0f %s", st[2], unit);
+        else snprintf(rows[1][1], 32, "--");   // (collecting: under 100 frames since it was turned on)
+        snprintf(rows[2][0], 32, "%s", pc_tr("worst"));
+        snprintf(rows[2][1], 32, "%.0f ms", st[3]);
+    }
+    // the number's box keeps the width of three digits, so the slab does not change size with the number
+    const float wn = std::max(fb->CalcTextSizeA(N, FLT_MAX, 0, "000").x, fb->CalcTextSizeA(N, FLT_MAX, 0, num).x);
+    const float wu = fm->CalcTextSizeA(U, FLT_MAX, 0, unit).x;
+    float wl = 0, wv = 0;
+    for (int i = 0; i < nrows; i++) {
+        wl = std::max(wl, fm->CalcTextSizeA(R, FLT_MAX, 0, rows[i][0]).x);
+        wv = std::max(wv, fm->CalcTextSizeA(R, FLT_MAX, 0, rows[i][1]).x);
+    }
+    const float head = N * 0.78f;   // the number line: about the digits' height
+    const float iw = std::max(wn + 0.22f * N + wu, nrows ? wl + 0.8f * N + wv : 0.0f);
+    const float ih = head + (nrows ? kGap * N + nrows * R * kLead : 0.0f);
+    const float pw = iw + 2 * kPadX * N, ph = ih + 2 * kPadY * N, m = kMargin * k;
+    const float x0 = corner == 1 || corner == 3 ? m : w - pw - m, y0 = corner < 2 ? m : h - ph - m;
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    const float rad = kRadius * N, hair = std::max(1.0f, floorf(k));
+    dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + pw, y0 + ph), kSlab, rad);
+    dl->AddRect(ImVec2(x0 + hair / 2, y0 + hair / 2), ImVec2(x0 + pw - hair / 2, y0 + ph - hair / 2), kHair, rad, 0, hair);
+    // the number, right-aligned in its box, on a glow of eight taps round it at two radii; its digits' top at the padding
+    const float asc = fb->GetFontBaked(N)->Ascent, bx = x0 + kPadX * N, ny = y0 + kPadY * N - (asc - head);
+    const ImVec2 np(bx + wn - fb->CalcTextSizeA(N, FLT_MAX, 0, num).x, ny);
+    for (float r : {0.05f * N, 0.1f * N})
+        for (int i = 0; i < 8; i++) {
+            const float a = i * 0.7853982f;
+            dl->AddText(fb, N, ImVec2(np.x + r * cosf(a), np.y + r * sinf(a)), kGlow, num);
+        }
+    dl->AddText(fb, N, np, kMint, num);
+    // the unit on the number's baseline
+    dl->AddText(fm, U, ImVec2(bx + wn + 0.22f * N, ny + asc - fm->GetFontBaked(U)->Ascent), kBone, unit);
+    float y = y0 + kPadY * N + head + kGap * N;
+    for (int i = 0; i < nrows; i++, y += R * kLead) {
+        dl->AddText(fm, R, ImVec2(bx, y), kMuted, rows[i][0]);
+        dl->AddText(fm, R, ImVec2(bx + iw - fm->CalcTextSizeA(R, FLT_MAX, 0, rows[i][1]).x, y), kBone, rows[i][1]);
+    }
+}
+
 // ImGui key -> hle_hid.cpp vk_from_name()'s name (NULL: not bindable by name)
 const char *bind_name(ImGuiKey k) {
     static char b[8];
@@ -533,7 +653,8 @@ void settings_window(uint32_t w, uint32_t h) {
             // The pad's L / R switch pages; not while an item is active, where L / R are ImGui's slower / faster value
             // steps
             static int want = -1;
-            if (g_open_keys.exchange(false)) want = (int)pages.size();   // pc_overlay_open_keys: the Keys tab
+            if (g_open_keys.exchange(false))   // pc_overlay_open_keys: the Keys tab
+                want = (int)pages.size() + (pc_mods_tab_available() ? 1 : 0) + (pc_cheats_tab_available() ? 1 : 0);
             int cur = 0;
             for (int i = 0; i < (int)pages.size(); i++)
                 if (ImGui::BeginTabItem((std::string(pc_tr(pages[i])) + "###" + pages[i]).c_str(), nullptr,
@@ -542,9 +663,27 @@ void settings_window(uint32_t w, uint32_t h) {
                     settings_page(pages[i]);
                     ImGui::EndTabItem();
                 }
+            // the player's mods (pc_mods_ui.cpp), when a launcher set a mods folder
+            const bool with_mods = pc_mods_tab_available();
+            const int mods = (int)pages.size();
+            if (with_mods && ImGui::BeginTabItem((std::string(pc_tr("Mods")) + "###Mods").c_str(), nullptr,
+                                                 want == mods ? ImGuiTabItemFlags_SetSelected : 0)) {
+                cur = mods;
+                pc_mods_tab();
+                ImGui::EndTabItem();
+            }
+            // the mods' cheats (pc_cheats_ui.cpp), when a mod on has a cheat file for this game version
+            const bool with_cheats = pc_cheats_tab_available();
+            const int cheats = mods + (with_mods ? 1 : 0);
+            if (with_cheats && ImGui::BeginTabItem((std::string(pc_tr("Cheats")) + "###Cheats").c_str(), nullptr,
+                                                   want == cheats ? ImGuiTabItemFlags_SetSelected : 0)) {
+                cur = cheats;
+                pc_cheats_tab();
+                ImGui::EndTabItem();
+            }
             // the rebinding pages: the last tab, once the rebinding API answers
             const bool with_keys = pc_bind_keys_available();
-            const int keys = (int)pages.size(), tabs = keys + (with_keys ? 1 : 0);
+            const int keys = cheats + (with_cheats ? 1 : 0), tabs = keys + (with_keys ? 1 : 0);
             if (with_keys && ImGui::BeginTabItem((std::string(pc_tr("Keys")) + "###Keys").c_str(), nullptr, want == keys ? ImGuiTabItemFlags_SetSelected : 0)) {
                 cur = keys;
                 pc_bind_keys_tab();
@@ -561,6 +700,7 @@ void settings_window(uint32_t w, uint32_t h) {
         ImGui::Separator();
         bool pending = false;
         for (int i = 0, n = pc_settings_count(); i < n; i++) pending |= pc_settings_at(i).restart_pending;
+        pending |= pc_mods_changed();
         if (pending) {
             ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.3f, 1.0f), "%s", pc_tr("Some changes apply when the game starts again."));
 #ifdef _WIN32
@@ -821,7 +961,8 @@ extern "C" const pc_draw *pc_overlay_build(uint32_t w, uint32_t h) {
         const bool scripted = getenv("TOTK_PRESS") || getenv("TOTK_CTL");
         if (pc_settings_first_run() && done && !strcmp(done, "0") && !(off && *off == '0') && !scripted) g_welcome = true;
     }
-    const bool visible = open_now || g_perf.load() || g_welcome.load();
+    const bool readout = shim_fps_overlay_mode() != 0;   // (the fps readout: F3, display.fps_readout)
+    const bool visible = open_now || g_perf.load() || g_welcome.load() || readout;
     if (!visible) {
         if (was_visible) {   // drop what was queued while closing, so nothing replays at the next open
             std::lock_guard<std::mutex> lk(g_q_mu);
@@ -847,10 +988,12 @@ extern "C" const pc_draw *pc_overlay_build(uint32_t w, uint32_t h) {
     else io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     feed_pad();
     pc_settings_tick(false);
+    if (readout) fps_fonts();
     ImGui::NewFrame();
     welcome_window(w, h);
     settings_window(w, h);
     perf_window();
+    fps_readout(w, h);
     ImGui::Render();
     ImDrawData *dd = ImGui::GetDrawData();
     handle_textures(dd);

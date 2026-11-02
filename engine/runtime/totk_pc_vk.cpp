@@ -34,22 +34,22 @@ constexpr u64 kInputFlags = 0x455aa88;                  // the flag set the orig
 constexpr u32 kInputOffHash = 0xf6e0a4c8u;
 constexpr u64 kZlGate = 0x4557b30;                      // +0x58 != 0: the original skips the ZL tail
 constexpr u64 kTimeScale = 0x45577c0;                   // +0x88 * +0x108 < 1: the slow-motion path instead
-constexpr u64 kVerbOn = totk_main(0x165b4e8);              // (player, verb, flag) -> bool
-constexpr u64 kLockTarget = totk_main(0x1ccff34);          // (AttentionReceiver)
+constexpr u64 kVerbOnOff = 0x165b4e8, kVerbOn = totk_main(kVerbOnOff);           // (player, verb, flag) -> bool
+constexpr u64 kLockTargetOff = 0x1ccff34, kLockTarget = totk_main(kLockTargetOff);   // (AttentionReceiver)
 constexpr u64 kVkZl = 1ull << 2;
 // The guard's own virtual key (games/totk/patches/sites_v100.py VK_GUARD, feature vk_guard): the pad's ZL sets it
 // with VK 2, so a controller still guards; a PC key can set VK 2 alone (lock-on, shield down).
 constexpr u64 kVkGuard = 1ull << 27;
 constexpr u64 kLockoutTrig = 0xF6000Cull, kLockoutHold = 0xF40004ull;
 // vk_guard's first site (GUARD_SITES[0]): `mov w1, #27` when the feature is applied, the shipped `mov w1, #2` otherwise
-constexpr u64 kGuardSite = totk_main(0x1cfe320);
+constexpr u64 kGuardSiteOff = 0x1cfe320, kGuardSite = totk_main(kGuardSiteOff);
 constexpr u32 kMovW1Guard = 0x52800361u;   // movz w1, #27
 
 // Whether the guard reads VK 27 (vk_guard applied). Without it nothing reads 27, so the hook leaves the masks as the
 // original wrote them. main's code is not written after load: read once.
 bool guard_patched() {
     static const bool on = [] {
-        const u32 w = ld32(kGuardSite);
+        const u32 w = totk_main_known(kGuardSiteOff) ? ld32(kGuardSite) : 0;
         printf("[pc-vk] vk_guard %s (main+0x1cfe320 = %#x)\n", w == kMovW1Guard ? "applied: pad ZL mirrored to VK 27"
                                                                                : "not applied: no VK 27 mirror", w);
         return w == kMovW1Guard;
@@ -59,6 +59,21 @@ bool guard_patched() {
 
 bool ptr_ok(u64 p) { return totk_ptr_ok(p); }
 bool data_ok(u64 p) { return p >= 0x10000 && p < (1ull << 47); }   // any alignment (blackboard storage)
+
+// The guest struct fields the hook reads, at their 1.0.0 offsets (totk_version.h totk_field; the structs past the node
+// have no game name here and are named by what the hook takes from them). Another version's build maps each one or does
+// not compile; a diagnostic build runs the original alone while one is unplaced. 1.0.0: always true.
+bool fields_known() {
+    return totk_field_known(InputFlags, 0x30) && totk_field_known(FlagSet, 0x0) && totk_field_known(FlagSet, 0x10) &&
+           totk_field_known(FlagTable, 0x0) && totk_field_known(FlagTable, 0x8) &&
+           totk_field_known(FlagTable, 0x14) && totk_field_known(ExecutePlayerCalcKey, 0x8) &&
+           totk_field_known(ExecutePlayerCalcKey, 0x28) && totk_field_known(ExecutePlayerCalcKey, 0x38) &&
+           totk_field_known(ExecutePlayerCalcKey, 0x48) && totk_field_known(CalcKeyOwner, 0x8) &&
+           totk_field_known(CalcKeyCtx, 0x1f8) && totk_field_known(Actor, 0x220) &&
+           totk_field_known(ActorComps, 0x128) && totk_field_known(ActorComps, 0x3a8) &&
+           totk_field_known(Player, 0x28) && totk_field_known(Player, 0x10d8) && totk_field_known(EventMgr, 0x58) &&
+           totk_field_known(TimeScale, 0x88) && totk_field_known(TimeScale, 0x108);
+}
 
 // Each reason the hook leaves a run alone, logged the first time it happens (h1-first showed no [pc-vk] line at all).
 void left_alone(int why, u64 a, u64 b) {
@@ -73,12 +88,13 @@ void left_alone(int why, u64 a, u64 b) {
 // The lookup the game itself does at main+0x1ccf8a8 .. 0x1ccf938: an open-addressing table of u32 hashes, the bit index of each
 // in a byte array, the bits in the set's words. 1 set, 0 clear, -1 not in the set (or the set unreadable).
 int cut_reason(u32 hash, int *bit_out) {
+    if (!fields_known()) return -1;
     const u64 base = totk_global(kInputFlags);
     if (!ptr_ok(base)) return -1;
-    const u64 set = base + 0x30, tab = ld64(set + 0x10);
+    const u64 set = base + totk_field(InputFlags, 0x30), tab = ld64(set + totk_field(FlagSet, 0x10));
     if (!ptr_ok(tab)) return -1;
-    const u32 n = ld32(tab + 0x14);
-    const u64 keys = ld64(tab);
+    const u32 n = ld32(tab + totk_field(FlagTable, 0x14));
+    const u64 keys = ld64(tab + totk_field(FlagTable, 0x0));
     if (!n || !ptr_ok(keys)) return -1;
     const u32 start = hash % n;
     u32 i = start;
@@ -89,11 +105,11 @@ int cut_reason(u32 hash, int *bit_out) {
         i = i + 1 >= n ? 0 : i + 1;
         if (i == start) return -1;
     }
-    const u64 idx = ld64(tab + 8);
+    const u64 idx = ld64(tab + totk_field(FlagTable, 0x8));
     if (!ptr_ok(idx)) return -1;
     const u32 bit = ld8(idx + i);
     *bit_out = (int)bit;
-    return (ld32(set + ((bit >> 3) & 0x1c)) >> (bit & 31)) & 1;
+    return (ld32(set + totk_field(FlagSet, 0x0) + ((bit >> 3) & 0x1c)) >> (bit & 31)) & 1;
 }
 bool input_off(int *bit_out) { return cut_reason(kInputOffHash, bit_out) == 1; }
 
@@ -107,13 +123,15 @@ u64 call(Ctx *c, u64 fn, u64 a0, u64 a1 = 0, u64 a2 = 0) {
 // What the game does after its ZL test (main+0x1ccfbb4 .. 0x1ccfc14, 0x1ccfde0 .. 0x1ccfe20), for a VK 2 hold that
 // only the PC keys give.
 void zl_tail(Ctx *c, u64 comps) {
+    if (!totk_main_known(kVerbOnOff) || !totk_main_known(kLockTargetOff)) return;
     const u64 gate = totk_global(kZlGate);
-    if (ptr_ok(gate) && ld64(gate + 0x58)) return;
-    const u64 att = ld64(comps + 0x128), player = ld64(comps + 0x3a8);
+    if (ptr_ok(gate) && ld64(gate + totk_field(EventMgr, 0x58))) return;
+    const u64 att = ld64(comps + totk_field(ActorComps, 0x128)), player = ld64(comps + totk_field(ActorComps, 0x3a8));
     if (!ptr_ok(att) || !ptr_ok(player)) return;
     const u64 ts = totk_global(kTimeScale);
-    if (!ptr_ok(ts) || ldf32(ts + 0x88) * ldf32(ts + 0x108) < 1.0f) return;
-    if (ld64(player + 0x28) & 0x200080000ull) return;
+    if (!ptr_ok(ts) || ldf32(ts + totk_field(TimeScale, 0x88)) * ldf32(ts + totk_field(TimeScale, 0x108)) < 1.0f)
+        return;
+    if (ld64(player + totk_field(Player, 0x28)) & 0x200080000ull) return;
     if (call(c, kVerbOn, player, 0x34, 1) & 1) return;
     if (call(c, kVerbOn, player, 0x35, 0) & 1) return;
     call(c, kLockTarget, att);
@@ -153,6 +171,14 @@ void hook_f_1ccf894(Ctx *__restrict c) {   // ExecutePlayerCalcKey::updateImpl_(
         return m;
     }();
     if (!mode) return;
+    if (!fields_known()) {   // (as TOTK_PCVK=orig: no VK 2 -> 27 mirror, so on a vk_guard key the pad's ZL stops guarding)
+        static bool said;
+        if (!said) {
+            said = true;
+            printf("[pc-vk] fields not placed in this version: the original alone\n");
+        }
+        return;
+    }
     const u64 ret = c->x[0];
     static bool entered;
     if (!entered) {
@@ -160,7 +186,9 @@ void hook_f_1ccf894(Ctx *__restrict c) {   // ExecutePlayerCalcKey::updateImpl_(
         printf("[pc-vk] hook_f_1ccf894 runs (node %#llx)\n", (unsigned long long)node);
     }
     if (!ptr_ok(node)) return left_alone(0, node, 0);
-    const u64 trig = ld64(node + 0x28), hold = ld64(node + 0x38), rel = ld64(node + 0x48);
+    const u64 trig = ld64(node + totk_field(ExecutePlayerCalcKey, 0x28)),
+              hold = ld64(node + totk_field(ExecutePlayerCalcKey, 0x38)),
+              rel = ld64(node + totk_field(ExecutePlayerCalcKey, 0x48));
     if (!data_ok(trig) || !data_ok(hold) || !data_ok(rel)) return left_alone(1, trig, hold);
     // With vk_guard the pad's VK 2 also means guard: mirrored to VK 27 in all three masks, before anything else can
     // return (a controller must guard whatever the PC side does).
@@ -170,8 +198,10 @@ void hook_f_1ccf894(Ctx *__restrict c) {   // ExecutePlayerCalcKey::updateImpl_(
             if (ld64(m) & kVkZl) st64(m, ld64(m) | kVkGuard);
     if (mode == 1) return;
     const u64 pad_h = ld64(hold);   // the pad's hold, for the ZL tail below
-    const u64 a = ld64(node + 8), b = ptr_ok(a) ? ld64(a + 8) : 0, actor = ptr_ok(b) ? ld64(b + 0x1f8) : 0;
-    const u64 comps = ptr_ok(actor) ? ld64(actor + 0x220) : 0;
+    const u64 a = ld64(node + totk_field(ExecutePlayerCalcKey, 0x8)),
+              b = ptr_ok(a) ? ld64(a + totk_field(CalcKeyOwner, 0x8)) : 0,
+              actor = ptr_ok(b) ? ld64(b + totk_field(CalcKeyCtx, 0x1f8)) : 0;
+    const u64 comps = ptr_ok(actor) ? ld64(actor + totk_field(Actor, 0x220)) : 0;
     if (!ptr_ok(comps)) return left_alone(2, actor, comps);
     // Only the player's node (D1: the player actor is the proc of the link at the global main+0x4562308 + 0x20;
     // totk_globals.h, the same reader as totk_player_state.cpp).
@@ -208,8 +238,8 @@ void hook_f_1ccf894(Ctx *__restrict c) {   // ExecutePlayerCalcKey::updateImpl_(
     bool lockout = false;
     if (off) kt = kh = kr = 0;
     else {
-        const u64 player = ld64(comps + 0x3a8);
-        lockout = ptr_ok(player) && ldf32(player + 0x10d8) > bitsf(0x34000000u);
+        const u64 player = ld64(comps + totk_field(ActorComps, 0x3a8));
+        lockout = ptr_ok(player) && ldf32(player + totk_field(Player, 0x10d8)) > bitsf(0x34000000u);
         if (lockout) kt = kLockoutTrig | guard, kh = kLockoutHold | guard, kr = 0;
     }
     static bool was_lockout;
@@ -224,8 +254,8 @@ void hook_f_1ccf894(Ctx *__restrict c) {   // ExecutePlayerCalcKey::updateImpl_(
     // TOTK_VK_DIAG=1: on each change, the node's hold bits 2 / 27 next to what the game's own reader
     // (Player::getVirtualKeyHoldValue, main+0x1ccadcc) returns for 2 and 27, and the action verb
     static const bool diag = [] { const char *e = getenv("TOTK_VK_DIAG"); return e && atoi(e) > 0; }();
-    if (diag) {
-        const u64 player = ld64(comps + 0x3a8);
+    if (diag && totk_main_known(0x1ccadcc)) {
+        const u64 player = ld64(comps + totk_field(ActorComps, 0x3a8));
         if (ptr_ok(player)) {
             const u64 h = ld64(hold);
             const u64 g2 = call(c, totk_main(0x1ccadcc), player, 2) & 1, g27 = call(c, totk_main(0x1ccadcc), player, 27) & 1;

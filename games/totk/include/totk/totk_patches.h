@@ -33,6 +33,7 @@ typedef struct TotkSettings {
                                            render_w x render_h); 0 = the game's own tiers (down to its lowest) */
     float fov_scale;                    /* camera vertical field-of-view multiplier (default 0 = the game's own) */
     float shadow_scale;                 /* depth shadow map size multiplier (default 0 = the game's own) */
+    float shadow_fixed;                 /* 1 = the shadow map at its largest size, steady (default 0 = the view's) */
     float lod_scale;                    /* model LOD distance multiplier (default 0 = the game's own) */
     float actor_lod_scale;              /* actor LOD area distance multiplier (default 0 = the game's own) */
     float terrain_lod_scale;            /* terrain LoD distance multiplier (default 0 = the game's own) */

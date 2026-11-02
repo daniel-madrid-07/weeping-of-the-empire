@@ -213,8 +213,12 @@ def update_program(f, keys, size, title_id=TOTK_UPDATE_TITLE_ID):
     metadata = [r for r, _ in records if r['content_type'] == CONTENT_META]
     require(len(metadata) == 1 and metadata[0]['title_id'] == title_id,
             f'Expected the update {title_id} (one metadata NCA); base games, DLC and combined packages go elsewhere')
+    # an update's Program NCA carries the application's program id (the base title's), its metadata the update's:
+    # either is accepted, the BKTR section below makes it an update
     programs = [(r, h) for r, h in records if r['content_type'] == CONTENT_PROGRAM]
-    require(len(programs) == 1 and programs[0][0]['title_id'] == title_id, f'Expected one Program NCA of {title_id}')
+    base_id = f'{int(title_id, 16) & ~0xFFF:016X}'     # (an update's title id is its application's + 0x800)
+    require(len(programs) == 1 and programs[0][0]['title_id'] in (base_id, title_id),
+            f'Expected one Program NCA of {base_id} / {title_id}')
     record, hdr = programs[0]
     require(any(hdr[0x400 + i * 512 + 4] == 4 for i in range(4)), 'Expected an update (BKTR) Program NCA')
     return kind, [r for r, _ in records], record, hdr, nca_ctr_key(hdr, keys, tickets)

@@ -1,0 +1,16 @@
+{
+ "_": "Every release asset the Setup or the Builder downloads, pinned: the one list (installer's release_publish.py refuses a draft that lacks an asset pinned to its own tag, or an asset pinned to an earlier tag that is not live there with this sha256). tag = the release that really carries the file (an unchanged file stays on the release that first carried it; never 'latest'). used_by: builder:<NAME> = builder.py's NAME, setup:<Key> = make_setup.py bakes it into the Setup (Release.<Key>Asset / Tag / Sha256; it checks the zip it builds has this sha256, --repin rewrites the entry).",
+ "repo": "daniel-madrid-07/weeping-of-the-empire",
+ "assets": [
+  {"used_by": "builder:PGO", "tag": "v0.1.5", "name": "855fd396bdf75b97.profdata", "size": 56037960,
+   "sha256": "855fd396bdf75b9724a00c30786069f43b1efcd26be50348dda31a594eb3a6c8"},
+  {"used_by": "builder:PGO_RECORD", "tag": "v0.1.5", "name": "855fd396bdf75b97.json", "size": 889,
+   "sha256": "3f98fcde299a65f789a18abed30f2bcf2d4268bff15ed705c96080b0382a28c8"},
+  {"used_by": "builder:SEED", "tag": "v0.1.6", "name": "precompile.bin", "size": 4550776,
+   "sha256": "9ed350d4ea5c536d61a33725f4ce34ee79242646a7f8ea5f6eb3c048bcd69d2f"},
+  {"used_by": "setup:Llvm", "tag": "v0.1.7", "name": "setup-llvm.zip", "size": 80852283,
+   "sha256": "27bf3fd2ea4340580a38662502eb287a5bf1e4a953ae606f368b22d80906aee1"},
+  {"used_by": "setup:Vulkan", "tag": "v0.1.7", "name": "setup-vulkan-sdk.zip", "size": 13064178,
+   "sha256": "d3b384e4dd9a8107a37bf1b999120d40e85111f540b374d76b4c1260f7a15c9e"}
+ ]
+}

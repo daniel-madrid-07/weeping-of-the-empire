@@ -2,7 +2,9 @@
 // Host state lives in maps keyed by the guest object's address (not inside the guest struct), so objects the game
 // set up with static initializers (never passed to Initialize*) still work; Initialize* (re)creates the state.
 #include "hle.h"
+#include "nxr_game.h"   // (NXR_GAME_TOTK: forms TotK's build leaves out)
 #include "totk_version.h"
+#include "cpu_place.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
@@ -12,6 +14,9 @@
 #include <shared_mutex>
 #include <unordered_map>
 #include <deque>
+#if !NXR_GAME_TOTK
+#include <random>
+#endif
 #include <vector>
 #include <atomic>
 #include <chrono>
@@ -91,6 +96,9 @@ struct HThread {
     u64 type = 0, fn = 0, arg = 0, stack = 0, stack_size = 0;
     int prio = 16, core = -1; u64 core_mask = 7;
     HANDLE h = nullptr; DWORD tid = 0; std::string name;
+#if !NXR_GAME_TOTK
+    u64 name_ptr = 0;   // SetThreadNamePointer's (GetThreadNamePointer returns it; the SDK keeps the pointer, not a copy)
+#endif
     u32 fpcr = 0;   // the creator's FPCR at CreateThread (TOTK_FPCR=1: the new thread starts with it)
 };
 static Registry<HThread> g_threads;
@@ -208,6 +216,10 @@ static std::atomic<u64> g_tw_n, g_tw_req, g_tw_act, g_tw_out;   // timed event w
 // Handoff latency (signal / send -> the blocked waiter running again), "[sleep] ... | ev ... | mq ..." every ~5 s:
 // kind 0 = event waits (Event / LightEvent / SystemEvent), 1 = message-queue receives. Buckets <20 us, <100 us, <1 ms, more.
 static std::atomic<u64> g_hw_n[2], g_hw_blk[2], g_hw_lat[2], g_hw_b[2][4];
+// nn::os::YieldThread, "[sleep] ... | YieldThread ..." every ~5 s (os_YieldThread, below)
+static std::atomic<u64> g_y_n, g_y_ns, g_y_max, g_y_long, g_y_frames;
+static const char* yield_mode_name();
+extern "C" uint64_t nvn_present_count(void);   // (hle_vi / nvn: presents so far)
 static void hw_note(int k, bool blocked, s64 lat) {
     g_hw_n[k]++;
     if (!blocked) return;
@@ -215,6 +227,72 @@ static void hw_note(int k, bool blocked, s64 lat) {
     if (lat < 0) lat = 0;
     g_hw_lat[k] += (u64)lat;
     g_hw_b[k][lat < 20000 ? 0 : lat < 100000 ? 1 : lat < 1000000 ? 2 : 3]++;
+}
+// How a guest thread gives way (TOTK_YIELD, os_YieldThread below: the reasons). The same mode drives every spin wait of
+// this file (spin_pass: the spun part of a guest sleep below 1 ms, the tail of a 1-4 ms sleep, SleepThread(0), a zero
+// TimedWaitConditionVariable), which were SwitchToThread too: under load a 20 us sleep could come back a clock tick late.
+// TOTK_YIELD=switch: all as before. The default is hybrid on a CPU with SMT and switch (as v0.1.6) without: hybrid's pause
+// keeps the core, which on an SMT core gives its sibling the pipeline, but on a core of its own (an i7-9700K's 8c/8t: a
+// player's report of more stutter, 2026-11-02) only holds off a ready thread for up to TOTK_YIELD_CAP_US; route-measured on
+// SMT only.
+enum { YIELD_SWITCH, YIELD_PAUSE, YIELD_SLEEP0, YIELD_HYBRID };
+static int yield_mode() {
+    static const int m = [] {
+        const char* e = getenv("TOTK_YIELD");
+        if (!e || !*e) {
+            const bool smt = cpu_place_smt() != 0;   // (-1 unknown: hybrid, as before)
+            printf("[os] YieldThread and spin waits: %s (TOTK_YIELD unset; %s)\n", smt ? "hybrid" : "switch",
+                   smt ? "SMT cores" : "no SMT: a pause would hold its core, as v0.1.6 they switch");
+            return smt ? (int)YIELD_HYBRID : (int)YIELD_SWITCH;
+        }
+        if (!strcmp(e, "hybrid")) return (int)YIELD_HYBRID;
+        if (!strcmp(e, "switch")) return (int)YIELD_SWITCH;
+        if (!strcmp(e, "pause")) return (int)YIELD_PAUSE;
+        if (!strcmp(e, "sleep0")) return (int)YIELD_SLEEP0;
+        fprintf(stderr, "[os] TOTK_YIELD=%s: unknown (hybrid | switch | pause | sleep0): hybrid\n", e);
+        return (int)YIELD_HYBRID;
+    }();
+    return m;
+}
+static const char* yield_mode_name() {
+    static const char* nm[4] = {"switch", "pause", "sleep0", "hybrid"};
+    return nm[yield_mode()];
+}
+// hybrid: this thread's last real SwitchToThread; one is due when it has not switched for TOTK_YIELD_CAP_US (default
+// 1000; 0 = no cap): a ready thread that can only run on this core waits at most that long
+static thread_local s64 t_switched;
+static bool switch_due(s64 now) {
+    static const s64 cap = getenv("TOTK_YIELD_CAP_US") ? (s64)atoll(getenv("TOTK_YIELD_CAP_US")) * 1000 : 1000000;
+    return cap > 0 && now - t_switched > cap;
+}
+// one pass of a spin wait: switch mode SwitchToThread (as before); hybrid a pause, a real switch at least once a ms; pause
+// / sleep0 as named. TOTK_SPIN=<mode> overrides TOTK_YIELD for the spin waits alone (unset: follow TOTK_YIELD), so a gate
+// can tell the two changes apart without a rebuild: YieldThread's hybrid is route-measured, the spin waits' is not, and
+// low-core PCs are where it can cost most.
+static int spin_mode() {
+    static const int m = [] {
+        const char* e = getenv("TOTK_SPIN");
+        if (!e || !*e) return yield_mode();
+        if (!strcmp(e, "switch")) return (int)YIELD_SWITCH;
+        if (!strcmp(e, "hybrid")) return (int)YIELD_HYBRID;
+        if (!strcmp(e, "pause")) return (int)YIELD_PAUSE;
+        if (!strcmp(e, "sleep0")) return (int)YIELD_SLEEP0;
+        fprintf(stderr, "[os] TOTK_SPIN=%s: unknown (switch | hybrid | pause | sleep0): following TOTK_YIELD\n", e);
+        return yield_mode();
+    }();
+    return m;
+}
+static void spin_pass() {
+    switch (spin_mode()) {
+    case YIELD_PAUSE: YieldProcessor(); return;
+    case YIELD_SLEEP0: Sleep(0); return;
+    case YIELD_HYBRID: {
+        const s64 now = now_ns();
+        if (switch_due(now)) { SwitchToThread(); t_switched = now; } else YieldProcessor();
+        return;
+    }
+    default: SwitchToThread();
+    }
 }
 // Guest sleeps at the Switch's precision. sleep_for rounds up to the Windows timer, SleepThread(20 us) took 1.59 ms on
 // average (~310 calls/s, the game's job waits) and SleepThread(1 ms) 1.75 ms. Below 1 ms: yield until the deadline;
@@ -227,7 +305,7 @@ static void guest_sleep_ns(s64 ns) {
     if (off) { std::this_thread::sleep_for(std::chrono::nanoseconds(ns)); return; }
     if (ns < 1000000) {
         s64 end = now_ns() + ns;
-        do SwitchToThread(); while (now_ns() < end);
+        do spin_pass(); while (now_ns() < end);
         return;
     }
     s64 end = now_ns() + ns;
@@ -242,7 +320,7 @@ static void guest_sleep_ns(s64 ns) {
     due.QuadPart = -(LONGLONG)((ns - early) / 100);   // relative, 100 ns units
     if (timer && SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) WaitForSingleObject(timer, INFINITE);
     else std::this_thread::sleep_for(std::chrono::nanoseconds(ns - early));
-    if (early) while (now_ns() < end) SwitchToThread();
+    if (early) while (now_ns() < end) spin_pass();
 }
 // The actor creation threads' back-off: shaft::baseproc:: CreateAndDeleteThread::calc_ (main+0x23c7cc4, one thread per
 // guest core) creates queued actors one after another, and after each one, if the main thread's once-a-frame priority
@@ -261,7 +339,7 @@ HLE_AS(os_SleepThread, "_ZN2nn2os11SleepThreadENS_8TimeSpanE") {
         if (us >= 0 && us * 1000 < ns) ns = us * 1000;
     }
     s64 t0 = now_ns();
-    if (ns <= 0) SwitchToThread(); else guest_sleep_ns(ns);
+    if (ns <= 0) spin_pass(); else guest_sleep_ns(ns);
     s64 t1 = now_ns();
     int b = ns <= 0 ? 0 : ns < 1000000 ? 1 : ns <= 2000000 ? 2 : 3;
     g_sl_n[b]++; g_sl_req[b] += ns > 0 ? (u64)ns : 0; g_sl_act[b] += (u64)(t1 - t0);
@@ -292,10 +370,59 @@ HLE_AS(os_SleepThread, "_ZN2nn2os11SleepThreadENS_8TimeSpanE") {
                                  hk[k], (unsigned long long)n, (unsigned long long)b, b ? lat / 1e3 / b : 0.0, (unsigned long long)h0,
                                  (unsigned long long)h1, (unsigned long long)h2, (unsigned long long)h3);
         }
+        // (the frame count moves every window, a window without yields included)
+        const u64 fr = nvn_present_count(), f0 = g_y_frames.exchange(fr);
+        if (u64 n = g_y_n.exchange(0)) {
+            const u64 ns = g_y_ns.exchange(0);
+            o += snprintf(buf + o, sizeof buf - o, " | YieldThread (%s) %llu calls, %.1f a frame, %.1f ms in it, max %.2f ms, %llu over 1 ms",
+                          yield_mode_name(), (unsigned long long)n, fr > f0 && f0 ? (double)n / (double)(fr - f0) : 0.0, ns / 1e6,
+                          g_y_max.exchange(0) / 1e6, (unsigned long long)g_y_long.exchange(0));
+        }
         printf("%s\n", buf);
     }
 }
-HLE_AS(os_YieldThread, "_ZN2nn2os11YieldThreadEv") { SwitchToThread(); }
+// nn::os::YieldThread. On the Switch it lets a same-priority thread on the same core run, which costs little. SwitchToThread
+// hands the rest of the quantum to ANY ready thread on this CPU (our pipeline / translator workers, other processes) and
+// waits for the CPU to come back. TotK's actor jobs (ActorBase PreCalc / PostCalc / SleepCalc / PostSensorCalc) yield once
+// per actor while the main thread waits for the frame's jobs: a worker that loses its slice there stalls the frame.
+// TOTK_YIELD=hybrid (the default since the stutter sprint: route ABBA 89 -> 111 fps median, 1 % low 31.7 -> 36.3) | switch
+// (SwitchToThread, as before) | pause (a CPU pause hint, no OS yield) | sleep0 (Sleep(0): equal or higher priority threads
+// only) | hybrid (a pause while this thread's back-to-back yields have lasted under TOTK_YIELD_SPIN_US, default 50;
+// SwitchToThread after: a guest loop that needs another thread on this core to run still gets it). A loop whose body runs
+// longer than 20 us between yields starts a new run at every yield and would only ever pause, so hybrid also switches when
+// this thread has not really switched for TOTK_YIELD_CAP_US (default 1000; 0 = no cap): a ready thread that can only run on
+// this core waits at most that long.
+HLE_AS(os_YieldThread, "_ZN2nn2os11YieldThreadEv") {
+    static const s64 spin = getenv("TOTK_YIELD_SPIN_US") ? (s64)atoll(getenv("TOTK_YIELD_SPIN_US")) * 1000 : 50000;
+    // hybrid: this thread's last yield and the start of its run of back-to-back yields (its last real switch: t_switched)
+    thread_local s64 t_last, t_run;
+    const s64 t0 = now_ns();
+    switch (yield_mode()) {
+    case YIELD_PAUSE: YieldProcessor(); break;
+    case YIELD_SLEEP0: Sleep(0); break;
+    case YIELD_HYBRID:
+        if (t0 - t_last > 20000) t_run = t0;   // (more than 20 us since its last yield: a new run)
+        t_last = t0;
+        if (t0 - t_run < spin && !switch_due(t0)) YieldProcessor();
+        else { SwitchToThread(); t_switched = t0; }
+        break;
+    default: SwitchToThread();
+    }
+    // the counter: per thread, flushed every 256 calls (about 70k yields a second from every job thread: no shared line
+    // per call)
+    thread_local struct { u64 n, ns, mx, lng; } y;
+    const u64 d = (u64)(now_ns() - t0);
+    y.n++; y.ns += d;
+    if (d > 1000000) y.lng++;
+    if (d > y.mx) y.mx = d;
+    if ((y.n & 255) == 0) {
+        g_y_n.fetch_add(y.n, std::memory_order_relaxed); g_y_ns.fetch_add(y.ns, std::memory_order_relaxed);
+        g_y_long.fetch_add(y.lng, std::memory_order_relaxed);
+        u64 mx = g_y_max.load(std::memory_order_relaxed);
+        while (y.mx > mx && !g_y_max.compare_exchange_weak(mx, y.mx, std::memory_order_relaxed)) {}
+        y = {};
+    }
+}
 HLE_AS(os_GetCurrentFiber, "_ZN2nn2os15GetCurrentFiberEv") { c->x[0] = 0; }
 HLE_AS(os_SwitchToFiber, "_ZN2nn2os13SwitchToFiberEPNS0_9FiberTypeE") { rt_trap(c, c->x[30], "SwitchToFiber not implemented"); }
 
@@ -602,7 +729,11 @@ HLE_AS(os_TimedPeekLightMessageQueue, "_ZN2nn2os26TimedPeekLightMessageQueueEPmP
 }
 
 // ---------------------------------------------------------------- multi-wait (polling; holders bound to Events)
+#if NXR_GAME_TOTK
 struct HHolder { u64 event = 0; u64 multi = 0; };
+#else
+struct HHolder { u64 event = 0; u64 multi = 0; u64 user = 0; };
+#endif
 struct HMulti { std::mutex m; std::vector<u64> holders; };
 static Registry<HHolder> g_holder;
 static Registry<HMulti> g_multi;
@@ -631,6 +762,99 @@ HLE_AS(os_WaitAny, "_ZN2nn2os7WaitAnyEPNS0_13MultiWaitTypeE") {
     }
 }
 
+#if !NXR_GAME_TOTK
+HLE_AS(os_SetMultiWaitHolderUserData, "_ZN2nn2os26SetMultiWaitHolderUserDataEPNS0_19MultiWaitHolderTypeEm") { g_holder.get(c->x[0])->user = c->x[1]; }
+HLE_AS(os_GetMultiWaitHolderUserData, "_ZN2nn2os26GetMultiWaitHolderUserDataEPKNS0_19MultiWaitHolderTypeE") { c->x[0] = g_holder.get(c->x[0])->user; }
+
+// ---------------------------------------------------------------- forms TotK never imported (SDK 11.4)
+// CreateThread with an ideal core (7 arguments): as the 6-argument form, the thread then held to that core (>= 0), as
+// SetThreadCoreMask with a one-core mask would.
+HLE_AS(os_CreateThreadCore, "_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii") {
+    const u64 tt = c->x[0];
+    const int core = (int)c->x[6];
+    hle_os_CreateThread(c);
+    if (core >= 0 && core < 3) { HThread* t = g_threads.get(tt); t->core = core; t->core_mask = 1ull << core; }
+}
+HLE_AS(os_SetThreadNamePointer, "_ZN2nn2os20SetThreadNamePointerEPNS0_10ThreadTypeEPKc") {
+    const u64 tt = c->x[0], p = c->x[1];
+    hle_os_SetThreadName(c);
+    g_threads.get(tt)->name_ptr = p;
+}
+HLE_AS(os_GetThreadNamePointer, "_ZN2nn2os20GetThreadNamePointerEPKNS0_10ThreadTypeE") {
+    HThread* t = g_threads.get(c->x[0]);
+    c->x[0] = t->name_ptr ? t->name_ptr : (u64)t->name.c_str();
+}
+HLE_AS(os_GetThreadCoreMask, "_ZN2nn2os17GetThreadCoreMaskEPiPmPKNS0_10ThreadTypeE") {
+    HThread* t = g_threads.get(c->x[2]);
+    int core = t->core;
+    if (core < 0) { core = 0; u64 m = t->core_mask & 7; if (m) while (!(m & (1ull << core))) core++; }
+    if (c->x[0]) *(int*)c->x[0] = core;
+    if (c->x[1]) *(u64*)c->x[1] = t->core_mask;
+}
+// Events (EventType): the same waits as the light / system events
+HLE_AS(os_WaitEvent, "_ZN2nn2os9WaitEventEPNS0_9EventTypeE") { evlog('W', c->x[0], c->x[30]); ev_wait(g_event.get(c->x[0]), -1); evlog('w', c->x[0], c->x[30]); }
+HLE_AS(os_TryWaitEvent, "_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE") { c->x[0] = ev_try(g_event.get(c->x[0])); }
+HLE_AS(os_TimedWaitEvent, "_ZN2nn2os14TimedWaitEventEPNS0_9EventTypeENS_8TimeSpanE") {
+    const s64 ns = timespan_ns(c->x[1]); c->x[0] = ev_wait(g_event.get(c->x[0]), ns < 0 ? 0 : ns);
+}
+HLE_AS(os_TimedWaitSystemEvent, "_ZN2nn2os20TimedWaitSystemEventEPNS0_15SystemEventTypeENS_8TimeSpanE") {
+    const s64 ns = timespan_ns(c->x[1]); c->x[0] = ev_wait(g_event.get(c->x[0]), ns < 0 ? 0 : ns);
+}
+// Condition variables: Broadcast; TimedWait returns ConditionVariableStatus, 0 Timeout / 1 NoTimeout (the sdk's timed
+// wait returns 0 straight away for a zero TimeSpan after a release / re-acquire of the mutex: SDK 11.4's sdk at 0x345c00)
+HLE_AS(os_BroadcastConditionVariable, "_ZN2nn2os26BroadcastConditionVariableEPNS0_21ConditionVariableTypeE") {
+    evlog('U', c->x[0], c->x[30]); g_cond.get(c->x[0])->cv.notify_all();
+}
+HLE_AS(os_TimedWaitConditionVariable, "_ZN2nn2os26TimedWaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeENS_8TimeSpanE") {
+    HCond* cv = g_cond.get(c->x[0]); HMutex* m = mtx_get(c->x[1]);
+    const s64 ns = timespan_ns(c->x[2]);
+    int d = m->depth; m->depth = 0; m->owner = 0;
+    std::unique_lock<std::recursive_mutex> l(m->m, std::adopt_lock);
+    bool woke = false;
+    if (ns > 0) woke = cv->cv.wait_for(l, std::chrono::nanoseconds(ns)) == std::cv_status::no_timeout;
+    else { l.unlock(); spin_pass(); l.lock(); }
+    l.release(); m->owner = GetCurrentThreadId(); m->depth = d;
+    c->x[0] = woke ? 1 : 0;
+}
+// Message queues (MessageQueueType): the light queue's operations
+HLE_AS(os_TrySendMessageQueue, "_ZN2nn2os19TrySendMessageQueueEPNS0_16MessageQueueTypeEm") { c->x[0] = q_send(g_queue.get(c->x[0]), c->x[1], false, false); }
+HLE_AS(os_JamMessageQueue, "_ZN2nn2os15JamMessageQueueEPNS0_16MessageQueueTypeEm") { q_send(g_queue.get(c->x[0]), c->x[1], true, true); }
+HLE_AS(os_TryReceiveMessageQueue, "_ZN2nn2os22TryReceiveMessageQueueEPmPNS0_16MessageQueueTypeE") { c->x[0] = q_recv(g_queue.get(c->x[1]), (u64*)c->x[0], false, false); }
+HLE_AS(os_TimedReceiveMessageQueue, "_ZN2nn2os24TimedReceiveMessageQueueEPmPNS0_16MessageQueueTypeENS_8TimeSpanE") {
+    const s64 ns = timespan_ns(c->x[2]); c->x[0] = q_recv(g_queue.get(c->x[1]), (u64*)c->x[0], true, false, ns < 0 ? 0 : ns);
+}
+HLE_AS(os_GenerateRandomBytes, "_ZN2nn2os19GenerateRandomBytesEPvm") {
+    static std::mutex m; static std::random_device rd;
+    std::lock_guard<std::mutex> l(m);
+    u8* p = (u8*)c->x[0];
+    for (u64 i = 0; i < c->x[1]; i += 4) { const u32 v = rd(); memcpy(p + i, &v, c->x[1] - i < 4 ? c->x[1] - i : 4); }
+}
+
+// ---------------------------------------------------------------- the nnos* C API (SDK 11.4): each one forwards 1:1 to its
+// nn::os function in the sdk (checked over an SDK 11.4 sdk's wrappers; nnosCreateThread masks the result to its
+// module / description bits, 0 here)
+HLE_AS(osc_CreateThread, "nnosCreateThread") { hle_os_CreateThread(c); }
+HLE_AS(osc_StartThread, "nnosStartThread") { hle_os_StartThread(c); }
+HLE_AS(osc_WaitThread, "nnosWaitThread") { hle_os_WaitThread(c); }
+HLE_AS(osc_DestroyThread, "nnosDestroyThread") { hle_os_DestroyThread(c); }
+HLE_AS(osc_GetCurrentThread, "nnosGetCurrentThread") { hle_os_GetCurrentThread(c); }
+HLE_AS(osc_SetThreadNamePointer, "nnosSetThreadNamePointer") { hle_os_SetThreadNamePointer(c); }
+HLE_AS(osc_GetThreadPriority, "nnosGetThreadPriority") { hle_os_GetThreadPriority(c); }
+HLE_AS(osc_GetThreadCoreMask, "nnosGetThreadCoreMask") { hle_os_GetThreadCoreMask(c); }
+HLE_AS(osc_SetThreadCoreMask, "nnosSetThreadCoreMask") { hle_os_SetThreadCoreMask(c); }
+HLE_AS(osc_SleepThread, "nnosSleepThread") { hle_os_SleepThread(c); }
+HLE_AS(osc_GetSystemTick, "nnosGetSystemTick") { hle_os_GetSystemTick(c); }
+HLE_AS(osc_GetSystemTickFrequency, "nnosGetSystemTickFrequency") { hle_os_GetSystemTickFrequency(c); }
+HLE_AS(osc_InitializeMutex, "nnosInitializeMutex") { c->x[1] &= 1; hle_os_InitializeMutex(c); }
+HLE_AS(osc_FinalizeMutex, "nnosFinalizeMutex") { hle_os_FinalizeMutex(c); }
+HLE_AS(osc_LockMutex, "nnosLockMutex") { hle_os_LockMutex(c); }
+HLE_AS(osc_UnlockMutex, "nnosUnlockMutex") { hle_os_UnlockMutex(c); }
+HLE_AS(osc_InitializeEvent, "nnosInitializeEvent") { c->x[1] &= 1; hle_os_InitializeEvent(c); }
+HLE_AS(osc_FinalizeEvent, "nnosFinalizeEvent") { hle_os_FinalizeEvent(c); }
+HLE_AS(osc_SignalEvent, "nnosSignalEvent") { hle_os_SignalEvent(c); }
+HLE_AS(osc_WaitEvent, "nnosWaitEvent") { hle_os_WaitEvent(c); }
+
+#endif
 // ---------------------------------------------------------------- address space
 // AllocateAddressRegion / FreeAddressRegion live in hle_os_mem.cpp (alias region allocator).
 HLE_AS(os_SetDyingMessageRegion, "_ZN2nn2os21SetDyingMessageRegionEmm") { c->x[0] = 0; }

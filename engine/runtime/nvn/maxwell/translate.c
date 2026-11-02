@@ -120,6 +120,8 @@ typedef struct {
     bool gmem_coherent;   // LARECOMP_GMEM_COHERENT=1 and a cache-bypassing LDG / STG or a MEMBAR.GL / .SYS: gmem_ / gdev_ coherent volatile
     bool soft_f64;        // F64 ops emitted as soft_f64.h calls on uint64_t (maxwell_soft_f64): the library goes in the header
     bool uses_d16q;       // depth-compare references rounded to D16 where the texture is D16 (d16q(), d16_ref_on)
+    int soft_n;           // cascade compares emitted as nxsoft<slot>() (soft_shadow_pct); soft_twin[slot] = its raw-depth
+    int8_t soft_twin[32]; // binding + 1 (the same texture without the compare: the blocker search reads its depth)
 } Ctx;
 
 // Global memory windows (exec.c gmem_import): where one buffer cannot hold the heap, [k * W, (k + 1) * W) is buffer
@@ -323,6 +325,22 @@ extern bool maxwell_nvidia;
 static int d16_ref_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("LARECOMP_D16_REF"); v = e ? *e == '1' : !maxwell_nvidia; }
+    return v;
+}
+// TOTK_SOFT_SHADOWS=<percent> (graphics.soft_shadows, restart; 0 = the game's look): fragment-shader compares of a
+// 2D-array shadow map at an explicit LOD (the sun's cascades) become a contact-hardening filter (PCSS): 8 depth reads
+// around the point find the average blocker in front of it, the penumbra is that distance x 0.5 x percent / 100 (clamped
+// to 0.35 .. 5 texels of a 960 map, as in the rival's v0.3.1 patch 0010, MIT), then 8 compares on a disc of that radius
+// are averaged; no blocker = the original single compare. Shaders with more than TOTK_SOFT_SHADOWS_MAX (default 8) such
+// compares are the game's own wide kernels already: left as they are. The changed sources are new shaders (compiled once).
+static int soft_shadow_pct(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_SOFT_SHADOWS"); v = e ? atoi(e) : 0; if (v < 0 || v > 200) v = 0; }
+    return v;
+}
+static int soft_shadow_max(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_SOFT_SHADOWS_MAX"); v = e && *e ? atoi(e) : 8; if (v < 1) v = 1; }
     return v;
 }
 static int fs_zero_unwritten(void) {
@@ -963,6 +981,17 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
         snprintf(P, sizeof P, "vec%d(%s, %s)", n + 1, xs, dref);
     }
     char e[2000], ex[300] = "";
+    if (t->shadow && type == TEXTYPE_2D_ARRAY && layer && lod_kind == 1 && c->stage == STAGE_FRAGMENT && slot < 32 &&
+        (c->soft_twin[slot] || c->info->ntex < 30) &&
+        !t->bindless && soft_shadow_pct() > 0) {   // (soft_shadow_pct: the sun's cascades through nxsoft<slot>)
+        int tw = c->soft_twin[slot] ? c->soft_twin[slot] - 1 : tex_slot(c, t->handle_offset / 4, TEXTYPE_2D_ARRAY, false, true);
+        if (!c->fail && tw > 0 && tw < 32) {
+            c->soft_twin[slot] = (int8_t)(tw + 1);
+            c->soft_n++;
+            sprintf(out, "vec4(vec3(nxsoft%d(%s, %s)), 1.0f)", slot, P, lod);
+            return;
+        }
+    }
     if (extra) snprintf(ex, sizeof ex, ", %s", extra);
     if (lod_kind == 0) snprintf(e, sizeof e, "texture(t%d, %s%s)", slot, P, ex);
     else if (lod_kind == 1) snprintf(e, sizeof e, "textureLod(t%d, %s%s, %s)", slot, P, ex, lod);
@@ -2419,6 +2448,11 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         sprintf(t2, "(as_u(%s) + uint((%s(ulong(%s) << 32 | ulong(%s))) >> %du))", cb, bits(w, 56, 1) ? "0ul - " : "", R(hi), R(a),
                 32 - scale);
         set_reg(c, d, t2);
+    } else if (OPM(0x50e0000000000000ull, 0xfff8000000000000ull)) {
+        // VOTE.VTG (vertex / tessellation / geometry stages): a vote on the attribute-fetch state, with no register or
+        // predicate result. Ryujinx and yuzu treat it as a no-op (a newer game's vertex shaders carry it: 3923 of 8741
+        // failed here before it was decoded; none of TotK's do)
+        sp(&c->body, "    /* vote.vtg */\n");
     } else if (OPM(0xf0a8000000000000ull, 0xfff8000000000000ull)) {  // BAR
         if (!c->glsl) sp(&c->body, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
         else if (c->stage == STAGE_COMPUTE) sp(&c->body, "    barrier();\n");
@@ -2795,6 +2829,37 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                    "  return acc;\n"
                    "}\n", i, i, i, i);
     }
+    // soft_shadow_pct: nxsoft<slot>(P = (u, v, layer, reference), l), unrolled. The blocker search does not assume a
+    // depth direction (the sampler's compare op decides it, unseen here): a tap whose own compare fails (< 0.5) is a
+    // blocker, its depth read through the twin, its distance |reference - depth|; no blocker: the single compare as before
+    // (8 compares + 8 depth reads, then 8 compares)
+    for (int i = 0; i < 32 && i < info->ntex; i++) {
+        if (!c->soft_twin[i]) continue;
+        const int tw = c->soft_twin[i] - 1;
+        if (c->soft_n > soft_shadow_max()) {   // a wide kernel of the game's own: its compares as they were
+            sp(&s, "float nxsoft%d(vec4 P, float l) { return textureLod(t%d, P, l); }\n", i, i);
+            continue;
+        }
+        static const float disc[8][2] = {{-0.326f, -0.406f}, {-0.840f, -0.074f}, {-0.696f, 0.457f}, {-0.203f, 0.621f},
+                                         {0.962f, -0.195f}, {0.473f, -0.480f}, {0.519f, 0.767f}, {0.185f, -0.893f}};
+        const float k = 0.5f * (float)soft_shadow_pct() / 100.0f;
+        sp(&s, "float nxsoft%d(vec4 P, float l) {\n  float bs = 0.0f, bn = 0.0f;\n  vec2 q;\n", i);
+        for (int j = 0; j < 8; j++)
+            sp(&s, "  q = P.xy + vec2(%.3ff, %.3ff) * 0.0041667f;"
+                   " if (textureLod(t%d, vec4(q, P.z, P.w), l) < 0.5f) { bs += abs(P.w - textureLod(t%d, vec3(q, P.z), l).x);"
+                   " bn += 1.0f; }\n", disc[j][0], disc[j][1], i, tw);
+        sp(&s, "  if (bn == 0.0f) return textureLod(t%d, P, l);\n"
+               "  float r = clamp(bs / bn * %.4ff, 0.00036458f, 0.0052083f);\n  float s = 0.0f;\n", i, k);
+        for (int j = 0; j < 8; j++)
+            sp(&s, "  s += textureLod(t%d, vec4(P.xy + vec2(%.3ff, %.3ff) * r, P.z, P.w), l);\n", i, disc[j][0], disc[j][1]);
+        sp(&s, "  return s * 0.125f;\n}\n");
+    }
+    if (c->soft_n) {
+        static _Atomic int nlog;
+        if (nlog++ < 8)
+            printf("[shader] soft shadows: %d cascade compare(s)%s\n", c->soft_n,
+                   c->soft_n > soft_shadow_max() ? " left as they are (a wide kernel of the game's own)" : " filtered");
+    }
     if (stage == STAGE_VERTEX) {
         for (int i = 0; i < 32; i++) {
             if (!(c->in_attr_mask & (1u << i))) continue;
@@ -2970,7 +3035,7 @@ static bool brx_targets(const uint64_t *code, size_t i, size_t end, uint8_t *mar
         if ((v & 0xfff0000000000000ull) == 0xe240000000000000ull || (v & 0xfff0000000000000ull) == 0xe250000000000000ull ||
             (v & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (v & 0xfff0000000000000ull) == 0xe340000000000000ull ||
             (v & 0xfff0000000000000ull) == 0xe350000000000000ull)
-            return false;   // (control flow in between: not a straight-line table lookup)
+            break;   // (control flow in between: not a straight-line table lookup; every table's entries, below)
         if ((int)bits(v, 0, 8) != areg) continue;
         // the last instruction with Ra as its destination field: must be an unpredicated 32-bit LDC from c1, register-indexed
         if ((v & 0xfff8000000000000ull) != 0xef90000000000000ull) return false;
@@ -2990,7 +3055,28 @@ static bool brx_targets(const uint64_t *code, size_t i, size_t end, uint8_t *mar
         }
         return n > 0;
     }
-    return false;
+    // No table LDC in reach (Ra loaded before a SYNC / SSY or more than 24 slots back, as for a second BRX on the same
+    // index): every word of c1 is taken as a possible entry, all the tables' targets together (still a superset; c1's
+    // other words land outside the code or misaligned and are dropped). Issue #9: fs ab01398d (program 9fad2c77, 12 BRX,
+    // 4 of them this way) made every instruction a case, 977 of them, and AMD's driver compiled that for minutes, its
+    // memory past 20 GB; with this, 60 cases. In a 1,774-program recording it changes no other stage.
+    // LARECOMP_BRX_C1_ALL=0: every instruction, as before.
+    static int c1_all = -1;
+    if (c1_all < 0) { const char *e = getenv("LARECOMP_BRX_C1_ALL"); c1_all = !(e && *e == '0'); }
+    if (!c1_all) return false;
+    uint32_t brx_pc = (uint32_t)(i * 8);
+    int64_t imm = sbits(w, 20, 24);
+    int n = 0;
+    for (int64_t o = 0; o + 4 <= (int64_t)maxwell_const_size; o += 4) {
+        uint32_t e;
+        memcpy(&e, maxwell_const_data + o, 4);
+        uint32_t t = brx_pc + 8 + e + (uint32_t)imm;
+        if (((t >> 3) & 3u) == 0u) t += 8u;
+        if ((t & 7u) || t / 8 >= end) continue;
+        if (!mark[t / 8]) mark[t / 8] = 2;
+        n++;
+    }
+    return n > 0;
 }
 
 // Flat plan (2026-10-16, Deck d10: the cloud box fs 195655ef = 5.5 of ~15 ms GPU, a pc-loop shader with only forward
@@ -3251,6 +3337,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         } else if (!c->flat && any_branch && label[i]) {
             if (c->minpc && any_label && label[i] == 1) sp(&c->body, "    pc = %uu; continue;\n", pc);   // (no fall-through; see above)
             sp(&c->body, "  case %uu:\n", pc);
+            info->pc_cases++;
             any_label = true;
         }
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);

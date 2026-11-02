@@ -5,6 +5,7 @@
 #include "hle.h"
 #include "pc.h"
 #include "cpu_place.h"
+#include "mods_exefs.h"
 extern "C" void hle_fs_index_romfs_early(void);   // hle_fs.cpp: the RomFS pack's index built ahead of the first open
 extern "C" void ui_window_init(void);   // nvn/vulkan/device.c (prepare mode: the device without the game)
 extern "C" int vk_prepare(void);        // nvn/vulkan/exec.c (prepare mode)
@@ -80,18 +81,41 @@ static void load_module(Module& m, const std::string& path) {
     if (memcmp(&tmp[mod0], "MOD0", 4)) die("%s: no MOD0", m.name);
     s32 bss_end = *(s32*)&tmp[mod0 + 12];
     m.size = ((u64)(mod0 + bss_end) + 0xFFFF) & ~0xFFFFull;
+    if (!strcmp(m.name, "main")) {
+        // and the game patches' data page right after main's image (games/totk/include/totk/data_page.h: 16 KiB at
+        // the image's size rounded up to 16 KiB). 1.0.0's 64 KiB rounding already held it; 1.4.2's ends on the page
+        const u64 page_end = (((u64)(mod0 + bss_end) + 0x3fff) & ~0x3fffull) + 0x4000;
+        if (m.size < page_end) m.size = (page_end + 0xFFFF) & ~0xFFFFull;
+    }
     if (m.size < (u64)fsz) m.size = ((u64)fsz + 0xFFFF) & ~0xFFFFull;
     void* p = VirtualAlloc((void*)m.base, m.size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (p != (void*)m.base) die("%s: cannot map at %llx (err %lu)", m.name, m.base, GetLastError());
     memcpy(p, tmp.data(), fsz);
-    u64 dyn = m.base + mod0 + *(s32*)&tmp[mod0 + 4];
+    u64 dyn = m.base + mod0 + *(s32*)&tmp[mod0 + 4], gnu_hash = 0;
     for (u64 d = dyn; ; d += 16) {
         u64 tag = *(u64*)d, val = *(u64*)(d + 8);
         if (tag == 0) break;
         if (tag < 64) m.dyn[tag] = val;
+        else if (tag == 0x6ffffef5) gnu_hash = val;     // DT_GNU_HASH
     }
     u64 symtab = m.base + m.dyn[6], strtab = m.base + m.dyn[5];
-    u32 nsyms = *(u32*)(m.base + m.dyn[4] + 4);          // DT_HASH nchain
+    u32 nsyms = 0;
+    if (m.dyn[4]) {
+        nsyms = *(u32*)(m.base + m.dyn[4] + 4);          // DT_HASH nchain
+    } else if (gnu_hash) {
+        // only DT_GNU_HASH (the 1.4.x sdk): the highest symbol a bucket starts, then its chain to the end bit
+        const u64 h = m.base + gnu_hash;
+        const u32 nbuckets = *(u32*)h, symoffset = *(u32*)(h + 4), bloom = *(u32*)(h + 8);
+        const u32* buckets = (const u32*)(h + 16 + 8ull * bloom);
+        const u32* chain = buckets + nbuckets;
+        u32 last = 0;
+        for (u32 b = 0; b < nbuckets; b++) last = buckets[b] > last ? buckets[b] : last;
+        if (last < symoffset) nsyms = symoffset;
+        else {
+            while (!(chain[last - symoffset] & 1)) last++;
+            nsyms = last + 1;
+        }
+    } else die("%s: no DT_HASH or DT_GNU_HASH", m.name);
     for (u32 i = 0; i < nsyms; i++) {
         u64 s = symtab + i * 24ull;
         Sym y{ std::string((const char*)(strtab + *(u32*)s)), (u8)(*(u8*)(s + 4) & 0xF), *(u16*)(s + 6), *(u64*)(s + 8) };
@@ -138,6 +162,23 @@ static void relocate(Module& m) {
             case 257: case 1025: case 1026: *where = resolve(m, sym, &unresolved) + add; break; // ABS64 / GLOB_DAT / JUMP_SLOT
             case 0: break;
             default: die("%s: reloc type %u at %llx", m.name, type, off);
+            }
+        }
+    }
+    // DT_RELR (36) / DT_RELRSZ (35): the packed RELATIVE relocations newer linkers emit (the 1.4.x modules carry
+    // most of theirs so; 1.0.0's have none). An even entry is an address, an odd one a bitmap of the 63 words after
+    // the last address; each marked word holds its target's module offset
+    if (m.dyn[36] && m.dyn[35]) {
+        u64 next = 0;
+        for (u64 r = m.base + m.dyn[36]; r < m.base + m.dyn[36] + m.dyn[35]; r += 8) {
+            const u64 e = *(u64*)r;
+            if (!(e & 1)) {
+                *(u64*)(m.base + e) += m.base, n++;
+                next = m.base + e + 8;
+            } else {
+                for (u32 i = 0; i < 63; i++)
+                    if ((e >> (i + 1)) & 1) *(u64*)(next + 8ull * i) += m.base, n++;
+                next += 63 * 8;
             }
         }
     }
@@ -1169,6 +1210,7 @@ int main(int argc, char** argv) {
 
     load_module(g_main, dir + "/main.bin");
     load_module(g_sdk, dir + "/sdk.bin");
+    mods_exefs_start(dir.c_str());   // the mods' ExeFS patches into main (before relocation, as the Switch loader), cheats
     relocate(g_sdk);
     relocate(g_main);
     totk_engine_boot(MAIN_BASE);  // TotK game patches' data page; inert unpatched

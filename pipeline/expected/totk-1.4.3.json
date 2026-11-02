@@ -1,5 +1,5 @@
 {
-  "_comment": "Hashes (no game data) of what a genuine TotK 1.4.3 dump produces: the update's ExeFS and the update's RomFS merged over the base game's (python -m pipeline.extract romfs --update). From valentderah/totk-pc-recomp tools/data/expected-v1.4.3.json (MIT); to confirm on the owner's own dump. Unlike 1.0.0 -> 1.2.1, sdk, rtld and subsdk0 change too. main.npdm differs between dumps and is not checked.",
+  "_comment": "Hashes (no game data) of what a genuine TotK 1.4.3 dump produces: the update's ExeFS and the update's RomFS merged over the base game's (python -m pipeline.extract romfs --update). From valentderah/totk-pc-recomp tools/data/expected-v1.4.3.json (MIT); confirmed on the developer's own dump 2026-11-01 (ExeFS main, RomFS size and sha256 as extracted). Unlike 1.0.0 -> 1.2.1, sdk, rtld and subsdk0 change too. main.npdm differs between dumps and is not checked.",
   "title_id": "0100F2C0115B6000",
   "update_title_id": "0100F2C0115B6800",
   "version": 720896,

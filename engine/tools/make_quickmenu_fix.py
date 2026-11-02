@@ -78,6 +78,8 @@ def sarc_member(data, want):
 
 ROMFS = os.environ.get('TOTK_ROMFS', 'C:/totk/extract/romfs')
 REL = 'UI/LayoutArchive/Common.Product.100.Nin_NX_NVN.blarc.zs'
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from romfs_src import RomFS   # (the folder, or romfs.bin beside it: a player's install unpacks none)
 OUT = os.environ.get('TOTK_OVERLAY_OUT', 'C:/totk/overlay/romfs') + '/' + REL
 MEMBERS = {'anim/ShortCutBG_00_In.bflan': ('C_CaptureBG_00', 'C_CaptureClearBG_00', 'P_CaptureClearBG_00'),
            'anim/AutoBuilder_00_In.bflan': ('C_CaptureBG_00',)}
@@ -119,8 +121,9 @@ def flvi_keys(data, base):
         pos += size
     return out
 
-dic = sarc_member(unzstd(open(f'{ROMFS}/Pack/ZsDic.pack.zs', 'rb').read()), 'zs.zsdic')
-original = unzstd(open(f'{ROMFS}/{REL}', 'rb').read(), dic)
+rom = RomFS(ROMFS)
+dic = sarc_member(unzstd(rom.read('Pack/ZsDic.pack.zs')), 'zs.zsdic')
+original = unzstd(rom.read(REL), dic)
 blarc = bytearray(original)
 members = sarc_members(blarc)
 for member, panes in MEMBERS.items():

@@ -34,7 +34,8 @@ State g_st;   // (procFrame_ runs on the game's main thread)
 
 bool fps60_reads_min() {
     static const bool on = [] {
-        const bool v = word_hash(ld32(totk_main(0x8f6c60))) == kSiteHash && ld32(totk_main(0x8f6c88)) == kNop;
+        const bool v = totk_main_known(0x8f6c60) && totk_main_known(0x8f6c88) &&
+                       word_hash(ld32(totk_main(0x8f6c60))) == kSiteHash && ld32(totk_main(0x8f6c88)) == kNop;
         printf("[interval-min] %s\n", v ? "fps60 reads the controller's minimum: set from the frame-rate setting"
                                         : "fps60 absent or with a fixed minimum: the game's field left alone");
         return v;

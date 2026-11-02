@@ -45,6 +45,8 @@ enum {
     TOTK_DP_LATCH_FLAGS = 148,     /* runtime u32: bit 0 = the bow drawn, the Purah Pad camera or the Scope in use */
     TOTK_DP_LATCH_TOTALS = 152,    /* runtime f64 x, f64 y: the PC page's mouse totals (the TOTK_DP_MOUSE_LAST counter) */
     TOTK_DP_LATCH_QPC = 168,       /* runtime i64: QueryPerformanceCounter when those totals were read */
+    TOTK_DP_SHADOW_FIXED = 208,    /* runtime f32: non-zero = the depth shadow map at the largest size the game picks, not
+                                      the view-derived one (shadowres); 0 = the game's own */
     /* platform's PlatPcPage (platform/include/platform/pc.h, 0x80 bytes): mouse totals, glyph style, overlay state.
        app binds it after totk_patches_init: plat_pc_page_bind(page + TOTK_DP_PC_OFFSET, sizeof(PlatPcPage)). */
     TOTK_DP_PC_OFFSET = 0x100,

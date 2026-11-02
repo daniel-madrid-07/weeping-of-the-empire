@@ -280,6 +280,11 @@ struct Table {
 };
 Table g_t;
 std::mutex g_glyph_mu;   // g_t.glyph (the fs thread's glyph lookups read it)
+// The keys the last build refused (two actions on one input in one context, from a hand-edited settings.ini: the
+// later one loses it), for F10's Keys tab (pc_bind_refused, present thread). Under g_refused_mu.
+struct Refused { int input; const char *action, *holder; };
+std::vector<Refused> g_refused;
+std::mutex g_refused_mu;
 int g_glyph_tab[PCX_COUNT][24];
 std::atomic<int> g_ctx{PCX_WORLD};
 std::atomic<int> g_last_game{PCX_WORLD};   // the last gameplay context (pc_glyph_game_set)
@@ -289,6 +294,9 @@ std::atomic<int> g_scheme{-1};   // 1 the PC scheme, 0 the console layout; -1 no
 
 bool tree_ok();
 bool scheme_read() {
+#if defined(TOTK_BETA_OFF_PC_MENUS) || defined(TOTK_BETA_OFF_PC_VIRTUAL_KEYS)
+    return false;   // (a beta of another game version without the PC scheme's hooks: the console layout, always)
+#endif
     if (!tree_ok()) return false;
     char v[32] = {};
     const char *e = getenv("TOTK_CONTROLS");
@@ -350,7 +358,8 @@ int row_of(int c, const char *action, bool gp) {
 }
 // One context's table: each action from its most specific row in the context's chain, its keys from the most specific
 // settings level that has them, else the row's. Two actions on one input: the later is refused (logged unless quiet).
-void build_ctx(Table &t, int c, bool gp, const Look &look, int *overrides, int *conflicts, bool quiet) {
+void build_ctx(Table &t, int c, bool gp, const Look &look, int *overrides, int *conflicts, bool quiet,
+               std::vector<Refused> *refused = nullptr) {
     // (controls.gameplay = console: pc_scheme_gameplay.inc's rows and no-layout marks are not the gameplay contexts')
     const bool rows2 = gp || !in_scope(c, S_GAMEPLAY);
     for (int k = 0; k < kInputs; k++) t.route[c][k] = -1;
@@ -395,6 +404,11 @@ void build_ctx(Table &t, int c, bool gp, const Look &look, int *overrides, int *
                         printf("[pc] %s: %s is %s's already, not also %s's\n", kCtxNames[c], input_name(k, b, sizeof b),
                                kRows[t.route[c][k]].action, row.action);
                     ++*conflicts;
+                    if (refused) {
+                        bool have = false;
+                        for (const Refused &f : *refused) have |= f.input == k && !strcmp(f.action, row.action);
+                        if (!have) refused->push_back({k, row.action, kRows[t.route[c][k]].action});
+                    }
                     continue;
                 }
                 t.route[c][k] = (int16_t)r;
@@ -434,7 +448,12 @@ void build(int gen) {
     const bool gp = gameplay_pc();
     static int gp_was = -1;
     if (gp_was != (int)gp) { gp_was = gp; printf("[pc] gameplay keys: %s\n", gp ? "pc" : "console"); }
-    for (int c = 0; c < PCX_COUNT; c++) build_ctx(g_t, c, gp, Look(), &overrides, &conflicts, false);
+    std::vector<Refused> refused;
+    for (int c = 0; c < PCX_COUNT; c++) build_ctx(g_t, c, gp, Look(), &overrides, &conflicts, false, &refused);
+    {
+        std::lock_guard<std::mutex> l(g_refused_mu);
+        g_refused = std::move(refused);
+    }
     // a saved bind of an action the scheme no longer has (4.22 parry, 4.23 aim) is never read: no row looks it up.
     // Said once, so a dev settings file's stale line reads as ignored, not as a bind that silently failed
     static bool told_retired;
@@ -484,6 +503,9 @@ void build(int gen) {
 extern "C" void pc_input_focus(bool focused);   // (below: the accessibility hotkeys off / back)
 extern "C" void pc_input_keys_restore(void);
 void pc_input_scheme_set(const char *v) {
+#if defined(TOTK_BETA_OFF_PC_MENUS) || defined(TOTK_BETA_OFF_PC_VIRTUAL_KEYS)
+    return;         // (a beta without the PC scheme's hooks: the row cannot turn it on)
+#endif
     if (g_scheme.load() < 0) return;   // (not read yet: pc_scheme_on reads it, after tree_ok, at its first call)
     const char *e = getenv("TOTK_CONTROLS");
     const bool pc = e && *e ? g_scheme.load() != 0
@@ -565,6 +587,31 @@ bool same_action(int16_t a, int16_t b) { return a >= 0 && b >= 0 && !strcmp(kRow
 struct Sticky { int key = 0; uint64_t at = 0; bool seen = false; };
 Sticky g_stk;
 bool g_stk_eaten[256];   // a close's press: dead until let go
+// Toggle sprint / toggle lock-on (controls.sprint_toggle / controls.lock_toggle: TOTK_SPRINT_TOGGLE / TOTK_LOCK_TOGGLE,
+// off by default; the scheme's [X6], GAPS-zelda-on-pc 1 and 2). A press of a key the context routes to the action
+// latches it, the next press of it lets go (the key then works as held until it is released). The latch reads as that
+// key held (pc_route's is_down), so the row, its macro (sprint's put-away tap) and the carries into AIM / AIR work as
+// for a held key, only where the context routes the key to the same action: elsewhere (a jump, the glider, where Shift
+// is something else) it waits, and sprint runs on after a landing. Let go in a UI context (menus, dialogue, the
+// overlay), and sprint once Link stops: no movement key held for kToggleStopMs after one was.
+struct Toggle { const char *action, *env; int key; bool moved; uint64_t still; std::atomic<int> on; };
+Toggle g_tog[2] = {{"sprint", "TOTK_SPRINT_TOGGLE", 0, false, 0, {-1}}, {"lock_on", "TOTK_LOCK_TOGGLE", 0, false, 0, {-1}}};
+constexpr uint64_t kToggleStopMs = 300;
+bool toggle_enabled(Toggle &t) {
+    int v = t.on.load(std::memory_order_relaxed);
+    if (v < 0) {   // (the start's value, from the settings' start-up bridge; a change later comes through pc_input_toggle_set)
+        const char *e = getenv(t.env);
+        t.on = v = e && *e && strcmp(e, "0") != 0;
+    }
+    return v != 0;
+}
+void toggle_off(Toggle &t, const char *why) {
+    if (!t.key) return;
+    static int logs;
+    if (logs++ < 200) printf("[pc] toggle: %s off (%s)\n", t.action, why);
+    t.key = 0;
+    t.moved = false;
+}
 const char *const kStripActions[] = {"weapons", "shields", "bows", "materials"};
 bool strip_key(int c, int k) {   // k opens a strip in the gameplay context c (its row, a T pair's hold row)
     if (c < 0 || c >= PCX_COUNT || pc_ctx_is_ui(c) || k <= 0 || k >= 256) return false;
@@ -748,6 +795,10 @@ bool undecided(const KeyState &s) { return s.row >= 0 && kRows[s.row].kind == 'T
 
 extern "C" int pc_ctx(void) { return g_ctx.load(std::memory_order_relaxed); }
 extern "C" const char *pc_ctx_name(int c) { return c >= 0 && c < PCX_COUNT ? kCtxNames[c] : "?"; }
+// hle_hid.cpp's controls.sprint_toggle / controls.lock_toggle rows (live): 0 sprint, 1 lock-on; "1" on
+extern "C" void pc_input_toggle_set(int which, const char *v) {
+    if (which >= 0 && which < 2) g_tog[which].on = v && *v && strcmp(v, "0") != 0;
+}
 extern "C" bool pc_ctx_is_ui(int c) { return c == PCX_TRANSITION || (c >= 0 && c < PCX_COUNT && in_scope(c, S_UI)); }
 extern "C" void pc_input_gameplay_set(const char *v) {   // (controls.gameplay changed: the table rebuilt at the next read)
     g_gameplay_pc = !(v && (!_stricmp(v, "console") || !_stricmp(v, "off") || !strcmp(v, "0")));   // (as gameplay_pc)
@@ -1137,12 +1188,16 @@ void pc_macro_register(int id, const PcMacroOps *ops) {
 // then EventMgr (totk_globals.h; one load, as before, read +0x58 of the variable's neighbours, set in the world).
 // Aligned loads under SEH.
 static bool in_event_try() {
+    if (!totk_field_known(EventMgr, 0x58)) return false;   // (totk_version.h: another version's diagnostic build)
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    if (!totk_main_known_rt(0x4557b30)) return false;      // (another version: the slot not placed; logged once)
+#endif
     __try {
         auto ok = [](uint64_t p) { return p >= 0x10000 && p < (1ull << 47) && (p & 7) == 0; };
         const uint64_t var = *(const volatile uint64_t *)totk_main(0x4557b30);
         if (!ok(var)) return false;
         const uint64_t mgr = *(const volatile uint64_t *)var;
-        return ok(mgr) && *(const volatile uint64_t *)(mgr + 0x58) != 0;
+        return ok(mgr) && *(const volatile uint64_t *)(mgr + totk_field(EventMgr, 0x58)) != 0;
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         return false;
     }
@@ -1328,6 +1383,21 @@ int pc_ctx_decide(bool overlay, bool title_phase, uint32_t menu_screen, int gues
     return c;
 }
 
+// A latched toggle key (g_tog) in a context that routes it to the latch's action: it reads as held, for the routing
+// (is_down) and for a macro's own key reads (sprint's run: macro_down)
+bool toggle_holds(int c, int k) {
+    for (const Toggle &t : g_tog)
+        if (t.key == k && c >= 0 && c < PCX_COUNT) {
+            const int16_t r = g_t.route[c][k];   // (a dead row of the action, the quick menus' RMB: waits, as elsewhere)
+            return r >= 0 && kRows[r].kind != 'X' && !strcmp(kRows[r].action, t.action);
+        }
+    return false;
+}
+struct MacroDown { bool (*down)(int, void *); void *user; int ctx; };
+bool macro_down(int k, void *u) {
+    const MacroDown *d = (const MacroDown *)u;
+    return d->down(k, d->user) || toggle_holds(d->ctx, k);
+}
 void pc_route(const PcRouteIn &in, PcRouteOut *out) {
     out->bits = 0;
     out->wheel_taken = false;
@@ -1377,7 +1447,57 @@ void pc_route(const PcRouteIn &in, PcRouteOut *out) {
             else if (c != PCX_TRANSITION && in.now_ms - g_stk.at > 1000) close("no strip in 1 s", 0);
         }
     }
-    auto is_down = [&](int k) { return k > 0 && k < 256 && ((in.down(k, in.user) && !g_stk_eaten[k]) || k == g_stk.key); };
+    {   // toggle sprint / lock-on (g_tog, above): the physical presses latch and release, before the routing reads the keys
+        static bool tp[256];
+        const bool menu = pc_ctx_is_ui(c) || c == PCX_OVERLAY;   // (not pc_route's ui: that is "no layout fallback" too)
+        auto action_of = [&](int k) -> const char * {
+            const int16_t r = k > 0 && k < 256 && !menu ? g_t.route[c][k] : -1;
+            return r >= 0 && kRows[r].kind != 'X' ? kRows[r].action : nullptr;   // (a dead row: the quick menus' RMB)
+        };
+        bool moving = false;
+        for (int k = 1; k < 256 && !moving; k++)
+            if (in.down(k, in.user)) {
+                const char *a = action_of(k);
+                moving = a && !strncmp(a, "move_", 5);
+            }
+        for (Toggle &t : g_tog) {
+            if (!toggle_enabled(t)) { toggle_off(t, "setting off"); continue; }
+            if (menu) { toggle_off(t, "a menu"); continue; }
+            if (t.key && !strcmp(t.action, "sprint")) {
+                if (moving) t.moved = true, t.still = 0;
+                else if (t.moved && !t.still) t.still = in.now_ms;
+                else if (t.moved && in.now_ms - t.still >= kToggleStopMs) toggle_off(t, "Link stopped");
+            }
+        }
+        bool flipped[2] = {};   // (one flip a read: Shift comes as VK_SHIFT and VK_LSHIFT together)
+        for (int k = 1; k < 256; k++) {
+            const bool d = in.down(k, in.user);
+            if (d && !tp[k])
+                if (const char *a = action_of(k))
+                    for (int j = 0; j < 2; j++)
+                        if (Toggle &t = g_tog[j]; !flipped[j] && !strcmp(a, t.action) && toggle_enabled(t)) {
+                            flipped[j] = true;
+                            if (t.key) toggle_off(t, "pressed again");
+                            else {
+                                t.key = k, t.moved = moving, t.still = 0;
+                                static int logs;
+                                char nb[16];
+                                if (logs++ < 200) printf("[pc] toggle: %s on (%s)\n", t.action, input_id(k, nb, sizeof nb));
+                            }
+                        }
+            tp[k] = d;
+        }
+        // A latched key that went dead held (pressed in a context where its action is a dead row, the quick menus' RMB,
+        // and carried back): routed again as a fresh press where the latch holds it
+        for (const Toggle &t : g_tog)
+            if (t.key && !in.down(t.key, in.user) && toggle_holds(c, t.key) && g_keys[t.key].down && g_keys[t.key].dead) {
+                g_keys[t.key] = KeyState();
+                g_phys_prev[t.key] = false;
+            }
+    }
+    auto is_down = [&](int k) {
+        return k > 0 && k < 256 && ((in.down(k, in.user) && !g_stk_eaten[k]) || k == g_stk.key || toggle_holds(c, k));
+    };
     // the presses queued in a transition (or a quickmenu's close), played in the settled context c
     auto replay_queued = [&]() {
         for (int i = 0; i < g_queued_n; i++) {
@@ -1693,7 +1813,8 @@ void pc_route(const PcRouteIn &in, PcRouteOut *out) {
             Running &r = *order[i];
             const PcMacroOps *m = g_macros[r.id].load();
             const bool mine = &r == mouse_run;
-            PcMacroIn mi = {c, r.input, in.frame, in.now_ms, in.down, in.user, mine ? mdx : 0, mine ? mdy : 0, mine ? mw : 0};
+            MacroDown md = {in.down, in.user, c};   // (a latched toggle reads as held: macro_down)
+            PcMacroIn mi = {c, r.input, in.frame, in.now_ms, macro_down, &md, mine ? mdx : 0, mine ? mdy : 0, mine ? mw : 0};
             PcMacroOut mo = {};
             if (!m || !m->tick || !m->tick(&mi, &mo)) { macro_stop(r, false); continue; }
             for (int v : mo.claim) if (v > 0 && v < 256) claims[v] = true;
@@ -2006,6 +2127,17 @@ int bind_change(int scope, const char *action, int slot, int input, bool reset, 
 
 extern "C" int pc_bind_set(int scope, const char *action, int slot, int input, PcBindChange *out, int max) {
     return bind_change(scope, action, slot, input, false, out, max);
+}
+extern "C" int pc_bind_refused(const char *action, int *inputs, const char **holders, int max) {
+    std::lock_guard<std::mutex> l(g_refused_mu);
+    int n = 0;
+    for (const Refused &f : g_refused)
+        if (action && !strcmp(f.action, action) && n < max) {
+            if (inputs) inputs[n] = f.input;
+            if (holders) holders[n] = f.holder;
+            n++;
+        }
+    return n;
 }
 extern "C" int pc_bind_get(int scope, const char *action, int *inputs, int max, unsigned *flags) {
     if (flags) *flags = 0;
@@ -2416,6 +2548,7 @@ extern "C" int pc_bind_get(int, const char *, int *, int, unsigned *flags) {
 }
 extern "C" int pc_bind_reset(int, const char *, PcBindChange *, int) { return PCB_NOT_READY; }
 extern "C" int pc_bind_actions(int, void (*)(const char *, unsigned, void *), void *) { return PCB_NOT_READY; }
+extern "C" int pc_bind_refused(const char *, int *, const char **, int) { return 0; }
 extern "C" bool pc_input_capture_begin(unsigned) { return false; }
 extern "C" int pc_input_capture_poll(void) { return -1; }
 extern "C" void pc_input_capture_cancel(void) {}

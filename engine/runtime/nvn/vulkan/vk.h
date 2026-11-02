@@ -42,6 +42,7 @@ typedef struct {
     bool maint8;  // VK_KHR_maintenance8 enabled: vkCmdCopyImage between depth and matching colour formats (textures.c)
     bool astc_ldr;   // textureCompressionASTC_LDR enabled: ASTC images are created natively (textures.c), else decoded to RGBA8
     bool fill_nonsolid, dual_src_blend, depth_clamp;  // core features the device has (device.c; exec.c falls back without)
+    bool storage_ext;   // shaderStorageImageExtendedFormats (contact.c: the B10G11R11 scene colour as a storage image)
     bool feedback_loop;  // attachment feedback loops declared to the driver (device.c: EXT layout + dynamic state, unified layouts)
     bool fbl_layout;     // the feedback-loop LAYOUT extension alone (AMD Windows): live reads in FEEDBACK_LOOP_OPTIMAL (exec.c)
     bool depth_unrestricted;  // VK_EXT_depth_range_unrestricted enabled (textures.c depth twins: D32 values outside [0,1])
@@ -142,7 +143,10 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
 VkImageView vk_dummy_view(int textype);
+VkImageView vk_dummy_depth_view(int textype);   // textures.c: 1x1 D32 at 0.0 (2D / 2D array / cube; else NULL)
+bool vk_depth_twin_format(VkFormat f);           // textures.c: R32F / R16: a colour format a depth compare can read
 VkSampler vk_sampler(NvnSamplerDesc *d);
+VkSampler vk_sampler_plain(NvnSamplerDesc *d);   // textures.c: the same sampler without its depth compare
 VkSampler vk_default_sampler(bool linear);
 void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect);
 // Destruction once every submission that may use the object has completed.

@@ -1,7 +1,8 @@
 // Setup.exe / Builder.exe: drop the three files you dumped from your own console (the dump, the keys and the firmware),
 // pick a folder and press Install. One window for two cases:
 //   Setup:   the exe on its own (downloaded from the GitHub release). It fetches what the build needs into the install
-//            folder (Python, git, this repository at the exe's own release tag), then runs tools/builder/builder.py
+//            folder (Python, git, LLVM's part and the Vulkan files from its own release's assets, this repository at the
+//            exe's own release tag; each pinned by sha256), then runs tools/builder/builder.py
 //            --install, which fetches the compilers and builds. Nothing is installed system-wide; no administrator.
 //   Builder: the exe inside a clone of the repository (tools\builder\builder.py next to it): builds from that clone.
 // Build: tools\builder\gui\build.ps1 (the C# compiler that ships with Windows, .NET Framework 4.x; no install needed).
@@ -89,7 +90,7 @@ class Row : Painted
     readonly int index; readonly string title, hint;
     readonly Func<string, bool> accepts;
     public string FilePath { get; private set; }
-    public bool Locked, FolderOnly;
+    public bool Locked, FolderOnly, Clearable;   // Clearable: an optional row, emptied by a right-click
     public Func<string, string> Describe;   // the line under the title once set (default: the file name)
     public event Action Changed;
     public Action<string[]> DropMany;   // every dropped file goes to the row that takes it
@@ -108,7 +109,8 @@ class Row : Painted
             foreach (var f in files) if (accepts(f)) { Set(f); break; }
             if (DropMany != null) DropMany(files);
         };
-        Click += (s, e) => Browse();
+        MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) Browse(); };   // (a right-click is no choose)
+        MouseUp += (s, e) => { if (e.Button == MouseButtons.Right && Clearable && !Locked && FilePath != null) { FilePath = null; Invalidate(); if (Changed != null) Changed(); } };
         KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) Browse(); };
     }
 
@@ -226,22 +228,50 @@ class StatusView : Painted
 // repository at this exe's release tag. Release.cs (written by build.ps1) holds the tag and the repository.
 static class Fetch
 {
-    public class Item { public string Name, Url, Sha256, Dir, Strip; }
+    public class Item { public string Name, Url, Sha256, Dir, Strip; public string[] Keys; }   // Keys: files that must be there (else fetched again)
 
     // Python (python.org's NuGet package: a full CPython with venv and pip, no installer) and MinGit (git for Windows'
     // portable build for tools). Both unpack into <install>\tools.
     public static readonly Item Python = new Item
     {
-        Name = "Python 3.13.14", Dir = "python", Strip = "tools/",   // (the release PC's version: same package wheels)
+        Name = "Python 3.13.14", Dir = "python", Strip = "tools/", Keys = new[] { "python.exe" },   // (the release PC's version: same package wheels)
         Url = "https://api.nuget.org/v3-flatcontainer/python/3.13.14/python.3.13.14.nupkg",
         Sha256 = "9ac15cfa6cab1115c83d48f2af55c554efa4d1bb044bbc4ab1c9d17ad426e16c",
     };
     public static readonly Item Git = new Item
     {
-        Name = "MinGit 2.56.0", Dir = "git", Strip = "",
+        Name = "MinGit 2.56.0", Dir = "git", Strip = "", Keys = new[] { @"cmd\git.exe" },
         Url = "https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.4/MinGit-2.56.0.4-64-bit.zip",
         Sha256 = "e3bf78351fe777fba47ddee5950082f8a98bb0f02604fdc7ba3ee2cb68ffa877",
     };
+
+    // The part of LLVM the build runs and the Vulkan files it links: release assets, pinned in tools/builder/assets.json
+    // (the release that carries each, its sha256) and baked in here by make_setup.py (a Builder.exe has none: the PC's
+    // own tools serve). They used to ride inside the exe: 89 MB of compressed data in its code section, which antivirus
+    // heuristics read as packed (issue #14).
+    public static readonly Item Llvm = Asset("LLVM " + Release.LlvmVersion, Release.LlvmTag, Release.LlvmAsset, Release.LlvmSha256, "llvm",
+                                             new[] { @"bin\clang.exe", @"bin\clang-cl.exe", @"bin\lld-link.exe" });
+    public static readonly Item Vulkan = Asset("the Vulkan headers and libraries", Release.VulkanTag, Release.VulkanAsset, Release.VulkanSha256,
+                                               "vulkan-sdk", new[] { @"Lib\vulkan-1.lib", @"Lib\shaderc_combined.lib" });
+
+    // tag: the release that carries the file (pinned; an unchanged zip stays on the release that first carried it)
+    public static Item Asset(string name, string tag, string file, string sha, string dir, string[] keys)
+    {
+        return new Item { Name = name, Dir = dir, Strip = "", Keys = keys, Sha256 = sha,
+                          Url = "https://github.com/" + Release.Repo + "/releases/download/" + tag + "/" + file };
+    }
+
+    // The item's file next to this exe, if it is the pinned one (a release folder before it is published, a zip with
+    // the Setup and its files loose): used instead of the download
+    public static string Local(Item it, string dir)
+    {
+        try
+        {
+            string p = Path.Combine(dir, Path.GetFileName(new Uri(it.Url).LocalPath));
+            return File.Exists(p) && string.Equals(Sha256(p), it.Sha256, StringComparison.OrdinalIgnoreCase) ? p : null;
+        }
+        catch { return null; }
+    }
 
     // Download url to path with progress(done, total); resumes a .part file, retries with a pause, checks the sha256.
     public static void Download(Item it, string path, Action<long, long> progress, Func<bool> cancelled)
@@ -290,7 +320,12 @@ static class Fetch
                 if (!(e is WebException || e is IOException)) throw;
                 var r = (e is WebException) ? ((WebException)e).Response as HttpWebResponse : null;
                 if (r != null && (int)r.StatusCode == 416) { File.Delete(part); }   // (a stale .part longer than the file)
-                if (attempt >= 6) throw new IOException(string.Format("{0}: download failed ({1}). Check the internet connection and press Install again.", it.Name, e.Message));
+                if (attempt >= 6)
+                {
+                    string host = new Uri(it.Url).Host;
+                    throw new IOException(string.Format("Could not download {0} from {1} ({2}). Check the internet connection; a firewall, proxy or " +
+                        "school / work network can block {1}. Then press Install again: it continues where it stopped.", it.Name, host, e.Message));
+                }
                 Thread.Sleep(2000 * attempt);
             }
         }
@@ -323,9 +358,333 @@ static class Fetch
     }
 }
 
+// What the PC must have before Setup downloads anything (the first seconds, not after 30 minutes of building): each
+// problem is one sentence saying what to do. builder.py checks the same again (and the keys, the dump) once it runs.
+static class Preflight
+{
+    const double MinRamGb = 7.5;                       // (builder.py MIN_RAM_GB: an "8 GB" PC reports ~7.8)
+    const int FirstRunGb = 25, ResumeGb = 9, ToolsGb = 5, UpdateUnpackGb = 18;   // (builder.py FIRST_RUN_GB, RESUME_GB, TOOLS_GB, UPDATE_UNPACK_GB)
+
+    // What a first install asks for, as the window says it (Builder mode: no tools; the 1.4.3 update: its RomFS too)
+    public static int FirstInstallGb(bool tools, bool update) { return FirstRunGb + (tools ? ToolsGb : 0) + (update ? UpdateUnpackGb : 0); }
+    const uint Vk13 = (1u << 22) | (3u << 12);
+
+    [DllImport("kernel32.dll")] static extern bool IsProcessorFeaturePresent(int feature);
+    [StructLayout(LayoutKind.Sequential)]
+    struct MemoryStatus { public uint Length, Load; public ulong Total, Avail, PageTotal, PageAvail, VirtTotal, VirtAvail, ExtAvail; }
+    [DllImport("kernel32.dll")] static extern bool GlobalMemoryStatusEx(ref MemoryStatus m);
+
+    // Problems (the install cannot work: Setup stops) and notes (said once, the install goes on); details: for setup.log
+    // only (each GPU the check saw, for support). dir: the install folder (null in Builder mode: builder.py checks it).
+    public static void Check(string dir, List<string> problems, List<string> notes, List<string> details = null, bool update = false)
+    {
+        if (!Environment.Is64BitOperatingSystem)
+            problems.Add("This is 32-bit Windows; the game needs 64-bit Windows 10 or 11.");
+        if (!(IsProcessorFeaturePresent(36) && IsProcessorFeaturePresent(37) && IsProcessorFeaturePresent(38)))   // PF_SSSE3, PF_SSE4_1, _2
+            problems.Add("This processor is too old for the game: it needs SSE4.2 (Intel from 2008, AMD from 2011 on).");
+        else if (!IsProcessorFeaturePresent(40))   // PF_AVX2_INSTRUCTIONS_AVAILABLE
+            notes.Add("This processor has no AVX2: Setup builds the version for older processors (it runs a little slower).");
+        var m = new MemoryStatus { Length = (uint)Marshal.SizeOf(typeof(MemoryStatus)) };
+        if (GlobalMemoryStatusEx(ref m) && m.Total / 1073741824.0 < MinRamGb)
+            problems.Add(string.Format("This PC has {0:0.0} GB of memory; building the game needs at least 8 GB.", m.Total / 1073741824.0));
+        if (dir != null) Disk(dir, update, problems);
+        Vulkan(problems, notes, details ?? new List<string>());
+        notes.Add(Vp9Note(Vp9Mft()));
+        notes.Add("Visual C++ runtime in Windows: " + (CrtVersion() ?? "none"));
+    }
+
+    // The cutscene movies are VP9: Windows decodes them with the Store's "VP9 Video Extensions" (a Media Foundation
+    // MFT), which installs without the Store (LTSC, N, offline images) lack; the game then uses its own libvpx
+    // (engine/runtime/movie_core.h; issues #22, #25). Not a problem either way: a note. 1 = MFT, 0 = none, -1 = no
+    // Media Foundation at all (an N edition without the Media Feature Pack). The launcher says it too, once.
+    [StructLayout(LayoutKind.Sequential)] struct MftTypeInfo { public Guid Major, Sub; }
+    [DllImport("mfplat.dll", ExactSpelling = true)]
+    static extern int MFTEnumEx(Guid category, uint flags, ref MftTypeInfo input, IntPtr output, out IntPtr activates, out uint count);
+
+    static int Vp9Mft()
+    {
+        try
+        {
+            var input = new MftTypeInfo { Major = new Guid("73646976-0000-0010-8000-00aa00389b71"),     // MFMediaType_Video
+                                          Sub = new Guid("30395056-0000-0010-8000-00aa00389b71") };     // MFVideoFormat_VP90
+            IntPtr acts; uint n;
+            // MFT_CATEGORY_VIDEO_DECODER; SYNCMFT | LOCALMFT | SORTANDFILTER | UNTRUSTED_STOREMFT, as the game enumerates
+            int hr = MFTEnumEx(new Guid("d6c02d4b-6833-45b4-971a-05a4b04bab91"), 0x1 | 0x8 | 0x40 | 0x400, ref input, IntPtr.Zero, out acts, out n);
+            for (uint i = 0; hr >= 0 && i < n; i++) Marshal.Release(Marshal.ReadIntPtr(acts, (int)i * IntPtr.Size));
+            if (acts != IntPtr.Zero) Marshal.FreeCoTaskMem(acts);
+            return hr >= 0 && n > 0 ? 1 : 0;
+        }
+        catch (DllNotFoundException) { return -1; }
+        catch (EntryPointNotFoundException) { return -1; }
+    }
+
+    public static string Vp9Note(int mft)
+    {
+        if (mft > 0) return "Video: Windows has the VP9 Video Extensions; cutscenes are decoded by Windows (on the graphics card where it can).";
+        return "Video: Windows has no " + (mft < 0 ? "Media Foundation (an N edition without the Media Feature Pack) and no " : "") +
+               "VP9 Video Extensions. Cutscenes still play and look the same: the game decodes them with its own decoder (libvpx) on " +
+               "the processor. To decode them on the graphics card, install \"VP9 Video Extensions\" from the Microsoft Store.";
+    }
+
+    // The same sum as builder.py's, a run whose game files (of the version built: v100, or v143 with the update dump)
+    // are already extracted 15, the update's unpacked RomFS 18 more until it is, the tools 5
+    public static int NeedGb(string dir, bool update = false)
+    {
+        bool resume = File.Exists(Path.Combine(dir, "work", "extracted", update ? "v143" : "v100", "READY.json"));
+        return (resume ? ResumeGb : FirstRunGb) + (update && !resume ? UpdateUnpackGb : 0)
+             + (File.Exists(Path.Combine(dir, "tools", "llvm", ".toolchain.json")) ? 0 : ToolsGb);
+    }
+
+    static void Disk(string dir, bool update, List<string> problems)
+    {
+        try
+        {
+            int need = NeedGb(dir, update);
+            var d = new DriveInfo(Path.GetPathRoot(dir));
+            double free = d.AvailableFreeSpace / 1073741824.0;
+            if (free < need)
+                problems.Add(string.Format("Drive {0} has {1:0} GB free; this install needs about {2} GB. Free some space or choose a folder on another drive.",
+                                           d.Name.TrimEnd('\\'), free, need));
+        }
+        catch { }   // (builder.py checks again)
+    }
+
+    // A GPU must be able to run the game (Vulkan 1.3 and the rest of device.c's device_unfit). Asked in a child process
+    // (this exe with --vkcheck): a broken driver can crash the process that loads it, and that must not be Setup's window.
+    static void Vulkan(List<string> problems, List<string> notes, List<string> details)
+    {
+        string line = null;
+        try
+        {
+            var psi = new ProcessStartInfo(Process.GetCurrentProcess().MainModule.FileName, "--vkcheck")
+            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true };
+            using (var p = Process.Start(psi))
+            {
+                var read = p.StandardOutput.ReadToEndAsync();
+                if (!p.WaitForExit(20000)) { try { p.Kill(); } catch { } notes.Add("Could not check the graphics driver (no answer in 20 s); going on."); return; }
+                var lines = read.Result.Split('\n').Select(l => l.TrimEnd('\r')).ToList();
+                details.AddRange(lines.Where(l => l.StartsWith("gpu\t")).Select(l => "vkcheck: " + l.Substring(4).Replace("\t", " | ").TrimEnd(' ', '|')));
+                line = lines.LastOrDefault(l => l.StartsWith("result\t"));
+            }
+        }
+        catch (Exception e) { notes.Add("Could not check the graphics driver (" + e.Message + "); going on."); return; }
+        if (line == null) { notes.Add("Could not check the graphics driver (it stopped the check); going on."); return; }
+        Verdict(line, problems, notes);
+    }
+
+    // The child's last line: result <TAB> ok|unfit|nodevice|noloader|error <TAB> api <TAB> vendor id <TAB> GPU <TAB> why
+    public static void Verdict(string line, List<string> problems, List<string> notes)
+    {
+        var f = line.Split('\t');
+        string kind = f.Length > 1 ? f[1] : "";
+        if (kind == "noloader" || kind == "nodevice")
+            problems.Add("No graphics driver with Vulkan was found. Install the current driver for your graphics card (from NVIDIA, AMD or Intel), then run Setup again.");
+        else if (kind == "unfit" && f.Length == 6)
+            problems.Add(string.Format("{0} cannot run the game: {1}. Update the graphics driver{2}, then run Setup again " +
+                                       "(if it still says this, this graphics card cannot run the game).", f[4], f[5], Vendor(f[3])));
+        else if (kind == "ok" && f.Length >= 5)
+            notes.Add(string.Format("Graphics: {0}, Vulkan {1}", f[4], f[2]));
+        else notes.Add("Could not check the graphics driver (" + string.Join(" ", f.Skip(1)) + "); going on.");
+    }
+
+    static string Vendor(string id)
+    {
+        switch (id)
+        {
+            case "10de": return " from nvidia.com/drivers";
+            case "1002": return " from amd.com/support";
+            case "8086": return " from intel.com/support";
+            default: return "";
+        }
+    }
+
+    // msvcp140.dll in System32: its version, or null when Windows has none (the game carries what it needs)
+    static string CrtVersion()
+    {
+        try
+        {
+            var v = FileVersionInfo.GetVersionInfo(Path.Combine(Environment.SystemDirectory, "msvcp140.dll"));
+            return string.Format("{0}.{1}.{2}", v.FileMajorPart, v.FileMinorPart, v.FileBuildPart);
+        }
+        catch { return null; }
+    }
+
+    // ---- --vkcheck: the child process. One line: result ok|old <api> <vendor id> <name> (the best real GPU) ----
+    [DllImport("kernel32", CharSet = CharSet.Unicode)] static extern IntPtr LoadLibraryW(string name);
+    [DllImport("vulkan-1")] static extern int vkEnumerateInstanceVersion(out uint version);
+    [DllImport("vulkan-1")] static extern int vkCreateInstance(IntPtr info, IntPtr alloc, out IntPtr instance);
+    [DllImport("vulkan-1")] static extern int vkEnumeratePhysicalDevices(IntPtr instance, ref uint count, IntPtr[] devices);
+    [DllImport("vulkan-1")] static extern void vkGetPhysicalDeviceProperties(IntPtr device, IntPtr props);
+    [DllImport("vulkan-1")] static extern void vkDestroyInstance(IntPtr instance, IntPtr alloc);
+    [DllImport("vulkan-1")] static extern int vkEnumerateDeviceExtensionProperties(IntPtr device, IntPtr layer, ref uint count, IntPtr props);
+    [DllImport("vulkan-1")] static extern void vkGetPhysicalDeviceFeatures(IntPtr device, IntPtr features);
+    [DllImport("vulkan-1")] static extern void vkGetPhysicalDeviceProperties2(IntPtr device, IntPtr props2);
+
+    static string Ver(uint v) { return string.Format("{0}.{1}.{2}", v >> 22, (v >> 12) & 0x3ff, v & 0xfff); }
+
+    // Why a device cannot run the game (null: it can): device.c's device_unfit, all but the queue that presents to the
+    // window (that needs one). Vulkan 1.3, VK_KHR_swapchain, VK_EXT_external_memory_host, shaderInt64, and the subgroup
+    // operations basic | vote | ballot | shuffle | shuffle_relative in the vertex, fragment and compute stages.
+    static string Unfit(IntPtr pd, uint api, uint loader)
+    {
+        if (api < Vk13) return string.Format("its driver offers Vulkan {0}.{1}, 1.3 is needed", api >> 22, (api >> 12) & 0x3ff);
+        if (loader < Vk13) return string.Format("the Vulkan runtime in Windows is {0}.{1}, 1.3 is needed", loader >> 22, (loader >> 12) & 0x3ff);
+        uint ne = 0;
+        vkEnumerateDeviceExtensionProperties(pd, IntPtr.Zero, ref ne, IntPtr.Zero);
+        var names = new HashSet<string>();
+        IntPtr ep = Marshal.AllocHGlobal((int)Math.Max(1, ne) * 260);   // VkExtensionProperties: char extensionName[256], uint32 specVersion
+        try
+        {
+            vkEnumerateDeviceExtensionProperties(pd, IntPtr.Zero, ref ne, ep);
+            for (int i = 0; i < ne; i++) names.Add(Marshal.PtrToStringAnsi(new IntPtr(ep.ToInt64() + i * 260)));
+        }
+        finally { Marshal.FreeHGlobal(ep); }
+        foreach (var e in new[] { "VK_KHR_swapchain", "VK_EXT_external_memory_host" })
+            if (!names.Contains(e)) return "its driver lacks " + e;
+        IntPtr feat = Marshal.AllocHGlobal(256), p2 = Marshal.AllocHGlobal(4096), sg = Marshal.AllocHGlobal(32);
+        try
+        {
+            for (int i = 0; i < 256; i += 4) Marshal.WriteInt32(feat, i, 0);   // (zeroed: a pass is the driver's own 1)
+            vkGetPhysicalDeviceFeatures(pd, feat);   // VkPhysicalDeviceFeatures: 55 VkBool32, shaderInt64 the 41st
+            if (Marshal.ReadInt32(feat, 40 * 4) == 0) return "no 64-bit integers in shaders (shaderInt64)";
+            for (int i = 0; i < 32; i += 4) Marshal.WriteInt32(sg, i, 0);
+            Marshal.WriteInt32(sg, 0, 1000094000);   // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES
+            Marshal.WriteInt32(p2, 0, 1000059001);   // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+            Marshal.WriteIntPtr(p2, 8, sg);          // .pNext
+            vkGetPhysicalDeviceProperties2(pd, p2);
+            int stages = Marshal.ReadInt32(sg, 20), ops = Marshal.ReadInt32(sg, 24);   // .supportedStages, .supportedOperations
+            const int needOps = 0x01 | 0x02 | 0x08 | 0x10 | 0x20, needStages = 0x01 | 0x10 | 0x20;
+            if ((ops & needOps) != needOps || (stages & needStages) != needStages)
+                return string.Format("too few subgroup operations in shaders (ops 0x{0:x} in stages 0x{1:x})", ops, stages);
+        }
+        finally { Marshal.FreeHGlobal(feat); Marshal.FreeHGlobal(p2); Marshal.FreeHGlobal(sg); }
+        return null;
+    }
+
+    static uint Loader()
+    {
+        uint v;
+        try { if (vkEnumerateInstanceVersion(out v) == 0) return v; }
+        catch (EntryPointNotFoundException) { }   // (a 1.0 loader has no such call)
+        return 1u << 22;
+    }
+
+    // The whole child in one try: whatever a driver or an old loader throws ends as a result line, never a silent death
+    public static int VulkanChild()
+    {
+        try { return VulkanChildBody(); }
+        catch (Exception e) { Console.WriteLine("result\terror\t" + e.GetType().Name + ": " + e.Message); return 3; }
+    }
+
+    static int VulkanChildBody()
+    {
+        if (IntPtr.Size != 8) { Console.WriteLine("result\terror\tnot a 64-bit process"); return 3; }   // (the layouts below are x64's)
+        if (LoadLibraryW("vulkan-1.dll") == IntPtr.Zero) { Console.WriteLine("result\tnoloader"); return 2; }
+        uint loader = Loader();
+        IntPtr app = Marshal.AllocHGlobal(48), info = Marshal.AllocHGlobal(64), props = Marshal.AllocHGlobal(4096);
+        try
+        {
+            for (int i = 0; i < 48; i += 4) Marshal.WriteInt32(app, i, 0);   // VkApplicationInfo
+            for (int i = 0; i < 64; i += 4) Marshal.WriteInt32(info, i, 0);  // VkInstanceCreateInfo
+            Marshal.WriteInt32(app, 44, (int)Math.Min(loader, Vk13));        // .apiVersion
+            Marshal.WriteInt32(info, 0, 1);                                  // .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+            Marshal.WriteIntPtr(info, 24, app);                              // .pApplicationInfo
+            IntPtr inst;
+            int r = vkCreateInstance(info, IntPtr.Zero, out inst);
+            if (r == -9) { Console.WriteLine("result\tnodevice"); return 4; }   // VK_ERROR_INCOMPATIBLE_DRIVER: no driver speaks Vulkan
+            if (r != 0) { Console.WriteLine("result\terror\tvkCreateInstance " + r); return 3; }
+            uint n = 0;
+            vkEnumeratePhysicalDevices(inst, ref n, null);
+            var devs = new IntPtr[n];
+            if (n > 0) vkEnumeratePhysicalDevices(inst, ref n, devs);
+            // device.c's pick: the best device that can run the game, discrete before integrated before the rest; none
+            // can: name the most capable one turned down and why. (A software renderer counts as no GPU here.)
+            string fit = null, rejected = null; int fitScore = -1, rejScore = -1;
+            for (int d = 0; d < n; d++)
+            {
+                vkGetPhysicalDeviceProperties(devs[d], props);   // VkPhysicalDeviceProperties: apiVersion, driverVersion, vendorID, deviceID, deviceType, deviceName[256]
+                uint api = (uint)Marshal.ReadInt32(props, 0), vendor = (uint)Marshal.ReadInt32(props, 8), type = (uint)Marshal.ReadInt32(props, 16);
+                var raw = new byte[256];
+                Marshal.Copy(new IntPtr(props.ToInt64() + 20), raw, 0, 256);
+                int len = Array.IndexOf(raw, (byte)0);
+                string name = Encoding.UTF8.GetString(raw, 0, len < 0 ? 256 : len);
+                string why = type == 4 ? "a software renderer" : Unfit(devs[d], api, loader);
+                Console.WriteLine("gpu\t{0}\t{1:x4}\t{2}\t{3}\t{4}", type, vendor, Ver(api), name, why ?? "");
+                if (type == 4) continue;   // VK_PHYSICAL_DEVICE_TYPE_CPU
+                int score = type == 2 ? 4 : type == 1 ? 3 : 2;   // discrete, integrated, virtual / other
+                string verdict = string.Format("{0}\t{1:x4}\t{2}", Ver(api), vendor, name);
+                if (why == null && score > fitScore) { fitScore = score; fit = verdict; }
+                if (why != null && score > rejScore) { rejScore = score; rejected = verdict + "\t" + why; }
+            }
+            vkDestroyInstance(inst, IntPtr.Zero);
+            if (fit != null) { Console.WriteLine("result\tok\t" + fit); return 0; }
+            if (rejected != null) { Console.WriteLine("result\tunfit\t" + rejected); return 1; }
+            Console.WriteLine("result\tnodevice");
+            return 4;
+        }
+        catch (Exception e) { Console.WriteLine("result\terror\t" + e.GetType().Name + ": " + e.Message); return 3; }
+        finally { Marshal.FreeHGlobal(app); Marshal.FreeHGlobal(info); Marshal.FreeHGlobal(props); }
+    }
+
+    // A folder that would break the install although its drive is fine (null: none). OneDrive uploads what lands in it
+    // (the build files, FirstRunGb) and turns files into online-only stubs; Windows Security's Controlled folder access blocks
+    // unknown programs (our compilers) from writing into Documents, Desktop, Pictures, Videos and Music.
+    public static string FolderProblem(string f)
+    {
+        string full;
+        try { full = Path.GetFullPath(f).TrimEnd('\\') + "\\"; } catch { return null; }
+        foreach (var v in new[] { "OneDrive", "OneDriveConsumer", "OneDriveCommercial" })
+        {
+            string od = Environment.GetEnvironmentVariable(v);
+            if (!string.IsNullOrEmpty(od) && full.StartsWith(od.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))
+                return "This folder is inside OneDrive, which would upload the " + FirstRunGb + " GB of build files. Choose a folder outside OneDrive.";
+        }
+        if (ControlledFolderAccess())
+            foreach (var sf in new[] { Environment.SpecialFolder.MyDocuments, Environment.SpecialFolder.DesktopDirectory, Environment.SpecialFolder.MyPictures,
+                                       Environment.SpecialFolder.MyVideos, Environment.SpecialFolder.MyMusic })
+            {
+                string p = Environment.GetFolderPath(sf);
+                if (p.Length > 0 && full.StartsWith(p.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))
+                    return "Windows Security's Controlled folder access protects this folder and would block the build. Choose a folder outside Documents, Desktop, Pictures, Videos and Music.";
+            }
+        return Unwritable(full.TrimEnd('\\'));
+    }
+
+    // A folder this account may not create files in (Program Files, Windows, another user's folder: Setup needs no
+    // administrator and asks for none), else .NET's "Access to the path is denied" mid-install. Tried in the nearest
+    // folder that exists (a new folder and away again); anything but a refusal is left to the install itself.
+    static string Unwritable(string dir)
+    {
+        string at = dir;
+        while (at != null && !Directory.Exists(at)) at = Path.GetDirectoryName(at);
+        if (at == null) return null;
+        string probe = Path.Combine(at, ".setup-write-test-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+        try { Directory.CreateDirectory(probe); Directory.Delete(probe); return null; }
+        catch (UnauthorizedAccessException)
+        {
+            return string.Format("Windows does not let this account create files in {0}. Choose a folder you can write in, for example C:\\Games.", at);
+        }
+        catch { return null; }
+    }
+
+    // Controlled folder access in block mode (1; 2 = audit only), as set by the user or by a policy
+    public static bool ControlledFolderAccess()
+    {
+        foreach (var key in new[] { @"SOFTWARE\Microsoft\Windows Defender\Windows Defender Exploit Guard\Controlled Folder Access",
+                                    @"SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\Controlled Folder Access" })
+            try
+            {
+                using (var k = Registry.LocalMachine.OpenSubKey(key))
+                    if (k != null && Convert.ToInt32(k.GetValue("EnableControlledFolderAccess", 0)) == 1) return true;
+            }
+            catch { }
+        return false;
+    }
+}
+
 class BuilderForm : Form
 {
-    readonly Row dump, keys, firmware, install;
+    readonly Row dump, keys, update, firmware, install;
     readonly Row[] rows;
     readonly PrimaryButton build;
     readonly StatusView status;
@@ -335,7 +694,8 @@ class BuilderForm : Form
     volatile bool stopping;
     string launcher;               // the game's launcher, once a build is done
     string source;                 // --source=: the repository Setup fetches from instead of GitHub's
-    bool acceptTerms, auto, hidden, noShortcut;
+    bool acceptTerms, auto, hidden, noShortcut, noPreflight, scanNote;
+    string toolsDir;               // <install>\tools once a run set it up (a failed run checks what an antivirus took)
     string builderArgs = "";
     StreamWriter log;              // <install>\setup.log: every line the window shows (for a bug report)
 
@@ -373,20 +733,30 @@ class BuilderForm : Form
         var sub = new Label { Text = "Turns a dump of your own console into a native PC build.", Font = T.Body, ForeColor = T.TextDim,
                               AutoSize = true, Location = new Point(pad, T.S6 + T.D(36)) };
 
-        dump = new Row(1, "Dump", "Drop it here or click to choose", f => File.Exists(f) &&
-            (f.EndsWith(".nsp", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".xci", StringComparison.OrdinalIgnoreCase)));
+        dump = new Row(1, "Dump", "Drop it here or click to choose", f => IsDump(f));
         keys = new Row(2, "Keys", "The keys file from the same console", f => File.Exists(f) &&
             f.EndsWith(".keys", StringComparison.OrdinalIgnoreCase) && !f.EndsWith("title.keys", StringComparison.OrdinalIgnoreCase));
-        firmware = new Row(3, "Firmware (optional)",
+        // (the game's 1.4.3 update dump: builds that version, next to a 1.0.0 one; without it, 1.0.0 as before)
+        update = new Row(3, "Update (optional)", "Your " + UpdateVersion + " update dump: builds version " + UpdateVersion,
+            f => IsDump(f)) { Clearable = true, Describe = f => Path.GetFileName(f) + "   (right-click to remove: builds 1.0.0)" };
+        firmware = new Row(ShowUpdate ? 4 : 3, "Firmware (optional)",
             CjkWindows ? "Recommended: Korean and Chinese text looks right with its fonts" : "Only Korean and Chinese text needs it: its folder or .zip",
             f => Directory.Exists(f) ||
             (File.Exists(f) && f.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)));
-        install = new Row(4, "Install to", "A folder with about 75 GB free", f => IsFolderTarget(f)) { FolderOnly = true, Describe = DescribeFolder };
-        rows = repo != null ? new[] { dump, keys, firmware } : new[] { dump, keys, firmware, install };
+        install = new Row(ShowUpdate ? 5 : 4, "Install to", "A folder with about " + Preflight.FirstInstallGb(true, false) + " GB free", f => IsFolderTarget(f)) { FolderOnly = true, Describe = DescribeFolder };
+        rows = (repo != null ? new[] { dump, keys, update, firmware } : new[] { dump, keys, update, firmware, install })
+            .Where(r => ShowUpdate || r != update).ToArray();
         int rowY = T.D(104), rowH = T.D(62);
         var top = new Label { BackColor = T.Rule, Bounds = new Rectangle(pad, rowY - 1, inner, 1) };   // rule above the list
         for (int i = 0; i < rows.Length; i++) { rows[i].Bounds = new Rectangle(pad, rowY + i * rowH, inner, rowH); rows[i].Changed += UpdateState; }
-        dump.DropMany = keys.DropMany = firmware.DropMany = Distribute;
+        dump.DropMany = keys.DropMany = update.DropMany = firmware.DropMany = Distribute;
+        update.Changed += () =>
+        {
+            if (update.FilePath == null || Busy) return;
+            status.Add(SavesNote);
+            status.Add(string.Format("With the {0} update the first build needs about {1} GB free (its game files are unpacked).",
+                                     UpdateVersion, Preflight.FirstInstallGb(repo == null, true)));
+        };
 
         build = new PrimaryButton { Text = repo != null ? "Build" : "Install", Bounds = new Rectangle(pad, rowY + rows.Length * rowH + T.S6, inner, T.D(42)), Enabled = false };
         build.Click += (s, e) => { if (!build.Enabled) return; if (launcher != null && proc == null && worker == null) Play(); else Start(); };
@@ -416,12 +786,13 @@ class BuilderForm : Form
                 if (log != null) { try { log.WriteLine("Stopped: the window was closed"); log.Dispose(); } catch { } log = null; }
             }
         };
-        status.Add(string.Format("The first build takes 30 to 60 minutes and needs about {0} GB free.", repo != null ? 60 : 75));   // the empty state says what to expect
+        status.Add(string.Format("The first build takes 30 to 60 minutes and needs about {0} GB free.", Preflight.FirstInstallGb(repo == null, false)));   // the empty state says what to expect
         status.Add("Later builds and updates reuse what is already done and take minutes.");
         if (repo == null) { RestoreChoices(); CheckNewer(); }
         // Files dropped onto the exe's icon, and options for an unattended run (tests, scripted installs):
         //   --install-to=DIR  --accept-terms  --auto (press Install)  --hidden (no window; exits 0 / 1 at the end)  --no-shortcut
         //   --source=<git url or path>: fetch the tag from another repository (testing a Setup before its release)
+        //   --no-preflight: skip the PC check (processor, memory, disk, graphics driver) that runs before any download
         var files = new List<string>();
         string to = null;
         var argv = Environment.GetCommandLineArgs().Skip(1).ToList();
@@ -434,6 +805,7 @@ class BuilderForm : Form
             else if (a == "--auto") auto = true;
             else if (a == "--hidden") hidden = true;
             else if (a == "--no-shortcut") noShortcut = true;
+            else if (a == "--no-preflight") noPreflight = true;   // (support: a PC check that is wrong about this PC)
             else files.Add(a);
         Distribute(files.ToArray());
         if (to != null && repo == null) install.Set(Path.GetFullPath(to));
@@ -444,7 +816,21 @@ class BuilderForm : Form
             t.Tick += (s, e) => { t.Stop(); AutoStart(); };
             t.Start();
         }
+        else if (repo == null && !noPreflight) EarlyCheck();
         UpdateState();
+    }
+
+    // What the PC lacks, shown as the window opens (before the three files are even chosen); Install checks again
+    void EarlyCheck()
+    {
+        string dir = install.FilePath;
+        bool withUpdate = update.FilePath != null;   // (the 1.4.3 update unpacks 18 GB more)
+        new Thread(() =>
+        {
+            var problems = new List<string>();
+            try { Preflight.Check(dir, problems, new List<string>(), null, withUpdate); } catch { return; }
+            if (problems.Count > 0) Post(() => { if (!Busy) foreach (var p in problems) status.Add(p); });
+        }) { IsBackground = true }.Start();
     }
 
     bool Busy { get { return proc != null || worker != null; } }
@@ -461,7 +847,26 @@ class BuilderForm : Form
         if (DwmSetWindowAttribute(Handle, 20, ref on, 4) != 0) DwmSetWindowAttribute(Handle, 19, ref on, 4);
     }
 
-    void Distribute(string[] files) { if (Busy) return; foreach (var f in files) if (!dump.Offer(f) && !keys.Offer(f)) firmware.Offer(f); }
+    // Every dropped file to the row that takes it: of two dumps the bigger is the game, the other its update (a file a
+    // row already holds, e.g. dropped onto the Update row itself, stays there)
+    void Distribute(string[] files)
+    {
+        if (Busy) return;
+        foreach (var f in files.OrderByDescending(f => IsDump(f) ? new FileInfo(f).Length : 0))
+            if (!rows.Any(r => r.FilePath == f) && !dump.Offer(f) && !keys.Offer(f) && !(ShowUpdate && IsDump(f) && update.Offer(f)))
+                firmware.Offer(f);
+    }
+
+    const string UpdateVersion = "1.4.3";   // (builder.py's UPDATE_VERSION)
+    // v0.1.7 ships without the 1.4.3 row: the row is not shown, a dropped or remembered update dump is not taken;
+    // builder.py's --update stays (Setup... -- --update <nsp>)
+    static readonly bool ShowUpdate = false;
+    const string SavesNote = UpdateVersion + " keeps its own saves: the first time it starts it copies your 1.0.0 saves once. " +
+        "Progress you make later in 1.0.0 does not appear in " + UpdateVersion + ", and " + UpdateVersion + " saves never go back to 1.0.0.";
+    static bool IsDump(string f)
+    {
+        return File.Exists(f) && (f.EndsWith(".nsp", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".xci", StringComparison.OrdinalIgnoreCase));
+    }
 
     // Windows' display language is Korean or Chinese: the game follows it, and without the firmware's shared fonts it
     // shows that text in a Windows font instead (hle_pl)
@@ -486,9 +891,10 @@ class BuilderForm : Form
 
     void UpdateState()
     {
-        // the firmware is optional: its shared fonts are only for Korean and Chinese text (a Windows font without them)
-        int n = 0, need = rows.Length - 1;
-        foreach (var r in rows) if (r != firmware && r.FilePath != null) n++;
+        // the firmware is optional: its shared fonts are only for Korean and Chinese text (a Windows font without them);
+        // the update too: without it the build is 1.0.0
+        int n = 0, need = rows.Count(r => r != firmware && r != update);   // (the update row may be hidden: ShowUpdate)
+        foreach (var r in rows) if (r != firmware && r != update && r.FilePath != null) n++;
         build.Enabled = n == need && !Busy;
         if (launcher != null && !Busy) return;   // (Done: the button plays)
         if (!Busy && !status.Failed)
@@ -523,7 +929,7 @@ class BuilderForm : Form
             if (d.DriveType != DriveType.Fixed) return "Choose a folder on a local drive (not a removable or network one).";
             if (d.DriveFormat.StartsWith("FAT", StringComparison.OrdinalIgnoreCase))
                 return string.Format("{0} is formatted {1}, which cannot hold files over 4 GB (the game's data needs one of 17 GB). Choose a folder on an NTFS drive.", d.Name, d.DriveFormat);
-            return null;
+            return Preflight.FolderProblem(f);
         }
         catch (Exception e) { return e.Message; }
     }
@@ -575,11 +981,13 @@ class BuilderForm : Form
         {
             Func<string, string> get = n => k == null ? null : k.GetValue(n) as string;
             string dir = get("InstallDir");
-            install.Set(dir != null && IsFolderTarget(dir) ? dir : DefaultFolder());
-            foreach (var r in new[] { new { Row = dump, Name = "Dump" }, new { Row = keys, Name = "Keys" }, new { Row = firmware, Name = "Firmware" } })
+            // (an install made before a folder rule existed, e.g. in OneDrive, stays where it is: an update reuses its build)
+            install.Set(dir != null && (IsFolderTarget(dir) || Directory.Exists(Path.Combine(dir, "tools"))) ? dir : DefaultFolder());
+            foreach (var r in new[] { new { Row = dump, Name = "Dump" }, new { Row = keys, Name = "Keys" }, new { Row = update, Name = "Update" },
+                                      new { Row = firmware, Name = "Firmware" } })
             {
                 string p = get(r.Name);
-                if (p != null && (File.Exists(p) || Directory.Exists(p))) r.Row.Offer(p);
+                if (p != null && (File.Exists(p) || Directory.Exists(p)) && (ShowUpdate || r.Row != update)) r.Row.Offer(p);
             }
             string tag = get("Tag");
             if (tag != null) build.Text = tag == Release.Tag ? "Rebuild" : "Update";
@@ -594,6 +1002,7 @@ class BuilderForm : Form
             {
                 k.SetValue("InstallDir", install.FilePath); k.SetValue("Dump", dump.FilePath);
                 k.SetValue("Keys", keys.FilePath); if (firmware.FilePath != null) k.SetValue("Firmware", firmware.FilePath); else k.DeleteValue("Firmware", false);
+                if (update.FilePath != null) k.SetValue("Update", update.FilePath); else k.DeleteValue("Update", false);
                 if (done) k.SetValue("Tag", Release.Tag);
             }
         }
@@ -666,6 +1075,11 @@ class BuilderForm : Form
             stepStart = Progress(name); stepSpan = Span(name);
             status.Value = stepStart;
             status.Add(string.Format("step {0}/{1} {2}", i, n, name));   // (the command line itself is noise here)
+            if (name == "romfs" && !scanNote)   // (the first step that writes tens of GB: antivirus scanning shows here)
+            {
+                scanNote = true;
+                Append("[Builder] Windows Security scans every new file: on some PCs that makes this step and the build slower. That is normal.");
+            }
             return;
         }
         var p = Percent.Match(line);
@@ -692,11 +1106,12 @@ class BuilderForm : Form
         Environment.SetEnvironmentVariable("GIT_CONFIG_COUNT", "1");
         Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_0", "safe.directory");
         Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_0", "*");
-        build.Enabled = false; Lock(true); stopping = false; launcher = null;
+        build.Enabled = false; Lock(true); stopping = false; launcher = null; scanNote = false;
         status.Clear(); status.Failed = false; status.Running = true; status.Value = 0; status.Step = "Starting"; status.Invalidate();
         if (repo != null) { RunBuilder(repo, "py", "-3 ", null); return; }
         SaveChoices(false);
         string dir = install.FilePath.TrimEnd('\\');
+        bool withUpdate = update.FilePath != null;
         worker = new Thread(() =>
         {
             try
@@ -705,13 +1120,24 @@ class BuilderForm : Form
                 var w = new StreamWriter(Path.Combine(dir, "setup.log"), true, new UTF8Encoding(false)) { AutoFlush = true };
                 w.WriteLine("---- " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " Setup " + Release.Tag);
                 Post(() => log = w);
+                if (!noPreflight)
+                {
+                    var problems = new List<string>(); var notes = new List<string>(); var details = new List<string>();
+                    Preflight.Check(dir, problems, notes, details, withUpdate);
+                    Post(() => { if (log != null) foreach (var d in details) log.WriteLine(d); });   // (the log only: support)
+                    foreach (var n in notes) Append("[Builder] " + n);
+                    foreach (var p in problems) Append("[Builder] " + p);
+                    if (problems.Count > 0)   // (the log, not the window: for support, when the check is wrong about a PC)
+                        Post(() => { if (log != null) log.WriteLine("(support: starting Setup with --no-preflight skips this check)"); });
+                    if (problems.Count > 0) throw new IOException("Setup stopped before downloading anything: fix what is said above, then press Install again.");
+                }
                 File.WriteAllText(Path.Combine(dir, ".setup-root"), dir);   // (SafeRoot checks its junction by it)
                 string root = SafeRoot(dir);
                 if (root != dir) Append("[Builder] working through " + root + " (a short plain path every compiler takes)");
                 string tools = Path.Combine(root, "tools");
+                toolsDir = tools;
                 Ensure(Fetch.Python, tools); Ensure(Fetch.Git, tools);
-                EnsureEmbedded("vulkan-sdk.zip", Path.Combine(tools, "vulkan-sdk"), Release.VulkanSha256, "the Vulkan headers and libraries");
-                EnsureEmbedded("llvm.zip", Path.Combine(tools, "llvm"), Release.LlvmSha256, "LLVM " + Release.LlvmVersion, ClangNames);
+                Ensure(Fetch.Vulkan, tools); Ensure(Fetch.Llvm, tools, ClangNames);
                 string src = Source(root, tools);
                 Post(() =>
                 {
@@ -733,38 +1159,43 @@ class BuilderForm : Form
         worker.Start();
     }
 
-    // One pinned download into <tools>\<dir>, skipped when its stamp says it is already there
-    void Ensure(Fetch.Item it, string tools)
+    // One pinned download into <tools>\<dir>, skipped when its stamp says it is already there and its key file is (an
+    // antivirus that removed it: fetched again, so Install again repairs it)
+    void Ensure(Fetch.Item it, string tools, Action<string> after = null)
     {
+        if (it.Sha256.Length == 0) return;   // (a Builder.exe pins no release assets: the PC's own tools serve)
         string dir = Path.Combine(tools, it.Dir), stamp = Path.Combine(dir, ".setup.json");
-        if (File.Exists(stamp) && File.ReadAllText(stamp).Contains(it.Sha256)) return;
+        if (File.Exists(stamp) && File.ReadAllText(stamp).Contains(it.Sha256) && it.Keys.All(k => File.Exists(Path.Combine(dir, k)))) return;
         Directory.CreateDirectory(tools);
         string zip = Path.Combine(tools, it.Dir + ".zip");
         Append("[Builder] step 0/8 tools");
-        Append("[Builder] downloading " + it.Name);
-        Fetch.Download(it, zip, (done, total) => Append(total > 0
-            ? string.Format("[Builder] download {0}: {1}% ({2:0}/{3:0} MB)", it.Name, done * 100 / total, done / 1048576.0, total / 1048576.0)
-            : string.Format("[Builder] download {0}: {1:0} MB", it.Name, done / 1048576.0)), () => stopping);
+        string local = Fetch.Local(it, AppDomain.CurrentDomain.BaseDirectory);
+        if (local != null) { Append("[Builder] " + it.Name + ": the copy next to Setup"); File.Copy(local, zip, true); }
+        else
+        {
+            Append("[Builder] downloading " + it.Name);
+            Fetch.Download(it, zip, (done, total) => Append(total > 0
+                ? string.Format("[Builder] download {0}: {1}% ({2:0}/{3:0} MB)", it.Name, done * 100 / total, done / 1048576.0, total / 1048576.0)
+                : string.Format("[Builder] download {0}: {1:0} MB", it.Name, done / 1048576.0)), () => stopping);
+        }
         Append("[Builder] unpacking " + it.Name);
         Fetch.Unzip(it, zip, dir);
         File.Delete(zip);
+        if (after != null) after(dir);
         File.WriteAllText(stamp, "{\"sha256\": \"" + it.Sha256 + "\"}\n");
     }
 
-    // What this exe carries (make_setup.py), unpacked into <tools>\<dir> once per content (its sha256 in the stamp)
-    void EnsureEmbedded(string resource, string dir, string sha, string what, Action<string> after = null)
+    // After a failed run: a file Setup put in <tools> that is gone (an antivirus took it), or null. Install again
+    // fetches it again (Ensure checks the same files), unless the antivirus takes it again.
+    internal static string RemovedTool(string tools)
     {
-        if (sha.Length == 0) return;   // (a Builder.exe build carries none: the PC's own tools serve)
-        string stamp = Path.Combine(dir, ".setup.json");
-        if (File.Exists(stamp) && File.ReadAllText(stamp).Contains(sha)) return;
-        Append("[Builder] unpacking " + what);
-        string zip = dir + ".zip";
-        using (var s = typeof(BuilderForm).Assembly.GetManifestResourceStream(resource))
-        using (var f = File.Create(zip)) s.CopyTo(f);
-        Fetch.Unzip(new Fetch.Item { Name = what, Strip = "" }, zip, dir);
-        File.Delete(zip);
-        if (after != null) after(dir);
-        File.WriteAllText(stamp, "{\"sha256\": \"" + sha + "\"}\n");
+        foreach (var it in new[] { Fetch.Python, Fetch.Git, Fetch.Vulkan, Fetch.Llvm })
+            foreach (var k in it.Keys)
+            {
+                string dir = Path.Combine(tools, it.Dir);
+                if (File.Exists(Path.Combine(dir, ".setup.json")) && !File.Exists(Path.Combine(dir, k))) return Path.Combine(dir, k);
+            }
+        return null;
     }
 
     // clang.exe is also clang-cl.exe and clang++.exe (the driver reads its own name): hard links, copies if refused
@@ -786,18 +1217,22 @@ class BuilderForm : Form
     {
         if (acceptTerms) return true;
         using (var k = Registry.CurrentUser.OpenSubKey(RegKey))
-            if (k != null && k.GetValue("AcceptedTerms") as string == "1") return true;
+            if (k != null && k.GetValue("AcceptedTerms") as string == TermsVersion) return true;
         var r = MessageBox.Show(
-            "Setup downloads the free tools the build needs into the install folder: Python, MinGit and the " +
-            "Python packages the build uses. When Visual Studio's C++ tools are not installed, it also downloads " +
+            "Setup downloads the free tools the build needs into the install folder: Python, MinGit, the Python " +
+            "packages the build uses, and LLVM's compiler and the Vulkan SDK files from this project's GitHub release. " +
+            "When Visual Studio's C++ tools are not installed, it also downloads " +
             "Microsoft's C++ libraries and the Windows SDK from Microsoft's servers, under the Visual Studio Build " +
             "Tools license:\n\n" + MsLicense + "\n\nNothing is installed system-wide. Accept and continue?",
             Text, MessageBoxButtons.YesNo, MessageBoxIcon.Information);
         if (r != DialogResult.Yes) return false;
-        try { using (var k = Registry.CurrentUser.CreateSubKey(RegKey)) k.SetValue("AcceptedTerms", "1"); } catch { }
+        try { using (var k = Registry.CurrentUser.CreateSubKey(RegKey)) k.SetValue("AcceptedTerms", TermsVersion); } catch { }
         return true;
     }
     const string MsLicense = "https://go.microsoft.com/fwlink/?LinkId=2179911";
+    // The terms the player accepted (registry AcceptedTerms): raise it whenever the text above or the license changes, so
+    // every player reads the new ones once, also in the launcher's automatic update (it runs Setup without --accept-terms)
+    const string TermsVersion = "1";
 
     // The repository at this Setup's tag: cloned once, then moved to the new tag by a newer Setup (an update)
     string Source(string root, string tools)
@@ -812,7 +1247,12 @@ class BuilderForm : Form
         }
         // only the tag's own files (no history); an update moves the same folder to the newer tag
         Append("[Builder] fetching the source (" + Release.Tag + ")");
-        Run(git, string.Format("-C \"{0}\" fetch --progress --depth 1 --force \"{1}\" \"{2}\"", src, url, Release.Tag), null);
+        try { Run(git, string.Format("-C \"{0}\" fetch --progress --depth 1 --force \"{1}\" \"{2}\"", src, url, Release.Tag), null); }
+        catch (IOException e)   // (git's own last lines are already in the log above)
+        {
+            throw new IOException(string.Format("Could not download the source code ({0}) from {1}. Check the internet connection; a firewall, " +
+                "proxy or school / work network can block github.com. Then press Install again. ({2})", Release.Tag, source ?? "github.com", e.Message));
+        }
         Run(git, string.Format("-C \"{0}\" checkout --quiet --force --detach FETCH_HEAD", src), null);
         return src;
     }
@@ -856,6 +1296,7 @@ class BuilderForm : Form
     void RunBuilder(string src, string python, string pyArgs, Dictionary<string, string> env, string extra = "")
     {
         string fw = firmware.FilePath == null ? "" : " \"" + firmware.FilePath.TrimEnd('\\') + "\"";   // (optional)
+        if (update.FilePath != null) fw += " --update \"" + update.FilePath + "\"";   // (optional: builds 1.4.3)
         var psi = new ProcessStartInfo(python, string.Format("{0}\"{1}\" \"{2}\" \"{3}\"{4} --gui-pid {5}{6}",   // (it ends with us)
             pyArgs, Path.Combine(src, "tools", "builder", "builder.py"), dump.FilePath, keys.FilePath, fw,
             Process.GetCurrentProcess().Id, extra))
@@ -892,14 +1333,19 @@ class BuilderForm : Form
         if (ok && launcher != null && File.Exists(launcher))
         {
             if (repo == null) SaveChoices(true);
-            if (!noShortcut) Shortcut(launcher);
-            status.Step = "Done: the game is on your desktop";
+            // (Controlled folder access blocks an unknown program's shortcut on the desktop: then Play is the way in)
+            status.Step = noShortcut || Shortcut(launcher) ? "Done: the game is on your desktop"
+                        : "Done: press Play (Windows did not let Setup put a shortcut on the desktop)";
             status.Value = 1f; build.Text = "Play";
         }
         else
         {
             launcher = null;
             status.Step = stopping ? "Stopped" : ok ? "Done" : "Stopped: see the last lines below";
+            string gone = !ok && !stopping && toolsDir != null ? RemovedTool(toolsDir) : null;
+            if (gone != null)
+                Append("[Builder] Windows Security (or another antivirus) seems to have removed " + gone + ". Restore it in Windows Security > " +
+                       "Virus & threat protection > Protection history (Allow), then press Install again: Setup fetches what is missing.");
             build.Text = "Try again";
         }
         status.Invalidate();
@@ -917,11 +1363,14 @@ class BuilderForm : Form
 
     // The desktop shortcut, pointed at the newest build (an update re-points it; saves and settings live in the user's
     // profile, not in the build folder, so they carry over)
-    static void Shortcut(string target)
+    static bool Shortcut(string target)
     {
         try
         {
-            string lnk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), Release.Product + ".lnk");
+            // (a 1.4.3 build, ...-v143 folder, gets its own shortcut: the 1.0.0 one keeps pointing at 1.0.0)
+            var v = Regex.Match(Path.GetFileName(Path.GetDirectoryName(target)), @"-v(\d)(\d)(\d)(-beta)?$");
+            string name = Release.Product + (v.Success ? string.Format(" {0}.{1}.{2}", v.Groups[1], v.Groups[2], v.Groups[3]) : "");
+            string lnk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), name + ".lnk");
             var shellType = Type.GetTypeFromProgID("WScript.Shell");
             object shell = Activator.CreateInstance(shellType);
             object sc = shellType.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { lnk });
@@ -931,8 +1380,9 @@ class BuilderForm : Form
             t.InvokeMember("IconLocation", System.Reflection.BindingFlags.SetProperty, null, sc, new object[] { target + ",0" });
             t.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, sc, null);
             Marshal.FinalReleaseComObject(sc); Marshal.FinalReleaseComObject(shell);
+            return File.Exists(lnk);
         }
-        catch { }
+        catch { return false; }
     }
 
     // Stop: the build is python (builder.py) -> build.py -> compilers, all below the process we started, so the whole
@@ -979,6 +1429,7 @@ class BuilderForm : Form
     [STAThread]   // (drag and drop needs a single-threaded apartment)
     static void Main()
     {
+        if (Environment.GetCommandLineArgs().Skip(1).FirstOrDefault() == "--vkcheck") { Environment.Exit(Preflight.VulkanChild()); return; }
         try { SetProcessDpiAwareness(1); } catch { SetProcessDPIAware(); }   // DPI aware: drawn at the real resolution, sharp text
         JoinKillOnCloseJob();
         Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false); Application.Run(new BuilderForm());

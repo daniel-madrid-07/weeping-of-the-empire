@@ -86,10 +86,16 @@ static int g_hdr_mode;               // of the current swapchain
 static bool g_hdr_sup[3], g_fmts_known;
 void vk_present_set_hdr(int mode, float peak, float paper) {
     cfg_init();
+    const float peak0 = g_hdr_peak, paper0 = g_hdr_paper;
     if (peak >= 80.0f && peak <= 10000.0f) g_hdr_peak = peak;
     if (paper >= 80.0f && paper <= 1000.0f) g_hdr_paper = paper;
     if (mode < VKP_HDR_OFF || mode > VKP_HDR_SCRGB) mode = VKP_HDR_OFF;
-    if (atomic_exchange(&g_hdr_req, mode) != mode) vk_request_swapchain_recreate();
+    // (a new peak / paper white with HDR on: the encode reads them every frame, but the display's HDR metadata is set
+    // only with a new swapchain; without one it kept the start's values. LARECOMP_HDR_META_RECREATE=0: as before)
+    static int meta_off = -1;
+    if (meta_off < 0) { const char *e = getenv("LARECOMP_HDR_META_RECREATE"); meta_off = e && *e == '0'; }
+    const bool meta = !meta_off && mode != VKP_HDR_OFF && g_hdr_mode != VKP_HDR_OFF && (g_hdr_peak != peak0 || g_hdr_paper != paper0);
+    if (atomic_exchange(&g_hdr_req, mode) != mode || meta) vk_request_swapchain_recreate();
 }
 int vk_present_hdr_supported(int mode) {
     if (!g_fmts_known) return -1;

@@ -8,6 +8,10 @@ usage: python mkninja_win.py --gen DIR --out DIR --obj DIR --vcpkg DIR [--gen-op
   --rt-include D  (--game-only) take rt.h from D instead of <root>/runtime, so the command lines do not depend on the tree
   --vcpkg   an installed vcpkg tree (x64-windows-static-md: lib/opus.lib)
   --vksdk   the Vulkan SDK (default $VULKAN_SDK): Include/, Lib/vulkan-1.lib, Lib/shaderc_combined.lib
+  --rt-exclude P,..  another game (games/<game>/game.py): runtime sources to leave out, globs relative to <root>/runtime
+                     (its TotK-only files); --rt-extra F,.. sources to add (runtime/game/none.cpp); --define D,..
+                     -D flags for every runtime and generated TU (NXR_GAME_ID=<n>); --exe NAME the link output
+                     (default totk.exe). None given (TotK): build.ninja exactly as before.
 Same source sets as mkninja_linux.py, but the Win32 side: runtime/nvn/shim (SDL3 / pthread / unistd / vma stand-ins,
 compat.h force-included into the Vulkan TUs), nvn/vulkan/shim_win.c instead of runtime/linux/*.
 """
@@ -24,6 +28,10 @@ game_only = '--game-only' in args
 if game_only: args.remove('--game-only')
 rt_include = opt('--rt-include')     # game-only: the directory holding rt.h (a stable path per rt.h hash, not a tree)
 gen_opt = opt('--gen-opt')
+rt_exclude = [p for p in (opt('--rt-exclude') or '').split(',') if p]
+rt_extra = [p for p in (opt('--rt-extra') or '').split(',') if p]
+defines = [d for d in (opt('--define') or '').split(',') if d]
+exe_name = opt('--exe', 'totk.exe')
 gen_pool = int(opt('--gen-pool', '2'))
 here = os.path.dirname(os.path.abspath(__file__))
 root = os.path.abspath(opt('--root', os.path.join(here, '..', '..')))
@@ -44,6 +52,13 @@ rt_cpp = sorted(glob.glob(os.path.join(RT, '*.cpp')))
 nvn_c = [s for s in sorted(glob.glob(os.path.join(RT, 'nvn', '*.c'))) if os.path.basename(s) != 'backend_null.c']
 vk_c = sorted(glob.glob(os.path.join(RT, 'nvn', 'vulkan', '*.c')))
 mw_c = sorted(glob.glob(os.path.join(RT, 'nvn', 'maxwell', '*.c')))
+if rt_exclude or rt_extra:   # another game: leave out its TotK-only sources, add its own (runtime-relative paths)
+    import fnmatch
+    def kept(src): return not any(fnmatch.fnmatchcase(os.path.relpath(src, RT).replace(os.sep, '/'), p) for p in rt_exclude)
+    rt_cpp, nvn_c, vk_c, mw_c = ([s for s in l if kept(s)] for l in (rt_cpp, nvn_c, vk_c, mw_c))
+    for e in rt_extra:
+        src = fw(os.path.join(RT, e))
+        (rt_cpp if src.endswith('.cpp') else nvn_c).append(src)
 sdk_dir = os.path.join(os.path.dirname(gen), 'sdk')
 VL = fw(os.path.join(vcpkg, 'lib')); SI = fw(os.path.join(vksdk, 'Include')); SL = fw(os.path.join(vksdk, 'Lib'))
 os.makedirs(out, exist_ok=True)
@@ -53,6 +68,7 @@ os.makedirs(out, exist_ok=True)
 # -fno-math-errno: with errno semantics clang calls the UCRT's sqrtf / sqrt instead of sqrtss / sqrtps (fsqrt: 4
 # calls per 4s op); no generated or runtime code reads errno after a math call.
 common = '--target=x86_64-pc-windows-msvc -O2 -march=x86-64-v3 -fdenormal-fp-math=dynamic -fno-math-errno -Wno-everything -D_CRT_SECURE_NO_WARNINGS -DNOMINMAX -D_USE_MATH_DEFINES -gline-tables-only -fms-runtime-lib=dll'
+if defines: common += ''.join(' -D' + d for d in defines)
 cxxflags = f'-std=c++20 {common} -fno-exceptions -I{fw(rt_include) if game_only and rt_include else RT}'
 cflags = f'-std=gnu17 {common} -I{RT}/nvn -I{RT}/nvn/shim'
 # (-Werror=implicit-function-declaration: under -Wno-everything C took an undeclared function as returning int, and
@@ -70,6 +86,7 @@ with open(os.path.join(out, 'build.ninja'), 'w', newline='\n') as f:
     f.write('rule c\n  command = $cc_ $cflags -MD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n  description = CC $out\n')
     f.write('rule cvk\n  command = $cc_ $cvkflags -MD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n  description = CVK $out\n')
     gen_objs, objs = [], []
+    rt_extra_set = {fw(os.path.join(RT, e)) for e in rt_extra}   # (game_<name>.o: never clashes with a runtime/ object)
     def gen_edge(sub, src):
         o = os.path.join(obj, sub, os.path.splitext(os.path.basename(src))[0] + '.o')
         if not prebuilt: f.write(f'build {esc(o)}: gen {esc(src)}\n')
@@ -83,6 +100,7 @@ with open(os.path.join(out, 'build.ninja'), 'w', newline='\n') as f:
         sys.exit(0)
     for src in rt_cpp:
         o = os.path.join(out, 'rt', os.path.splitext(os.path.basename(src))[0] + '.o')
+        if src in rt_extra_set: o = os.path.join(out, 'rt', 'game_' + os.path.splitext(os.path.basename(src))[0] + '.o')
         f.write(f'build {esc(o)}: cxx {esc(src)}\n'); objs.append(o)
     for src in nvn_c:
         o = os.path.join(out, 'nvn', os.path.splitext(os.path.basename(src))[0] + '.o')
@@ -95,13 +113,22 @@ with open(os.path.join(out, 'build.ninja'), 'w', newline='\n') as f:
     f.write('build objs-rt: phony ' + ' '.join(esc(o) for o in objs) + '\n')
     # NVIDIA NGX (DLSS, runtime/nvn/vulkan/ngx.c): the SDK's static loader for the dynamic CRT; the feature DLLs load at run time
     ngx_lib = fw(os.path.join(root, 'third_party', 'dlss', 'lib', 'nvsdk_ngx_d.lib'))
-    libs = (f'{SL}/vulkan-1.lib {SL}/shaderc_combined.lib {VL}/opus.lib {ngx_lib} '
+    # libvpx's VP9 decoder (runtime/movie_core.h: the movies on a Windows without the Store's VP9 Video Extensions)
+    vpx_lib = fw(os.path.join(root, 'third_party', 'libvpx', 'lib', 'vpx.lib'))
+    libs = (f'{SL}/vulkan-1.lib {SL}/shaderc_combined.lib {VL}/opus.lib {vpx_lib} {ngx_lib} '
             + ' '.join('-l' + l for l in 'user32 gdi32 kernel32 ole32 oleaut32 uuid shell32 advapi32 winmm mfplat mfuuid mf '
-                                         'mfreadwrite propsys psapi dbghelp avrt synchronization ntdll'.split())
-            + ' -rtlib=compiler-rt')     # __divti3 / __udivti3 for the generated u128 code (clang_rt.builtins)
+                                         'mfreadwrite propsys psapi dbghelp avrt synchronization ntdll bcrypt'.split())
+            + ' -rtlib=compiler-rt'      # __divti3 / __udivti3 for the generated u128 code (clang_rt.builtins)
+            # Media Foundation delay-loaded: an N edition without the Media Feature Pack has none, and the game must still
+            # start (its movies then go to libvpx: movie_core.h MftVp9Dec::have_mf)
+            + ' -Wl,/DELAYLOAD:mfplat.dll -Wl,/DELAYLOAD:mf.dll -Wl,/DELAYLOAD:mfreadwrite.dll -ldelayimp')
     f.write('rule link\n  command = $cxx --target=x86_64-pc-windows-msvc -fuse-ld=lld -fms-runtime-lib=dll -Wl,/STACK:8388608 -Wl,/DEBUG -Wl,/MAP:$out.map '
             f'-o $out @$out.rsp {libs}\n  rspfile = $out.rsp\n  rspfile_content = $in\n  description = LINK $out\n')
-    exe = os.path.join(out, 'totk.exe')
-    f.write(f'build {esc(exe)}: link ' + ' '.join(esc(o) for o in gen_objs + objs) + '\n')
+    exe = os.path.join(out, exe_name)
+    # TOTK_APP_ICON_RES: the app icon as a .res (games/totk/app_icon.py, made by the Builder from the player's own game
+    # files: never in the repo), a link input like an object; unset (every other build): no resource, the same exe
+    icon_res = os.environ.get('TOTK_APP_ICON_RES', '')
+    icon = [os.path.abspath(icon_res)] if icon_res else []
+    f.write(f'build {esc(exe)}: link ' + ' '.join(esc(o) for o in gen_objs + objs + icon) + '\n')
     f.write(f'default {esc(exe)}\n')
 print('vulkan |', len(gen_objs), 'generated objects,', len(objs), 'runtime objects ->', out)

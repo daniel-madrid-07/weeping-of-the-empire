@@ -12,6 +12,8 @@ import ctypes, ctypes.util, hashlib, os, shutil, struct, sys
 
 ROMFS = os.environ.get("TOTK_ROMFS", "C:/totk/extract/romfs")
 REL = "Event/EventFlow/DmF_SY_GameOver.bfevfl.zs"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from romfs_src import RomFS   # (the folder, or romfs.bin beside it: a player's install unpacks none)
 OUT = os.environ.get("TOTK_OVERLAY_OUT", "C:/totk/overlay/romfs") + "/" + REL
 SHA256 = "c59975494fb30063b7a339fd66bbde8b456b11c73a5b4332bc070d63ece66b7d"
 def _libzstd():
@@ -77,8 +79,9 @@ def sarc_member(data, want):
         if data[o:data.index(0, o)].decode() == want: return data[start + lo:start + hi]
     raise KeyError(want)
 
-dic = sarc_member(unzstd(open(f"{ROMFS}/Pack/ZsDic.pack.zs", "rb").read()), "zs.zsdic")
-raw = open(f"{ROMFS}/{REL}", "rb").read()
+rom = RomFS(ROMFS)
+dic = sarc_member(unzstd(rom.read("Pack/ZsDic.pack.zs")), "zs.zsdic")
+raw = rom.read(REL)
 flow = bytearray(unzstd(raw, dic))
 assert hashlib.sha256(flow).hexdigest() == SHA256, "DmF_SY_GameOver.bfevfl is not the analysed v1.0.0 file"
 def event(i):   # BFEVFL events: 0x28 bytes from 0x1f0, name ref at +0, type at +8, next event index at +0xa

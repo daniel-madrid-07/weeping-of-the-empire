@@ -111,7 +111,8 @@ void hook_f_f0fdec(Ctx *__restrict c) {   // UIMapScreen's Hero's Path player (t
     }();
     const u64 scr = c->x[0], fd = totk_global(kFrameDelta);
     const float dt = totk_ptr_ok(fd) ? rdf(fd + kRatio) : 1.0f;
-    if (!on || !totk_ptr_ok(scr) || !(dt > 0.01f && dt < 1.0f)) return f_f0fdec_orig(c);
+    if (!on || !totk_main_known(kPathSteps) || !totk_ptr_ok(scr) || !(dt > 0.01f && dt < 1.0f))
+        return f_f0fdec_orig(c);
     const u64 e = totk_hero_path_step_addr(totk_main(kPathSteps), ld32(scr + kPathSpeed), ld32(scr + kZoom));
     const u32 saved = e < totk_main(kPathSteps) + 48 ? ld32(e) : 0;   // speed 3 reads past the 3 rows (zeros)
     if (!saved) return f_f0fdec_orig(c);  // never write outside the table

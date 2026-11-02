@@ -69,10 +69,12 @@ def below_normal_priority():
             pass
 
 
-def free_ram_bytes():
+def _memory_status():
+    """(available, total) physical RAM in bytes, or None where it can't be read."""
     if sys.platform != 'win32':
         try:
-            return os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+            page = os.sysconf('SC_PAGE_SIZE')
+            return os.sysconf('SC_AVPHYS_PAGES') * page, os.sysconf('SC_PHYS_PAGES') * page
         except (ValueError, OSError):
             return None
 
@@ -86,18 +88,41 @@ def free_ram_bytes():
     status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
     if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
         return None
-    return status.ullAvailPhys
+    return status.ullAvailPhys, status.ullTotalPhys
 
 
-def wait_for_ram(min_free=6 * GiB, log=print, poll=5.0):
-    """Block while the machine has less than `min_free` physical RAM available (shared-machine rule)."""
-    warned = False
+def free_ram_bytes():
+    st = _memory_status()
+    return st[0] if st else None
+
+
+def _solo_pc():
+    """A player's own PC building once."""
+    fleet = os.environ.get('NXR_FLEET_LOCKS') or r'C:\nxrecomp-work\locks'
+    return bool(os.environ.get('NXR_SOLO_PC')) and not os.path.isdir(fleet)
+
+
+def wait_for_ram(min_free=6 * GiB, log=print, poll=5.0, max_wait=None):
+    """Block while the machine has less than `min_free` physical RAM available (shared-machine rule). The bar is at
+    most a third of the machine's RAM, and on a player's own PC the step goes on after `max_wait` seconds (default
+    120 there, whose low-memory reaper the rule is for): an 8 GB PC never has 6 GiB free, and Setup's extraction
+    stood still at 'waiting: only 4.8 GiB RAM free' forever (a player's setup.log, 2026-11-01)."""
+    st = _memory_status()
+    if st is None:
+        return
+    min_free = min(min_free, st[1] / 3)
+    if max_wait is None and _solo_pc():
+        max_wait = 120.0
+    t0, warned = time.monotonic(), False
     while True:
         free = free_ram_bytes()
         if free is None or free >= min_free:
             return
+        if max_wait is not None and time.monotonic() - t0 >= max_wait:
+            log(f'only {free / GiB:.1f} GiB RAM free after {max_wait:.0f} s: going on (it may be slower)')
+            return
         if not warned:
-            log(f'waiting: only {free / GiB:.1f} GiB RAM free (< {min_free / GiB:.0f} GiB)')
+            log(f'waiting: only {free / GiB:.1f} GiB RAM free (< {min_free / GiB:.1f} GiB)')
             warned = True
         time.sleep(poll)
 

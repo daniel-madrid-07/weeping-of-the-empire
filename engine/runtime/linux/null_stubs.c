@@ -15,6 +15,7 @@ int vk_precompile_warmup_progress(int *done, int *total) { (void)done; (void)tot
 void vk_warm_present(int gameplay, int menu) { (void)gameplay; (void)menu; }   // exec.c: the archive warm-up's governor
 void backend_texture_created(NvnTexture *t) { (void)t; }   // preupload.c: objects.c nvnTextureInitialize
 unsigned long long renderer_video_frames(void) { return 0; }   // textures.c: hle_vi.cpp's load-on-screen test
+void renderer_note_video_frame(void) {}
 uint64_t vk_scene_idle_frames(void) { return 0; }   // exec.c: presents since the 3D scene was drawn (pause-screen checks)
 void renderer_fence_submit(void) {}                 // exec.c: objects.c nvnQueueFenceSync
 

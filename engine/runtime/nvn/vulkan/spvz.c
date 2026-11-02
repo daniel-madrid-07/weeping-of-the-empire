@@ -62,7 +62,9 @@ uint8_t *spvz_pack(const uint32_t *spv, size_t bytes, size_t *out_bytes) {
     return NULL;
 }
 
-uint32_t *spvz_unpack(const uint8_t *file, size_t n, size_t *bytes) {
+uint32_t *spvz_unpack(const uint8_t *file, size_t n, size_t *bytes) { return spvz_unpack_as(file, n, bytes, 0x07230203); }
+
+uint32_t *spvz_unpack_as(const uint8_t *file, size_t n, size_t *bytes, uint32_t first) {
     uint32_t h[4];
     if (n < 16) return NULL;
     memcpy(h, file, sizeof h);
@@ -73,13 +75,13 @@ uint32_t *spvz_unpack(const uint8_t *file, size_t n, size_t *bytes) {
     void *d = handle(false);
     uint32_t *w = d ? malloc(h[2]) : NULL;
     size_t got = 0;
-    if (w && decompress_(d, file + 16, h[3], w, h[2], &got) && got == h[2] && w[0] == 0x07230203) {
+    if (w && decompress_(d, file + 16, h[3], w, h[2], &got) && got == h[2] && w[0] == first) {
         *bytes = h[2];
         return w;
     }
     free(w);
 #else
-    (void)bytes;
+    (void)bytes, (void)first;
 #endif
     return NULL;
 }

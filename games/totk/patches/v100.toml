@@ -73,7 +73,7 @@ original_sha256 = "71af282d792b867b32cacfcf16bb4d129f06fe25d123532ae52d08eebe116
 name = "shadowres"
 default = true
 needs = []
-original_sha256 = "b83ec698f0d626954a2b72469a6e13f41a4459814e11e8232cd1fa72d7fc76a3"
+original_sha256 = "ce79f41cd0819bd698cc535dde64f32301117a28495c452a4d108f505ca1553d"
 
 [[feature]]
 name = "lod"
@@ -1487,7 +1487,7 @@ reason = "fov veneer for main+0x1233e48 [15]"
 feature = "shadowres"
 module = "main"
 start = 0x2aa6c30
-end = 0x2aa6c64
+end = 0x2aa6c70
 
 [[patch]]
 feature = "shadowres"
@@ -1509,8 +1509,8 @@ reason = "shadow map size veneer [0]"
 feature = "shadowres"
 module = "main"
 offset = 0x2aa6c34
-new = "ea0300f9"
-new_asm = "str x10, [sp]"
+new = "ea2f00a9"
+new_asm = "stp x10, x11, [sp]"
 reason = "shadow map size veneer [1]"
 
 [[patch]]
@@ -1533,73 +1533,97 @@ reason = "shadow map size veneer [3]"
 feature = "shadowres"
 module = "main"
 offset = 0x2aa6c40
-new = "4a4940b9"
-new_asm = "ldr w10, [x10, #0x48]"
+new = "4bd140b9"
+new_asm = "ldr w11, [x10, #0xd0]"
 reason = "shadow map size veneer [4]"
 
 [[patch]]
 feature = "shadowres"
 module = "main"
 offset = 0x2aa6c44
-new = "6a000034"
-new_asm = "cbz w10, #0x2aa6c50"
+new = "4b000034"
+new_asm = "cbz w11, #0x2aa6c4c"
 reason = "shadow map size veneer [5]"
 
 [[patch]]
 feature = "shadowres"
 module = "main"
 offset = 0x2aa6c48
-new = "5f01271e"
-new_asm = "fmov s31, w10"
+new = "0041201e"
+new_asm = "fmov s0, s8"
 reason = "shadow map size veneer [6]"
 
 [[patch]]
 feature = "shadowres"
 module = "main"
 offset = 0x2aa6c4c
-new = "00083f1e"
-new_asm = "fmul s0, s0, s31"
+new = "4a4940b9"
+new_asm = "ldr w10, [x10, #0x48]"
 reason = "shadow map size veneer [7]"
 
 [[patch]]
 feature = "shadowres"
 module = "main"
 offset = 0x2aa6c50
-new = "ff07c03d"
-new_asm = "ldr q31, [sp, #0x10]"
+new = "6a000034"
+new_asm = "cbz w10, #0x2aa6c5c"
 reason = "shadow map size veneer [8]"
 
 [[patch]]
 feature = "shadowres"
 module = "main"
 offset = 0x2aa6c54
-new = "ea0340f9"
-new_asm = "ldr x10, [sp]"
+new = "5f01271e"
+new_asm = "fmov s31, w10"
 reason = "shadow map size veneer [9]"
 
 [[patch]]
 feature = "shadowres"
 module = "main"
 offset = 0x2aa6c58
-new = "ff830091"
-new_asm = "add sp, sp, #0x20"
+new = "00083f1e"
+new_asm = "fmul s0, s0, s31"
 reason = "shadow map size veneer [10]"
 
 [[patch]]
 feature = "shadowres"
 module = "main"
 offset = 0x2aa6c5c
-copy_of = 0xa22658
-new_asm = "(the word at main+0xa22658)"
+new = "ff07c03d"
+new_asm = "ldr q31, [sp, #0x10]"
 reason = "shadow map size veneer [11]"
 
 [[patch]]
 feature = "shadowres"
 module = "main"
 offset = 0x2aa6c60
-new = "7fee7d17"
-new_asm = "b #0xa2265c"
+new = "ea2f40a9"
+new_asm = "ldp x10, x11, [sp]"
 reason = "shadow map size veneer [12]"
+
+[[patch]]
+feature = "shadowres"
+module = "main"
+offset = 0x2aa6c64
+new = "ff830091"
+new_asm = "add sp, sp, #0x20"
+reason = "shadow map size veneer [13]"
+
+[[patch]]
+feature = "shadowres"
+module = "main"
+offset = 0x2aa6c68
+copy_of = 0xa22658
+new_asm = "(the word at main+0xa22658)"
+reason = "shadow map size veneer [14]"
+
+[[patch]]
+feature = "shadowres"
+module = "main"
+offset = 0x2aa6c6c
+new = "7cee7d17"
+new_asm = "b #0xa2265c"
+reason = "shadow map size veneer [15]"
 
 [[veneer]]
 feature = "lod"

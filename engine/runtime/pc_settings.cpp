@@ -698,12 +698,12 @@ void aa_apply(const char *v) { renderer_apply_post(v, nullptr, nullptr); }
 void upscale_apply(const char *v) { renderer_apply_post(nullptr, v, nullptr); }
 void sharpen_apply(const char *v) { renderer_apply_post(nullptr, nullptr, v); }
 void screenshots_apply(const char *v) { pc_shot_set_enabled(strcmp(v, "0") != 0); }
-extern "C" void shim_set_fps_overlay(int mode);   // shim_win.c / shim_sdl3.c: -1 automatic (fullscreen), 0 off, 1 on
+extern "C" void shim_set_fps_overlay(int mode);   // shim_win.c / shim_sdl3.c: 0 off, 1 minimal, 2 detailed
 extern "C" int shim_fps_overlay_mode(void);
-void fps_readout_apply(const char *v) { shim_set_fps_overlay(!*v ? -1 : strcmp(v, "0") != 0); }
+void fps_readout_apply(const char *v) { shim_set_fps_overlay(!strcmp(v, "detailed") ? 2 : !strcmp(v, "minimal") ? 1 : 0); }
 const char *fps_readout_now() {   // F3 toggles it behind the overlay's back
     const int m = shim_fps_overlay_mode();
-    return m < 0 ? "" : m ? "1" : "0";
+    return m == 2 ? "detailed" : m == 1 ? "minimal" : "0";
 }
 // crash reports and the backups kept follow a change while the game runs. Only a change: apply never runs at start
 // (pc_settings_set alone calls it), where the variables stay in charge, since pc_crash_install at static init would
@@ -736,8 +736,15 @@ const char *const N_SIZE[] = {"1280 x 720 (default)", "1600 x 900", "1920 x 1080
 const char *const V_FPS[] = {"30", "60", "90", "120", "unlocked", "steady", nullptr};
 const char *const N_FPS[] = {"30 (the game's own)", "60", "90", "120", "Unlocked (monitor rate)",
                              "Unlocked, steady (a rate it can hold)", nullptr};
-const char *const V_FPSOSD[] = {"", "1", "0", nullptr};
-const char *const N_FPSOSD[] = {"In fullscreen (default)", "Always", "Never", nullptr};
+// The fps readout: off by default (nothing over the game's image), F3 shows the last style chosen; the corner and
+// size are read by the overlay as it draws
+const char *const V_FPSOSD[] = {"0", "minimal", "detailed", nullptr};
+const char *const N_FPSOSD[] = {"Off (default; F3 shows it)", "Minimal: fps", "Detailed: fps, frame time, 1% low, worst",
+                                nullptr};
+const char *const V_FPSPOS[] = {"top_right", "top_left", "bottom_right", "bottom_left", nullptr};
+const char *const N_FPSPOS[] = {"Top right (default)", "Top left", "Bottom right", "Bottom left", nullptr};
+const char *const V_FPSSIZE[] = {"small", "medium", "large", nullptr};
+const char *const N_FPSSIZE[] = {"Small (default)", "Medium size", "Large size", nullptr};
 const char *const V_SCALE[] = {"0.67", "0.8", "0.9", "1", "1.5", "2", "auto", nullptr};
 const char *const N_SCALE[] = {"67 %", "80 %", "90 %", "100 % (native)", "150 %", "200 %", "Follow the window height", nullptr};
 const char *const V_NATIVE_UI[] = {"", "0", nullptr};
@@ -776,6 +783,10 @@ const char *const V_SHARPEN[] = {"", "1", "0.5", "0.2", nullptr};
 const char *const N_SHARPEN[] = {"Off", "RCAS low", "RCAS medium", "RCAS high", nullptr};
 const char *const V_SHADOW[] = {"1", "2", "3", "4", nullptr};
 const char *const N_SHADOW[] = {"1x (Switch)", "2x (default)", "3x", "4x", nullptr};
+const char *const V_SOFT_SHADOW[] = {"", "50", "100", "200", nullptr};
+const char *const N_SOFT_SHADOW[] = {"Off (the game's)", "Soft", "Softer", "Softest", nullptr};
+const char *const V_CONTACT[] = {"", "35", "60", "100", nullptr};
+const char *const N_CONTACT[] = {"Off (the game's)", "Subtle", "Medium", "Strong", nullptr};
 const char *const V_LABELS[] = {"", "1", nullptr};
 const char *const N_LABELS[] = {"By position (Switch layout)", "By label (Xbox A = A)", nullptr};
 const char *const V_RUMBLE[] = {"0", "1", "2", "3", "4", nullptr};
@@ -805,8 +816,12 @@ const pc_setting k_engine[] = {
      "the scene keeps, in whole refreshes of the monitor (240, 120, 80, 60 on a 240 Hz one), instead of swinging.", "30", V_FPS, N_FPS, 0, 0, 0, 0, nullptr, fps_env, fps_apply, nullptr},
     {"display.perf_overlay", "Graphics", "Display", "Perf overlay (F9)", "Fps, 1% low and the frame-time graph.", "0",
      V_OFFON, N_OFFON, 0, 0, 0, 0, nullptr, perf_apply, perf_apply, perf_now},
-    {"display.fps_readout", "Graphics", "Display", "Fps readout (F3)", "TOTK_FPS_OVERLAY. F3 toggles it in game.", "",
-     V_FPSOSD, N_FPSOSD, 0, 0, 0, 0, "TOTK_FPS_OVERLAY", nullptr, fps_readout_apply, fps_readout_now},
+    {"display.fps_readout", "Graphics", "Display", "Fps readout (F3)", "TOTK_FPS_OVERLAY. F3 shows or hides it in game.",
+     "0", V_FPSOSD, N_FPSOSD, 0, 0, 0, 0, "TOTK_FPS_OVERLAY", nullptr, fps_readout_apply, fps_readout_now},
+    {"display.fps_position", "Graphics", "Display", "Fps readout corner", "Top right keeps clear of the hearts and the "
+     "map.", "top_right", V_FPSPOS, N_FPSPOS, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr},
+    {"display.fps_size", "Graphics", "Display", "Fps readout size", "Follows the window height (1080p to 4K).", "small",
+     V_FPSSIZE, N_FPSSIZE, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr},
     {"graphics.render_scale", "Graphics", "Rendering", "Render resolution", "TOTK_RES_SCALE, of the game's 1600 x 900.",
      "1", V_SCALE, N_SCALE, 0, 0, 0, R, "TOTK_RES_SCALE", nullptr, nullptr, nullptr},
     {"graphics.native_ui", "Graphics", "Rendering", "Native-resolution interface", "TOTK_OUT_SCALE: above 1080p, menus, "
@@ -834,6 +849,14 @@ const pc_setting k_engine[] = {
     {"graphics.shadow_scale", "Graphics", "Rendering", "Shadow map scale (renderer)", "TOTK_SHADOW_SCALE: the renderer's "
      "shadow targets. The game patches' Shadow resolution is separate.", "2", V_SHADOW,
      N_SHADOW, 0, 0, 0, R, "TOTK_SHADOW_SCALE", nullptr, nullptr, nullptr},
+    {"graphics.soft_shadows", "Graphics", "Rendering", "Soft shadows", "TOTK_SOFT_SHADOWS: the sun's shadow edges widen with "
+     "the distance to what casts them (contact-hardening, PCSS) instead of keeping one width. Off is the game's "
+     "look; the first start with it on compiles the shadowed shaders again.", "", V_SOFT_SHADOW, N_SOFT_SHADOW, 0, 0, 0,
+     R, "TOTK_SOFT_SHADOWS", nullptr, nullptr, nullptr},
+    {"graphics.contact_shadows", "Graphics", "Rendering", "Contact shadows", "TOTK_CONTACT_SHADOWS: small sun shadows at "
+     "feet, under stones and in grass, which the shadow maps are too coarse for (a short march toward the sun through "
+     "the scene's depth, up to 80 m). Off is the game's look; costs some GPU.", "", V_CONTACT, N_CONTACT, 0, 0, 0, R,
+     "TOTK_CONTACT_SHADOWS", nullptr, nullptr, nullptr},
     {"audio.volume", "Audio", "Output", "Volume", "TOTK_VOLUME, master gain.", "1", nullptr, nullptr, 0.0f, 1.0f, 0.05f,
      0, "TOTK_VOLUME", nullptr, volume_apply, nullptr},
     {"audio.mute_unfocused", "Audio", "Output", "Mute in the background", "TOTK_MUTE_UNFOCUSED: no sound while the game "
@@ -898,6 +921,10 @@ const pc_setting k_pc[] = {
      N_OFFON, 0, 0, 0, 0, "TOTK_PC_SHOT", nullptr, screenshots_apply, nullptr},
     {"game.crash_reports", "Game", "PC", "Crash reports", "TOTK_PC_CRASH: a report and a minidump per crash.", "1",
      V_OFFON, N_OFFON, 0, 0, 0, 0, "TOTK_PC_CRASH", nullptr, crash_reports_apply, nullptr},
+    // (read by the launcher at its next start, installer's auto-update; nothing in the game)
+    {"launcher.auto_update", "Game", "PC", "Automatic updates", "Checks GitHub for a newer version when the game "
+     "starts (at most once a day); asks first if the update rebuilds the game.", "1", V_OFFON, N_OFFON, 0, 0, 0, R,
+     nullptr, nullptr, nullptr, nullptr},
 };
 
 // Key bindings of the Custom layout: TOTK_KBM_<ACTION> (hle_hid.cpp bindings()), read once at start

@@ -1,7 +1,11 @@
 // Host-side movie support for hle_movie.cpp and tools/movieprobe.cpp: a WebM (Matroska) demuxer over a mapped file
 // and a Media Foundation VP9 decoder that hands out tightly packed NV12 frames.
 // TotK's pre-rendered cutscenes (romfs Event/Movie/*.webm) are all VP9 1920x1080, 30 fps, video only (measured 2026-10-15).
-// VP9 decoding comes from Windows (the "VP9 Video Extensions" MFT); nothing is bundled.
+// Windows decodes VP9 with the Media Foundation MFT of the Store's "VP9 Video Extensions" (hardware where the GPU has it)
+// and falls back to libvpx (static, BSD-3-Clause, engine/third_party/libvpx) when that MFT is missing or refuses the
+// stream: Windows installs without the Store (LTSC, N, offline images) have none (issues #22, #25: the Ganon cutscene
+// never ended). Linux always uses libvpx. NXR_MOVIE_DECODER picks one: auto (default), mft (no fallback), soft (libvpx
+// only: the MFT hidden, the gate's test switch), none (no decoder: the movie is skipped).
 #pragma once
 #ifdef _WIN32
 #include <windows.h>
@@ -16,9 +20,16 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+#ifdef _WIN32
+#include "../third_party/libvpx/include/vpx/vpx_decoder.h"   // (lib/vpx.lib: the decoder's members only, see its README)
+#include "../third_party/libvpx/include/vpx/vp8dx.h"
+#else
 #include <vpx/vpx_decoder.h>
 #include <vpx/vp8dx.h>
 #endif
+#include <cstdlib>
+#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -40,6 +51,7 @@ struct Sample { int track; int64_t pts_us; uint64_t off; uint32_t size; bool key
 struct WebM {
 #ifdef _WIN32
     HANDLE file = INVALID_HANDLE_VALUE, map = nullptr;
+    const uint8_t* view = nullptr;         // the mapped view: d itself, or below it for a slice (open_slice)
 #endif
     const uint8_t* d = nullptr; uint64_t n = 0;
     uint64_t timescale = 1000000;          // ns per timecode unit
@@ -157,7 +169,7 @@ struct WebM {
         if (file == INVALID_HANDLE_VALUE) { snprintf(err, errn, "open failed (%lu)", GetLastError()); return false; }
         LARGE_INTEGER li; GetFileSizeEx(file, &li); n = (uint64_t)li.QuadPart;
         map = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        d = map ? (const uint8_t*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) : nullptr;
+        d = view = map ? (const uint8_t*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) : nullptr;
         if (!d) { snprintf(err, errn, "map failed (%lu)", GetLastError()); close(); return false; }
 #else
         int fd = ::open(path, O_RDONLY | O_CLOEXEC);
@@ -170,6 +182,23 @@ struct WebM {
         if (m == MAP_FAILED) { snprintf(err, errn, "map failed (%d)", errno); n = 0; return false; }
         d = (const uint8_t*)m;
 #endif
+        return index(err, errn);
+    }
+#ifdef _WIN32
+    // A movie stored inside a bigger file (the RomFS pack: romfs.bin holds it at `off`, a player's install keeps no
+    // unpacked folder): a read-only view of just that range.
+    bool open_slice(HANDLE f, uint64_t off, uint64_t size, char* err, size_t errn) {
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        const uint64_t base = off - off % si.dwAllocationGranularity;   // (a view starts on the allocation granularity)
+        map = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        view = map ? (const uint8_t*)MapViewOfFile(map, FILE_MAP_READ, (DWORD)(base >> 32), (DWORD)base,
+                                                   (SIZE_T)(off - base + size)) : nullptr;
+        if (!view) { snprintf(err, errn, "map of the pack's slice failed (%lu)", GetLastError()); close(); return false; }
+        d = view + (off - base); n = size;
+        return index(err, errn);
+    }
+#endif
+    bool index(char* err, size_t errn) {
         int64_t tc = 0;
         walk(0, n, 0, nullptr, &tc);
         if (tracks.empty()) { snprintf(err, errn, "no tracks"); close(); return false; }
@@ -177,10 +206,10 @@ struct WebM {
     }
     void close() {
 #ifdef _WIN32
-        if (d) UnmapViewOfFile(d);
+        if (view) UnmapViewOfFile(view);
         if (map) CloseHandle(map);
         if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
-        d = nullptr; map = nullptr; file = INVALID_HANDLE_VALUE; n = 0;
+        d = view = nullptr; map = nullptr; file = INVALID_HANDLE_VALUE; n = 0;
 #else
         if (d) munmap((void*)d, (size_t)n);
         d = nullptr; n = 0;
@@ -191,7 +220,7 @@ struct WebM {
 
 #ifdef _WIN32
 // Media Foundation VP9 decoder (synchronous MFT). The calling thread must have called CoInitializeEx.
-struct Vp9Dec {
+struct MftVp9Dec {
     IMFTransform* t = nullptr;
     IMFSample* out_sample = nullptr;       // when the MFT does not provide samples
     int w = 0, h = 0;                      // display size (tight NV12 output)
@@ -229,7 +258,11 @@ struct Vp9Dec {
             ot->Release();
         }
     }
+    // totk.exe delay-loads Media Foundation (mkninja_win.py /DELAYLOAD): an N edition without the Media Feature Pack has
+    // no mfplat.dll, and the first MF call would fault, so it is loaded here first (and kept)
+    static bool have_mf() { static const bool ok = LoadLibraryExW(L"mfplat.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32) != nullptr; return ok; }
     bool open(int width, int height, char* err, size_t errn) {
+        if (!have_mf()) { snprintf(err, errn, "no Media Foundation (mfplat.dll: an N edition without the Media Feature Pack)"); return false; }
         startup();
         w = width; h = height;
         MFT_REGISTER_TYPE_INFO in{MFMediaType_Video, MFVideoFormat_VP90};
@@ -334,14 +367,14 @@ struct Vp9Dec {
         if (out_sample) { out_sample->Release(); out_sample = nullptr; }
         if (t) { t->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0); t->Release(); t = nullptr; }
     }
-    ~Vp9Dec() { close(); }
+    ~MftVp9Dec() { close(); }
 };
-#else
-// libvpx VP9 decoder (software, 4 threads) with the same interface as the Media Foundation one above: open / decode / drain / flush /
+#endif
+// libvpx VP9 decoder (software, up to 4 threads) with the same interface as the Media Foundation one above: open / decode / drain / flush /
 // close, frames handed to the callback as tight NV12 (w x h Y, then interleaved UV), pts in microseconds. VP9 has no output
 // reordering, so a frame comes out with the pts of the input that produced it (a hidden alt-ref input produces none; a
 // show-existing-frame input produces one).
-struct Vp9Dec {
+struct VpxVp9Dec {
     vpx_codec_ctx_t ctx{};
     bool ok = false;
     int w = 0, h = 0;                      // display size (tight NV12 output)
@@ -352,7 +385,8 @@ struct Vp9Dec {
     bool open(int width, int height, char* err, size_t errn) {
         w = width; h = height;
         vpx_codec_dec_cfg_t cfg{};
-        cfg.threads = 4; cfg.w = (unsigned)w; cfg.h = (unsigned)h;
+        unsigned hw = std::thread::hardware_concurrency();      // (a 2-thread PC keeps one for the game)
+        cfg.threads = hw >= 5 ? 4 : hw > 1 ? hw - 1 : 1; cfg.w = (unsigned)w; cfg.h = (unsigned)h;
         vpx_codec_iface_t* iface = vpx_codec_vp9_dx();
         if (vpx_codec_dec_init(&ctx, iface, &cfg, 0) != VPX_CODEC_OK) {
             snprintf(err, errn, "vpx_codec_dec_init: %s", vpx_codec_error(&ctx));
@@ -400,8 +434,88 @@ struct Vp9Dec {
     }
     void flush() { if (ok) vpx_codec_decode(&ctx, nullptr, 0, nullptr, 0); }
     void close() { if (ok) { vpx_codec_destroy(&ctx); ok = false; } }
-    ~Vp9Dec() { close(); }
+    ~VpxVp9Dec() { close(); }
 };
+
+// The VP9 decoder hle_movie.cpp and movieprobe use. Windows: the MFT when there is one (it costs nothing where the
+// extension is installed), else libvpx; an MFT that refuses the stream's first input also hands over to libvpx from that
+// keyframe. Linux: libvpx.
+struct Vp9Dec {
+#ifdef _WIN32
+    MftVp9Dec mft;
 #endif
+    VpxVp9Dec vpx;
+    bool soft = false, dead = false;       // libvpx decodes / no decoder left (decode fails at once)
+    int w = 0, h = 0;
+    char name[400] = "";
+    char mft_err[200] = "";                // why the MFT is not used ("" = it is, or Linux)
+    uint64_t frames_out = 0, inputs = 0;
+
+    static const char* mode() { const char* m = getenv("NXR_MOVIE_DECODER"); return m && *m ? m : "auto"; }   // auto|mft|soft|none
+    bool open(int width, int height, char* err, size_t errn) {
+        w = width; h = height;
+        const char* m = mode();
+        if (!strcmp(m, "none")) { dead = true; snprintf(err, errn, "no decoder (NXR_MOVIE_DECODER=none)"); return false; }
+#ifdef _WIN32
+        if (strcmp(m, "soft")) {
+            if (mft.open(w, h, mft_err, sizeof mft_err)) { mft_err[0] = 0; snprintf(name, sizeof name, "%s", mft.name); return true; }
+            if (!strcmp(m, "mft")) { dead = true; snprintf(err, errn, "%s", mft_err); return false; }
+        } else snprintf(mft_err, sizeof mft_err, "hidden (NXR_MOVIE_DECODER=soft)");
+#endif
+        return open_soft(err, errn);
+    }
+    bool open_soft(char* err, size_t errn) {
+        char e[200] = "";
+        if (!vpx.open(w, h, e, sizeof e)) {
+            dead = true;
+            snprintf(err, errn, "%s%s%s", mft_err, mft_err[0] ? "; " : "", e);
+            return false;
+        }
+        soft = true;
+        snprintf(name, sizeof name, "%s%s%s", vpx.name, mft_err[0] ? ", the VP9 MFT: " : "", mft_err);
+        return true;
+    }
+    template <class F> bool decode(const uint8_t* p, uint32_t n, int64_t pts_us, F&& cb) {
+        if (dead) return false;
+        inputs++;
+        bool r;
+#ifdef _WIN32
+        if (!soft) {
+            r = mft.decode(p, n, pts_us, cb);
+            frames_out = mft.frames_out;
+            if (r || mft.inputs != 1 || mft.frames_out || !strcmp(mode(), "mft")) return r;
+            // the MFT refused the first input (a broken extension, or a GPU decoder that cannot take this stream): this
+            // is the keyframe, so libvpx can take over from here
+            mft.close();
+            snprintf(mft_err, sizeof mft_err, "refused the first input");
+            char e[400];
+            if (!open_soft(e, sizeof e)) { printf("[movie] vp9: the MFT refused the first input and libvpx failed: %s\n", e); return false; }
+            printf("[movie] vp9: the MFT refused the first input: %s takes over\n", vpx.name);
+        }
+#endif
+        r = vpx.decode(p, n, pts_us, cb);
+        frames_out = vpx.frames_out;
+        return r;
+    }
+    template <class F> void drain(F&& cb) {
+        if (dead) return;
+#ifdef _WIN32
+        if (!soft) { mft.drain(cb); frames_out = mft.frames_out; return; }
+#endif
+        vpx.drain(cb); frames_out = vpx.frames_out;
+    }
+    void flush() {
+#ifdef _WIN32
+        if (!soft) { mft.flush(); return; }
+#endif
+        vpx.flush();
+    }
+    void close() {
+#ifdef _WIN32
+        mft.close();
+#endif
+        vpx.close();
+    }
+};
 
 }  // namespace movie_host
