@@ -17,11 +17,13 @@ from pathlib import Path
 from . import (FAST_TRAVEL, SCENE_W, SCENE_H, RomFS, Zstd, build_base, build_fast_travel, build_fog, build_grass,
                build_output, build_shadow, build_skip_opening, parse_size)
 
-# 1440p and 4K 16:9; the ultrawide (21:9, 32:9) and 16:10 canvases the aspect sets lay the UI out for.
-DEFAULT_OUTPUTS = '2560x1440,3840x2160,3440x1440,5120x1440,2560x1600'
+# 1440p and 4K 16:9; the ultrawide (21:9, 32:9) and 16:10 canvases the aspect sets lay the UI out for, and 1920x1200, the
+# canvas graphics.aspect_ratio = 16:10 draws (games/totk/engine/totk_engine.c wide_canvas; its layouts are 2560x1600's).
+DEFAULT_OUTPUTS = '2560x1440,3840x2160,3440x1440,5120x1440,2560x1600,1920x1200'
 DEFAULT_ASPECTS = '3440x1440,5120x1440,2560x1600'
-# Render sizes for the output-<w>x<h>-scene-<w>x<h> sets; each output also gets a scene of its own size.
-DEFAULT_SCENES = '1920x1080,2560x1440,3840x2160'
+# Render sizes for the output-<w>x<h>-scene-<w>x<h> sets; each output also gets a scene of its own size. 1600x1000:
+# the 16:10 canvas's scene.
+DEFAULT_SCENES = '1920x1080,2560x1440,3840x2160,1600x1000'
 
 
 def scene_pairs(outputs, scenes):
@@ -45,8 +47,12 @@ def main(argv=None):
     p.add_argument('--aspects', default=DEFAULT_ASPECTS, help='canvas sizes for UI layout sets ("" for none)')
     p.add_argument('--scenes', default=DEFAULT_SCENES,
                    help='render sizes for output-<w>x<h>-scene-<w>x<h> sets, built for every output and 1920x1080 ("" for none)')
-    p.add_argument('--hud', choices=('corner', 'center'), default='corner')
+    p.add_argument('--hud', default='corner',
+                   help='HUD placements for the wide aspect sets: corner (aspect-<w>x<h>), center (aspect-<w>x<h>-center, '
+                        'the HUD in the middle 16:9; graphics.hud_layout), or corner,center for both')
     p.add_argument('--grass', default='', help='grass density multipliers for grass-<percent> sets, e.g. 2,3 ("" for none)')
+    p.add_argument('--grass-noturf', default='', help='the same as grass-<percent>-noturf sets: the ground carpet (TurfSet) '
+                   'left as shipped (a test candidate for public issue #16; Setup does not build them)')
     p.add_argument('--shadow', default='', help='shadow cascade distance multipliers for shadow-<percent> sets, e.g. 2 ("" for none)')
     p.add_argument('--fog', default='', help='distance fog multipliers for fog-<percent> sets, e.g. 1.5,2 ("" for none)')
     p.add_argument('--texture-cache', default='',
@@ -57,6 +63,8 @@ def main(argv=None):
     p.add_argument('--only-fast-travel', action='store_true', help='build the --fast-travel sets alone')
     p.add_argument('--capture-frame', type=float, default=0.0)
     p.add_argument('--only-skip-opening', action='store_true', help='build skip_opening/ alone (tools/engine/build.py overlay)')
+    p.add_argument('--only-aspects', action='store_true',
+                   help='build the --aspects / --hud sets alone (a shape built on demand: tools/engine/aspect_sets.py)')
     args = p.parse_args(argv)
     romfs = RomFS(args.romfs)
     zstd = Zstd(romfs)
@@ -71,16 +79,27 @@ def main(argv=None):
         jobs += [lambda s=s, c=c, x=x: build_output(romfs, zstd, args.out, s, c, x)
                  for s, c in scene_pairs(outputs, args.scenes)]
     jobs += [lambda g=g: build_grass(romfs, zstd, args.out, float(g)) for g in args.grass.split(',') if g]
+    jobs += [lambda g=g: build_grass(romfs, zstd, args.out, float(g), turf=False) for g in args.grass_noturf.split(',') if g]
     jobs += [lambda d=d: build_shadow(romfs, zstd, args.out, float(d)) for d in args.shadow.split(',') if d]
     jobs += [lambda d=d: build_fog(romfs, zstd, args.out, float(d)) for d in args.fog.split(',') if d]
-    jobs += [lambda s=s: build_base(romfs, zstd, args.out, aspect=s, hud=args.hud, capture_frame=args.capture_frame)
-             for s in args.aspects.split(',') if s]
+    huds = [h for h in args.hud.split(',') if h]
+    if not huds or set(huds) - {'corner', 'center'}:
+        p.error(f'--hud {args.hud!r}: corner, center or corner,center')
+
+    def wide(s):
+        w, h = parse_size(s)
+        return w * 9 > h * 16
+    aspects = [lambda s=s, h=h: build_base(romfs, zstd, args.out, aspect=s, hud=h, capture_frame=args.capture_frame)
+               for s in args.aspects.split(',') if s for h in huds if h == 'corner' or wide(s)]
+    jobs += aspects
     fast = [lambda v=v: build_fast_travel(romfs, zstd, args.out, v) for v in args.fast_travel.split(',') if v]
     jobs += fast
     if args.only_skip_opening:
         jobs = [lambda: build_skip_opening(romfs, zstd, args.out)]
     if args.only_fast_travel:
         jobs = fast
+    if args.only_aspects:
+        jobs = aspects
     for job in jobs:
         try:
             print(json.dumps(dict(status='pass', **job())), flush=True)

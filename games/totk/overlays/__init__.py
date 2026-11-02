@@ -27,7 +27,7 @@ import zstandard
 
 
 class RomFS:
-    """Read files from the extracted RomFS: pipeline's <dir>/romfs-index.json + romfs.bin (pipeline/extract.py),
+    """Read files from the extracted RomFS: pipeline's <dir>/romfs-index.json + romfs.bin or romfs-source.txt (pipeline/extract.py),
     MacNativeGames' <dir>/index.json + romfs.bin, or an unpacked tree (<dir>/<path>)."""
 
     def __init__(self, root):
@@ -52,7 +52,8 @@ class RomFS:
         if self.files is None:
             return (self.tree / path).read_bytes()
         f = self.files[path]
-        with self.image.open('rb') as image:
+        from pipeline.nx.romsource import open_image   # (romfs.bin, or romfs-source.txt: the image in the dump)
+        with open_image(self.image) as image:
             image.seek(f['offset'])
             data = image.read(f['size'])
         if len(data) != f['size']:
@@ -477,10 +478,13 @@ GRASS_PACK = 'Pack/Grass.pack.zs'
 GRASS_DENSITY_KINDS = ('ResVegeSet', 'ResLeavesSet', 'ResStoneSet', 'ResChipsSet')
 
 
-def build_grass(romfs, zstd, out_root, density):
+def build_grass(romfs, zstd, out_root, density, turf=True):
     """grass-<percent>/: Pack/Grass.pack with every DensityMin / DensityMax of the vegetation, leaves, stone and chips
     sets multiplied by `density` (capped at 1.0, the highest shipped value), edited in place in the archive (sizes and
-    layout unchanged; each original float is read from the shipped file). Grass draw distance is code, not data."""
+    layout unchanged; each original float is read from the shipped file). Grass draw distance is code, not data.
+    turf=False: grass-<percent>-noturf/, the ground carpet (ResVegeSet's TurfSet) left as shipped: the v0.1.8 gate's
+    candidate for public issue #16 (4), grass that would not stay cut at density 3 on one AMD PC, in case the denser
+    carpet (TurfSet 0.4..0.6 -> 1.0) is what reads as uncut grass; not built by Setup."""
     import struct as _struct
     from . import byml
     if not 0.25 <= density <= 4:
@@ -493,12 +497,14 @@ def build_grass(romfs, zstd, out_root, density):
             continue
         for path, t, value, off in byml.walk(bytes(pack[start:end])):
             if t == byml.FLOAT and path and path[-1] in ('DensityMin', 'DensityMax') and value > 0:
+                if not turf and len(path) > 1 and path[-2] == 'TurfSet':
+                    continue
                 _struct.pack_into('<f', pack, start + off, min(1.0, value * density))
                 edits += 1
     if not edits:
         raise ValueError('grass pack: no density values found (not the 1.0.0 RomFS?)')
     data = zstd.compress(pack, dict_id)
-    name = f'grass-{round(density * 100)}'
+    name = f'grass-{round(density * 100)}' + ('' if turf else '-noturf')
     out_dir = Path(out_root) / name
     _write_set(out_dir, [(GRASS_PACK, data, raw)])
     return dict(set=name, dir=str(out_dir), density=density, values=edits)

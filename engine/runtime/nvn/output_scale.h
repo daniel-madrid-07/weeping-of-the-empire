@@ -11,6 +11,10 @@ typedef struct {
 // dw x dh: the window's drawable size in pixels; now: seconds; gpu_ms: GPU time of the last frame (< 0: unknown)
 void output_scale(double dw, double dh, bool reshape_allowed, double now, double gpu_ms, OutScale *o);
 double output_scale_dynamic_factor(void);
+// graphics.render_scale, live (pc_settings.cpp): TOTK_RES_SCALE's value from now on ("auto", a number, "" = 1), taken
+// at the next present; output_res_scaled: that value is not 1 (exec.c: the upscale program's form, tp_env)
+void output_set_res_scale(const char *v);
+bool output_res_scaled(void);
 // The presented image's own aspect, crop included (device.c backend_present, each present), and the fit that places an
 // image of that aspect in the window over output_scale's 16:9 rect (the 21:9 / 32:9 canvases). device.c draws with it
 // and the menu cursor maps the pointer through it; a 16:9 or unknown aspect leaves *o as it is.

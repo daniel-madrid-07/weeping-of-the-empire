@@ -28,6 +28,19 @@ int main(void) {
     uint8_t *renderer = calloc(1, 0x1000);
     TotkSettings s;
     totk_settings_default(&s);
+    /* v0.1.8 release: the floor is 1/240 s again (gameplay steps under it crashed Havok's solver), 1/360 opt-in */
+    CHECK(totk_max_fps_highest() == 240 && fabs(s.min_frame_ms - 1000.0 / 240) < 1e-9, "frame step floor 1/240 s by default");
+    {
+        TotkSettings d = s;
+        _putenv("TOTK_MAX_FPS=360");
+        CHECK(totk_settings_from_env(&d) != NULL, "TOTK_MAX_FPS=360 refused without TOTK_STEP_360=1");
+        _putenv("TOTK_MAX_FPS=240");
+        CHECK(totk_settings_from_env(&d) == NULL && fabs(d.min_frame_ms - 1000.0 / 240) < 1e-9, "TOTK_MAX_FPS=240");
+        _putenv("TOTK_MAX_FPS=");
+    }
+    /* the rest runs the opt-in 1/360 path (TOTK_STEP_360=1: gameplay down to 1/360, held at 1/240 through loads) */
+    _putenv("TOTK_STEP_360=1");
+    totk_settings_default(&s);
     CHECK(TOTK_DATA_PAGE_OFFSET(SPAN) == 0x14000, "page offset %#llx", (unsigned long long)TOTK_DATA_PAGE_OFFSET(SPAN));
     CHECK(TOTK_DATA_PAGE_OFFSET(0x4666000) == 0x4668000, "1.0.0 main page offset");
     CHECK((uint8_t *)totk_data_page(main_base, SPAN) == main_base + 0x14000, "totk_data_page");
@@ -42,6 +55,15 @@ int main(void) {
     CHECK(totk_settings_from_env(&e) != NULL, "bad TOTK_OUTPUT_RES refused");
     _putenv("TOTK_OUTPUT_RES=");
     _putenv("TOTK_RENDER_RES=");
+    {   /* TOTK_TEMP_UNIT: c / f / empty, anything else refused */
+        TotkSettings t;
+        totk_settings_default(&t);
+        _putenv("TOTK_TEMP_UNIT=f");
+        CHECK(!totk_settings_from_env(&t) && t.temp_unit == 2, "TOTK_TEMP_UNIT=f");
+        _putenv("TOTK_TEMP_UNIT=x");
+        CHECK(totk_settings_from_env(&t) != NULL, "TOTK_TEMP_UNIT=x refused");
+        _putenv("TOTK_TEMP_UNIT=");
+    }
     _putenv("TOTK_ASPECT=21:9");
     e = s;
     CHECK(totk_settings_from_env(&e) == NULL && fabsf(e.aspect - 21.0f / 9.0f) < 1e-6f, "TOTK_ASPECT");
@@ -60,9 +82,11 @@ int main(void) {
     CHECK(totk_settings_from_env(&e) != NULL, "TOTK_DYNAMIC_RES floor out of range refused");
     _putenv("TOTK_DYNAMIC_RES=");
     e = s;
-    CHECK(fabs(e.min_frame_ms - 1000.0 / 240) < 1e-9, "frame step floor 1/240 s by default");
+    CHECK(totk_max_fps_highest() == 360 && fabs(e.min_frame_ms - 1000.0 / 360) < 1e-9, "TOTK_STEP_360=1: floor 1/360 s");
     _putenv("TOTK_MAX_FPS=480");
-    CHECK(totk_settings_from_env(&e) != NULL, "TOTK_MAX_FPS above 240 refused");
+    CHECK(totk_settings_from_env(&e) != NULL, "TOTK_MAX_FPS above 360 refused");
+    _putenv("TOTK_MAX_FPS=360");
+    CHECK(totk_settings_from_env(&e) == NULL && fabs(e.min_frame_ms - 1000.0 / 360) < 1e-9, "TOTK_MAX_FPS=360");
     _putenv("TOTK_MAX_FPS=144");
     CHECK(totk_settings_from_env(&e) == NULL && fabs(e.min_frame_ms - 1000.0 / 144) < 1e-9, "TOTK_MAX_FPS=144");
     _putenv("TOTK_MAX_FPS=");
@@ -101,6 +125,11 @@ int main(void) {
     CHECK(f32_at(page, TOTK_DP_RES_FLOOR) == 1.0f, "dynamic resolution floor 1 (fixed)");
     CHECK(f32_at(page, TOTK_DP_FOV_SCALE) == 0.0f, "field of view: the game's own");
     CHECK(f32_at(page, TOTK_DP_SHADOW_FIXED) == 0.0f, "shadow map size: the game's own");
+    CHECK(u32_at(page, TOTK_DP_TEMP_UNIT) == 0, "temperature unit: the game's own");
+    totk_temp_unit_set(2);
+    CHECK(u32_at(page, TOTK_DP_TEMP_UNIT) == 2, "temperature unit set live: F");
+    totk_temp_unit_set(7);
+    CHECK(u32_at(page, TOTK_DP_TEMP_UNIT) == 0, "temperature unit out of range: the game's own");
     CHECK(f32_at(page, TOTK_DP_MOUSE_SCALE) == 1.0f && f32_at(page, TOTK_DP_MOUSE_RATE) == TOTK_MOUSE_RATE_DEFAULT,
           "mouse multiplier 1, rate default");
     CHECK(f32_at(page, TOTK_DP_ACTOR_LOD) == 0.0f && u32_at(page, TOTK_DP_CAMERA) == 0, "actor LOD: the game's own; no camera yet");
@@ -113,11 +142,74 @@ int main(void) {
     for (unsigned r = 0; r < sizeof rates / sizeof *rates; r++) {
         for (int i = 0; i < 3000; i++) totk_frame_step_update(t += (uint64_t)(1e9 / rates[r]));
         double want = 1.0 / rates[r];
-        if (want < 1.0 / 240) want = 1.0 / 240;   /* TOTK_MAX_FPS default*/
+        if (want < 1.0 / TOTK_HOLD_FPS) want = 1.0 / TOTK_HOLD_FPS;   /* held from the start*/
         if (want > 1.0 / 15) want = 1.0 / 15;
         float sec = f32_at(page, TOTK_DP_FRAME_SECONDS), ratio = f32_at(page, TOTK_DP_FRAME_RATIO);
         CHECK(fabs(sec - want) < 2e-6 && fabs(ratio - want * 30) < 5e-5, "%g Hz: seconds %g ratio %g, want %g", rates[r], sec, ratio, want);
     }
+    /* the hold: released, 300 / 360 fps step at their own rate, 600 at TOTK_MAX_FPS's 1/360; held again, a 360 fps frame
+       steps 1/240 at once; the time it ran ahead is not repaid after the release (no slow motion), and the release
+       reaches the measured rate within the retarget ramp*/
+    totk_frame_step_hold(0);
+    const double unheld[] = {300, 360, 600};
+    for (unsigned r = 0; r < sizeof unheld / sizeof *unheld; r++) {
+        for (int i = 0; i < 3000; i++) totk_frame_step_update(t += (uint64_t)(1e9 / unheld[r]));
+        double want = unheld[r] > 360 ? 1.0 / 360 : 1.0 / unheld[r];
+        float sec = f32_at(page, TOTK_DP_FRAME_SECONDS);
+        CHECK(fabs(sec - want) < 2e-6, "released, %g Hz: seconds %g, want %g", unheld[r], sec, want);
+    }
+    for (int i = 0; i < 3000; i++) totk_frame_step_update(t += (uint64_t)(1e9 / 360));
+    totk_frame_step_hold(1);
+    totk_frame_step_update(t += (uint64_t)(1e9 / 360));
+    CHECK(fabs(f32_at(page, TOTK_DP_FRAME_SECONDS) - 1.0 / TOTK_HOLD_FPS) < 1e-6, "held: 1/%d at once", TOTK_HOLD_FPS);
+    double low = 1;
+    for (int i = 0; i < 720; i++) {   /* 2 s of a load at 360 fps: 0.67 s ahead */
+        totk_frame_step_update(t += (uint64_t)(1e9 / 360));
+        float sec = f32_at(page, TOTK_DP_FRAME_SECONDS);
+        if (sec < low) low = sec;
+    }
+    CHECK(low >= 1.0 / TOTK_HOLD_FPS - 1e-7, "held: never under 1/%d (lowest %g)", TOTK_HOLD_FPS, low);
+    totk_frame_step_hold(0);
+    int reached = -1;
+    for (int i = 0; i < 120; i++) {
+        totk_frame_step_update(t += (uint64_t)(1e9 / 360));
+        if (reached < 0 && fabs(f32_at(page, TOTK_DP_FRAME_SECONDS) * 360 - 1) < 0.03) reached = i;
+    }
+    CHECK(reached >= 0 && reached <= 15, "released: within 3 %% of 1/360 after %d frames, want <= 15", reached);
+    double game = 0;
+    for (int i = 0; i < 3000; i++) {   /* 25 s at 120 fps: game time = real time, nothing of the hold repaid */
+        totk_frame_step_update(t += (uint64_t)(1e9 / 120));
+        game += f32_at(page, TOTK_DP_FRAME_SECONDS);
+    }
+    CHECK(fabs(game - 25.0) < 0.02, "after the hold: 25 s of 120 fps stepped %g s of game time", game);
+    totk_frame_step_hold(1);
+    totk_frame_step_hold(1);   /* (held twice: nothing changes, no retarget) */
+    for (int i = 0; i < 600; i++) totk_frame_step_update(t += (uint64_t)(1e9 / 360));
+    CHECK(fabs(f32_at(page, TOTK_DP_FRAME_SECONDS) - 1.0 / TOTK_HOLD_FPS) < 1e-6, "held again at 360 fps: 1/%d", TOTK_HOLD_FPS);
+    totk_frame_step_hold(0);
+    /* a hold the floor never touched (#16, fast travel at a 120 cap: the warp and the load at 75-120 fps, then the world
+       at 60): its release is no retarget, so the step still moves at most 3 % a frame and the owed time stays owed: game
+       time = real time across the hold and its end */
+    for (int i = 0; i < 3000; i++) totk_frame_step_update(t += (uint64_t)(1e9 / 120));
+    {
+        double hgiven = 0, hreal = 0, worst = 1, prev = f32_at(page, TOTK_DP_FRAME_SECONDS);
+        totk_frame_step_hold(1);
+        for (int i = 0; i < 1800; i++) {
+            if (i == 600) totk_frame_step_hold(0);   /* (5 s held: the warp + load, then the world) */
+            uint64_t d = i < 600 ? (i % 3 ? 8333333 : 13333333) : i < 900 ? (i & 1 ? 12000000 : 21333333) : 16666667;
+            hgiven += f32_at(page, TOTK_DP_FRAME_SECONDS);
+            totk_frame_step_update(t += d);
+            hreal += d * 1e-9;
+            double s = f32_at(page, TOTK_DP_FRAME_SECONDS), r = s > prev ? s / prev : prev / s;
+            if (r > worst) worst = r;
+            prev = s;
+        }
+        /* (the world's 100 -> 60 fps change after the release opens the dip follow, bow-step: up to 25 % a frame by
+           design, its lag still owed; on this trace its steps stay small, the bound only guards against a retarget) */
+        CHECK(worst <= 1.05, "unclamped hold released: step moved %.3fx in one frame, want <= 1.05", worst);
+        CHECK(fabs(hgiven - hreal) < 0.005, "unclamped hold: given %.4f s for %.4f s real", hgiven, hreal);
+    }
+
     /* at most 3 % per frame: a 200 ms hitch at 60 Hz moves the next step by 3 %, not by the hitch */
     for (int i = 0; i < 3000; i++) totk_frame_step_update(t += 16666667);
     totk_frame_step_update(t += 200000000);
@@ -142,6 +234,53 @@ int main(void) {
         real += d * 1e-9;
     }
     CHECK(fabs(given - real) < 0.005, "short frames: given %.4f s for %.4f s real", given, real);
+    /* the frame rate moves by itself (a heavier view, GPU-bound): 120 -> 58 -> 120 fps with no retarget. The step
+       reaches the new rate within 8 presents (the 3 % ramp alone took ~60, the game at ~0.5x then paid back fast), each
+       frame after those runs within 6 % of real time, and the clock keeps real time. Two long frames in a row are still
+       a hitch: 3 % each.*/
+    for (int i = 0; i < 3000; i++) totk_frame_step_update(t += 8333333);
+    totk_frame_step_update(t += 50000000);
+    totk_frame_step_update(t += 50000000);
+    float pair2 = f32_at(page, TOTK_DP_FRAME_SECONDS);
+    CHECK(pair2 <= 1.0610f / 120, "two long frames: step %g, want <= 1.03^2 / 120", pair2);
+    for (int i = 0; i < 3000; i++) totk_frame_step_update(t += 8333333);
+    const double dip[3] = {120, 58, 120};
+    given = real = 0;
+    for (int k = 1; k < 3; k++) {
+        int near = -1;
+        double worst = 0;
+        for (int i = 0; i < (int)(dip[k] * 2); i++) {
+            float g = f32_at(page, TOTK_DP_FRAME_SECONDS);
+            given += g;
+            totk_frame_step_update(t += (uint64_t)(1e9 / dip[k]));
+            real += 1 / dip[k];
+            if (near < 0 && fabs(f32_at(page, TOTK_DP_FRAME_SECONDS) * dip[k] - 1) < 0.05) near = i;
+            if (i > 8 && fabs(g * dip[k] - 1) > worst) worst = fabs(g * dip[k] - 1);
+        }
+        CHECK(near >= 0 && near <= 8, "%g -> %g fps by itself: within 5 %% of the new step after %d presents, want <= 8",
+              dip[k - 1], dip[k], near);
+        CHECK(worst < 0.06, "%g -> %g fps by itself: a frame after the first 8 ran %.0f %% off real time", dip[k - 1], dip[k],
+              worst * 100);
+    }
+    for (int i = 0; i < 600; i++) {
+        given += f32_at(page, TOTK_DP_FRAME_SECONDS);
+        totk_frame_step_update(t += 8333333);
+        real += 0.008333333;
+    }
+    CHECK(fabs(given - real) < 0.005, "dip: the clock keeps real time (given %.4f s for %.4f s)", given, real);
+    /* a small dip at a 60 cap: 60 -> 54 -> 60 fps, every frame after the first 10 within 3 % of real time*/
+    for (int i = 0; i < 3000; i++) totk_frame_step_update(t += 16666667);
+    const double dip60[3] = {60, 54, 60};
+    for (int k = 1; k < 3; k++) {
+        double worst = 0;
+        for (int i = 0; i < (int)(dip60[k] * 2); i++) {
+            float g = f32_at(page, TOTK_DP_FRAME_SECONDS);
+            totk_frame_step_update(t += (uint64_t)(1e9 / dip60[k]));
+            if (i > 10 && fabs(g * dip60[k] - 1) > worst) worst = fabs(g * dip60[k] - 1);
+        }
+        CHECK(worst < 0.03, "%g -> %g fps: a frame after the first 10 ran %.1f %% off real time", dip60[k - 1], dip60[k],
+              worst * 100);
+    }
     /* a live frame-rate cap change (totk_frame_step_retarget): 240 -> 30 and 30 -> 240 reach the new step within 0.4 s
        and the clock is off by the ramp alone (< 0.2 s), then runs at 1.0x; without it (the control) 240 -> 30 is still
        slow motion 0.4 s later */
@@ -159,8 +298,11 @@ int main(void) {
                 real += 1 / to;
                 if (!step_at && real >= 0.4) step_at = f32_at(page, TOTK_DP_FRAME_SECONDS), given_at = given, real_at = real;
             }
-            if (ctl) {
-                CHECK(step_at < 0.5 / to, "control, no retarget: %g -> %g Hz still slow 0.4 s later (step %g)", from, to, step_at);
+            if (ctl) {   /* (the rate change alone: followed too, but its lag stays owed and comes back at <= 1.05x) */
+                CHECK(fabs(step_at * to - 1) < 0.06, "no retarget: %g -> %g Hz: step %g after 0.4 s, want %g +- 6 %%", from,
+                      to, step_at, 1 / to);
+                CHECK(given_at < real_at - 0.05, "no retarget: %g -> %g Hz: the lag still owed after 0.4 s (%.3f s)", from,
+                      to, real_at - given_at);
                 continue;
             }
             CHECK(fabs(step_at * to - 1) < 0.05, "retarget %g -> %g Hz: step %g after 0.4 s, want %g", from, to, step_at, 1 / to);
@@ -282,6 +424,17 @@ int main(void) {
     o.output_w = o.max_w = 3440, o.output_h = o.max_h = 1440;
     int n = totk_overlay_sets(&o, names);
     CHECK(n == 2 && !strcmp(names[0], "aspect-3440x1440") && !strcmp(names[1], "output-3440x1440"), "ultrawide sets: %d %s %s", n, names[0], n > 1 ? names[1] : "");
+    /* 16:10 (graphics.aspect_ratio 16:10): the 2560x1600 layouts, the canvas's own output and scene sets */
+    o.output_w = o.max_w = 1920, o.output_h = o.max_h = 1200, o.render_w = 1600, o.render_h = 1000;
+    n = totk_overlay_sets(&o, names);
+    CHECK(n == 2 && !strcmp(names[0], "aspect-2560x1600") && !strcmp(names[1], "output-1920x1200-scene-1600x1000"),
+          "16:10 sets: %d %s %s", n, names[0], n > 1 ? names[1] : "");
+    char lay[64] = "untouched";
+    CHECK(totk_layout_set(2560, 1080, lay) && !strcmp(lay, "aspect-3440x1440"), "2560x1080 is 21:9's layout: %s", lay);
+    CHECK(totk_layout_set(3840, 1080, lay) && !strcmp(lay, "aspect-5120x1440"), "3840x1080 is 32:9's layout: %s", lay);
+    CHECK(totk_layout_set(1280, 1024, lay) && !strcmp(lay, "aspect-1280x1024"), "an unbuilt shape keeps its size: %s", lay);
+    strcpy(lay, "untouched");
+    CHECK(!totk_layout_set(2560, 1440, lay) && !strcmp(lay, "untouched"), "16:9 has no layout set");
     totk_settings_default(&o);
     n = totk_overlay_sets(&o, names);
     CHECK(n == 1 && !strcmp(names[0], "base"), "default sets");

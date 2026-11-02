@@ -8,6 +8,8 @@ outside the measurement windows.
 copy): nothing to compare, so the record is written from the extraction's own proof instead: romfs-report.json passed
 (all six IVFC levels verified while romfs.bin was written, its sha256 the pinned version's), romfs.bin still that size,
 every indexed file inside it. Seconds; the runtime serves the image through its own index (test_romfs_image.py).
+Since v0.1.8 the image may stay in the player's dump (romfs-source.txt, pipeline/nx/romsource.py: extract --in-dump):
+--from-report records it the same way, from the extraction's proof, and checks the dump is still there at its size.
 Run: python tools/engine/romfs_image_verify.py [--image romfs.bin] [--index romfs-index.json] [--romfs DIR] [--from-report]"""
 import argparse
 import json
@@ -20,22 +22,37 @@ from concurrent.futures import ThreadPoolExecutor
 V100 = os.path.join(os.environ.get('NXRECOMP_WORK') or r'C:\nxrecomp-work', 'extracted', 'v100')
 CHUNK = 8 << 20
 ROMFS_IMAGE = os.path.join(V100, 'romfs.bin')   # served in place (TOTK_ROMFS_PACK), the folder behind it
+ROMFS_SOURCE = os.path.join(V100, 'romfs-source.txt')   # or the image in the player's dump (v0.1.8)
 
 
 def romfs_image(romfs_dir):
     """The extraction's RomFS image when this check found it byte-identical to romfs_dir, the RomFS folder the boot /
     package really uses (its .verified.json names that folder and the image's size and mtime), else None: another
     folder (a package's romfs=, another version's extraction) never gets v100's image as its pack. One handle instead
-    of thousands of first opens per load (boot.py and package.py)."""
-    try:
-        v = json.load(open(ROMFS_IMAGE + '.verified.json', encoding='utf-8'))
-        st = os.stat(ROMFS_IMAGE)
-        same = lambda p: os.path.normcase(os.path.abspath(p))
-        if (v.get('size'), v.get('mtime_ns')) != (st.st_size, st.st_mtime_ns) or not romfs_dir or                 same(v.get('romfs') or '') != same(romfs_dir):
-            return None
-        return ROMFS_IMAGE
-    except (OSError, ValueError):
-        return None
+    of thousands of first opens per load (boot.py and package.py). romfs.bin first, then romfs-source.txt (the image
+    in the player's dump: the runtime reads it the same way)."""
+    for image in (ROMFS_IMAGE, ROMFS_SOURCE):
+        try:
+            v = json.load(open(image + '.verified.json', encoding='utf-8'))
+            st = os.stat(image)
+            same = lambda p: os.path.normcase(os.path.abspath(p))
+            if (v.get('size'), v.get('mtime_ns')) != (st.st_size, st.st_mtime_ns) or not romfs_dir or                     same(v.get('romfs') or '') != same(romfs_dir):
+                continue
+            return image
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def open_image(path):
+    """romfs.bin unbuffered, or romfs-source.txt as pipeline/nx/romsource.py's DumpImage"""
+    if os.path.basename(path).lower() != 'romfs-source.txt':
+        return open(path, 'rb', buffering=0)
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+    from pipeline.nx.romsource import DumpImage
+    return DumpImage(path)
 
 
 def write_record(a, files, nbytes, **extra):
@@ -48,16 +65,19 @@ def write_record(a, files, nbytes, **extra):
 def from_report(a, files):
     try:
         rep = json.load(open(os.path.join(os.path.dirname(a.image), 'romfs-report.json'), encoding='utf-8'))
-        size = os.path.getsize(a.image)
+        with open_image(a.image) as img:   # (the image in the dump: also checks the dump is there at its size)
+            size = img.seek(0, 2)
     except (OSError, ValueError) as e:
         print(f'romfs_image_verify: FAIL (no extraction report or image: {e})')
         return 1
     bad = [m for m, ok in (
         ('the extraction did not pass', rep.get('status') == 'pass'),
         ('its sha256 was not checked against the pinned version', rep.get('expected_match')),
-        (f'romfs.bin is {size} bytes, the extraction wrote {rep.get("romfs_size")}', rep.get('romfs_size') == size),
+        (f'the image is {size} bytes, the extraction wrote {rep.get("romfs_size")}', rep.get('romfs_size') == size),
+        (f'the extraction wrote {rep.get("image")}, not {os.path.basename(a.image)}',
+         rep.get('image', 'romfs.bin') == os.path.basename(a.image)),
         (f'the index lists {len(files)} files, the extraction {rep.get("file_count")}', rep.get('file_count') == len(files)),
-        ('an indexed file lies outside romfs.bin', all(0 <= f['offset'] and f['offset'] + f['size'] <= size
+        ('an indexed file lies outside the image', all(0 <= f['offset'] and f['offset'] + f['size'] <= size
                                                         for f in files))) if not ok]
     if os.path.isdir(a.romfs) and any(True for _ in os.scandir(a.romfs)):
         bad.append(f'{a.romfs} holds files: compare them (run without --from-report)')
@@ -74,13 +94,15 @@ def from_report(a, files):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--image', default=os.path.join(V100, 'romfs.bin'))
+    ap.add_argument('--image', help='default: the image romfs-index.json names (romfs.bin or romfs-source.txt)')
     ap.add_argument('--index', default=os.path.join(V100, 'romfs-index.json'))
     ap.add_argument('--romfs', default=os.path.join(V100, 'romfs'))
     ap.add_argument('--threads', type=int, default=8)
     ap.add_argument('--from-report', action='store_true', help='no folder: record the image from the extraction report')
     a = ap.parse_args()
-    files = json.load(open(a.index, encoding='utf-8'))['files']
+    index = json.load(open(a.index, encoding='utf-8'))
+    files = index['files']
+    a.image = a.image or os.path.join(os.path.dirname(os.path.abspath(a.index)), index.get('image', 'romfs.bin'))
     if a.from_report:
         return from_report(a, files)
     local = threading.local()
@@ -89,7 +111,7 @@ def main():
     def check(f):
         img = getattr(local, 'img', None)
         if img is None:
-            img = local.img = open(a.image, 'rb', buffering=0)
+            img = local.img = open_image(a.image)
         path = os.path.join(a.romfs, *f['path'].split('/'))
         try:
             with open(path, 'rb', buffering=0) as src:

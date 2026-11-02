@@ -7,6 +7,7 @@
 // third_party/imgui/LICENSE.txt), the SPIR-V copied as is.
 #include "vk.h"
 #include "../../pc_overlay.h"
+#include "../../pc_settings.h"
 #include <string.h>
 
 void vk_frame_suspend(void);
@@ -274,6 +275,7 @@ void pc_overlay_vk_record(void) {
         for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
             if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT && mp.memoryHeaps[i].size > local) local = mp.memoryHeaps[i].size;
         pc_overlay_note_gpu(g_vk.props.deviceName, (uint32_t)(local >> 20));
+        if (g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) pc_settings_first_start_igpu();   // (Steam Deck, APUs)
     }
     const uint32_t w = g_vk.sc_extent.width, h = g_vk.sc_extent.height;
     const pc_draw *d = pc_overlay_build(w, h);

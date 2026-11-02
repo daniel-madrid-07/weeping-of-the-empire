@@ -13,6 +13,8 @@ extern "C" {
 // The text for the player: its Spanish when the game is in Spanish and pc_text_es.inc has it, else `en` itself (UTF-8;
 // a format string keeps its specifiers in order). nullptr stays nullptr.
 const char *pc_tr(const char *en);
+// every text of the player's language's table (pc_overlay.cpp: the glyphs to draw ahead); none for English. Any thread.
+void pc_tr_each(void (*fn)(const char *text, void *ctx), void *ctx);
 
 #ifdef __cplusplus
 }

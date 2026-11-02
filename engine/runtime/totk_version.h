@@ -84,3 +84,12 @@ uint64_t totk_main_off_c(uint64_t off);   // totk_version.cpp
 #define totk_field(S, off) (off)
 #define totk_field_known(S, off) 1
 #endif
+
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+// The ActionVerb numbers the engine compares (totk_player_state.cpp's readers, totk_pc_vk.cpp's hook) are 1.0.0's.
+// 1.4.3 keeps them all: the game's own per-verb name table (1.0.0 main+0x42258d0, 1.4.3 main+0x36370b8) names the
+// same verb at every index 0.. 283 in both builds, so Invalid stays 284 and each id keeps its meaning (57: 0x16e8f1c
+// -> 0x1d02818). Another version without such a check: 0, and that code stands down whatever the field table places.
+// 1.0.0 builds do not define it.
+#define TOTK_VERBS_KNOWN (TOTK_GAME_VERSION == 143)
+#endif

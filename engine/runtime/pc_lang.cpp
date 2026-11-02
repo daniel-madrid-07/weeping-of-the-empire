@@ -24,7 +24,8 @@ const char *const N_LANG[] = {"Automatic (Windows' language)", "English (US)", "
 
 const pc_setting k_lang[] = {
     {"game.language", "Game", "Language", "Language", "TOTK_LANG: the game's texts and voices' subtitles, and the PC "
-     "settings' own texts (English or Spanish). Automatic: Windows' display language if the game has it, else English.",
+     "settings' own texts (English, Spanish, Russian, Simplified Chinese; Brazilian Portuguese on a Portuguese Windows). "
+     "Automatic: Windows' display language if the game has it, else English.",
      "", V_LANG, N_LANG, 0, 0, 0, PC_SET_RESTART, "TOTK_LANG", nullptr, nullptr, nullptr},
 };
 // The row, once: from this TU's static initializer, or from pc_lang_code when another TU's static initializer asks for the
@@ -101,6 +102,7 @@ static const char *with_fonts(const char *c) {
     return "en-US";
 }
 
+static char g_windows_tag[96];   // Windows' display language, when game.language follows it ("": it does not)
 extern "C" const char *pc_lang_code(void) {
     static const char *code = [] {
         add_lang_rows();
@@ -110,12 +112,25 @@ extern "C" const char *pc_lang_code(void) {
                 printf("[lang] %s (game.language)\n", V_LANG[i]);
                 return with_fonts(V_LANG[i]);
             }
-        char tag[96];
-        const char *c = windows_code(tag, sizeof tag);
-        printf("[lang] %s (Windows' display language %s)\n", c, tag);
+        const char *c = windows_code(g_windows_tag, sizeof g_windows_tag);
+        printf("[lang] %s (Windows' display language %s)\n", c, g_windows_tag);
         return with_fonts(c);
     }();
     return code;
+}
+
+// The PC port's own texts follow the game's language where they have it (Spanish, Russian, Simplified Chinese), and
+// Brazilian Portuguese, which the game lacks (it plays in English then), when the game follows a Portuguese Windows
+extern "C" const char *pc_ui_lang(void) {
+    static const char *ui = [] {
+        const char *c = pc_lang_code();
+        if (c[0] == 'e' && c[1] == 's') return "es";
+        if (!strcmp(c, "ru") || !strcmp(c, "zh-Hans")) return c;
+        if (!strncmp(g_windows_tag, "pt", 2) && (!g_windows_tag[2] || g_windows_tag[2] == '-' || g_windows_tag[2] == '_'))
+            return "pt";
+        return "";
+    }();
+    return ui;
 }
 
 extern "C" const char *pc_lang_key(void) {

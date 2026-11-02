@@ -34,6 +34,7 @@ std::vector<Row> &rows() { static std::vector<Row> v; return v; }
 std::vector<std::string> g_lines;   // the file as read: comments and unknown keys are written back
 std::string g_path;
 bool g_booted, g_file_on, g_dirty, g_first_run, g_fresh_file;
+std::string g_first_cap;   // the Frame rate this first start took from the package / the monitor ("": none; pc_settings_first_start_igpu)
 std::vector<pc_preset_row> g_presets;   // graphics.preset's members (pc_settings_add_presets)
 ULONGLONG g_dirty_at;
 
@@ -140,17 +141,26 @@ int import_recomp_settings(std::vector<std::pair<std::string, std::string>> *kv)
 void save_now();
 std::vector<std::pair<std::string, std::string>> g_kv;   // key -> value as read from the file at start
 
+// display.fps_cap's 300 / 360 (v0.1.8 before its cut, V_FPS): 240, the highest now, rather than the default 30
+std::string fps_cap_saved(const pc_setting *d, const char *v) {
+    return !strcmp(d->key, "display.fps_cap") && (!strcmp(v, "300") || !strcmp(v, "360")) ? "240" : v;
+}
+
 // A row's value for this run: the file's, then NX_SET_<KEY> over it; into the environment when either is set
 void start_value(Row &r) {
     bool set = false;
-    for (const auto &e : g_kv)
-        if (e.first == r.def->key && valid(r.def, e.second.c_str())) {
-            snprintf(r.value, sizeof r.value, "%s", e.second.c_str());
+    for (const auto &e : g_kv) {
+        const std::string v = fps_cap_saved(r.def, e.second.c_str());
+        if (e.first == r.def->key && valid(r.def, v.c_str())) {
+            snprintf(r.value, sizeof r.value, "%s", v.c_str());
             set = true;
         }
+    }
     memcpy(r.saved, r.value, sizeof r.saved);
     std::string on = override_name(r.def->key);
-    if (const char *o = getenv(on.c_str())) {
+    if (const char *env = getenv(on.c_str())) {
+        const std::string mapped = fps_cap_saved(r.def, env);
+        const char *o = mapped.c_str();
         if (valid(r.def, o)) { snprintf(r.value, sizeof r.value, "%s", o); r.overridden = set = true; }
         else printf("[pc-settings] %s=%s is not a value of %s: ignored\n", on.c_str(), o, r.def->key);
     }
@@ -424,11 +434,13 @@ void boot() {
             const bool vrr = !scripted && !has_vrr && c.vrr == PCD_VRR_ON;   // (MONITOR: suggested only)
             pcd_caps fixed = c;   // (VRR left off: the frame rate of a fixed refresh)
             if (!vrr) fixed.vrr = PCD_VRR_NONE;
-            if (kv[cap].second == "120")
+            if (kv[cap].second == "120") {
                 if (const char *fps = first_run_fps_cap(fixed)) {
                     kv[cap].second = fps;
                     set("display.fps_cap", fps, false);
                 }
+                if (!scripted && !vrr) g_first_cap = kv[cap].second;   // (the device's kind comes later: below)
+            }
             if (vrr) set("display.vrr", "on", true);
             if (!scripted && !has_peak && c.hdr_on && c.peak_nits > 0) {
                 char p[16];
@@ -609,6 +621,26 @@ extern "C" void pc_settings_save_pending(void) {
     if (g_dirty) save_now();
 }
 
+// The first start on an integrated GPU (pc_overlay_vk.c, once the device is known: boot() runs before it exists): Frame
+// rate "steady" instead of the monitor's rate or the package's 120. An APU (Steam Deck, laptops) seldom holds 60 here,
+// and a fixed cap it misses shows uneven frames on a fixed refresh (FIFO: a frame on screen for one refresh, then two);
+// steady paces at a rate the frames hold, whole refreshes (60 or 30 on a 60 Hz panel; hle_vi.cpp steady_period). Only
+// while the value is still the one this start chose (the player has not picked one), never with VRR on (Unlocked paces
+// inside its range) nor in scripted boots. No picture change: the frame rate only.
+extern "C" void pc_settings_first_start_igpu(void) {
+    std::string was;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        was.swap(g_first_cap);
+    }
+    if (was.empty()) return;
+    char now[64] = "", vrr[16] = "";
+    pc_settings_copy("display.vrr", vrr, sizeof vrr);
+    if (!pc_settings_copy("display.fps_cap", now, sizeof now) || was != now || !strcmp(vrr, "on")) return;
+    printf("[pc-settings] first start: display.fps_cap %s -> steady (an integrated GPU)\n", now);
+    pc_settings_set("display.fps_cap", "steady");
+}
+
 const char *pc_settings_file() { return g_file_on && !g_path.empty() ? g_path.c_str() : nullptr; }
 bool pc_settings_first_run() { return g_first_run || g_fresh_file; }
 
@@ -690,6 +722,12 @@ void window_size_apply(const char *v) {
 const char *perf_now() { return pc_overlay_perf() ? "1" : "0"; }   // F9 toggles it behind the overlay's back
 void perf_apply(const char *v) { pc_overlay_set_perf(strcmp(v, "1") == 0); }
 void mute_unfocused_apply(const char *v) { hle_audio_set_mute_unfocused(!strcmp(v, "1")); }
+extern "C" void totk_temp_unit_set(unsigned unit);   // games/totk/runtime/totk_patches.c: the data page's slot, live
+void temp_unit_apply(const char *v) { totk_temp_unit_set(!strcmp(v, "c") ? 1u : !strcmp(v, "f") ? 2u : 0u); }
+// The Purah Pad map's temperature (GAPS-zelda-on-pc 9; the tempunit patch + sign hook, v0.1.8): the game shows °F in
+// English (US) only, °C in every other language
+const char *const V_TEMP[] = {"", "c", "f", nullptr};
+const char *const N_TEMP[] = {"Automatic (by the game's language)", "°C (Celsius)", "°F (Fahrenheit)", nullptr};
 extern "C" void pc_shot_set_enabled(bool on);   // pc_shot.cpp
 // anti-aliasing, the window upscaler and sharpening act from the next presented frame (exec.c; nullptr keeps that
 // one as it is; the values are their variables')
@@ -697,6 +735,18 @@ extern "C" void renderer_apply_post(const char *aa, const char *upscale, const c
 void aa_apply(const char *v) { renderer_apply_post(v, nullptr, nullptr); }
 void upscale_apply(const char *v) { renderer_apply_post(nullptr, v, nullptr); }
 void sharpen_apply(const char *v) { renderer_apply_post(nullptr, nullptr, v); }
+// The colour adjustment (exec.c renderer_apply_color; rival parity, their color_preset): any of its five rows passes all
+// five, so a slider moved while the preset is Custom acts at once, and the preset row alone picks fixed values
+const char *const V_COLOR[] = {"", "vivid", "bright", "custom", nullptr};
+const char *const N_COLOR[] = {"Off (the game's own colours; default)", "Vivid", "Brighter dark tones",
+                               "Custom (the four rows below)", nullptr};
+extern "C" void renderer_apply_color(const char *preset, const char *bright, const char *contrast, const char *sat,
+                                     const char *gamma);
+void color_apply(const char *) {
+    renderer_apply_color(pc_settings_get("display.color"), pc_settings_get("display.color_brightness"),
+                         pc_settings_get("display.color_contrast"), pc_settings_get("display.color_saturation"),
+                         pc_settings_get("display.color_gamma"));
+}
 void screenshots_apply(const char *v) { pc_shot_set_enabled(strcmp(v, "0") != 0); }
 extern "C" void shim_set_fps_overlay(int mode);   // shim_win.c / shim_sdl3.c: 0 off, 1 minimal, 2 detailed
 extern "C" int shim_fps_overlay_mode(void);
@@ -725,6 +775,29 @@ void fps_env(const char *v) {   // hle_vi.cpp: TOTK_FPS (unset: the game's own 3
     env_put("TOTK_UNLOCK_STEADY", !steady ? "" : st && !strcmp(st, "vrr") ? "vrr" : "1");
 }
 extern "C" void vi_set_frame_rate(const char *v);   // hle_vi.cpp: the pacing reads it per frame
+// Rendering rows live since 2026-11-02 (live-settings; they were restart rows): each takes effect between two frames, as
+// a start with the new value would have it, the targets remade with their contents (textures.c rescale_image) and the
+// shaders a value changes rebuilt in the background while the old ones draw (exec.c knob_fit)
+extern "C" void output_set_res_scale(const char *v);   // totk_hooks.c: the render scale from the next present
+extern "C" void renderer_set_native_ui(int on);        // textures.c: the output canvas in or out at the next present
+extern "C" void vk_set_soft_shadows(const char *v);    // exec.c: the soft-shadow percent of the translations from now
+extern "C" void vk_set_upscaler_3d(const char *v);     // exec.c: the upscale program's form (TOTK_SSAA), likewise
+extern "C" void vk_set_scene_upscaler(const char *v);  // exec.c: its resample as EASU or bicubic (TOTK_SCENE_UPSCALE)
+extern "C" void contact_set_strength(const char *v);   // contact.c: from the next pass
+extern "C" void renderer_set_shadow_scale(const char *v);   // textures.c: the shadow maps' scale at the next present
+extern "C" void vk_set_dynres_clock(const char *v);         // exec.c: the resolution clock's aim from the next frame
+extern "C" void renderer_set_aniso(const char *v);          // textures.c: samplers re-made at the next present
+extern "C" void renderer_set_lod_bias(const char *v);
+void render_scale_apply(const char *v) { output_set_res_scale(v); }
+void native_ui_apply(const char *v) { renderer_set_native_ui(strcmp(v, "0") != 0); }
+void soft_shadows_apply(const char *v) { vk_set_soft_shadows(v); }
+void upscaler_3d_apply(const char *v) { vk_set_upscaler_3d(v); }
+void scene_upscaler_apply(const char *v) { vk_set_scene_upscaler(v); }
+void contact_shadows_apply(const char *v) { contact_set_strength(v); }
+void shadow_scale_apply(const char *v) { renderer_set_shadow_scale(v); }
+void dynres_clock_apply(const char *v) { vk_set_dynres_clock(v); }
+void aniso_apply(const char *v) { renderer_set_aniso(v); }
+void lod_bias_apply(const char *v) { renderer_set_lod_bias(v); }
 void fps_apply(const char *v) { vi_set_frame_rate(v); }  // (live since 2026-10-27)
 
 const char *const V_WINDOW[] = {"windowed", "borderless", nullptr};
@@ -732,10 +805,15 @@ const char *const N_WINDOW[] = {"Windowed", "Borderless fullscreen", nullptr};
 const char *const V_SIZE[] = {"", "1600x900", "1920x1080", "2560x1440", "3840x2160", nullptr};
 const char *const N_SIZE[] = {"1280 x 720 (default)", "1600 x 900", "1920 x 1080", "2560 x 1440", "3840 x 2160", nullptr};
 // "unlocked": present's unlocked mode (hle_vi.cpp unlock_mode 1, 17b9f4d: paced up to the monitor's rate, 60..240, or
-// TOTK_UNLOCK_CEIL), never "raw"
-const char *const V_FPS[] = {"30", "60", "90", "120", "unlocked", "steady", nullptr};
-const char *const N_FPS[] = {"30 (the game's own)", "60", "90", "120", "Unlocked (monitor rate)",
-                             "Unlocked, steady (a rate it can hold)", nullptr};
+// TOTK_UNLOCK_CEIL), never "raw", up to 240: the game's real-time step stops at 1/240 s (steps under it crash Havok's
+// solver: 3 of 4 runs), so a higher cap would run the game fast; 300 / 360 come back with the solver fixed
+// (TOTK_STEP_360=1 is that path, TOTK_FPS only; a saved 300 / 360 is 240, fps_cap_saved). 40 / 45 (rival parity, their
+// fps_limit): between the game's 30 and 60 for a PC that cannot hold 60; the clock pacer (hle_vi.cpp TOTK_FPS 31..59)
+// and the realtime step keep the game at full speed
+const char *const V_FPS[] = {"30", "40", "45", "60", "75", "90", "120", "144", "165", "180", "200", "240", "unlocked",
+                             "steady", nullptr};
+const char *const N_FPS[] = {"30 (the game's own)", "40", "45", "60", "75", "90", "120", "144", "165", "180", "200",
+                             "240", "Unlocked (monitor rate)", "Unlocked, steady (a rate it can hold)", nullptr};
 // The fps readout: off by default (nothing over the game's image), F3 shows the last style chosen; the corner and
 // size are read by the overlay as it draws
 const char *const V_FPSOSD[] = {"0", "minimal", "detailed", nullptr};
@@ -750,9 +828,9 @@ const char *const N_SCALE[] = {"67 %", "80 %", "90 %", "100 % (native)", "150 %"
 const char *const V_NATIVE_UI[] = {"", "0", nullptr};
 const char *const N_NATIVE_UI[] = {"On (default)", "Off", nullptr};
 const char *const V_OFFON[] = {"0", "1", nullptr};
-// Dynamic resolution as one row. The row writes both; its value is read back from them (a preset, F11 or an old
-// settings file moves them), the floor to the nearest step. The floor is live; the clock's aim (TOTK_DYNRES) takes the
-// next start, as before
+// Dynamic resolution as one row. The row writes both; its value is read back from them (a preset, F11 or an old settings
+// file moves them), the floor to the nearest step. Both are live: the floor through the data page, the clock's aim
+// (TOTK_DYNRES) through exec.c vk_set_dynres_clock since 2026-11-02 (it follows the frame rate too)
 const char *const V_DYNRES[] = {"off", "90", "75", "50", "game", nullptr};
 const char *const N_DYNRES[] = {"Off (fixed size)", "On, never below 90 %", "On, never below 75 %", "On, never below 50 %",
                                 "On, the game's own (no minimum)", nullptr};
@@ -801,11 +879,16 @@ const char *const N_MODE[] = {"Docked", "Handheld", nullptr};
 const unsigned R = PC_SET_RESTART;
 const char *const V_PRESET[] = {"low", "medium", "high", "ultra", "ultra+", "custom", nullptr};
 const char *const N_PRESET[] = {"Low", "Medium", "High", "Ultra", "Ultra+", "Custom", nullptr};
+const char *const V_F10_HINT[] = {"0", "1", "2", "3", nullptr};   // pc.f10_hint: times shown; 3 (also F10 opened): no more
 const pc_setting k_engine[] = {
     {"graphics.preset", "Graphics", "Preset", "Graphics preset", "Sets the rows below it; any change by hand makes it "
      "Custom.", "custom", V_PRESET, N_PRESET, 0, 0, 0, 0, nullptr, nullptr, preset_apply, preset_now},
     {"pc.welcome_done", "", "", "First-run screen done", nullptr, "0", V_OFFON, N_OFFON, 0, 0, 0, 0, nullptr, nullptr,
      nullptr, nullptr},   // (no page: not shown)
+    // the pause screens' "Graphics settings: F10" hint so far (hle_osd.cpp): shown on 3 of them, or F10 opened once
+    // (pc_overlay.cpp), and it stops for good (a player on Reddit, 11-02: "keeps popping up")
+    {"pc.f10_hint", "", "", "F10 hint shown", nullptr, "0", V_F10_HINT, V_F10_HINT, 0, 0, 0, 0, nullptr, nullptr, nullptr,
+     nullptr},   // (no page: not shown)
     // key, page, section, label, help, default, values, names, min, max, step, flags, env, to_env, apply, live_value
     {"display.window_mode", "Graphics", "Display", "Window mode", "F11 or Alt+Enter also switch it.", "borderless",
      V_WINDOW, N_WINDOW, 0, 0, 0, 0, nullptr, window_mode_env, window_mode_apply, window_mode_now},
@@ -813,7 +896,9 @@ const pc_setting k_engine[] = {
      V_SIZE, N_SIZE, 0, 0, 0, 0, nullptr, window_size_env, window_size_apply, nullptr},
     {"display.fps_cap", "Graphics", "Display", "Frame rate", "TOTK_FPS / TOTK_UNLOCK_FPS. Unlocked: up to the monitor's "
      "refresh rate (60 to 240), loading screens at the game's own pace. Steady: unlocked, but held at the highest rate "
-     "the scene keeps, in whole refreshes of the monitor (240, 120, 80, 60 on a 240 Hz one), instead of swinging.", "30", V_FPS, N_FPS, 0, 0, 0, 0, nullptr, fps_env, fps_apply, nullptr},
+     "the scene keeps, in whole refreshes of the monitor (240, 120, 80, 60 on a 240 Hz one), instead of swinging. 40 and 45: "
+     "for a PC that cannot hold 60; smooth on a monitor whose refresh they divide (40 on 120 Hz, 45 on 90 or 180 Hz) or "
+     "with VRR, uneven on a fixed 60 Hz.", "30", V_FPS, N_FPS, 0, 0, 0, 0, nullptr, fps_env, fps_apply, nullptr},
     {"display.perf_overlay", "Graphics", "Display", "Perf overlay (F9)", "Fps, 1% low and the frame-time graph.", "0",
      V_OFFON, N_OFFON, 0, 0, 0, 0, nullptr, perf_apply, perf_apply, perf_now},
     {"display.fps_readout", "Graphics", "Display", "Fps readout (F3)", "TOTK_FPS_OVERLAY. F3 shows or hides it in game.",
@@ -822,20 +907,20 @@ const pc_setting k_engine[] = {
      "map.", "top_right", V_FPSPOS, N_FPSPOS, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr},
     {"display.fps_size", "Graphics", "Display", "Fps readout size", "Follows the window height (1080p to 4K).", "small",
      V_FPSSIZE, N_FPSSIZE, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr},
-    {"graphics.render_scale", "Graphics", "Rendering", "Render resolution", "TOTK_RES_SCALE, of the game's 1600 x 900.",
-     "1", V_SCALE, N_SCALE, 0, 0, 0, R, "TOTK_RES_SCALE", nullptr, nullptr, nullptr},
+    {"graphics.render_scale", "Graphics", "Rendering", "Render resolution", "TOTK_RES_SCALE, of the game's 1600 x 900. "
+     "Applies at once.", "1", V_SCALE, N_SCALE, 0, 0, 0, 0, "TOTK_RES_SCALE", nullptr, render_scale_apply, nullptr},
     {"graphics.native_ui", "Graphics", "Rendering", "Native-resolution interface", "TOTK_OUT_SCALE: above 1080p, menus, "
-     "text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched.", "", V_NATIVE_UI,
-     N_NATIVE_UI, 0, 0, 0, R, nullptr, native_ui_env, nullptr, nullptr},
+     "text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched. Applies at once.", "",
+     V_NATIVE_UI, N_NATIVE_UI, 0, 0, 0, 0, nullptr, native_ui_env, native_ui_apply, nullptr},
     {"graphics.dynamic_resolution", "Graphics", "Rendering", "Dynamic resolution", "Off: the scene always at the render "
      "resolution. On: the game lowers it only when the GPU is short of time, never below the chosen floor, aiming at the "
-     "frame rate (that aim takes effect at the next start).", "off", V_DYNRES, N_DYNRES, 0, 0, 0, 0, nullptr, nullptr,
+     "frame rate. Applies at once.", "off", V_DYNRES, N_DYNRES, 0, 0, 0, 0, nullptr, nullptr,
      dynres_apply, dynres_now},
     // (internal since graphics.dynamic_resolution: no page)
     {"graphics.dynres", "", "Rendering", "Dynamic resolution (clock)", "TOTK_DYNRES: the game's own, aimed at the frame "
-     "rate.", "0", V_OFFON, N_OFFON, 0, 0, 0, R, "TOTK_DYNRES", nullptr, nullptr, nullptr},
-    {"graphics.upscaler_3d", "Graphics", "Rendering", "3D upscaler", "TOTK_SSAA.", "", V_SSAA, N_SSAA, 0, 0, 0, R,
-     "TOTK_SSAA", nullptr, nullptr, nullptr},
+     "rate.", "0", V_OFFON, N_OFFON, 0, 0, 0, 0, "TOTK_DYNRES", nullptr, dynres_clock_apply, nullptr},
+    {"graphics.upscaler_3d", "Graphics", "Rendering", "3D upscaler", "TOTK_SSAA. Applies at once.", "", V_SSAA, N_SSAA, 0,
+     0, 0, 0, "TOTK_SSAA", nullptr, upscaler_3d_apply, nullptr},
     {"graphics.shader_seed", "Graphics", "Rendering", "Shipped shader list", "TOTK_SHADER_SEED: on, the shader list "
      "that comes with the build lets the game prepare those shaders before you meet them (fewer stutters the first "
      "time). Off: only the shaders this PC has met itself. Takes effect at the next start.", "1", V_OFFON, N_OFFON, 0, 0,
@@ -846,17 +931,32 @@ const pc_setting k_engine[] = {
      N_AA, 0, 0, 0, 0, "TOTK_AA", nullptr, aa_apply, nullptr},
     {"graphics.sharpening", "Graphics", "Rendering", "Sharpening", "TOTK_SHARPEN.", "", V_SHARPEN, N_SHARPEN, 0, 0, 0,
      0, "TOTK_SHARPEN", nullptr, sharpen_apply, nullptr},
+    {"display.color", "Graphics", "Colour", "Colour adjustment", "TOTK_COLOR: the game's picture, its HUD included (not "
+     "this menu). Off shows the game's own colours unchanged and costs nothing. Vivid: livelier colours. Brighter dark "
+     "tones: caves, the Depths and nights lighter. Custom: the four rows below. Applies at once.", "", V_COLOR, N_COLOR,
+     0, 0, 0, 0, "TOTK_COLOR", nullptr, color_apply, nullptr},
+    {"display.color_brightness", "Graphics", "Colour", "Brightness", "TOTK_COLOR_BRIGHTNESS (Custom only): added to "
+     "every colour; 0 is the game's.", "0", nullptr, nullptr, -0.3f, 0.3f, 0.01f, 0, "TOTK_COLOR_BRIGHTNESS", nullptr,
+     color_apply, nullptr},
+    {"display.color_contrast", "Graphics", "Colour", "Contrast", "TOTK_COLOR_CONTRAST (Custom only): around mid grey; 1 "
+     "is the game's.", "1", nullptr, nullptr, 0.7f, 1.5f, 0.01f, 0, "TOTK_COLOR_CONTRAST", nullptr, color_apply, nullptr},
+    {"display.color_saturation", "Graphics", "Colour", "Saturation", "TOTK_COLOR_SATURATION (Custom only): 1 is the "
+     "game's, 0.5 greyer, 2 twice as colourful.", "1", nullptr, nullptr, 0.5f, 2.0f, 0.05f, 0, "TOTK_COLOR_SATURATION",
+     nullptr, color_apply, nullptr},
+    {"display.color_gamma", "Graphics", "Colour", "Gamma", "TOTK_COLOR_GAMMA (Custom only): below 1 brightens dark "
+     "tones, above 1 darkens them; 1 is the game's.", "1", nullptr, nullptr, 0.8f, 1.2f, 0.01f, 0, "TOTK_COLOR_GAMMA",
+     nullptr, color_apply, nullptr},
     {"graphics.shadow_scale", "Graphics", "Rendering", "Shadow map scale (renderer)", "TOTK_SHADOW_SCALE: the renderer's "
-     "shadow targets. The game patches' Shadow resolution is separate.", "2", V_SHADOW,
-     N_SHADOW, 0, 0, 0, R, "TOTK_SHADOW_SCALE", nullptr, nullptr, nullptr},
+     "shadow targets. The game patches' Shadow resolution is separate. Applies at once.", "2", V_SHADOW,
+     N_SHADOW, 0, 0, 0, 0, "TOTK_SHADOW_SCALE", nullptr, shadow_scale_apply, nullptr},
     {"graphics.soft_shadows", "Graphics", "Rendering", "Soft shadows", "TOTK_SOFT_SHADOWS: the sun's shadow edges widen with "
      "the distance to what casts them (contact-hardening, PCSS) instead of keeping one width. Off is the game's "
-     "look; the first start with it on compiles the shadowed shaders again.", "", V_SOFT_SHADOW, N_SOFT_SHADOW, 0, 0, 0,
-     R, "TOTK_SOFT_SHADOWS", nullptr, nullptr, nullptr},
+     "look. A change rebuilds the shadowed shaders in the background: the old shadows show until they are ready.", "",
+     V_SOFT_SHADOW, N_SOFT_SHADOW, 0, 0, 0, 0, "TOTK_SOFT_SHADOWS", nullptr, soft_shadows_apply, nullptr},
     {"graphics.contact_shadows", "Graphics", "Rendering", "Contact shadows", "TOTK_CONTACT_SHADOWS: small sun shadows at "
      "feet, under stones and in grass, which the shadow maps are too coarse for (a short march toward the sun through "
-     "the scene's depth, up to 80 m). Off is the game's look; costs some GPU.", "", V_CONTACT, N_CONTACT, 0, 0, 0, R,
-     "TOTK_CONTACT_SHADOWS", nullptr, nullptr, nullptr},
+     "the scene's depth, up to 80 m). Off is the game's look; costs some GPU. Applies at once.", "", V_CONTACT,
+     N_CONTACT, 0, 0, 0, 0, "TOTK_CONTACT_SHADOWS", nullptr, contact_shadows_apply, nullptr},
     {"audio.volume", "Audio", "Output", "Volume", "TOTK_VOLUME, master gain.", "1", nullptr, nullptr, 0.0f, 1.0f, 0.05f,
      0, "TOTK_VOLUME", nullptr, volume_apply, nullptr},
     {"audio.mute_unfocused", "Audio", "Output", "Mute in the background", "TOTK_MUTE_UNFOCUSED: no sound while the game "
@@ -907,18 +1007,28 @@ const pc_setting k_pc[] = {
      V_GYROMODE, N_GYROMODE, 0, 0, 0, R, "TOTK_MOUSE_GYRO", nullptr, nullptr, nullptr},
     {"controls.mouse_gyro_speed", "Controls", "Keyboard and mouse", "Motion aim speed", "TOTK_MOUSE_GYRO_SPEED.", "1",
      nullptr, nullptr, 0.05f, 4.0f, 0.05f, R, "TOTK_MOUSE_GYRO_SPEED", nullptr, nullptr, nullptr},
-    {"graphics.anisotropy", "Graphics", "Rendering", "Anisotropic filtering", "TOTK_ANISO: a floor under the game's.", "0",
-     V_ANISO, N_ANISO, 0, 0, 0, R, "TOTK_ANISO", nullptr, nullptr, nullptr},
-    {"graphics.lod_bias", "Graphics", "Rendering", "Texture LOD bias", "TOTK_LOD_BIAS: below 0 is sharper.", "0", nullptr,
-     nullptr, -2.0f, 2.0f, 0.25f, R, "TOTK_LOD_BIAS", nullptr, nullptr, nullptr},
-    {"graphics.scene_upscaler", "Graphics", "Rendering", "Scene upscaler", "TOTK_SCENE_UPSCALE.", "", V_SCENEUP, N_SCENEUP,
-     0, 0, 0, R, "TOTK_SCENE_UPSCALE", nullptr, nullptr, nullptr},
+    {"graphics.anisotropy", "Graphics", "Rendering", "Anisotropic filtering", "TOTK_ANISO: a floor under the game's. Applies at "
+     "once.", "0", V_ANISO, N_ANISO, 0, 0, 0, 0, "TOTK_ANISO", nullptr, aniso_apply, nullptr},
+    {"graphics.lod_bias", "Graphics", "Rendering", "Texture LOD bias", "TOTK_LOD_BIAS: below 0 is sharper. Applies at "
+     "once.", "0", nullptr, nullptr, -2.0f, 2.0f, 0.25f, 0, "TOTK_LOD_BIAS", nullptr, lod_bias_apply, nullptr},
+    {"graphics.scene_upscaler", "Graphics", "Rendering", "Scene upscaler", "TOTK_SCENE_UPSCALE. Applies at once.", "", V_SCENEUP,
+     N_SCENEUP, 0, 0, 0, 0, "TOTK_SCENE_UPSCALE", nullptr, scene_upscaler_apply, nullptr},
     {"game.pause_unfocused", "Game", "Window", "Pause when the window loses focus", "TOTK_PAUSE_UNFOCUSED.", "", V_OFF_DEF,
      N_OFF_DEF, 0, 0, 0, R, "TOTK_PAUSE_UNFOCUSED", nullptr, nullptr, nullptr},
     {"game.save_backups", "Game", "Saves", "Save backups kept", "TOTK_SAVE_BACKUPS.", "10", V_BACKUPS, N_BACKUPS, 0, 0, 0, 0,
      "TOTK_SAVE_BACKUPS", nullptr, save_backups_apply, nullptr},
     {"game.screenshots", "Game", "PC", "F12 screenshots", "TOTK_PC_SHOT: PNGs in the Screenshots folder.", "1", V_OFFON,
      N_OFFON, 0, 0, 0, 0, "TOTK_PC_SHOT", nullptr, screenshots_apply, nullptr},
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    // (hidden, page "": another game version places neither the unit patch nor the sign hook, 11-02)
+    {"game.temperature_unit", "", "", "Temperature unit", nullptr, "", V_TEMP, N_TEMP, 0, 0, 0, 0, "TOTK_TEMP_UNIT", nullptr,
+     temp_unit_apply, nullptr},
+#else
+    {"game.temperature_unit", "Game", "Display", "Temperature unit", "TOTK_TEMP_UNIT: the temperature on the Purah Pad's "
+     "map. Automatic: the game's (°F in English (US), °C in the other languages). The number changes at once, the "
+     "°C / °F sign beside it the next time the map is opened.", "", V_TEMP, N_TEMP, 0, 0, 0, 0,
+     "TOTK_TEMP_UNIT", nullptr, temp_unit_apply, nullptr},
+#endif
     {"game.crash_reports", "Game", "PC", "Crash reports", "TOTK_PC_CRASH: a report and a minidump per crash.", "1",
      V_OFFON, N_OFFON, 0, 0, 0, 0, "TOTK_PC_CRASH", nullptr, crash_reports_apply, nullptr},
     // (read by the launcher at its next start, installer's auto-update; nothing in the game)

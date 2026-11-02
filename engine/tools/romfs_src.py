@@ -4,6 +4,8 @@ A player's install keeps no unpacked folder (setup-speed, 2026-11-01: 304,207 fi
 Defender scan each; the game reads romfs.bin): RomFS(folder) reads the folder when it holds files, else the
 extraction's romfs.bin + romfs-index.json beside it (pipeline/extract.py: <ext>/romfs, <ext>/romfs.bin,
 <ext>/romfs-index.json). An empty folder counts as none (the runtime creates its mount folder at the first MountRom).
+Since v0.1.8 the index may name romfs-source.txt instead: the image read straight from the player's dump
+(pipeline/nx/romsource.py).
 
     from romfs_src import RomFS
     rom = RomFS(os.environ['TOTK_ROMFS'])
@@ -11,6 +13,7 @@ extraction's romfs.bin + romfs-index.json beside it (pipeline/extract.py: <ext>/
 """
 import json
 import os
+import sys
 
 
 def _has_files(folder):
@@ -56,9 +59,19 @@ class RomFS:
         if rel not in self.files:
             raise FileNotFoundError(f'{rel}: not in {self.image}')
         off, size = self.files[rel]
-        with open(self.image, 'rb') as f:
+        with _open_image(self.image) as f:
             f.seek(off)
             data = f.read(size)
         if len(data) != size:
             raise OSError(f'{rel}: short read from {self.image}')
         return data
+
+
+def _open_image(path):
+    if os.path.basename(path).lower() != 'romfs-source.txt':
+        return open(path, 'rb')
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+    from pipeline.nx.romsource import DumpImage
+    return DumpImage(path)

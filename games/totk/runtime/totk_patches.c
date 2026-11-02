@@ -20,8 +20,19 @@ static double g_step, g_smooth, g_debt;          /* the step written last, the E
 static uint32_t g_pinned_us;                     /* atomic: diagnostics pin, 0 = measured */
 static int g_retarget;                           /* atomic: presents left in a frame-rate cap change's fast ramp */
 static int g_interval = 2;                       /* the game's present interval (realtime off) */
+static int g_hold = 1;                           /* atomic: totk_frame_step_hold (held until the engine says otherwise) */
+static int g_hold_frames, g_hold_clamped;        /* atomic: this hold's frames, and those shorter than its floor */
 
 static uint64_t pack_size(unsigned w, unsigned h) { return (uint64_t)h << 32 | w; }
+
+/* v0.1.8 release blocker: gameplay steps under 1/240 s (dde084d4's 1/360 floor: 3 crashes in 4 exclusive v0.1.8 runs,
+   v0.1.7 none. So the floor is 1/240 everywhere again (TOTK_MAX_FPS default and highest 240, the engine holds the step
+   and paces at 240 at most, the 300 / 360 rows are hidden). TOTK_STEP_360=1: the 1/360 path (gameplay down to 1/360,
+   held at 1/240 through loads), until the solver gets steps of 1/240 or more at any rate.*/
+int totk_max_fps_highest(void) {
+    const char *e = getenv("TOTK_STEP_360");
+    return e && !strcmp(e, "1") ? 360 : TOTK_HOLD_FPS;
+}
 
 static uint64_t frame_step_bits(float seconds) {
     float ratio = seconds * 30.0f;
@@ -57,7 +68,7 @@ void totk_settings_default(TotkSettings *s) {
     s->res_floor = 1.0f;
     s->mouse_scale = 1.0f;
     s->mouse_rate = TOTK_MOUSE_RATE_DEFAULT;
-    s->min_frame_ms = 1000.0 / 240.0;   /* review N14: 1/120 ran the game 1.2x fast at 144 fps*/
+    s->min_frame_ms = 1000.0 / totk_max_fps_highest();   /* review N14: 1/120 ran the game 1.2x fast at 144 fps.*/
     s->max_frame_ms = 1000.0 / 15.0;
 }
 
@@ -120,6 +131,11 @@ const char *totk_settings_from_env(TotkSettings *s) {
         else if (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "game")) s->shadow_fixed = 0.0f;
         else return "TOTK_SHADOW_FIXED must be 1 / on (the shadow map at its largest size) or 0 / off (the game's own)";
     }
+    if ((e = getenv("TOTK_TEMP_UNIT")) && *e) {
+        if (!strcmp(e, "c") || !strcmp(e, "C")) s->temp_unit = 1;
+        else if (!strcmp(e, "f") || !strcmp(e, "F")) s->temp_unit = 2;
+        else return "TOTK_TEMP_UNIT must be c, f or empty (the game's own)";
+    }
     if ((e = getenv("TOTK_LOD")) && *e) {
         double f;
         char rest;
@@ -166,7 +182,9 @@ const char *totk_settings_from_env(TotkSettings *s) {
     }
     if ((e = getenv("TOTK_MAX_FPS")) && *e) {
         double hz = atof(e);
-        if (!(hz >= 30 && hz <= 240)) return "TOTK_MAX_FPS must be 30..240 (shorter steps corrupt the world load)";
+        if (!(hz >= 30 && hz <= totk_max_fps_highest()))
+            return totk_max_fps_highest() > TOTK_HOLD_FPS ? "TOTK_MAX_FPS must be 30..360"
+                : "TOTK_MAX_FPS must be 30..240 (shorter steps corrupt Havok's solver; TOTK_STEP_360=1: 30..360)";
         s->min_frame_ms = 1000.0 / hz;
     }
     return NULL;
@@ -205,6 +223,7 @@ const char *totk_patches_init(void *main_base, uint64_t main_span, const TotkSet
     put_f32(TOTK_DP_FOV_SCALE, s->fov_scale);
     put_f32(TOTK_DP_SHADOW_SCALE, s->shadow_scale);
     put_f32(TOTK_DP_SHADOW_FIXED, s->shadow_fixed);
+    __atomic_store_n((uint32_t *)(g_page + TOTK_DP_TEMP_UNIT), s->temp_unit, __ATOMIC_RELEASE);
     put_f32(TOTK_DP_LOD_SCALE, s->lod_scale);
     put_f32(TOTK_DP_ACTOR_LOD, s->actor_lod_scale);
     put_f32(TOTK_DP_TERRAIN_LOD, s->terrain_lod_scale);
@@ -248,41 +267,86 @@ void totk_frame_step_retarget(void) {
     __atomic_store_n(&g_retarget, TOTK_RETARGET_PRESENTS, __ATOMIC_RELAXED);
 }
 
-/* The step from one clamped present-to-present time (after Savage Wind's runtime/hle/framepace.c, MIT): an EMA (0.05) of the
-   measured time, plus 2 % per frame of the time the game still owes (real - given), so the game clock keeps real time; the step
-   changes at most 3 % per frame, so a hitch or an interval switch reaches physics and animation as a ramp, not a jump (the old
-   five-frame average moved a 200 ms hitch's 10 ms into five steps). A gap (loading, the window dragged) is not owed and leaves
-   the step alone. The step stays within [1/TOTK_MAX_FPS, 1/15 s]: below 15 fps the game slows down instead of taking huge
-   physics steps; above TOTK_MAX_FPS (default and highest 240) it would run fast, but only sustained rates above it do: single
-   short frames are repaid through the owed time. After a cap change (totk_frame_step_retarget) the step follows the new rate
-   within ~10 frames instead: EMA 0.5, up to 25 % per frame, and the switch's difference is not owed (repaying it would be the
-   slow or fast motion it avoids). The game clock lags or leads real time once by the ramp (240 -> 30: 0.17 s), not by seconds.
-   The fast window ends once it has converged (the step within 3 % of the EMA and the EMA within 3 % of the measured time, 3
-   presents in a row: at EMA 0.5 frame-time jitter would otherwise move the step up to 25 % a frame for the whole window),
-   TOTK_RETARGET_PRESENTS at most.*/
+/* The faults are in Havok's contact solver run during the load (main+0x286d50, its "TtSolveConstraints" /
+   "TtSolveJacobians" scopes -> main+0x29a898 -> main+0x2972dc -> phive::CompactibleHeap::alloc main+0x12f9268; the
+   neighbours main+0x2967f0 / +0x26d2a0 on the same path), while the world's new bodies are first solved. So while held (a
+   load, the title, a light screen, and a settle time after them: hle_vi.cpp load_track) the step stays at or above
+   1/TOTK_HOLD_FPS, and the time a held frame ran ahead is not owed (repaying it after the load would be slow motion). The
+   hold's end moves the step back to the measured rate within ~10 frames (the retarget ramp), but only when the floor held
+   the frames (a quarter of them or more shorter than it): at 240 fps or less (a 120 cap) the hold changed nothing, and the
+   ramp dropped the owed time and followed the frames' jitter at up to 25 % a frame, a speed-up / slow-down after every
+   fast travel; a lone catch-up frame under 1/240 is repaid as owed time. TOTK_HOLD_RETARGET=always: on every release, as
+   before.*/
+void totk_frame_step_hold(int on) {
+    static int always = -1;
+    if (always < 0) { const char *e = getenv("TOTK_HOLD_RETARGET"); always = e && !strcmp(e, "always"); }
+    if (__atomic_exchange_n(&g_hold, on ? 1 : 0, __ATOMIC_RELAXED) == (on ? 1 : 0)) return;   /* (no change) */
+    const int frames = __atomic_exchange_n(&g_hold_frames, 0, __ATOMIC_RELAXED);
+    const int clamped = __atomic_exchange_n(&g_hold_clamped, 0, __ATOMIC_RELAXED);
+    if (!on && (always || (frames && clamped * 4 >= frames))) totk_frame_step_retarget();   
+}
+
+/* The step from one clamped present-to-present time (after Savage Wind's runtime/hle/framepace.c, MIT): an EMA (0.1) of the measured time, plus 2 % per frame of the time the game still
+   owes (real - given), so the game clock keeps real time; the step changes at most 3 % per frame, so a hitch or an interval switch reaches physics and animation as a ramp, not a jump (the
+   old five-frame average moved a 200 ms hitch's 10 ms into five steps). A gap (loading, the window dragged) is not owed and leaves the step alone. The step stays within [1/TOTK_MAX_FPS,
+   1/15 s] (1/TOTK_HOLD_FPS while held, totk_frame_step_hold): below 15 fps the game slows down instead of taking huge physics steps; above TOTK_MAX_FPS (default and highest 240; 360 with
+   TOTK_STEP_360=1) it would run fast, but only sustained rates above it do: single short frames are repaid through the owed time. After a cap change (totk_frame_step_retarget) the step
+   follows the new rate within ~10 frames instead: EMA 0.5, up to 25 % per frame, and the switch's difference is not owed (repaying it would be the slow or fast motion it avoids). The game
+   clock lags or leads real time once by the ramp (240 -> 30: 0.17 s), not by seconds. The fast window ends once it has converged (the step within 3 % of the EMA and the EMA within 3 % of
+   the measured time, 3 presents in a row: at EMA 0.5 frame-time jitter would otherwise move the step up to 25 % a frame for the whole window), TOTK_RETARGET_PRESENTS at most. The frame
+   rate also moves by itself: the camera turns into a heavier view and a GPU-bound 120 fps falls to 58. Under the 3 % ramp and the 0.05 EMA the step took ~1 s to follow, so the game ran at
+   ~0.5x and then paid the owed time back fast: motion slowed and sped up at every camera move, never at a steady 30; at 60 a dip to 55 still ran ~0.9x for ~0.3 s ("almost imperceptible").
+   So FOLLOW_RUN presents in a row more than FOLLOW_RATIO above (or below) the EMA open the same fast window (an isolated hitch, or frames alternating around the mean, never do), with one
+   difference: the time it lags stays owed, since nobody chose the new rate (the clock keeps real time), and the steady EMA is 0.1 (0.05 before): smaller drifts follow in ~10 frames, the
+   step's own jitter at a noisy steady rate grows from 1.5 % to 1.8 %. TOTK_STEP_FOLLOW=0: the 3 % ramp and the 0.05 EMA alone.*/
+#define FOLLOW_RATIO 1.1
+#define FOLLOW_RUN 3
 static double frame_step_next(double real, double lo, double hi) {
     double dt = real < lo ? lo : real > hi ? hi : real;
     if (!(g_step > 0)) g_step = g_smooth = dt;
     double up = 1.03, down = 0.97;
     static int settled;   /* fast-window presents in a row that were converged */
+    static int follow;    /* presents left in a sustained rate change's fast window */
+    static int run;       /* presents in a row measured above (> 0) or below (< 0) the EMA by FOLLOW_RATIO */
+    static int follow_on = -1;
+    if (follow_on < 0) { const char *e = getenv("TOTK_STEP_FOLLOW"); follow_on = !(e && !strcmp(e, "0")); }
     int left = __atomic_load_n(&g_retarget, __ATOMIC_RELAXED);
-    if (left > 0) {
+    if (follow_on && left <= 0 && follow <= 0) {
+        int s = dt > g_smooth * FOLLOW_RATIO ? 1 : dt * FOLLOW_RATIO < g_smooth ? -1 : 0;
+        run = s && (run > 0) == (s > 0) ? run + s : s;
+        if (run >= FOLLOW_RUN || run <= -FOLLOW_RUN) {
+            static unsigned opened;   
+            follow = TOTK_RETARGET_PRESENTS, run = 0;
+            if (++opened <= 20 || opened % 100 == 0)
+                fprintf(stderr, "[totk] step follow #%u: %.2f ms frames against a %.2f ms mean\n", opened, dt * 1e3,
+                        g_smooth * 1e3);
+        }
+    }
+    if (left > 0 || follow > 0) {
         g_smooth += (dt - g_smooth) * 0.5;
-        g_debt = 0;
         up = 1.25, down = 1 / 1.25;
         settled = fabs(g_step / g_smooth - 1) < 0.03 && fabs(g_smooth / dt - 1) < 0.03 ? settled + 1 : 0;
-        /* (a CAS, so a retarget stored meanwhile by another thread is not lost) */
-        __atomic_compare_exchange_n(&g_retarget, &left, settled >= 3 ? 0 : left - 1, 0, __ATOMIC_RELAXED,
-                                    __ATOMIC_RELAXED);
+        if (left > 0) {
+            g_debt = 0;
+            follow = 0;
+            /* (a CAS, so a retarget stored meanwhile by another thread is not lost) */
+            __atomic_compare_exchange_n(&g_retarget, &left, settled >= 3 ? 0 : left - 1, 0, __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED);
+        } else {
+            g_debt += real - g_step;             /* (owed, as below) */
+            follow = settled >= 3 ? 0 : follow - 1;
+        }
     } else {
         settled = 0;
-        g_smooth += (dt - g_smooth) * 0.05;
+        g_smooth += (dt - g_smooth) * (follow_on ? 0.1 : 0.05);
         g_debt += real - g_step;                 /* the step written last was given for this frame; owed from the real
                                                     time, so frames shorter than the clamp are repaid too (review N14) */
     }
     if (g_debt > 0.5) g_debt = 0.5;           /* bounded (an interval switch 60 -> 30 owes ~0.25 s) */
     if (g_debt < -0.5) g_debt = -0.5;
-    double step = g_smooth + g_debt * 0.02;
+    /* (the repayment at most +-5 % of the step: a 200 ms hitch or a dip's lag comes back as a 1.05x stretch, not 1.2x) */
+    double repay = g_debt * 0.02, most = g_smooth * 0.05;
+    double step = g_smooth + (repay > most ? most : repay < -most ? -most : repay);
     if (step > g_step * up) step = g_step * up;
     if (step < g_step * down) step = g_step * down;
     if (step < lo) step = lo;
@@ -397,7 +461,19 @@ void totk_frame_step_update(uint64_t now_ns) {
     g_last_present_ns = now_ns;
     if (dt > 0.25 || dt < 0.0005) { g_debt = 0; return; }   /* a gap: not owed, the step stays */
     double lo = g_set.min_frame_ms * 1e-3, hi = g_set.max_frame_ms * 1e-3;
-    put_frame_step((float)frame_step_next(dt, lo, hi));
+    int hold = __atomic_load_n(&g_hold, __ATOMIC_RELAXED);
+    int clamped = 0;
+    if (hold && lo < 1.0 / TOTK_HOLD_FPS) {
+        lo = 1.0 / TOTK_HOLD_FPS;
+        clamped = dt < lo;
+        __atomic_add_fetch(&g_hold_frames, 1, __ATOMIC_RELAXED);
+        if (clamped) __atomic_add_fetch(&g_hold_clamped, 1, __ATOMIC_RELAXED);
+    }
+    double step = frame_step_next(dt, lo, hi);
+    /* (held: running ahead because of the floor is not owed, totk_frame_step_hold; a frame the floor did not touch
+       repays as any other, else a held fast travel at 120 fps with jitter ran 14 ms ahead in 5 s, test_totk_patches) */
+    if (clamped && g_debt < 0) g_debt = 0;
+    put_frame_step((float)step);
 }
 
 uint64_t totk_output_size_current(void) {
@@ -502,6 +578,11 @@ float totk_shadow_res_current(void) {
     float v;
     memcpy(&v, &bits, 4);
     return v;
+}
+
+void totk_temp_unit_set(unsigned unit) {
+    g_set.temp_unit = unit <= 2 ? unit : 0;
+    if (g_page) __atomic_store_n((uint32_t *)(g_page + TOTK_DP_TEMP_UNIT), g_set.temp_unit, __ATOMIC_RELEASE);
 }
 
 void totk_lod_set(float scale) {
@@ -612,11 +693,23 @@ uint64_t totk_output_extra_bytes(const TotkSettings *s) {
     return output_extra_bytes(s) + tex_extra_bytes(s);
 }
 
+int totk_layout_set(unsigned w, unsigned h, char name[64]) {
+    /* the shapes games/totk/overlays builds by default (DEFAULT_ASPECTS): its layouts depend on the shape alone */
+    static const unsigned built[][2] = {{3440, 1440}, {5120, 1440}, {2560, 1600}};
+    const double a = h ? (double)w / h : 0;
+    if (a > 16.0 / 9.0 * 0.99 && a < 16.0 / 9.0 * 1.01) return 0;
+    for (unsigned i = 0; i < sizeof built / sizeof built[0]; i++) {
+        const double b = (double)built[i][0] / built[i][1];
+        if (a > b * 0.99 && a < b * 1.01) w = built[i][0], h = built[i][1];
+    }
+    snprintf(name, 64, "aspect-%ux%u", w, h);
+    return 1;
+}
+
 int totk_overlay_sets(const TotkSettings *s, char names[2][64]) {
     int n = 0;
-    double shape = (double)s->output_w / s->output_h / (16.0 / 9.0);
-    if (shape < 0.99 || shape > 1.01)   /* the UI laid out for the canvas's shape (overlays: aspect-<w>x<h>) */
-        snprintf(names[n++], 64, "aspect-%ux%u", s->output_w, s->output_h);
+    if (totk_layout_set(s->output_w, s->output_h, names[n]))   /* the UI laid out for the canvas's shape */
+        n++;
     else
         snprintf(names[n++], 64, "base");
     if (totk_output_extra_bytes(s)) {

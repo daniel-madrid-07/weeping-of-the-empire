@@ -1,0 +1,236 @@
+{
+ "0x654514": {
+  "new": "0x72a588",
+  "body": "0e80e9554eb9c1a11d7a2e5d4c1dbc96ce8f92fe82f1e49673f5efbfaf6701fb",
+  "why": "the ride link's kind query (totk_player_state.cpp, the steering-stick test): placed by its 7 paired callers' aligned calls",
+  "checked": "first 34 instructions read side by side: the same live (+0x38 == 1) / id (+0x30 != -1) tests; 1.4.3 inlines the link getter 0x6fd8c4 (+0x28 data, +0x48 id, +0x40 proc)"
+ },
+ "0x671828": {
+  "new": "0x48447c",
+  "body": "fdbb94e7de096e1816c4c2eca6220161804c82fd72366ccdc4d8bf522efb563c",
+  "why": "a reader of the player's lockout timer: the same float reads in the same order as the key and stick code",
+  "checked": "read against 1.4.3 for the field evidence only; no hook, nothing calls it by name"
+ },
+ "0x6fd8c4": {
+  "new": "0x1b2f20",
+  "body": "e26c3347b709fffeb1f53673349c54f4d1276017bf59ea4c6d32be6d30427042",
+  "why": "the actor link's proc getter; 1.4.3's callee at the same call sites is the link's alive check: placed by its 2 paired callers' aligned calls",
+  "checked": "read side by side: id +0x10, data +8, its +0x48 id, +0x40 proc, +0x24 state 7..11 the same; 1.4.3 returns a bool and locks the data off the proc manager threads"
+ },
+ "0x7db2e4": {
+  "new": "0x2a8dd0",
+  "body": "d48477bf3990f99445cf1067ac11b774af7c94809a2055f61fc3b917e068af0e",
+  "why": "a large player update that tests the hand ability's grab state (state 5): placed by its callees, all 12 placed ones vote for it (next best 3; decomp-lead)",
+  "checked": "the grab test read side by side (component +0x478, its +0x28, that +0x18 compared with state five): the same in both; a large function, the rest not read"
+ },
+ "0x808a04": {
+  "new": "0x5e2d54",
+  "body": "23357f0d628d93e54ec2847c0606c3c5ae32a7045b4b6e3e0d5e14af50b1d4c3",
+  "why": "the attention receiver's client entry finder: placed by its 9 paired callers' aligned calls",
+  "checked": "read side by side: its first test, the receiver state at +0xe8 (2 or 3), the same; then the client count +0x58 and list +0x60 under the lock at +0x78, the same offsets"
+ },
+ "0x83e3f8": {
+  "new": "0x37d330",
+  "body": "2b339d1a5d869602ce7241d1e6687726e7fe2450e08ece0afd8d42630e1cbeeb",
+  "why": "the UI controller's frame update: placed by its caller's call pattern; the edge step is inlined, the hold / trigger / release words stay at +0x114 / +0x08 / +0x0c",
+  "checked": "totk_menu_cursor.cpp hook_f_83e3f8 (its writes after the original to +0x114 / +0x08 / +0x0c) read against the 1.4.3 listing; one callee taking the controller is unread"
+ },
+ "0x8f4510": {
+  "new": "0x3e2968",
+  "body": "0aa6dcd896523bbe7f270fb4767a30bc17672145257097bcbd02cc0398e89286",
+  "why": "a caller of the equipment test that inlines the bow take-out gate (the same shape as 0x16e80c0): 752 B in both, paired by its callees",
+  "checked": "prologue + 0x8f45ec.. read vs 0x3e2a44..: gate call 0xbc1870 -> 0x72c050, Actor +0x220 -> +0x228, components +0x3a8 / +0x478 / +0x230 and SpecialPower +0x6c same"
+ },
+ "0x9665d0": {
+  "new": "0x1aff9c",
+  "body": "0a39da90fac238ba252c4c6a36f51fc862e4c26304e9635f4181344b9596dce5",
+  "why": "a function that walks an actor link twice, lock-free and then under the link data's mutex: the porter's anchor pair",
+  "checked": "its two link walks read side by side (id +0x10, data +8, the data's +0x48 id, +0x40 proc, +0x24 state): equal in both; much else rewritten (32 of 89 offset accesses aligned)"
+ },
+ "0x98c090": {
+  "new": "0x64db0",
+  "body": "dfa17429cee36cb33b095f5a3ab0d30bb1a0347dd368be41d71ce87e45490da9",
+  "why": "the heap allocation (heap, size, align, 0) that 1.4.3's inlined choices allocation calls",
+  "checked": "totk_options_ui.h HeapAlloc against the inlined 1.4.3 copy"
+ },
+ "0xa02aec": {
+  "new": "0x66de24",
+  "body": "1e8d7b35160832ff391ca4af33e6723d6cb08f5efb6e6ad545bf08472f515c8d",
+  "why": "the flag setter: 16 call slots agree",
+  "checked": "totk_player_state.cpp call site"
+ },
+ "0xbb9f74": {
+  "new": "0x7216f0",
+  "body": "28eccf8386cce1e0ceb0c6cd6fa8457cfc61b73e8c36032ca723de33be9d7716",
+  "why": "the one function in each version that takes the player root global's link at +0x20 the same way (its address, a link call, then the id)",
+  "checked": "listed every use of the global in both mains: 3 in 1.0.0, 2 in 1.4.3; only this pair adds 0x20, calls the link getter and reads the id; a large function"
+ },
+ "0xbc0e1c": {
+  "new": "0x592264",
+  "body": "a6ce331ddb1ee171ac8d43bfdb8ba9b3cb5b1f11e5cd58c380ae4db274d080f5",
+  "why": "the ride link's live test (totk_player_state.cpp): placed by its 9 paired callers' aligned calls",
+  "checked": "read the stretch 0xbc0f00..0xbc0fd8 vs 0x592330..: the same loads, x19 = the ride link: +0x30 id, +0x28 data, data +0x48 / +0x40, proc +0x24; GOT slots moved"
+ },
+ "0xbf20f0": {
+  "new": "0x58fff0",
+  "body": "2bfc41938b5a1108995adcc797b494c0bf3b2598fb3fe0639ed78a3fa6be752e",
+  "why": "a sibling of 0xbf4b90 (the same +0x410 query): paired by its call",
+  "checked": "aligned listing read: Actor +0x220 -> +0x228 (3 sites), one field +0x1150 -> +0x118c, a GOT slot moved; the +0x410 load and its call the same"
+ },
+ "0xbf4b90": {
+  "new": "0x1d03770",
+  "body": "674fed95754facf184d3a4ad5aeee136695b57ae58f63bf775f116233564aec3",
+  "why": "a caller of the ride link component's query (it loads the component array's +0x410 and calls): paired by its call",
+  "checked": "aligned listing read: 31 of 36 offset accesses the same; Actor +0x220 -> +0x228 (3 sites), a GOT slot moved; the +0x410 load and its call the same"
+ },
+ "0xf6092c": {
+  "new": "0x9ea500",
+  "body": "89fca625243e143ab3b70dbbe7fc2abab62a7b4c2c5cfcfdffae330d64e9720f",
+  "why": "the options screen setup: body grew, the choices allocation is inlined; entry allocation at call slot 5",
+  "checked": "totk_options_ui.h / totk_options_menu.cpp read against decomp-lead's 1.4.3 offset diff and the inlined allocation"
+ },
+ "0x12af610": {
+  "new": "0xc7f440",
+  "body": "a2d228f2c148cd3e7689068cfcab4dca5d6d8ba681636a0a8a1ac3a1fbe28927",
+  "why": "the event player-state query: through its table, 20 of 20 neighbours agree; query 23 not yet re-read",
+  "checked": "totk_player_state.cpp call site (query id unverified)"
+ },
+ "0x130d34c": {
+  "new": "0x19633b4",
+  "body": "ea3b447c48ab3a01ca4ab46c91fd75e8a6ccec25dc2f9132b67064fb365e9c9d",
+  "why": "an actor reference's affordance mask getter: placed by its 8 paired callers' aligned calls",
+  "checked": "6 instructions read side by side: the same, the mask moved from actor +0x5a0 to +0x5a8 (the actor grew by 8, as +0x220 -> +0x228)"
+ },
+ "0x1557e84": {
+  "new": "0x1b26f74",
+  "body": "e5cce2a12fe17c2f8413dfff98d80e873739c903ebb8957f8cf505fcc0a2c260",
+  "why": "the attention client link getter (the best entry: its +0x20 flag bit 0, then its actor at +8): placed by its 11 paired callers' aligned calls",
+  "checked": "read side by side: the same entry finder call and flag tests (1.4.3 orders the bit 9 test first), entry +0x20 and +8 unchanged"
+ },
+ "0x157cd74": {
+  "new": "0x1b6382c",
+  "body": "bb5c6a57e766ed64a4b8019b1f4bd46074952812340fb9ec5bf08e8e9574e4e7",
+  "why": "a dynamic equipment component method (its owner at +0x18, the state flags byte at +0x3d0, the state at +0x3d4): paired by its anchors",
+  "checked": "aligned listing read: 24 of 36 offset accesses the same; +0x3d0 and the owner +0x18 unchanged, a member past them +0x408 -> +0x420, string and GOT offsets moved"
+ },
+ "0x16e7e2c": {
+  "new": "0x1bd0044",
+  "body": "a55a4196faaa1acf0992afa5e7ae3853fcfba051c7eaf1ac47cbb0eb779fd94a",
+  "why": "the player's slow-step type test (its type word equals the argument): placed by its 7 paired callers' aligned calls",
+  "checked": "5 instructions read side by side: the same compare, the type word moved from +0x12e8 to +0x1324 (the player component grew)"
+ },
+ "0x16e80c0": {
+  "new": "0x1d018a0",
+  "body": "fd2331e657bd26ae548be62a96dd73754e7feee56ea3522aee269ff90f34072b",
+  "why": "the bow take-out test (totk_player_state.cpp's 'take-out test' main+0x16e80c0): paired by its call",
+  "checked": "whole body read side by side: same code, Actor +0x220 -> +0x228, calls 0xbc1870 -> 0x72c050, 0x8f4c60 -> 0x3e322c; +0x3a8 / +0x478 / +0x230 / +0x6c same"
+ },
+ "0x16eb220": {
+  "new": "0x1d057a0",
+  "body": "2e9f71dcd631c067b98fe58e0e6ed04a5a66cdd0fe6599177c0c0930193a2f67",
+  "why": "a player-state test on slot 0's verb and Player +0xad8 / +0xae3 (the walk scheduler's family): paired by its call",
+  "checked": "whole body read side by side: same code, Actor +0x220 -> +0x228, a verb class gains verb 46 (mask bit 34; Invalid stays 284), callee 0x1122bbc -> 0x1bccec0; verb chain, +0xad8 same"
+ },
+ "0x1a067c8": {
+  "new": "0x9ead30",
+  "body": "2528080c5320bddd3757ed87b97a5f397c3b88f54ea8eb546b53910fc141b4af",
+  "why": "the options entry allocation: call slot 5 of the screen setup, same loop and entry size",
+  "checked": "totk_options_menu.cpp append_rows (entry size 0x28 unchanged)"
+ },
+ "0x1a06840": {
+  "new": "0x2089c14",
+  "body": "eedb8ade4087a28a90ae4b518894d9a473ba2b9aa14929f52c2ef90b6fdabe02",
+  "why": "options section hook (row count): same call slot in 3 callers",
+  "checked": "totk_options_menu.cpp zones against decomp-lead's 1.4.3 offset diff (entry fields unchanged)"
+ },
+ "0x1a068cc": {
+  "new": "0x2089cb4",
+  "body": "f5ca98ce1052f3ed46ffdef7daa89915e3849f53926c0e86c0a680083cab4998",
+  "why": "options section hook (n-th row): same call slot in 3 callers",
+  "checked": "totk_options_menu.cpp zones against decomp-lead's 1.4.3 offset diff (entry fields unchanged)"
+ },
+ "0x1a85b3c": {
+  "new": "0x212bf04",
+  "body": "5b89f33d02ab4957c170de212b6336de42d2579b8c70e8f46800c41d1f8ddb7b",
+  "why": "options row hook: confirmed pair, the screen owner's list moved +0x48",
+  "checked": "totk_options_ui.h against decomp-lead's 1.4.3 offset diff"
+ },
+ "0x1a85e4c": {
+  "new": "0x212c1e0",
+  "body": "8c5e41fc12b17984ab59ef026a8a9209036e79c93836eeb70f567870256c04e5",
+  "why": "options row hook: confirmed pair, selection row fields +8",
+  "checked": "totk_options_ui.h against decomp-lead's 1.4.3 offset diff"
+ },
+ "0x1a8604c": {
+  "new": "0x212c3e0",
+  "body": "a9e94dafd2a7bce961f91de6c0aabdaa78de1c7f0bbf40ce8fc236781398284b",
+  "why": "options row hook: confirmed pair, selection row fields +8",
+  "checked": "totk_options_ui.h against decomp-lead's 1.4.3 offset diff"
+ },
+ "0x1a862e4": {
+  "new": "0x212c6ac",
+  "body": "e13dfab4e523c096710f830c8efa3db10dd95b9c51816b7b56b3f78aa0eb670b",
+  "why": "options row hook: confirmed pair, body changed",
+  "checked": "totk_options_ui.h against decomp-lead's 1.4.3 offset diff (selection row +8)"
+ },
+ "0x1a86420": {
+  "new": "0x212c818",
+  "body": "2733c9dec8da4e64296227dbd4adecb2194b14e0ef3cd016947d0c5dd994b57e",
+  "why": "options row hook: confirmed pair, body changed",
+  "checked": "totk_options_ui.h against decomp-lead's 1.4.3 offset diff (selection row +8)"
+ },
+ "0x1ad7af4": {
+  "new": "0x218bba8",
+  "body": "6dbb04833a89f26cf1dff721651ca8e580d7f9eec24cdf07fe59a31a8b6008ac",
+  "why": "a return address: the options screen creation's row-count call returns here",
+  "checked": "totk_options_menu.cpp kCreateCountReturn"
+ },
+ "0x1c019f8": {
+  "new": "0x194f744",
+  "body": "fb2983b63e4652a11386f26ddb62df05eaf302a51f1f1317c0ba2795507a9a40",
+  "why": "the actor's SpecialPower component getter (totk_player_state.cpp): paired by its call",
+  "checked": "6 instructions read side by side: the same, Actor +0x220 -> +0x228, the component array +0x478 unchanged"
+ },
+ "0x1ccf894": {
+  "new": "0xf23d70",
+  "body": "3708df383750a49f93f3a855750bc1ad9ad429ef83900b87d7a56de1864bfc64",
+  "why": "the player key-hold hook: confirmed pair, body changed",
+  "checked": "totk_pc_vk.cpp fields via totk_field against decomp-lead's 1.4.3 offset diff"
+ },
+ "0x1ccff34": {
+  "new": "0x1b26eb8",
+  "body": "a64352fe34b61461da0b9f67f1ec0cf04e56961f9750012c5a4369ca3de00fa8",
+  "why": "the attention lock: identical masked body, same call slot in the key-hold hook",
+  "checked": "totk_pc_vk.cpp call site (arguments unchanged per decomp-lead)"
+ },
+ "0x1cfe320": {
+  "new": "0x23eb604",
+  "body": "8ed8e813a446558d8af3366133bfe07bbae84419e62b03d9008396003150c658",
+  "why": "an instruction: the key-hold guard's mode argument (2) before the drawn-state hold-value read",
+  "checked": "totk_pc_vk.cpp guard check (needs every guard site, ver143)"
+ },
+ "0x1d09d64": {
+  "new": "0x1bcf960",
+  "body": "dcafb081e53dfd5f7eb40dc34a2b1bc8dcdb4dcd7787dd6e75b0342f85769ece",
+  "why": "the player's move rate getter (a float clamped to 0 .. 0.5, 0 when negative): placed by its paired caller's aligned call",
+  "checked": "read side by side: the same clamp (1.4.3 compares and selects instead of a min), the float moved from +0xf24 to +0xf48"
+ },
+ "0x455aa88": {
+  "new": "0x398a9d8",
+  "body": "3708df383750a49f93f3a855750bc1ad9ad429ef83900b87d7a56de1864bfc64",
+  "why": "the input flags' pointer slot the key function loads first (its flag lookup); a relocated pointer in both builds",
+  "checked": "totk_pc_vk.cpp read against 1.4.3 (cut_reason: slot -> object -> +0x30)"
+ },
+ "0x4562308": {
+  "new": "0x3969918",
+  "body": "28eccf8386cce1e0ceb0c6cd6fa8457cfc61b73e8c36032ca723de33be9d7716",
+  "why": "the player root slot: the same three-step address computation in a paired reader",
+  "checked": "totk_globals.h totk_player_actor"
+ },
+ "0x45640e0": {
+  "new": "0x396bab8",
+  "body": "5b89f33d02ab4957c170de212b6336de42d2579b8c70e8f46800c41d1f8ddb7b",
+  "why": "the option choice names slot: read off the selection bind's page load and offset (the data vote's neighbour was wrong)",
+  "checked": "decomp options_menu.cpp choice names, decomp-lead's read"
+ }
+}

@@ -14,12 +14,14 @@
 #endif
 #include <windows.h>
 #include <dbghelp.h>
+#include <psapi.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -39,6 +41,48 @@ struct Job {
     const char* reason;
     const char* runtime_text;
 };
+
+// Key material (pc_crash_secret / pc_crash_secret_busy): ranges zeroed and left out of the minidump, and the threads
+// busy with it, whose context and stack stay out (players attach the dumps to public issues: a content key must not go
+// with them)
+struct Secret { void* base; size_t size; };
+Secret g_secret[8];
+std::atomic<int> g_nsecret{0};
+constexpr int kSlots = 256;
+std::atomic<DWORD> g_slot_owner[kSlots];   // a thread's own slot (claimed at its first decryption)
+std::atomic<int> g_slot_busy[kSlots];
+std::atomic<int> g_busy_unslotted{0};      // busy threads without a slot (all slots taken): every thread is left out
+
+bool secret_busy(DWORD tid) {
+    if (g_busy_unslotted.load()) return true;
+    for (int i = 0; i < kSlots; i++)
+        if (g_slot_owner[i].load(std::memory_order_relaxed) == tid) return g_slot_busy[i].load() != 0;
+    return false;
+}
+
+// MiniDumpWriteDump's callback: the secret ranges removed (one a call; size 0 ends), busy threads without context / stack
+BOOL CALLBACK dump_filter(PVOID, const PMINIDUMP_CALLBACK_INPUT in, PMINIDUMP_CALLBACK_OUTPUT out) {
+    static int next = 0;
+    switch (in->CallbackType) {
+    case RemoveMemoryCallback:
+        if (next < g_nsecret.load()) {
+            out->MemoryBase = (ULONG64)(uintptr_t)g_secret[next].base;
+            out->MemorySize = (ULONG)g_secret[next].size;
+            next++;
+            return TRUE;
+        }
+        out->MemorySize = 0;
+        return FALSE;
+    case ThreadCallback:
+    case ThreadExCallback:
+        if (secret_busy(in->Thread.ThreadId))
+            out->ThreadWriteFlags &= ~(ULONG)(ThreadWriteContext | ThreadWriteStack | ThreadWriteInstructionWindow |
+                                              ThreadWriteBackingStore);
+        return TRUE;
+    default:
+        return TRUE;
+    }
+}
 
 // The report is built in memory first: it goes to the .txt, to stderr and into the minidump.
 char g_text[64 << 10];
@@ -110,6 +154,22 @@ void host_frames(const CONTEXT* ctx_in) {
     }
 }
 
+// The process's and the PC's memory at the crash (rival parity, their #94: an allocation that failed under memory
+// pressure surfaces as a crash somewhere else; the report says how short the process and the PC were). No allocation.
+void memory_lines() {
+    constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+    PROCESS_MEMORY_COUNTERS_EX pm = {};
+    pm.cb = sizeof pm;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm))
+        say("Process memory: working set %.2f GiB (peak %.2f), private %.2f GiB, committed peak %.2f GiB\n",
+            pm.WorkingSetSize / GiB, pm.PeakWorkingSetSize / GiB, pm.PrivateUsage / GiB, pm.PeakPagefileUsage / GiB);
+    MEMORYSTATUSEX ms = {};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms))
+        say("System memory: %.1f of %.1f GiB free (%lu %% in use), commit %.1f of %.1f GiB free\n", ms.ullAvailPhys / GiB,
+            ms.ullTotalPhys / GiB, (unsigned long)ms.dwMemoryLoad, ms.ullAvailPageFile / GiB, ms.ullTotalPageFile / GiB);
+}
+
 void write_all(const wchar_t* path, const char* p, size_t n) {
     HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -129,6 +189,7 @@ DWORD WINAPI crash_thread(void* arg) {
     WideCharToMultiByte(CP_UTF8, 0, stem, -1, stem8, sizeof stem8, nullptr, nullptr);
 
     say("totk.exe crash: %s (host thread %lu)\n", job->reason, (unsigned long)job->thread_id);
+    memory_lines();
     if (job->ep) {
         EXCEPTION_RECORD* er = job->ep->ExceptionRecord;
         char sym[MAX_PATH + 32];
@@ -160,12 +221,24 @@ DWORD WINAPI crash_thread(void* arg) {
             MINIDUMP_EXCEPTION_INFORMATION mei = {job->thread_id, job->ep, FALSE};
             MINIDUMP_USER_STREAM us = {CommentStreamA, (ULONG)(g_len + 1), g_text};
             MINIDUMP_USER_STREAM_INFORMATION usi = {1, &us};
+            // key material: zeroed, its pages left out, the threads busy with it without context / stack; a crash
+            // inside a decryption keeps its exception context but not its vector registers
+            for (int i = 0; i < g_nsecret.load(); i++) SecureZeroMemory(g_secret[i].base, g_secret[i].size);
+            MINIDUMP_CALLBACK_INFORMATION mci = {dump_filter, nullptr};
+            CONTEXT clean;
+            EXCEPTION_POINTERS clean_ep;
+            if (job->ep && secret_busy(job->thread_id)) {
+                clean = *job->ep->ContextRecord;
+                SecureZeroMemory(&clean.FltSave, sizeof clean.FltSave);
+                clean_ep = {job->ep->ExceptionRecord, &clean};
+                mei.ExceptionPointers = &clean_ep;
+            }
             // Indirectly referenced memory captures what the registers point at without the multi-GiB guest regions. No data
             // segments: those of the 275 MB exe made a dump 97 MB (db-pc1); the text report carries the guest registers.
             dumped = write_dump(GetCurrentProcess(), GetCurrentProcessId(), f,
                                 (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory |
                                                 MiniDumpWithHandleData | MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules),
-                                job->ep ? &mei : nullptr, &usi, nullptr);
+                                job->ep ? &mei : nullptr, &usi, &mci);
             CloseHandle(f);
             if (!dumped) { dump_failed = true; DeleteFileW(path); }
         }
@@ -274,6 +347,30 @@ extern "C" void pc_crash_set_enabled(bool on) {
     if (on) pc_crash_install();
 }
 
+extern "C" void pc_crash_secret(void* base, size_t size) {
+    const int i = g_nsecret.load();
+    if (i >= (int)(sizeof g_secret / sizeof *g_secret)) return;
+    g_secret[i] = {base, size};
+    g_nsecret.store(i + 1);
+}
+
+extern "C" void pc_crash_secret_busy(int enter) {
+    static thread_local struct Slot {
+        int i = -2;   // -2: none asked yet, -1: none free
+        ~Slot() { if (i >= 0) { g_slot_busy[i].store(0); g_slot_owner[i].store(0); } }
+    } slot;
+    if (slot.i == -2) {
+        slot.i = -1;
+        const DWORD me = GetCurrentThreadId();
+        for (int k = 0; k < kSlots && slot.i < 0; k++) {
+            DWORD free_ = 0;
+            if (g_slot_owner[k].compare_exchange_strong(free_, me)) slot.i = k;
+        }
+    }
+    if (slot.i >= 0) g_slot_busy[slot.i].store(enter ? 1 : 0);
+    else g_busy_unslotted.fetch_add(enter ? 1 : -1);
+}
+
 extern "C" void pc_input_keys_restore(void);   // pc_input.cpp: the Sticky / Toggle / Filter Keys hotkeys as they were
 extern "C" void pc_crash_report(void* exception_pointers, const char* reason, const char* runtime_text) {
     pc_input_keys_restore();   // (before anything that can hang: the process ends after the report)
@@ -287,6 +384,8 @@ extern "C" void pc_crash_report(void* exception_pointers, const char* reason, co
 }
 
 #else   // not Windows: plat_posix.cpp's signal handler prints the report
+extern "C" void pc_crash_secret(void*, size_t) {}   // (rom_source.h maps the key MADV_DONTDUMP there)
+extern "C" void pc_crash_secret_busy(int) {}
 extern "C" bool pc_crash_enabled(void) { return false; }
 extern "C" void pc_crash_install(void) {}
 extern "C" void pc_crash_set_enabled(bool) {}

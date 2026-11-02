@@ -92,12 +92,18 @@ GEN_CODEGEN = ['--simd', '--nanrun', '--vdirect', '--lso-abi', 'auto']
 # drawn values scaled by the step. 27b6e64 SeqOneShotPrintLoadLapTimeForPatrol's oneShot: the game's load lap labels logged with TOTK_LOAD_LAPS=1. 11276cc ares::System::initializeThreads: the resource loader thread count,
 # TOTK_LOADER_THREADS=<n> for the A/B. 9c2ef0 aal's per-frame command-list flush: a full game -> audio ring keeps the frame's commands instead of dropping them above 200 fps. 9c2b70 the watchdog step AudioRendererController::calc
 # tail-calls: aal's jam watchdog fires after 10 s of jam, not 300 calls (1.25 s at 240 fps). 10bc078 game::event::Actor::initialize: the cutscene actors' 600-frame equipment fallback in game time. 13bd680
-# game::event::EventContext::isLoadFinished: the 61-frame 'surroundings stable' count before a cutscene starts in game time. abb518 the EnvSound one-shot emitter step: the 200-frame settle between two ambient one-shots in game
-# time. --vlocal: V registers in locals in these functions (stages 1-2; verified only on top of --vdirect; not `all`: the giant functions grow 20-60% in x86)
+# game::event::EventContext::isLoadFinished: the 61-frame 'surroundings stable' count before a cutscene starts in game time. 91a290 the layout-animation binder: the Purah Pad map's temperature sign follows game.temperature_unit.
+# abb518 the EnvSound one-shot emitter step: the 200-frame settle between two ambient one-shots in game time. --vlocal: V registers in locals in these functions (stages 1-2; verified only on top of --vdirect; not `all`: the giant
+# functions grow 20-60% in x86) --split: these functions as chunks (gen.py Emitter.split_text): every 1.0.0 function of 10,000+ guest instructions with no count in the release profile (855fd396: every block 0; 553d80, 5732d0,
+# 58fd70, 4d9ba0, 6e5b38, ae4c40, 719acc, ee92d8 have counts and stay whole, so no hot path crosses a chunk). They were 2.6k of a cold key's ~9.8k s of compile CPU and its 2.3 GB-a-compile peaks (setup-fast, 2026-11-02). Another
+# version / game: none (its own list). (v0.1.8 ships with the split off: the giants compile whole, as in v0.1.7, while a crash seen with it is looked into)
+SPLIT_FUNCS = []
+_SPLIT_FUNCS_OFF = ['433b78', '48429c', '5ad300', '5346a0', '516d00', '4f8610', '4cad70', '564b60', '426084', '546ce0',
+               '477234', '50a1a0', '4ebab0', '5a14f0', '528890', '584890', '41269c']
 GEN_MAIN = ['--hook', '7a83e4,f6092c,1a862e4,1a86420,1a85b3c,1a8604c,1a85e4c,83e3f8,1ccf894,'
             'b6afc8,75718c,18fb7d0,18fbf18,18fbf68,18fc0ac,279a77c,2798a1c,f15364,16e4728,8f689c,1cd0260,16e4610,f0fdec,1aa3e44,16e4b80,1d23614,a5f010,1d97648,1c17fb0,120ec94,9d8d00,212b740,1b7ba58,1aa6a94,1f61d6c,2833b60,200f61c,200f8b0,20147f4,27dcb98,1b3ebac,1a4f0ac,1c73fbc,1dbdcf0,'
-            '1a06840,1a068cc,704b7c,27b6e64,11276cc,9c2ef0,9c2b70,abb518,10bc078,13bd680', *GEN_CODEGEN,
-            '--vlocal', '260a970,317040,704b7c,10cfecc']
+            '1a06840,1a068cc,704b7c,27b6e64,11276cc,9c2ef0,9c2b70,abb518,10bc078,13bd680,91a290', *GEN_CODEGEN,
+            '--vlocal', '260a970,317040,704b7c,10cfecc', *(['--split', ','.join(SPLIT_FUNCS)] if SPLIT_FUNCS else [])]
 GEN_SDK = ['--base', '0x7180000000', '--prefix', 's', '--plt-all', *GEN_CODEGEN]
 GEN_EXTRA = []         # --gen-args: gen.py flags added for both modules (e.g. --fz); join the key, game-var/
 REF = None             # --ref: snapshot this commit / branch instead of HEAD; its commit joins the key, game-var/
@@ -128,16 +134,52 @@ SOLO = bool(os.environ.get('NXR_SOLO_PC')) and not os.path.isdir(os.environ.get(
                                                                   r'C:\nxrecomp-work\locks')
 if SOLO:
     GIANT_COMMIT_GB = 10  # one person's PC (tools/builder: heavy.py SOLO)
+SOLO_GATE_MIN = 3      # one person's PC: minutes a compile waits under its commit floor before it runs anyway
 GIANT_PEAK_GB = 2.2
+RAM_OS_GB = 4          # (giant_pool: what Windows and the rest of the PC keep, as tools/builder's jobs_for)
 GIANT_HOT = {'f_4d9ba0'}   # cx5 world profiles: rank 38-47, 0.4-0.6% of guest samples; the other giants absent
 
 
-def giant_pool(jobs):
+def giant_floor():
+    """the free commit a giant waits for: GIANT_COMMIT_GB, but on Wine / Proton (heavy.WINE_FLOORS: no pagefile, the
+    free commit is Linux's MemAvailable + swap, ~8 GB on a Steam Deck) one giant's peak and 2 GB for the rest"""
+    return GIANT_PEAK_GB + 2.0 if getattr(heavy_mod(), 'WINE_FLOORS', False) else GIANT_COMMIT_GB
+
+
+def retry_jobs(jobs):
+    """the compiles at once of each pass over the game objects: jobs, then halved down to one (a failure under memory
+    pressure gets fewer neighbours each time); at least one retry, as before"""
+    out = [int(jobs)]
+    while out[-1] > 1:
+        out.append(max(1, out[-1] // 2))
+    return out if len(out) > 1 else out * 2
+
+
+def retry_pools(path, jobs):
+    """objs.ninja's pools for a retry pass with `jobs` at once: `gen` that many, `giant` a quarter of them (at least
+    one; a giant peaks near GIANT_PEAK_GB, the first pass's giant_pool() is what failed)"""
+    text = open(path).read()
+    text = re.sub(r'^pool gen\n  depth = \d+$', f'pool gen\n  depth = {jobs}', text, count=1, flags=re.M)
+    text = re.sub(r'^pool giant\n  depth = \d+$', f'pool giant\n  depth = {max(1, jobs // 4)}', text, count=1,
+                  flags=re.M)
+    with open(path, 'w', newline='\n') as f:
+        f.write(text)
+
+
+def giant_pool(jobs, ram_gb=None):
     """giants at once. setup-speed, 2026-11-01 (cold key 2b7c4cb2, a player's PC, --jobs 16): at 3 the last ~200 s ran
     three giant chains alone (objects 903 s); a replay of that ninja log gives 727 s, the CPU floor, from 4 at --jobs
     16 (6 at 24). So on one person's PC a quarter of --jobs, never under GIANT_POOL; each giant still starts only with
-    GIANT_COMMIT_GB of free commit, which holds them back on a small-memory PC."""
-    return max(GIANT_POOL, int(jobs) // 4) if SOLO else GIANT_POOL
+    GIANT_COMMIT_GB of free commit, which holds them back on a small-memory PC. So half of --jobs, as many as the PC's
+    memory holds beside the other compiles (RAM_OS_GB for Windows, TU_COMMIT_GB a compile, GIANT_PEAK_GB a giant): 8
+    at --jobs 16 with 32 GB or more, 7 with 24 GB, GIANT_POOL with 16 GB (there the giants' own compile time is what
+    is left to cut)."""
+    if not SOLO:
+        return GIANT_POOL
+    if ram_gb is None:
+        ram_gb = heavy_mod().mem_status().ullTotalPhys / 2**30
+    fit = int((ram_gb - RAM_OS_GB - int(jobs) * TU_COMMIT_GB) / (GIANT_PEAK_GB - TU_COMMIT_GB))
+    return max(GIANT_POOL, min(int(jobs) // 2, fit))
 
 # Game version. Unset / 1.0.0: everything above as it is. TOTK_GAME_VERSION=1.4.3 builds the update from
 # <work>/extracted/v143 (python -m pipeline.extract... --update) with games/totk/patches/v143.toml (python -m
@@ -184,7 +226,7 @@ if GAME_VERSION != '1.0.0':
     DIAGNOSTIC = bool(_diag)
     _alias = {int(k, 16): int(v, 16) for k, v in _eng['alias'].items()}
     HOOKED_V100 = {f'{_alias[int(h, 16)]:x}' for h in _eng['hook']}
-    _lists = {'--hook': _eng['hook'], '--vlocal': _eng['vlocal']}
+    _lists = {'--hook': _eng['hook'], '--vlocal': _eng['vlocal'], '--split': _eng.get('split', [])}
     _gm, _skip = [], False
     for _i, _a in enumerate(GEN_MAIN):
         if _skip:
@@ -285,13 +327,17 @@ def run(cmd, **kw):
 def ensure_venv():
     # zstandard: the overlay's three engine fixes use it when the PC has no Git for Windows libzstd.dll (public issue #8);
     # a venv made before it gets it on its next build
-    zst = os.path.join(VENV, 'Lib', 'site-packages', 'zstandard')
-    if os.path.exists(PY) and os.path.exists(NINJA) and os.path.isdir(zst):
+    # cryptography: those fixes and shader_pack read the RomFS straight from the player's dump (romsource.DumpImage,
+    # AES-CTR) since 55307104; without it a fresh v0.1.8 install stopped at step 7 (installer fresh018, 11-02)
+    site = os.path.join(VENV, 'Lib', 'site-packages')
+    if os.path.exists(PY) and os.path.exists(NINJA) and all(os.path.isdir(os.path.join(site, m)) for m in ('zstandard', 'cryptography')):
         return
     os.makedirs(SIG, exist_ok=True)
     if not os.path.exists(PY):
         run([sys.executable, '-m', 'venv', VENV])
-    run([PY, '-m', 'pip', 'install', '--quiet', 'capstone==5.0.9', 'lz4', 'ninja', 'zstandard==0.25.0'])
+    # (wheels only, as toolchain.py: a missing wheel fails at once and says so, no source build of cryptography's Rust)
+    run([PY, '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', '--only-binary', ':all:',
+         'capstone==5.0.9', 'lz4', 'ninja', 'zstandard==0.25.0', 'cryptography==50.0.1'])
 
 
 def build_env():
@@ -404,6 +450,8 @@ def images(patch_file=None) -> str:
         mod = p.get('module', 'main')
         b = bins.setdefault(mod, bytearray(open(os.path.join(tmp, mod + '.bin'), 'rb').read()))
         off, new = int(str(p['offset']), 0), bytes.fromhex(p['bytes'])
+        if off + len(new) > len(b):   # a veneer in the extra area past the image's end (sites_v100 Layout.extra): zeros
+            b += bytes(off + len(new) - len(b))
         if 'expect' in p and b[off:off + len(new)] != bytes.fromhex(p['expect']):
             sys.exit(f"patch {p.get('name', '?')}: {mod}+{off:#x} is {b[off:off + len(new)].hex()}, expected {p['expect']}")
         b[off:off + len(new)] = new
@@ -446,9 +494,19 @@ DLSS_DLLS = {
 }
 
 
-def dlss_fetch(files, dst, flat):
+# AMD's FidelityFX SDK (runtime/nvn/vulkan/ffx.c: FSR 3.1 on any Vulkan GPU) at v1.1.4, the last release whose signed
+# runtime DLL is MIT (v2.x: a binary-only licence): the C API headers are in engine/third_party/fidelityfx, the DLL goes to
+# <work>/engine/ffx like DLSS's (boot.py and package.py point TOTK_FFX_DIR there).
+FFX_URL = 'https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v1.1.4/'
+FFX_DLLS = {
+    'PrebuiltSignedDLL/amd_fidelityfx_vk.dll': 'a1624cc4238fef046f30c4d80ce3f47be63fc5f5373f49e3ee9edb9960f54c78',
+    'LICENSE.txt': '82cf74fc23885107c7f69249ac3f1dac55898ff68320eb2c753984cae6b2d78a',
+}
+
+
+def dlss_fetch(files, dst, flat, url=DLSS_URL, what='DLSS SDK'):
     """files {upstream path: sha256} into dst (flat: by base name, else lib/ files as lib/<name>), downloaded once and
-    checked; a file already there with the right hash is kept."""
+    checked; a file already there with the right hash is kept. url / what: FidelityFX's too."""
     import urllib.request
     for path, want in files.items():
         name = os.path.basename(path) if flat else (path if not path.startswith('lib/') else 'lib/' + os.path.basename(path))
@@ -456,12 +514,12 @@ def dlss_fetch(files, dst, flat):
         if os.path.isfile(out) and sha256_file(out) == want:
             continue
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        log(f'DLSS SDK: {DLSS_URL}{path}')
-        with urllib.request.urlopen(DLSS_URL + path, timeout=120) as r:
+        log(f'{what}: {url}{path}')
+        with urllib.request.urlopen(url + path, timeout=120) as r:
             data = r.read()
         got = hashlib.sha256(data).hexdigest()
         if got != want:
-            sys.exit(f'DLSS SDK: {path} has sha256 {got}, expected {want}')
+            sys.exit(f'{what}: {path} has sha256 {got}, expected {want}')
         with open(out + '.tmp', 'wb') as f:
             f.write(data)
         os.replace(out + '.tmp', out)
@@ -506,6 +564,10 @@ def snapshot(ref='HEAD') -> str:
         dlss_sdk(os.path.join(d, 'engine', 'third_party', 'dlss'))
         open(os.path.join(d, 'DONE'), 'w').close()
     dlss_sdk(None)   # the runtime DLLs: <work>/engine/dlss (boot.py and package.py point TOTK_DLSS_DIR there)
+    try:   # (optional: Setup's builder unpacks the same files from our release asset first, so nothing is fetched there)
+        dlss_fetch(FFX_DLLS, os.path.join(SIG, 'ffx'), flat=True, url=FFX_URL, what='FidelityFX SDK')   # (TOTK_FFX_DIR)
+    except (Exception, SystemExit) as e:
+        log(f'FidelityFX SDK: not fetched ({e}): FSR unavailable in this build')
     log(f'sources: {ref} {c[:12]} -> {d}')
     return os.path.join(d, 'engine')
 
@@ -594,10 +656,13 @@ def key_of(img: str, root: str):
     if '--lso-abi' in gen_args(GEN_MAIN) + gen_args(GEN_SDK):   # (its keep file follows from the image, funcs.json and these)
         parts['abi_scan.py'] = fsha(os.path.join(root, 'tools', 'recomp', 'abi_scan.py'))
     pset = patch_set(img)
-    if pset.get('ext') or pset.get('fde_add'):   # only keys whose patch set has veneers
+    if uses_gen_ext(pset):   # only keys whose patch set has veneers or switch sites
         parts['gen_ext.py'] = fsha(os.path.join(root, 'tools', 'recomp', 'gen_ext.py'))
-        # (the veneers are not in the image, so their metadata joins the key itself)
-        parts['veneers'] = sha(json.dumps({'ext': pset.get('ext', {}), 'fde_add': pset.get('fde_add', {})}, sort_keys=True).encode())
+        # (the veneers are not in the image, so their metadata joins the key itself; so do the switch sites, whose
+        # words are not in it either)
+        parts['veneers'] = sha(json.dumps({'ext': pset.get('ext', {}), 'fde_add': pset.get('fde_add', {}),
+                                           **({'switch': pset['switch']} if pset.get('switch') else {})},
+                                          sort_keys=True).encode())
     if NOLINES:
         parts['objs'] = 'no line tables'
     if VARIANT:
@@ -645,6 +710,19 @@ class Lock:
             pass
 
 
+def link_or_copy(src, dst):
+    """a hard link, else a copy: exFAT / FAT32 drives (USB drives, SD cards) make none (public #31: os.link raised
+    WinError 1 'Incorrect function' at step 5 on an install folder on D:)"""
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise
+    except OSError:
+        if os.path.lexists(dst):   # (as os.link: never over an existing file)
+            raise FileExistsError(17, 'the target exists', dst)
+        shutil.copy2(src, dst)
+
+
 def clone_links(src, dst):
     """hard-link copy of a key directory (files written later are replaced by rename, so the base stays intact)"""
     for d, _, files in os.walk(src):
@@ -658,7 +736,48 @@ def clone_links(src, dst):
             if fn in ('build.ninja', '.ninja_log', '.ninja_deps'):  # ninja writes these in place
                 shutil.copy2(os.path.join(d, fn), os.path.join(dst, rel, fn))
                 continue
-            os.link(os.path.join(d, fn), os.path.join(dst, rel, fn))
+            link_or_copy(os.path.join(d, fn), os.path.join(dst, rel, fn))
+
+
+CLONE_SLACK = 8 << 30   # free space a copied base key leaves for the patched key's own compiles and link
+
+
+def hard_links_ok(d):
+    """whether d's drive makes hard links (exFAT / FAT32 do not)"""
+    p = os.path.join(d, f'.linkprobe-{os.getpid()}')
+    try:
+        open(p, 'wb').close()
+        os.link(p, p + '2')
+        os.remove(p + '2')
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def clone_base(bdir, kdir):
+    """a patched key starts from the base key's files (only changed TUs recompile): hard links, or on a drive without them a
+    copy (~12 GB) when it fits with CLONE_SLACK to spare, else nothing. Returns 'linked', 'copied' or 'skipped'."""
+    bkey = os.path.basename(bdir)
+    if hard_links_ok(kdir):
+        log(f'patched key: hard-linking the base key {bkey} (only changed TUs recompile)')
+        clone_links(bdir, kdir)
+        return 'linked'
+    size = sum(os.path.getsize(os.path.join(d, fn)) for d, _, files in os.walk(bdir)
+               if os.path.relpath(d, bdir).split(os.sep)[0] not in ('exe', '.lock') for fn in files)
+    free = shutil.disk_usage(kdir).free
+    if free < size + CLONE_SLACK:
+        log(f'patched key: this drive makes no hard links and a copy of the base key {bkey} ({size / 2**30:.1f} GB) '
+            f'does not fit in {free / 2**30:.1f} GB free with {CLONE_SLACK >> 30} GB to spare: every TU compiles')
+        return 'skipped'
+    log(f'patched key: this drive makes no hard links: copying the base key {bkey} ({size / 2**30:.1f} GB; only '
+        'changed TUs recompile)')
+    clone_links(bdir, kdir)
+    return 'copied'
 
 
 GEN_FREE_PARTS = ('variant', 'objs', 'clang', 'giants')   # key parts that change objects, never generated sources
@@ -703,7 +822,7 @@ def link_gen(src, dst):
             t = os.path.join(dst, rel, fn)
             if os.path.exists(t):
                 os.remove(t)
-            os.link(os.path.join(d, fn), t)
+            link_or_copy(os.path.join(d, fn), t)
     for fn in os.listdir(src):
         if fn.startswith('funcs_') and fn.endswith('.json'):
             shutil.copy2(os.path.join(src, fn), os.path.join(dst, fn))
@@ -738,7 +857,14 @@ def with_veneers(fj, pset):
         if hex(int(f, 16)) not in funcs['fde']:
             sys.exit(f'patch set ext: {f} is not a function start in {fj}')
     funcs['ext'] = pset.get('ext', {})
+    if pset.get('switch'):   # (switch sites: words chosen at run time, the mods' code cheats; gen_ext.py ExtEmitter)
+        funcs['switch'] = pset['switch']
     json.dump(funcs, open(fj, 'w', newline='\n'), indent=1)
+
+
+def uses_gen_ext(pset):
+    """main is generated by gen_ext.py: the patch set has veneers or switch sites"""
+    return bool(pset.get('ext') or pset.get('fde_add') or pset.get('switch'))
 
 
 def gen(img, kdir):
@@ -749,7 +875,7 @@ def gen(img, kdir):
         t0 = time.time()
         fj = os.path.join(kdir, f'funcs_{mod}.json')
         run([PY, '-I', os.path.join(TOOLS, 'tools', 'funcs.py'), os.path.join(img, mod), fj + '.tmp'], stdout=subprocess.DEVNULL)
-        veneers = mod == 'main' and (pset.get('ext') or pset.get('fde_add'))
+        veneers = mod == 'main' and uses_gen_ext(pset)
         if veneers:
             with_veneers(fj + '.tmp', pset)
         os.replace(fj + '.tmp', fj)
@@ -897,15 +1023,20 @@ def variant_rule(rule, hot):
 
 
 # any gen.py name prefix: f_ / s_ and the --fn-prefix ones (another game's or version's main: m_ ...); with [fs]_ only,
-# such a build's giants compiled at -O2 in the normal pool, ungated (a 228k-line function: 94 s, outside the giant pool)
-FUNC_DEF = re.compile(rb'void ([a-z][a-z0-9]*_[0-9a-f]+)\(Ctx\* __restrict cx\) \{')
+# such a build's giants compiled at -O2 in the normal pool, ungated (a 228k-line function: 94 s, outside the giant pool).
+# A --split function's chunks (f_<off>_c<k>, gen.py Emitter.split_text) count one by one: each compiles alone (f_5346a0's
+# largest of ~5.6k lines: 0.45 GB at -O1), so a split giant is no giant (no giant pool, no GIANT_COMMIT_GB wait); its
+# TU stays at COLD_OPT as a giant's would (unless --hot made it an h_ TU): cold by choice (f_41269c 45 s, -O2 128 s)
+FUNC_DEF = re.compile(rb'void ([a-z][a-z0-9]*_[0-9a-f]+(?:_c\d+)?)\(Ctx\* __restrict cx\) \{')
+SPLIT_CHUNK = re.compile(r'_[0-9a-f]+_c\d+$')
 
 
 def giant_of(src):
-    """(lines, name) of the TU's largest function when it has GIANT_LINES lines or more, else (0, None); TUs under
-    GIANT_LINES * 50 bytes are not read (generated code runs ~65 bytes a line)"""
+    """(lines, name, split) of the TU's largest function when it has GIANT_LINES lines or more, else (0, None, split);
+    split: the TU holds a --split function's chunks. TUs under GIANT_LINES * 50 bytes are not read (generated code runs
+    ~65 bytes a line; a split function has 10k+ guest instructions)"""
     if not GIANT_LINES or os.path.getsize(src) < GIANT_LINES * 50:
-        return 0, None
+        return 0, None, False
     data = open(src, 'rb').read()
     defs, i = [], data.find(b'\nvoid ')
     while i >= 0:     # (bytes.find, not a multiline regex over the whole TU: 1176 TUs in a few seconds)
@@ -918,7 +1049,8 @@ def giant_of(src):
         n = data.count(b'\n', start, nxt)
         if n > best[0]:
             best = (n, name)
-    return best if best[0] >= GIANT_LINES else (0, None)
+    split = any(SPLIT_CHUNK.search(name) for _, name in defs)
+    return (*best, split) if best[0] >= GIANT_LINES else (0, None, split)
 
 
 def objects(kdir, jobs, prio, cache):
@@ -947,11 +1079,11 @@ def objects(kdir, jobs, prio, cache):
     for obj, src in edges:
         rule = 'gen_cold' if os.path.basename(src).startswith('c_') else hot
         o, s = os.path.join(kdir, obj), os.path.join(kdir, src)
-        lines, name = giant_of(s)
+        lines, name, split = giant_of(s)
         if lines:
             giants[obj] = lines
-            if rule == hot and name not in GIANT_HOT and not os.path.basename(src).startswith('h_'):
-                rule = 'gen_cold'    # (an h_ TU: hot by --hot's profile, stays at -O2)
+        if (lines and name not in GIANT_HOT or split) and rule == hot and not os.path.basename(src).startswith('h_'):
+            rule = 'gen_cold'    # (an h_ TU: hot by --hot's profile, stays at -O2)
         placed.add(os.path.normcase(os.path.abspath(o)))
         oid = None
         if cache:
@@ -966,7 +1098,7 @@ def objects(kdir, jobs, prio, cache):
                     os.makedirs(os.path.dirname(o), exist_ok=True)
                     if os.path.exists(o):
                         os.remove(o)
-                    os.link(c, o)
+                    link_or_copy(c, o)
                 hits += 1
                 continue
             if os.path.exists(o) and os.stat(o).st_nlink > 1:
@@ -998,7 +1130,7 @@ def objects(kdir, jobs, prio, cache):
         for r, giant in {(t[2], t[0] in giants) for t in todo}:
             if rules[r].count(f'rule {r}\n') != 1 or rules[r].count('\n  command = ') != 1:
                 sys.exit(f'{kdir}: rule {r} has no single `rule {r}` / `  command = ` line to gate:\n{rules[r]}')
-            name, floor = (f'{r}_giant', f'{GIANT_COMMIT_GB:g}') if giant else (f'{r}_gated', f'{build_floor:g}')
+            name, floor = (f'{r}_giant', f'{giant_floor():g}') if giant else (f'{r}_gated', f'{build_floor:g}')
             grules[name] = rules[r].replace(f'rule {r}\n', f'rule {name}\n', 1).replace(
                 '\n  command = ', f'\n  command = {gate}{floor} {excl}-- ', 1)
         # the compiles at once: `pool gen` (mkninja_win's --gen-pool, an older key's 3) up to the cap, ninja's -j
@@ -1013,14 +1145,19 @@ def objects(kdir, jobs, prio, cache):
                                                                  -os.path.getsize(os.path.join(kdir, t[1])))):
                 f.write(f'build {obj}: {rule}_giant {src}\n  pool = giant\n' if obj in giants else
                         f'build {obj}: {rule}_gated {src}\n')
-        cmd = [sys.executable, HEAVY, '--prio', prio, '--', sys.executable, os.path.abspath(__file__), '_ninja', kdir,
-               f'auto{jobs}', 'objs.ninja']
-        rc = subprocess.call(cmd)
-        if rc:
-            # once more for what failed (ninja keeps what built): 2026-10-23, one TU of 1167 failed with clang's
-            # "unable to rename temporary....o.tmp to output file: no such file or directory" (the.tmp was there)
-            log('game objects: ninja failed, once more for the TUs that did not build')
-            rc = subprocess.call(cmd)
+        rc, ladder = 0, retry_jobs(jobs)
+        for i, j in enumerate(ladder):
+            if i:
+                # what failed, again with fewer at once (ninja keeps what built): a PC short of memory fails compiles
+                # when many run together (16 GB PCs: the rival's #17 / #28 / #66), and 2026-10-23 one TU of 1167
+                # failed with clang's "unable to rename temporary....o.tmp" (the.tmp was there)
+                log(f'game objects: some compiles failed; again with fewer at once ({ladder[i - 1]} -> {j}): on a PC '
+                    'short of memory compiles fail when many run together')
+                retry_pools(os.path.join(kdir, 'objs.ninja'), j)
+            rc = subprocess.call([sys.executable, HEAVY, '--prio', prio, '--', sys.executable, os.path.abspath(__file__),
+                                  '_ninja', kdir, f'auto{j}', 'objs.ninja'])
+            if not rc:
+                break
     stored = 0
     for obj, src, rule, oid in todo:
         o = os.path.join(kdir, obj)
@@ -1032,8 +1169,14 @@ def objects(kdir, jobs, prio, cache):
                 os.link(o, c); stored += 1
             except FileExistsError:
                 pass
+            except OSError as e:
+                # (a drive without hard links: a copy per object would double the ~11 GB of objects, so no cache)
+                log(f'game objects: no object cache on this drive ({e.strerror}: no hard links, exFAT / FAT32?); '
+                    'a later build compiles again')
+                break
     if rc:
-        sys.exit(f'game objects: ninja failed ({rc}); {stored} objects that did build are in the cache')
+        sys.exit(f'game objects: ninja failed ({rc}) even {ladder[-1]} compile(s) at a time (the lines above name the '
+                 f'one that failed); {stored} objects that did build are in the cache, so a new run picks up from there')
     return {'tus': len(edges), 'cached': hits, 'compiled': len(todo), 'minutes': round((time.time() - t0) / 60, 1)}
 
 
@@ -1096,8 +1239,7 @@ def cmd_game(a):
                     bkey, _ = key_of(images(None), TOOLS)
                     bdir = os.path.join(SIG, 'game', bkey)
                     if json.load(open(os.path.join(bdir, 'manifest.json'))).get('objs_done') if os.path.exists(os.path.join(bdir, 'manifest.json')) else False:
-                        log(f'patched key: hard-linking the base key {bkey} (only changed TUs recompile)')
-                        clone_links(bdir, kdir)
+                        clone_base(bdir, kdir)
                 twin = None if os.environ.get('NXR_GEN_TWIN') == '0' else gen_twin(parts, kdir)
                 if twin:
                     t0 = time.time()
@@ -1164,6 +1306,8 @@ def cmd_ninja(kdir, jobs, file='build.ninja', stop=None):
     # the game objects' measured-boot limit (commitgate.py --excl) loosens EXCL_BOUND_MIN after ninja starts, for the
     # whole build (per compile, boots back to back would hold each new compile its own bound)
     env = dict(build_env(), NXR_COMMITGATE_EXCL_UNTIL=str(time.time() + 60 * EXCL_BOUND_MIN))
+    if SOLO:   # one person's PC: a compile short of commit waits SOLO_GATE_MIN, then runs (objects() retries failures)
+        env.update(NXR_COMMITGATE_GO_ON='1', NXR_COMMITGATE_MAX_MIN=str(SOLO_GATE_MIN))
     rc = subprocess.call([NINJA, '-C', kdir, '-f', file, f'-j{jobs}'] + ([] if stop else ['-k', '0']), env=env)
     sys.exit(rc)
 
@@ -1185,6 +1329,10 @@ def small_link(out, pdb, mapfile, variant={}, rt_lto=False, root=None):
         rule = rule.replace(' -Wl,/DEBUG', ' -Wl,/OPT:NOREF -Wl,/OPT:NOICF')
     if not mapfile:
         rule = rule.replace(' -Wl,/MAP:$out.map', '')
+    # /Brepro: the exe's header timestamp is a hash of its contents, not the link time, so the same objects always link
+    # to the same bytes: an update that reused cached objects can be checked against a fresh build by the exe's hash
+    # (setup-speed, the v0.1.8 gate). A link flag only: no object, no key changes
+    rule = rule.replace(' -fuse-ld=lld', ' -fuse-ld=lld -Wl,/Brepro', 1)
     # The runtime's C++ with _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR, here in the relink's own build.ninja (its game
     # objects are prebuilt, so cxxflags is the runtime's alone; mkninja_win.py's lines join the key through gen_rule):
     # since MSVC 14.40 std::mutex's constexpr constructor needs that STL's msvcp140.dll, and a player's older one
@@ -1321,10 +1469,22 @@ def runtime_build(root, out, kdir, jobs, pdb=False, mapfile=False, rt_lto=False)
          '--gen', os.path.join(kdir, 'gen', 'main'), '--obj', os.path.join(kdir, 'obj'), '--out', out, '--vcpkg', VCPKG, *RT_ARGS])
     run_from = small_link(out, pdb, mapfile, json.loads(man['parts'].get('variant', '{}')), rt_lto, root)
     t0 = time.time()
-    # through heavy.py: 6 runtime compiles (~0.6 GB each) and lld (~1.2 GB)
-    run([sys.executable, HEAVY, '--prio', os.environ.get('NXR_HEAVY_PRIO', 'normal'), '--', sys.executable,
-         os.path.abspath(__file__), '_ninja', run_from or out, str(jobs),
-         os.path.join(os.path.abspath(out), 'build.ninja') if run_from else 'build.ninja', 'stop'])
+    # through heavy.py: 6 runtime compiles (~0.6 GB each) and lld (~1.2 GB); a failure (memory: see objects()) again
+    # with fewer at once, down to one
+    ladder = retry_jobs(jobs)
+    for i, j in enumerate(ladder):
+        if i:
+            log(f'runtime + link: it failed; again with fewer compiles at once ({ladder[i - 1]} -> {j}): on a PC short '
+                'of memory compiles fail when many run together')
+        try:
+            run([sys.executable, HEAVY, '--prio', os.environ.get('NXR_HEAVY_PRIO', 'normal'), '--', sys.executable,
+                 os.path.abspath(__file__), '_ninja', run_from or out, str(j),
+                 os.path.join(os.path.abspath(out), 'build.ninja') if run_from else 'build.ninja', 'stop'])
+            break
+        except subprocess.CalledProcessError as e:
+            if i == len(ladder) - 1:
+                sys.exit(f'runtime + link: failed ({e.returncode}) even {j} compile(s) at a time; the lines above name '
+                         'the step that failed')
     log(f'runtime + link: {time.time() - t0:.0f} s -> {os.path.join(out, "totk.exe")}')
     # what this exe was built from, next to it: the key manifest's src is the snapshot its game objects were generated
     # from and stays so (canary_engine.py reads that rt.h); a runtime-only relink from a newer tree would otherwise be
@@ -1395,14 +1555,45 @@ def cmd_overlay(a):
         sys.exit(f'{out} is in use ({e}): {out}.pc is built; run again with no game running (heavy.py --pool gpu --exclusive)')
     os.rename(out + '.pc', out)
     shutil.rmtree(out + '.old', ignore_errors=True)
-    def aspect(size):
-        aspect_overlay(out, size)
-        if os.path.isdir(f'{out}-aspect-{size}'):   # (aspect_overlay logs its own failure and leaves no dir)
-            glyph_bank(f'{out}-aspect-{size}', f'engine+glyphs@aspect-{size}')
+    wanted = aspect_sets_wanted()
+    for size in ASPECT_SETS:   # (a shape not wanted: an earlier build's copy goes, it holds an older overlay)
+        if size not in wanted:
+            drop_aspect_overlay(f'{out}-aspect-{size}', size)
     with ThreadPoolExecutor(3) as ex:   # (the 16:9 bank and each aspect overlay + its bank: different dirs)
-        for f in [ex.submit(glyph_bank, out)] + [ex.submit(aspect, size) for size in ('3440x1440', '5120x1440')]:
+        for f in [ex.submit(glyph_bank, out)] + [ex.submit(aspect_with_bank, out, size) for size in wanted]:
             f.result()
     open(os.path.join(SIG, 'overlay', 'DONE'), 'w').close()
+
+
+def aspect_with_bank(out, size):
+    aspect_overlay(out, size)
+    if os.path.isdir(f'{out}-aspect-{size}'):   # (aspect_overlay logs its own failure and leaves no dir)
+        glyph_bank(f'{out}-aspect-{size}', f'engine+glyphs@aspect-{size}')
+
+
+def aspect_sets_wanted():
+    """the aspect overlays to build: NXR_ASPECT_SETS (the Builder's: the monitors' shapes and those built on demand,
+    tools/engine/aspect_sets.py; "" none), else every one of ASPECT_SETS"""
+    e = os.environ.get('NXR_ASPECT_SETS')
+    return list(ASPECT_SETS) if e is None else [s for s in e.split(',') if s]
+
+
+def cmd_overlay_aspect(a):
+    """`build.py overlay-aspect --set <size>[-center]`: one shape's aspect overlay and its glyph bank, beside the engine
+    overlay a full `build.py overlay` made (a shape picked in the game, built on demand: tools/engine/aspect_sets.py)"""
+    out = os.path.join(SIG, 'overlay', 'romfs')
+    if not os.path.exists(os.path.join(SIG, 'overlay', 'DONE')):
+        sys.exit(f'{out}: no engine overlay yet (build.py overlay)')
+    aspect_with_bank(out, a.set)
+    if not os.path.isdir(f'{out}-aspect-{a.set}'):
+        sys.exit(f'{out}-aspect-{a.set} not built (above)')
+
+
+# The aspect overlays (romfs-aspect-<set>) the game can ask for: 21:9 and 32:9, each with the HUD at the screen's edges
+# and in the middle 16:9 (-center, graphics.hud_layout; totk_engine.c overlay_sets), and 16:10 (any 16:10 canvas uses
+# 2560x1600's layouts: totk_patches.c totk_layout_set). Every one by default; a Builder install only those of its monitors'
+# shapes and those built on demand (NXR_ASPECT_SETS, tools/engine/aspect_sets.py; `overlay-aspect` builds one more)
+ASPECT_SETS = ('3440x1440', '5120x1440', '3440x1440-center', '5120x1440-center', '2560x1600')
 
 
 def aspect_overlay(romfs, size):
@@ -1415,7 +1606,8 @@ def aspect_overlay(romfs, size):
     dst = f'{romfs}-{name}'
     if not os.path.isdir(os.path.join(sets, name)):
         log(f'WARNING: {dst} not built: no {name} set in {sets} (python -m games.totk.overlays --romfs '
-            f'{os.path.dirname(ROMFS)} --out {sets} --aspects {size}); a {size} window keeps the game\'s 16:9')
+            f'{os.path.dirname(ROMFS)} --out {sets} --aspects {size.split("-")[0]}'
+            f'{" --hud center" if size.endswith("-center") else ""}); a {size} window keeps the game\'s 16:9')
         drop_aspect_overlay(dst, size)
         return
     shutil.rmtree(dst + '.pc', ignore_errors=True)
@@ -1480,7 +1672,7 @@ def glyph_bank(overlay, name='engine+glyphs'):
 def glyph_banks(romfs):
     """`build.py glyphs`: the 16:9 overlay's bank and each aspect overlay's that exists"""
     glyph_bank(romfs)
-    for size in ('3440x1440', '5120x1440'):
+    for size in dict.fromkeys([*ASPECT_SETS, *aspect_sets_wanted()]):
         if os.path.isdir(f'{romfs}-aspect-{size}'):
             glyph_bank(f'{romfs}-aspect-{size}', f'engine+glyphs@aspect-{size}')
 
@@ -1571,6 +1763,7 @@ def main():
     split_args(r); debug_args(r)
     o = sub.add_parser('overlay'); o.add_argument('--force', action='store_true')
     sub.add_parser('glyphs')
+    o = sub.add_parser('overlay-aspect'); o.add_argument('--set', required=True, help='<w>x<h>[-center]')
     k = sub.add_parser('key'); k.add_argument('--patches'); k.add_argument('--root')
     split_args(k)
     a = ap.parse_args()
@@ -1597,7 +1790,7 @@ def main():
         VARIANT['pgo_rt'] = 1
     if HOT and not SPLIT:
         sys.exit('--hot needs --split')
-    {'game': cmd_game, 'runtime': cmd_runtime, 'overlay': cmd_overlay, 'key': cmd_key,
+    {'game': cmd_game, 'runtime': cmd_runtime, 'overlay': cmd_overlay, 'key': cmd_key, 'overlay-aspect': cmd_overlay_aspect,
      'glyphs': lambda a: glyph_banks(os.path.join(SIG, 'overlay', 'romfs'))}[a.cmd](a)
 
 

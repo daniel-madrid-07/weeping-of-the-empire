@@ -5,6 +5,7 @@ Port of MacNativeGames `games/totk/scripts/extract_romfs.py` (MIT). Differences:
 name and renamed only after every IVFC level verified, and `unpack()` can lay the files out as a directory tree.
 """
 import hashlib
+import io
 import os
 import queue
 import struct
@@ -13,6 +14,7 @@ from pathlib import Path
 
 from .common import MiB, read_at, require
 from .container import FS_ROMFS
+from .romsource import image_size, open_image
 
 CHUNK = 8 * MiB
 NO_ENTRY = 0xFFFFFFFF
@@ -63,27 +65,69 @@ def _chunks(section, offset, size, depth=4):
                 thread.join(0.05)
 
 
-def extract_image(section, image_path, log=print):
-    """Verify all six IVFC levels and write level 5 (the RomFS image) to `image_path`.
+def _good_prefix(image, have, size, block, parent, digest):
+    """How much of a .partial a stopped run left is good: the whole blocks from its start that match their level-4
+    hashes, read back from the disk (no dump read, no decryption); `digest` takes them in. A block cut off mid-write,
+    or a file from another dump (its first block fails), is written again from there."""
+    have = min(have, size)
+    if have < size:
+        have -= have % block
+    image.seek(0)
+    pos = 0
+    while pos < have:
+        data = image.read(min(CHUNK, have - pos))
+        if not data:
+            break
+        view = memoryview(data)
+        for j in range(0, len(data), block):
+            payload = view[j:j + block]
+            h = hashlib.sha256(payload)
+            if len(payload) < block:
+                h.update(bytes(block - len(payload)))
+            i = (pos + j) // block
+            if h.digest() != parent[i * 32:i * 32 + 32]:
+                digest.update(view[:j])
+                return pos + j
+        digest.update(data)
+        pos += len(data)
+    return pos
 
-    Returns dict(romfs_size, romfs_sha256, ivfc_blocks). Hash levels 0-4 stay in memory (tens of MB for TotK).
+
+def extract_image(section, image_path, log=print):
+    """Verify all six IVFC levels and write level 5 (the RomFS image) to `image_path` (None: verify and hash only, the
+    image stays in the dump: romsource.py).
+
+    Returns dict(romfs_size, romfs_sha256, ivfc_blocks, image_offset: level 5's offset in the section). Hash levels 0-4
+    stay in memory (tens of MB for TotK). A `.partial` left by a stopped run (Setup closed during step 1) is resumed:
+    its good blocks are kept (_good_prefix) and the image goes on from the first missing one, instead of reading and
+    decrypting 17 GB again.
     """
     fs = section.fs
     levels = ivfc_levels(fs)
-    image_path = Path(image_path)
-    tmp = image_path.with_name(image_path.name + '.partial')
+    tmp, have = None, 0
+    if image_path is not None:
+        image_path = Path(image_path)
+        tmp = image_path.with_name(image_path.name + '.partial')
+        have = tmp.stat().st_size if tmp.exists() else 0
     digest = hashlib.sha256()
     counts = []
     parent = fs[0xc8:0xe8]  # master hash
-    with open(tmp, 'wb') as image:
+    with (open(tmp, 'r+b' if have else 'wb') if tmp else io.BytesIO()) as image:
         for level, (offset, size, power, reserved) in enumerate(levels):
             require(12 <= power <= 24 and reserved == 0, 'IVFC block size')
             block = 1 << power
             require(len(parent) >= (size + block - 1) // block * 32, 'IVFC parent size')
             captured = bytearray() if level < 5 else None
-            index = 0
-            done = 0
-            for chunk in _chunks(section, offset, size):
+            start = 0
+            if level == 5 and have:
+                start = _good_prefix(image, have, size, block, parent, digest)
+                image.seek(start)
+                image.truncate()
+                log(f'  romfs: resuming a stopped run at {start / (1024 * MiB):.1f} / {size / (1024 * MiB):.1f} GiB '
+                    '(what it had written checked)')
+            index = start // block
+            done = start
+            for chunk in _chunks(section, offset + start, size - start):
                 view = memoryview(chunk)
                 for j in range(0, len(chunk), block):
                     payload = view[j:j + block]
@@ -95,7 +139,8 @@ def extract_image(section, image_path, log=print):
                 if captured is not None:
                     captured.extend(chunk)
                 else:
-                    image.write(chunk)
+                    if tmp:
+                        image.write(chunk)
                     digest.update(chunk)
                 done += len(chunk)
                 if level == 5 and done % (1024 * MiB) < CHUNK:
@@ -104,15 +149,16 @@ def extract_image(section, image_path, log=print):
             if captured is not None:
                 parent = bytes(captured)
             log(f'  IVFC level {level}: {index} blocks verified')
-    os.replace(tmp, image_path)
-    return dict(romfs_size=levels[-1][1], romfs_sha256=digest.hexdigest(), ivfc_blocks=counts)
+    if tmp:
+        os.replace(tmp, image_path)
+    return dict(romfs_size=levels[-1][1], romfs_sha256=digest.hexdigest(), ivfc_blocks=counts, image_offset=levels[-1][0])
 
 
 def index_romfs(path):
-    """List every file of a RomFS image: [{'path', 'offset', 'size'}] sorted by path; offsets are image-absolute."""
-    path = Path(path)
-    with path.open('rb') as f:
-        return _index(f, path.stat().st_size)
+    """List every file of a RomFS image (romfs.bin, or a romfs-source.txt): [{'path', 'offset', 'size'}] sorted by
+    path; offsets are image-absolute."""
+    with open_image(path) as f:
+        return _index(f, image_size(path))
 
 
 def _index(f, length):
@@ -164,7 +210,7 @@ def unpack(image_path, files, out_dir, log=print):
     """Copy every indexed file out of the image into `out_dir/<path>`. Skips files already present at full size."""
     out_dir = Path(out_dir)
     total = 0
-    with open(image_path, 'rb') as f:
+    with open_image(image_path) as f:
         for n, entry in enumerate(files):
             target = out_dir / entry['path']
             require(out_dir in target.parents, 'Unsafe path')
@@ -196,7 +242,7 @@ class RomFS:
 
     def read(self, path):
         entry = self.files[path]
-        with open(self.path, 'rb') as f:
+        with open_image(self.path) as f:
             f.seek(entry['offset'])
             data = f.read(entry['size'])
         require(len(data) == entry['size'], 'Truncated RomFS image')

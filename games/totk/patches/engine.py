@@ -161,16 +161,23 @@ def build_patch_set(table, features, lay, safe=()):
 # vk_guard's guard reads virtual key 27, which only hook_f_1ccf894 (engine/runtime/totk_pc_vk.cpp) sets from the pad.
 # build.py refuses a patch set whose hooks are not all in GEN_MAIN.
 HOOKS_NEEDED = {'vk_guard': ('1ccf894',)}
+# ... and the struct fields its hook needs to do its part, for another version (engine-map's fields_known): vk_guard
+# moves guard to VK 27, which only the key hook's mirror sets (the pad's VK 2 copied), and the mirror writes through
+# the node's trigger / hold / release mask pointers: without them the pad's ZL could not guard
+FIELDS_NEEDED = {'vk_guard': ('ExecutePlayerCalcKey+0x28', 'ExecutePlayerCalcKey+0x38', 'ExecutePlayerCalcKey+0x48')}
 # Features `default` means here on top of the table's defaults: they need an engine hook, so the generic `apply` path
 # (no hooks) leaves them off. `-name` after `default` still drops one.
 ENGINE_DEFAULT = ('vk_guard',)
 
 
-def engine_spec(spec, known=None):
+def engine_spec(spec, known=None, kept=None, fields=None):
     """--features for the engine: each `default` also selects ENGINE_DEFAULT (those of them the table has, `known`:
-    another version's table may lack them)."""
+    another version's table may lack them; and, for another version, only those whose HOOKS_NEEDED its engine map kept,
+    `kept`: kept_hooks)."""
     items = [s.strip() for s in (spec or 'default').split(',') if s.strip()]
-    extra = [f for f in ENGINE_DEFAULT if known is None or f in known]
+    extra = [f for f in ENGINE_DEFAULT if (known is None or f in known)
+             and (kept is None or set(HOOKS_NEEDED.get(f, ())) <= kept)
+             and (fields is None or set(FIELDS_NEEDED.get(f, ())) <= fields)]
     return ','.join(x for s in items for x in ([s, *extra] if s == 'default' else [s]))
 
 
@@ -186,6 +193,35 @@ def runtime_env(features, safe=()):
         env.update(TOTK_LOAD_FPS='0', TOTK_TITLE_FPS='0', TOTK_FPS='30', TOTK_UNLOCK_FPS='0')   # (the runtime holds
         # them too, over settings.ini: build.py compiles it with -DTOTK_CAP30)
     return env
+
+
+def known_fields(table_path, table):
+    """Another game version's known struct fields ('Struct+0x..') from its engine map; None for 1.0.0 (all known)."""
+    from pathlib import Path
+    if table['game']['version'] == '1.0.0':
+        return None
+    eng = Path(table_path).with_name(Path(table_path).stem + '.engine.json')
+    if not eng.exists():
+        raise EngineError(f'{eng} is missing (python -m games.totk.patches engine-map)')
+    import json
+    return set(json.loads(eng.read_text(encoding='utf-8')).get('fields_known', []))
+
+
+def kept_hooks(table_path, table):
+    """Another game version's hooked functions by their 1.0.0 names, from its engine map (hook + alias); None for
+    1.0.0 (GEN_MAIN's own list, build.py)."""
+    from pathlib import Path
+    if table['game']['version'] == '1.0.0':
+        return None
+    eng = Path(table_path).with_name(Path(table_path).stem + '.engine.json')
+    if not eng.exists():
+        raise EngineError(f'{eng} is missing (python -m games.totk.patches engine-map)')
+    import json
+    e = json.loads(eng.read_text(encoding='utf-8'))
+    lost = [h for h in e.get('hook', []) if h not in e.get('alias', {})]
+    if lost:   # (engine_map aliases every hooked function: one without would turn its feature off unsaid)
+        raise EngineError(f'{eng}: hooks without an alias (their 1.0.0 name): {", ".join(lost)}')
+    return {e['alias'][h][2:] for h in e.get('hook', [])}
 
 
 def safe_mode(table_path, table):

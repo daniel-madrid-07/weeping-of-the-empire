@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>   // (shim_host_line's thread count)
+#include <winternl.h>   // (NTSTATUS for d3dkmthk.h)
+#include <d3dkmthk.h>   // (shim_adapter_vram: D3DKMTQueryStatistics)
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_win32.h>
@@ -13,6 +15,7 @@
 #include <stdint.h>
 
 #include "../shim/las.h"
+#include "../../host_wine.h"
 #include "../../pc.h"
 #include "../../pc_overlay.h"
 #include "../../pc_settings.h"        // display.last_monitor / display.window_pos: where the game was played last
@@ -274,11 +277,48 @@ void *shim_window_hwnd(void) { return g_win.hwnd; }   // (hle_vi.cpp: the monito
 // every thread on the host (6,940 here, milliseconds), so it runs every 10 s on a thread of its own at the lowest
 // priority and the line prints the last count ("threads -" until the first one).
 static volatile LONG g_thread_count = -1;
+// The same thread sums the process heap (HeapSummary of GetProcessHeap: every malloc of ours and of the drivers' CRTs
+// lands there), for the [hostmem] line (amd-compat, #25 / #23): with the driver's counted allocations (device.c
+// vk_driver_mem_line) and our device memory ([vram]), what is left of the commit is VirtualAlloc (the guest's memory,
+// the drivers' own mappings). It takes the heap's lock, so not on the present thread. (Only the default heap: another
+// heap may be HEAP_NO_SERIALIZE, unsafe to read from this thread.) The lock is held at normal priority: preempted at
+// LOWEST while holding it, under cores saturated by the below-normal compile workers, every malloc of the process would
+// wait for Windows' starvation boost (seconds). But HeapSummary walks the whole heap under that lock: on the gate's 0.9
+// GB heap every malloc / free of the game, the HLE and the drivers waited, game-side 45-82 ms frames every 10.16 s. So
+// it is opt-in: LARECOMP_HEAP_SUMMARY=1 (a memory diagnosis asked of a player, never a timed run); unset, the line says
+// it was not read. LARECOMP_VK_ALLOC_COUNT=0: not either.
+static volatile LONG64 g_heap_committed = -1, g_heap_allocated;
+static int heaps_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_VK_ALLOC_COUNT"), *h = getenv("LARECOMP_HEAP_SUMMARY");
+        on = (!e || strcmp(e, "0") != 0) && h && *h && strcmp(h, "0") != 0;
+    }
+    return on;
+}
+static void heaps_sum(void) {
+    if (!heaps_on()) return;
+    HEAP_SUMMARY s = {.cb = sizeof s};
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+    const BOOL ok = HeapSummary(GetProcessHeap(), 0, &s);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    if (!ok) return;
+    InterlockedExchange64(&g_heap_allocated, (LONG64)s.cbAllocated);
+    InterlockedExchange64(&g_heap_committed, (LONG64)s.cbCommitted);
+}
+// "process heap X MB committed (Y MB allocated)" ("process heap -" until the first sum)
+void shim_heap_line(char *out, size_t n) {
+    const LONG64 com = InterlockedCompareExchange64(&g_heap_committed, 0, 0), all = InterlockedCompareExchange64(&g_heap_allocated, 0, 0);
+    if (!heaps_on()) snprintf(out, n, "process heap not read (LARECOMP_HEAP_SUMMARY=1 reads it)");
+    else if (com < 0) snprintf(out, n, "process heap -");
+    else snprintf(out, n, "process heap %.0f MB committed (%.0f MB allocated)", com / 1048576.0, all / 1048576.0);
+}
 static DWORD WINAPI thread_count_loop(LPVOID arg) {
     (void)arg;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
     const DWORD me = GetCurrentProcessId();
     for (;;) {
+        heaps_sum();
         HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (s != INVALID_HANDLE_VALUE) {
             THREADENTRY32 te = {.dwSize = sizeof te};
@@ -324,8 +364,36 @@ uint64_t shim_proc_commit(void) {
     GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pc, sizeof pc);
     return pc.PrivateUsage;
 }
+// Wine / Proton (setup-clean, after a Reddit report of Setup compiling at 9-10 % CPU there): GlobalMemoryStatusEx's free
+// commit is Linux's MemFree + SwapFree, and Linux keeps free RAM as page cache, so a big PC reads ~1 GB free and the
+// compile gate ran every build one at a time (the prepare and the first-sight compiles). Under Wine (ntdll exports
+// wine_get_version) the figures come from Linux itself, Z:\proc\meminfo: RAM free = MemAvailable, commit headroom =
+// MemAvailable + SwapFree of MemTotal + SwapTotal (Linux overcommits; that is what can still be backed). As heavy.py /
+// commitgate since eccbaabc. false: not Wine, or the file unreadable (the Windows figures then).
+static bool wine_mem(uint64_t *commit_avail, uint64_t *commit_limit, uint64_t *ram_avail, uint64_t *ram_total) {
+    if (!host_is_wine()) return false;
+    FILE *f = fopen("Z:\\proc\\meminfo", "r");
+    if (!f) return false;
+    unsigned long long total = 0, avail = 0, stotal = 0, sfree = 0, v;
+    char line[128], key[64];
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "%63[^:]: %llu", key, &v) == 2) {
+            if (!strcmp(key, "MemTotal")) total = v;
+            else if (!strcmp(key, "MemAvailable")) avail = v;
+            else if (!strcmp(key, "SwapTotal")) stotal = v;
+            else if (!strcmp(key, "SwapFree")) sfree = v;
+        }
+    fclose(f);
+    if (!total || !avail) return false;
+    *ram_total = total << 10;
+    *ram_avail = avail << 10;
+    *commit_limit = (total + stotal) << 10;
+    *commit_avail = (avail + sfree) << 10;
+    return true;
+}
 // exec.c's compile gate: commit headroom / limit and free / total RAM
 void shim_mem_room(uint64_t *commit_avail, uint64_t *commit_limit, uint64_t *ram_avail, uint64_t *ram_total) {
+    if (wine_mem(commit_avail, commit_limit, ram_avail, ram_total)) return;
     MEMORYSTATUSEX ms = {sizeof ms};
     GlobalMemoryStatusEx(&ms);
     *commit_avail = ms.ullAvailPageFile;
@@ -335,14 +403,99 @@ void shim_mem_room(uint64_t *commit_avail, uint64_t *commit_limit, uint64_t *ram
 }
 // textures.c VRAM residency: the system's commit headroom (bytes before the commit limit) and the limit
 void shim_commit_room(uint64_t *avail, uint64_t *limit) {
+    uint64_t ra, rt;
+    if (wine_mem(avail, limit, &ra, &rt)) return;
     MEMORYSTATUSEX ms = {sizeof ms};
     GlobalMemoryStatusEx(&ms);
     *avail = ms.ullAvailPageFile;
     *limit = ms.ullTotalPageFile;
 }
 
+// textures.c VRAM residency (vram-fit): device-local memory resident on the adapter for every process (the non-aperture
+// segments' BytesResident, Task Manager's "dedicated GPU memory") and those segments' size, by the adapter's LUID
+// (VkPhysicalDeviceIDProperties); and this process's local usage and the bytes of it the video memory manager demoted
+// (moved to system memory for lack of room: real contention). D3DKMTQueryStatistics from gdi32, as hle_vi.cpp's vblank
+// wait takes its D3DKMT calls. false: not available (the caller keeps the OS budget alone).
+bool shim_adapter_vram(const uint8_t luid[8], uint64_t *resident, uint64_t *size, uint64_t *ours, uint64_t *demoted) {
+    typedef NTSTATUS(APIENTRY * PFN_QS)(const D3DKMT_QUERYSTATISTICS *);
+    static PFN_QS qs;
+    static int tried;
+    if (!tried++) {
+        HMODULE g = GetModuleHandleA("gdi32.dll");
+        if (!g) g = LoadLibraryA("gdi32.dll");
+        qs = g ? (PFN_QS)GetProcAddress(g, "D3DKMTQueryStatistics") : NULL;
+    }
+    if (!qs) return false;
+    static D3DKMT_QUERYSTATISTICS q;   // (several KB: not on the render thread's stack)
+    memset(&q, 0, sizeof q);
+    q.Type = D3DKMT_QUERYSTATISTICS_ADAPTER;
+    memcpy(&q.AdapterLuid, luid, sizeof q.AdapterLuid);
+    if (qs(&q) < 0) return false;
+    const ULONG nseg = q.QueryResult.AdapterInformation.NbSegments;
+    uint64_t res = 0, sz = 0;
+    for (ULONG s = 0; s < nseg && s < 64; s++) {
+        memset(&q, 0, sizeof q);
+        q.Type = D3DKMT_QUERYSTATISTICS_SEGMENT;
+        memcpy(&q.AdapterLuid, luid, sizeof q.AdapterLuid);
+        q.QuerySegment.SegmentId = s;
+        if (qs(&q) < 0) return false;
+        const D3DKMT_QUERYSTATISTICS_SEGMENT_INFORMATION *si = &q.QueryResult.SegmentInformation;
+        if (si->Aperture) continue;   // (system memory the GPU maps)
+        res += si->BytesResident;
+        sz += si->CommitLimit;
+    }
+    if (!sz) return false;
+    memset(&q, 0, sizeof q);
+    q.Type = D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP;
+    memcpy(&q.AdapterLuid, luid, sizeof q.AdapterLuid);
+    q.hProcess = GetCurrentProcess();
+    q.QueryProcessSegmentGroup = D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL;
+    if (qs(&q) < 0) return false;
+    const D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP_INFORMATION *g = &q.QueryResult.ProcessSegmentGroupInformation;
+    uint64_t dem = 0;
+    for (int i = 0; i < D3DKMT_QUERYSTATISTICS_ALLOCATION_PRIORITY_CLASS_MAX; i++) dem += g->Demoted[i];
+    *resident = res;
+    *size = sz;
+    *ours = g->Usage;
+    *demoted = dem;
+    return true;
+}
+
 // device.c's pipeline-cache file: src over dst in one step (0 = done), and the tmp files of killed boots
 int shim_file_replace(const char *src, const char *dst) { return MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING) ? 0 : -1; }
+// A new file of `size` bytes (replaced if it exists), mapped read-write (device.c's pipeline cache save, ram-diet): the
+// pages are the file's, not the pagefile's, so a 0.3-2.6 GB save takes no commit charge. NULL: no file or no mapping
+// (the disk is full: the clusters are allocated when the mapping sets the size), the caller writes through the heap.
+typedef struct { HANDLE f, m; } ShimFileMap;
+void *shim_file_map_new(const char *path, size_t size, void **handle) {
+    *handle = NULL;
+    ShimFileMap *fm = malloc(sizeof *fm);
+    if (!fm) return NULL;
+    fm->f = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fm->f == INVALID_HANDLE_VALUE) { free(fm); return NULL; }
+    fm->m = CreateFileMappingA(fm->f, NULL, PAGE_READWRITE, (DWORD)((uint64_t)size >> 32), (DWORD)size, NULL);
+    void *v = fm->m ? MapViewOfFile(fm->m, FILE_MAP_WRITE, 0, 0, size) : NULL;
+    if (!v) {
+        if (fm->m) CloseHandle(fm->m);
+        CloseHandle(fm->f);
+        DeleteFileA(path);
+        free(fm);
+        return NULL;
+    }
+    *handle = fm;
+    return v;
+}
+// Unmaps it and cuts the file to `keep` bytes (0 on success); the OS writes the dirty pages back in its own time
+int shim_file_map_done(void *view, void *handle, size_t keep) {
+    ShimFileMap *fm = handle;
+    BOOL ok = UnmapViewOfFile(view);   // (no FlushViewOfFile: the dirty pages are the OS's now, written as fclose's were)
+    CloseHandle(fm->m);
+    LARGE_INTEGER at = {.QuadPart = (LONGLONG)keep};
+    ok = SetFilePointerEx(fm->f, at, NULL, FILE_BEGIN) && SetEndOfFile(fm->f) && ok;
+    ok = CloseHandle(fm->f) && ok;
+    free(fm);
+    return ok ? 0 : -1;
+}
 void shim_remove_old_files(const char *pattern, int min_age_s) {
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
@@ -398,6 +551,8 @@ static void keep_awake(bool on) {
     cur = on;
     SetThreadExecutionState(on ? ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
 }
+
+#include "win_ime.h"   // (win_no_ime: no input method on the game window)
 
 void oe_focus_update(bool focused);   // hle_oe.cpp: TOTK_PAUSE_UNFOCUSED (review N20: from activation, not a poll)
 void hid_devices_changed(void);       // hle_hid.cpp: the pad readers look for pads at once (hot-plug)
@@ -611,6 +766,26 @@ SDL_Window *SDL_CreateWindow(const char *title, int w, int h, SDL_WindowFlags fl
     }
     RECT r = {0, 0, w, h};
     AdjustWindowRectExForDpi(&r, style, FALSE, 0, dpi);
+    {   // (a window larger than its monitor's work area, frame included: 1280 x 720 on a 1280 x 800 Steam Deck, 1600 x
+        // 900 on a 1366 x 768 laptop, is made smaller at the same aspect, so its frame and title bar stay on screen).
+        // Not in scripted boots (TOTK_PRESS / TOTK_CTL: a measured 3840 x 2160 window keeps its size on any monitor),
+        // nor with LARECOMP_WINDOW_FIT=0
+        const char *nofit = getenv("LARECOMP_WINDOW_FIT");
+        const bool fit_on = !getenv("TOTK_PRESS") && !getenv("TOTK_CTL") && !(nofit && !strcmp(nofit, "0"));
+        MONITORINFO wa = {sizeof wa};
+        HMONITOR fit = mon ? mon : MonitorFromPoint((POINT){0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        const int fw = (r.right - r.left) - w, fh = (r.bottom - r.top) - h;   // (the frame)
+        if (fit_on && fit && GetMonitorInfoW(fit, &wa) && w > 0 && h > 0) {
+            const int aw = wa.rcWork.right - wa.rcWork.left - fw, ah = wa.rcWork.bottom - wa.rcWork.top - fh;
+            if (aw >= 320 && ah >= 180 && (w > aw || h > ah)) {
+                const double k = (double)aw / w < (double)ah / h ? (double)aw / w : (double)ah / h;
+                w = (int)(w * k);
+                h = (int)(h * k);
+                r = (RECT){0, 0, w, h};
+                AdjustWindowRectExForDpi(&r, style, FALSE, 0, dpi);
+            }
+        }
+    }
     int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
     if (mon && have_pos) {   // (kept inside the work area: a size larger than last time must not hang off the edge)
         x = saved.x + (r.right - r.left) > mi.rcWork.right ? mi.rcWork.right - (r.right - r.left) : saved.x;
@@ -625,6 +800,7 @@ SDL_Window *SDL_CreateWindow(const char *title, int w, int h, SDL_WindowFlags fl
     MultiByteToWideChar(CP_UTF8, 0, title, -1, wt, 128);
     g_win.hwnd = CreateWindowExW(0, L"TotKRecomp", wt, style, x, y, r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
     if (!g_win.hwnd) { snprintf(g_err, sizeof g_err, "CreateWindowExW failed (%lu)", GetLastError()); return NULL; }
+    win_no_ime(g_win.hwnd);
     {   // (CW_USEDEFAULT may have put it on a monitor of another DPI: the client size again, in pixels)
         RECT c;
         UINT wd = GetDpiForWindow(g_win.hwnd);

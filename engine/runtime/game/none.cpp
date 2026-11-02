@@ -5,6 +5,7 @@
 // names stay TotK's for now; a rename to game_* is a separate, pure change.
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "../totk_ability.h"
 #include "../totk_input_cuts.h"
@@ -15,7 +16,12 @@
 
 using u64 = uint64_t;
 
+// totk_camera_speed.cpp: no pack rebuilt (hle_fs.cpp), the mouse keeps its multiplier (pc_mouse.cpp)
+bool totk_camera_pack_build(const std::vector<uint8_t>&, std::vector<uint8_t>*) { return false; }
+
 extern "C" {
+const char *totk_camera_pack_rel(void) { return nullptr; }
+float totk_camera_stick_applied(void) { return 1.0f; }
 // games/totk/engine/totk_engine.c (via nvn/totk_game_patches.c): boot, per-present step, extra pool memory
 void totk_engine_boot(u64) {}
 void totk_engine_present(void) {}
@@ -25,6 +31,8 @@ u64 totk_engine_extra_memory(void) { return 0; }
 void *totk_data_page_current(void) { return nullptr; }
 void *totk_main_base(void) { return nullptr; }
 void totk_frame_step_retarget(void) {}
+void totk_frame_step_hold(int) {}
+int totk_max_fps_highest(void) { return 240; }
 float totk_dynamic_res_current(void) { return 1.0f; }
 const TotkQualityPreset *totk_quality_presets(unsigned *count) { if (count) *count = 0; return nullptr; }
 // totk_aal_commands.cpp / totk_load_laps.cpp

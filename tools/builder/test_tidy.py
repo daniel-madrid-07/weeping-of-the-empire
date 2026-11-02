@@ -74,7 +74,7 @@ check('7 tmp emptied', os.listdir(os.path.join(eng, 'tmp')) == [])
 check('8 img / overlay / venv / pgo untouched', all(exists(eng, k, 'f') for k in ('img', 'overlay', 'venv', 'pgo')))
 check('9 freed bytes and a log line', freed > 0 and calls[-1].startswith('tidy: '), calls[-1])
 if os.name == 'nt':
-    check('10 the kept key\'s gen/ compressed (NTFS)', 'generated code compressed' in done and
+    check('10 the kept key\'s dir compressed (NTFS)', 'the build compressed' in done and
           tidy.tree_bytes(os.path.join(cur, 'gen')) < os.path.getsize(os.path.join(cur, 'gen', 'main', 't_1.cpp')),
           str(done))
 check('11 the plan is logged before it runs', any(m.startswith('tidy: removing ') for m in calls), str(calls[:3]))

@@ -84,18 +84,20 @@ int vk_present_frames_in_flight(void) { cfg_init(); return atomic_load(&g_fif); 
 
 static int g_hdr_mode;               // of the current swapchain
 static bool g_hdr_sup[3], g_fmts_known;
+static atomic_int g_hdr_meta_dirty;  // peak / paper changed since the swapchain's metadata was set
 void vk_present_set_hdr(int mode, float peak, float paper) {
     cfg_init();
     const float peak0 = g_hdr_peak, paper0 = g_hdr_paper;
     if (peak >= 80.0f && peak <= 10000.0f) g_hdr_peak = peak;
     if (paper >= 80.0f && paper <= 1000.0f) g_hdr_paper = paper;
     if (mode < VKP_HDR_OFF || mode > VKP_HDR_SCRGB) mode = VKP_HDR_OFF;
-    // (a new peak / paper white with HDR on: the encode reads them every frame, but the display's HDR metadata is set
-    // only with a new swapchain; without one it kept the start's values. LARECOMP_HDR_META_RECREATE=0: as before)
+    // (a new peak / paper white with HDR on: the encode reads them every frame, but the display's HDR metadata was set
+    // only with a new swapchain, so it kept the start's values. Now set again on the live swapchain before the next
+    // present: vk_present_hdr_encode. LARECOMP_HDR_META_LIVE=0: as before)
     static int meta_off = -1;
-    if (meta_off < 0) { const char *e = getenv("LARECOMP_HDR_META_RECREATE"); meta_off = e && *e == '0'; }
-    const bool meta = !meta_off && mode != VKP_HDR_OFF && g_hdr_mode != VKP_HDR_OFF && (g_hdr_peak != peak0 || g_hdr_paper != paper0);
-    if (atomic_exchange(&g_hdr_req, mode) != mode || meta) vk_request_swapchain_recreate();
+    if (meta_off < 0) { const char *e = getenv("LARECOMP_HDR_META_LIVE"); meta_off = e && *e == '0'; }
+    if (!meta_off && (g_hdr_peak != peak0 || g_hdr_paper != paper0)) atomic_store(&g_hdr_meta_dirty, 1);
+    if (atomic_exchange(&g_hdr_req, mode) != mode) vk_request_swapchain_recreate();
 }
 int vk_present_hdr_supported(int mode) {
     if (!g_fmts_known) return -1;
@@ -798,12 +800,14 @@ void vk_present_latency_sleep(void) {
     bool slept = false;
     AcquireSRWLockShared(&g_sc_life);
     VkSwapchainKHR sc = g_vk.swapchain;
-    if (sc && (sc != applied_sc || mode != applied)) {
+    // (frame generation turned on / off in game, ngx.c's live row: the ids a frame follow it, rebased like a mode change)
+    const int want_scale = vk_ngx_fg_on() ? LL_FG_IDS : 1;
+    if (sc && (sc != applied_sc || mode != applied || (mode && want_scale != atomic_load(&g_ll_scale)))) {
         VkLatencySleepModeInfoNV mi = {.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV, .lowLatencyMode = mode == 1 || mode == 2,
                                        .lowLatencyBoost = mode == 2, .minimumIntervalUs = 0};
         VkResult r = set_mode(g_vk.dev, sc, &mi);
-        if (mode && applied <= 0) {   // (ids above every one chained so far; LL_FG_IDS a frame with DLSS-G, vk_present_chain)
-            atomic_store(&g_ll_scale, vk_ngx_fg_on() ? LL_FG_IDS : 1);
+        if (mode && (applied <= 0 || want_scale != atomic_load(&g_ll_scale))) {   // (ids above every one chained so far; LL_FG_IDS a frame with DLSS-G, vk_present_chain)
+            atomic_store(&g_ll_scale, want_scale);
             atomic_store(&g_ll_base, g_last_id + 1);
         }
         if (mode != applied)
@@ -1095,6 +1099,7 @@ void vk_present_swapchain_retire(void) {
     }
 }
 
+static void hdr_meta_set(void);
 // The new swapchain's images and views are in g_vk. HDR: they move here, and g_vk gets the SDR canvas in every slot.
 void vk_present_swapchain_ready(VkSurfaceFormatKHR sf, int mode) {
     atomic_store(&g_mode_active, mode);
@@ -1126,14 +1131,21 @@ void vk_present_swapchain_ready(VkSurfaceFormatKHR sf, int mode) {
     VK_CHECK(vkCreateImageView(g_vk.dev, &vi, NULL, &g_canvas_view));
     for (uint32_t i = 0; i < 8; i++) { g_vk.sc_images[i] = g_canvas; g_vk.sc_views[i] = g_canvas_view; }
     g_vk.sc_format = VK_FORMAT_B8G8R8A8_UNORM;
-    if (p_hdr_meta) {   // mastering display = what the expansion aims at
-        VkHdrMetadataEXT md = {.sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT,
-                               .displayPrimaryRed = {0.708f, 0.292f}, .displayPrimaryGreen = {0.170f, 0.797f},
-                               .displayPrimaryBlue = {0.131f, 0.046f}, .whitePoint = {0.3127f, 0.3290f},
-                               .maxLuminance = g_hdr_peak, .minLuminance = 0.0f,
-                               .maxContentLightLevel = g_hdr_peak, .maxFrameAverageLightLevel = g_hdr_paper};
-        p_hdr_meta(g_vk.dev, 1, &g_vk.swapchain, &md);
-    }
+    atomic_store(&g_hdr_meta_dirty, 0);
+    hdr_meta_set();
+}
+// mastering display = what the expansion aims at (a new swapchain, or the live one after a peak / paper change, under
+// the swapchain lock: the FG present thread may be presenting it)
+static void hdr_meta_set(void) {
+    if (!p_hdr_meta) return;
+    VkHdrMetadataEXT md = {.sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT,
+                           .displayPrimaryRed = {0.708f, 0.292f}, .displayPrimaryGreen = {0.170f, 0.797f},
+                           .displayPrimaryBlue = {0.131f, 0.046f}, .whitePoint = {0.3127f, 0.3290f},
+                           .maxLuminance = g_hdr_peak, .minLuminance = 0.0f,
+                           .maxContentLightLevel = g_hdr_peak, .maxFrameAverageLightLevel = g_hdr_paper};
+    vk_swapchain_lock();
+    p_hdr_meta(g_vk.dev, 1, &g_vk.swapchain, &md);
+    vk_swapchain_unlock();
 }
 
 // ================================================================== HDR encode pass
@@ -1235,6 +1247,7 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
 // The canvas is in COLOR_ATTACHMENT_OPTIMAL, outside rendering.
 bool vk_present_hdr_encode(VkCommandBuffer cb, uint32_t image) {
     if (!g_hdr_mode || !g_canvas || image >= g_real_count) return false;
+    if (atomic_load(&g_hdr_meta_dirty) && atomic_exchange(&g_hdr_meta_dirty, 0)) hdr_meta_set();   // (before this frame's present)
     VkPipeline p = hdr_pipeline(g_real_fmt);
     VkImage dst = g_real_img[image];
     barrier(cb, g_canvas, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

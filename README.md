@@ -19,7 +19,7 @@ Most of the code was written by AI coding agents directed by one developer, who 
   <sub>Captured from the developer's own copy on a Ryzen 7 9800X3D + RTX 5080 (developer build): a 2560x1415 window, unlocked frame rate, the port's fps overlay at the top right.</sub>
 </p>
 
-- **Frame rate:** 30, 60, 90, 120 or unlocked, up to your monitor's refresh rate (240 fps at most), at the game's real speed.
+- **Frame rate:** 30 to 240 (40 and 45 for a PC that cannot hold 60, and the usual monitor rates 60, 75, 90, 120, 144, 165, 180, 200, 240) or unlocked, up to your monitor's refresh rate (240 fps at most), at the game's real speed.
 - **Measured on one PC only** (Ryzen 7 9800X3D + RTX 5080, developer build, 2560x1440 window, 2133x1200 render, one run per place): 116.2-119.7 fps average at the 120 cap, 159.1-178.4 unlocked. Builds made by Setup get a list of the developer build's shaders instead of its full shader cache (the difference is not measured), so expect the same or lower. [Full table, and what is not measured](#performance-measured).
 - **Display:** any resolution, ultrawide, borderless or exclusive fullscreen; VRR and HDR options (not measured); NVIDIA DLSS super resolution on RTX cards and DLSS frame generation on RTX 40 / 50 series (both optional), FSR 1, SMAA.
 - **Controls:** keyboard and mouse with PC prompts in the game; Xbox, PlayStation and Switch controllers; settings window in game (F10).
@@ -35,8 +35,8 @@ and send how it runs on your hardware, with the log, as a
 ## Install in 3 steps
 
 1. **Download** the Setup exe from the [latest release](https://github.com/daniel-madrid-07/weeping-of-the-empire/releases/latest) and run it (no administrator rights needed). Setup is not code-signed, so Windows SmartScreen may warn the first time. Its SHA-256 is in the release notes.
-2. **Drop in your files:** your dump of the game, version 1.0.0 (`.nsp` or `.xci`), and your `prod.keys`. Pick a folder on an NTFS drive with about 30 GB free and press **Install**.
-3. **Wait once, then play.** Setup downloads the tools it needs, an optimisation profile (made by running the game on the developer's PC: function names and how often their branches ran) and a list of the shaders the game used there (hashes and render states; see [LEGAL.md](LEGAL.md) for both), decrypts and recompiles the game on your PC, and puts a shortcut on your desktop. Setup's own estimate is 30 to 60 minutes. One full install of an earlier version took about 33 minutes on a 16-thread CPU with 62 GB of RAM while other work was running, and its folder peaked at about 39 GB. Installs now keep the game data as one 17 GB file instead of also unpacking a second 17 GB copy, so Setup asks for about 30 GB. Internet is needed during the install. If it stops, press Install again and it continues where it stopped.
+2. **Drop in your files:** your dump of the game, version 1.0.0 (`.nsp` or `.xci`), and your `prod.keys`. Pick a folder on an NTFS drive with about 15 GB free (Setup says if it needs more) and press **Install**.
+3. **Wait once, then play.** Setup downloads the tools it needs, an optimisation profile (made by running the game on the developer's PC: function names and how often their branches ran) and a list of the shaders the game used there (hashes and render states; see [LEGAL.md](LEGAL.md) for both), decrypts and recompiles the game on your PC, and puts a shortcut on your desktop. Setup's own estimate is 30 to 60 minutes. One full install of an earlier version took about 33 minutes on a 16-thread CPU with 62 GB of RAM while other work was running, and its folder peaked at about 39 GB. Since v0.1.8 the game reads its data straight from your dump instead of a 17 GB copy, so keep the dump where it is: if you move it, the game asks you to pick it again. With the dump on a USB, removable or network drive, or with **Copy the game files** ticked in Setup, the data is copied instead (17 GB more) and the dump can then go. An install from an earlier version keeps its copy; untick **Copy the game files** to free those 17 GB (the dump then has to stay). The install then holds a key made from your keys (see [LEGAL.md](LEGAL.md)): do not share the install folder. Internet is needed during the install. If it stops, press Install again and it continues where it stopped.
 
 Optional: your console's firmware, for its own Korean and Chinese fonts. Without it, Korean and Chinese text uses a
 Windows font for that language, or English on a Windows that has none.
@@ -81,7 +81,7 @@ numbers are welcome: use the
 
 | | |
 |---|---|
-| **Frame rate** | 30, 60, 90, 120 or unlocked (up to your monitor's refresh rate, 240 fps at most), with the game running at its real speed |
+| **Frame rate** | 30 to 240 (30, 40, 45, 60, 75, 90, 120, 144, 165, 180, 200, 240) or unlocked (up to your monitor's refresh rate, 240 fps at most), with the game running at its real speed |
 | **Display** | Any window size and render resolution, ultrawide, borderless or exclusive fullscreen, VRR, HDR |
 | **Upscaling** | NVIDIA DLSS super resolution on RTX cards and DLSS frame generation on RTX 40 / 50 series (both optional), FSR 1, SMAA |
 | **Controls** | Keyboard and mouse made for a PC, with keyboard and mouse glyphs in the game's prompts; Xbox, PlayStation and Switch controllers |
@@ -96,7 +96,8 @@ generation) are options.
 ## Status and known limits
 
 - Only version **1.0.0** of the game is supported.
-- **Windows 10 / 11** only. Linux and Steam Deck are not supported or tested.
+- Made for **Windows 10 / 11**. Linux and Steam Deck through Proton: experimental, not tested on Linux / Steam Deck
+  yet ([Linux and Steam Deck](#linux-and-steam-deck-proton-experimental)).
 - First visits can stutter while shaders are built (above).
 - One graphics device loss was seen during a fight on the developer's PC. It has not been reproduced in several
   long test runs and its cause is unknown. If the game closes with a device-loss error, please send the newest
@@ -107,6 +108,35 @@ generation) are options.
   them there, add `env.TOTK_OPTIONS_MENU=0` to the game folder's `player.txt`.
 - Setup is not code-signed, so Windows SmartScreen may warn the first time.
 
+## Linux and Steam Deck (Proton, experimental)
+
+**Experimental, not tested on Linux / Steam Deck yet; reports welcome** (a
+[GitHub issue](https://github.com/daniel-madrid-07/weeping-of-the-empire/issues/new?template=bug_report.yml) with
+`setup.log` from the install folder and the newest `logs\totk-*.log` from the game folder).
+
+Setup and the game are Windows programs; on Linux they run through Steam's Proton. Both notice Proton (or any Wine)
+by themselves and take their Linux paths.
+
+1. **Add Setup to Steam.** Download the Setup exe. In Steam (on a Steam Deck: in Desktop Mode) choose
+   *Games > Add a Non-Steam Game to My Library > Browse*, set the file type to all files and pick the Setup exe. In
+   that entry's *Properties > Compatibility*, tick *Force the use of a specific Steam Play compatibility tool* and pick
+   Proton 9.0 or newer, or Proton Experimental.
+2. **Install.** Start the entry. Your Linux folders are on drive `Z:` (your home is `Z:\home\<user>`, on a Steam Deck
+   `Z:\home\deck`): pick or drop your dump and `prod.keys` from there. The suggested folder is `WeepingOfTheEmpire` in
+   your Linux home; any folder on a Linux drive with about 15 GB free works, but not one on drive `C:` (that is the
+   entry's Proton prefix, which Steam deletes with the entry). Press **Install**. Proton runs the compilers through
+   Wine, so the build takes longer than on Windows; on a Steam Deck keep it plugged in.
+3. **Play.** When Setup says Done, press **Play**. To start the game straight from Steam from then on, put `--play`
+   in the same entry's *Properties > Launch Options*: Setup then starts the newest build and closes. Clear it to open
+   Setup again (an update, or Uninstall).
+
+Keep Setup and the game on that one entry: they then share one Proton prefix, where the game's saves and settings
+live (`steamapps/compatdata/<number>/pfx/drive_c/users/steamuser/AppData/Roaming/nxrecomp/TotK-engine` in your Steam
+folder) and where the game's automatic update finds Setup's choices. Back that folder up before you remove the entry.
+Under Wine the game does not place its threads on chosen cores (Wine does not apply Windows' CPU Sets) and does not
+track which game memory was written (that clashes with the Linux graphics drivers), so it spends a little more
+processor time per frame than on Windows. Setup puts no shortcut on the desktop there.
+
 ## Requirements
 
 - **Your own files:** the game, version 1.0.0 (`.nsp` or `.xci`, title `0100F2C0115B6000`) and your `prod.keys`;
@@ -116,7 +146,9 @@ generation) are options.
   by itself; a player confirmed it on a Pentium G4600 (no AVX); expect low fps on such processors.
   Reports welcome. Setup refuses processors without SSE4.2. **GPU** with a current Vulkan 1.3 driver.
 - **8 GB of RAM** (16 GB recommended: the build runs fewer compiles at once on less).
-- **About 40 GB free** on an NTFS drive, and an internet connection during the install.
+- **About 15 GB free** on an NTFS drive (the game's data stays in your dump: keep the dump where it is), about 30 GB
+  when Setup copies the data out of the dump (a dump on a USB drive, or the window's "Copy the game files"); and an
+  internet connection during the install.
 
 ## FAQ
 
@@ -146,11 +178,13 @@ whole build runs on your PC.
 folder; `%APPDATA%\nxrecomp\TotK-engine\mods` works too), laid out as emulators take them: `<mod>\romfs\...`,
 the SD card's `atmosphere\contents\0100F2C0115B6000\romfs\...`, or TKMM's merged output. A whole emulator mods
 folder can be copied in as it is (yuzu's `load\0100F2C0115B6000`, Ryujinx's `mods\contents\0100f2c0115b6000`):
-each mod in it is listed on its own. In the game, F10 > Mods
+each mod in it is listed on its own. Or let the game install a mod as you downloaded it (`.zip`, `.7z`, `.rar` or a
+folder): F10 > Mods > Install a mod..., or drop it on `TotK Launcher.exe` or the desktop shortcut. In the game, F10 > Mods
 shows them in load order (the top one wins a file two mods change), switches each one on or off, and says why a mod
 cannot be used; changes apply at the next start. The resource size table is adjusted by itself, so mods with bigger
 files do not need their own. Mods must be for version 1.0.0; the port's own files (PC button prompts, fixes) stay
-over a mod's. No mods ship with the port.
+over a mod's. No mods ship with the port. The full guide (layouts, F10 > Mods, why a mod is not used):
+[MODS.md](MODS.md).
 
 **Do code patches (.ips, .pchtxt) and cheats work?** Yes, for version 1.0.0: a mod's `exefs` folder (or the SD card's
 `atmosphere\exefs_patches\<name>`) and its `cheats\082CE09B06E33A12.txt` (Atmosphere format; a folder holding only

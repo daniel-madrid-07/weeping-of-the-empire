@@ -11,11 +11,13 @@ Kept, because an update or the game needs it:
   - the source snapshot the key was built from (<work>/engine/src/<head12>).
 Removed: every other key dir (earlier versions, a mods build the launcher made: it is made again at the next start
 with mods, from the cache), objcache entries no key links, older source snapshots, <work>/engine/tmp.
-Then NTFS compression (compact /c) of what is only read again at an update: the kept key's gen/ (generated C++).
+Then NTFS compression (compact /c) of the kept key's whole dir, read again only at an update: gen/ (generated C++),
+obj/ (the same files as their objcache entries) and exe/ (setup-speed, 2026-11-02: a key's objects 1.49 GB on disk ->
+0.77 compressed; its totk.exe linked from them in 2.5 s plain, 2.7 s compressed, 1.2-1.3 s warm either way).
 From extracted/ only the v100 RomFS folder an older install unpacked (17 GB), once romfs.bin is proven to serve the
 game instead (the passing pinned extraction report, romfs.bin's size, its verified record); the empty folder stays as
 the game's mount root. Never touched: the rest of extracted/, img/, overlay/, overlays/, glyphs/, seed/, pgo/, dlss/,
-venv/: the game or the next build reads them. Everything is listed in the log before it goes, and nothing outside
+ffx/ (AMD's FSR runtime), venv/: the game or the next build reads them. Everything is listed in the log before it goes, and nothing outside
 <work> (no link out of it) is ever removed. Cached objects go by file identity (not by link count): an install copied
 with hard links shares them with other folders.
 """
@@ -200,8 +202,8 @@ def tidy(work, key, head, log=print, run=subprocess.run):
             pass
     if stale:
         done.append(f'{len(stale)} cached objects no build uses')
-    if compress(os.path.join(mine[0][0], 'gen'), run):
-        done.append('generated code compressed')
+    if compress(mine[0][0], run):
+        done.append('the build compressed')
     freed = max(0, before - tree_bytes(eng)) + folder_bytes
     log(f'tidy: {freed / 1e9:.1f} GB freed (' + (', '.join(done[:6]) + (', ...' if len(done) > 6 else '') if done else
                                                            'nothing to remove') + ')')

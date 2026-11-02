@@ -29,6 +29,7 @@ SEED = os.path.join(ENG, 'seed')  # the precompile seed: programs and pipelines 
 # them in the background, so a shader no session recorded is a cache hit at its first draw (exec.c pa_load)
 ARCHIVE = os.path.join(ENG, 'archive_shaders.bin')
 DLSS = os.path.join(ENG, 'dlss')
+FFX = os.path.join(ENG, 'ffx')   # (AMD's FidelityFX runtime for FSR, fetched by tools/engine/build.py)
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 ENV = {'NXR_PC_OVERLAY': '1',   # the F10 overlay and settings.ini (engine-overlay.md)
        'TOTK_MOUSE_CAMERA': '1',  # the mouse camera
@@ -40,7 +41,7 @@ IMPORT = os.path.join(WORK, 'saves', '100pct')   # offered by the launcher's imp
 SETTINGS = """\
 # Valores iniciales del paquete. El juego los cambia desde el menú F10 (pc_settings.cpp).
 display.window_mode = borderless  # Pantalla completa sin bordes (F11 o Alt+Intro cambian)
-display.fps_cap = 120  # 120 fps; F10 > Gráficos ofrece 30, 60, 90, 120 o Unlocked (hasta la frecuencia del monitor, máx. 240)
+display.fps_cap = 120  # 120 fps; F10 > Gráficos ofrece 30 a 240 (40, 45, 60, 75, 90, 120, 144, 165...) o Unlocked (hasta la frecuencia del monitor, máx. 240)
 graphics.render_scale = auto  # Resolución de render: la altura de la ventana
 game.screenshots = 1  # F12 guarda una captura en Imágenes\\Capturas de pantalla
 game.crash_reports = 1  # Informe y minivolcado si el juego se cierra por un fallo
@@ -229,6 +230,8 @@ def main():
         env['TOTK_ROMFS_PACK'] = romfs_image(ROMFS)
     if os.path.isfile(os.path.join(DLSS, 'nvngx_dlss.dll')):   # NVIDIA's DLSS DLLs, fetched by tools/engine/build.py
         env['TOTK_DLSS_DIR'] = DLSS
+    if os.path.isfile(os.path.join(FFX, 'amd_fidelityfx_vk.dll')):
+        env['TOTK_FFX_DIR'] = FFX
     if version == '1.0.0' and archive_pack():   # (--env TOTK_PRECOMPILE_ARCHIVE=0 turns the warm-up off)
         env['TOTK_ARCHIVE_SHADERS'] = ARCHIVE
     env.update(kv.split('=', 1) for kv in a.env)

@@ -46,11 +46,24 @@ static bool dlss_mode(const char *m) {
     return e && !strcmp(e, m);
 }
 
-bool vk_ngx_on(void) {
-    if (g_on < 0) {
+// AMD FSR 3.1 (the ffx.c, any Vulkan GPU) behind the same inputs: TOTK_FSR_SR=1 / TOTK_FSR_FG=1, or the rows' "fsr"
+// values (pc_dlss.cpp). Each path picks its backend; NGX starts only for a DLSS one.
+static int g_ngx_env = -1;        // NGX wanted at the start: its extensions and Init with the device
+static bool g_sr_ffx, g_fg_ffx;   // SR / FG through FidelityFX instead of NGX
+static bool g_sr_dlaa;            // DLSS SR with the scene at the output's size (vk_ngx_scene_scale): DLAA
+static bool g_fg_ffx_hl;          // FidelityFX's FG context takes the HUD-less image (as g_fg_hl for NGX's)
+extern int rt_fleet(void);  // (rt_main.cpp, TOTK_FLEET=1)
+static bool ngx_env(void) {
+    if (g_ngx_env < 0) {
         const char *e = getenv("TOTK_DLSS");
-        g_on = (e && *e && strcmp(e, "0") != 0) || dlss_env("TOTK_DLSS_SR") == 1 || dlss_env("TOTK_DLSS_FG") == 1;
+        g_ngx_env = !rt_fleet() && ((e && *e && strcmp(e, "0") != 0) || dlss_env("TOTK_DLSS_SR") == 1 || dlss_env("TOTK_DLSS_FG") == 1);
     }
+    return g_ngx_env;
+}
+
+// The temporal path wanted (DLSS or FSR): exec.c latches the G-buffer's camera for it
+bool vk_ngx_on(void) {
+    if (g_on < 0) g_on = ngx_env() || (!rt_fleet() && (dlss_env("TOTK_FSR_SR") == 1 || dlss_env("TOTK_FSR_FG") == 1));
     return g_on;
 }
 
@@ -108,7 +121,7 @@ static void add_unique(const char **ext, uint32_t *n, uint32_t room, const char 
 
 // Instance extensions both features ask for (NGX's arrays are static for the process, so the names stay valid).
 uint32_t vk_ngx_instance_exts(const char **ext, uint32_t n, uint32_t room) {
-    if (!vk_ngx_on()) return n;
+    if (!ngx_env()) return n;
     for (int f = 0; f < 2; f++) {
         NVSDK_NGX_FeatureDiscoveryInfo d;
         discovery(&d, k_features[f]);
@@ -124,10 +137,29 @@ uint32_t vk_ngx_instance_exts(const char **ext, uint32_t n, uint32_t room) {
     return n;
 }
 
-// Device extensions both features ask for on this GPU, the ones the device has; also whether the GPU can run each at
-// all (GetFeatureRequirements, answered before Init: an unsupported machine never loads the feature DLLs).
+// Device extensions both features ask for on this GPU, the ones the device has; also whether the GPU can run each at all
+// (GetFeatureRequirements, answered before Init: an unsupported machine never loads the feature DLLs). DLSS off at the
+// start, on an NVIDIA GPU: the extensions NGX asked for on RTX GPUs (310.x: the log's "needs device extension" lines) are
+// enabled if the device has them, without asking NGX (nothing of NGX runs, no DLL is looked up), so the Options rows can
+// turn DLSS on later (ngx_init, from vk_ngx_prepare). Enabling them changes nothing by itself. No instance extension is
+// added for it: the only one NGX 310.x asks is VK_KHR_get_physical_device_properties2, core in device.c's Vulkan 1.3
+// instance.
+static bool g_live_exts;   // (DLSS off at the start: they were all there)
 void vk_ngx_device_exts(const VkExtensionProperties *ep, uint32_t ne, const char **ext, uint32_t *n_ext, uint32_t room) {
-    if (!vk_ngx_on()) return;
+    if (!ngx_env()) {
+        static const char *const known[] = {"VK_NVX_binary_import", "VK_NVX_image_view_handle", "VK_KHR_buffer_device_address",
+                                            "VK_KHR_push_descriptor"};
+        if (g_vk.props.vendorID != 0x10DE) return;
+        int have_all = 1;
+        for (int i = 0; i < 4; i++) {
+            bool have = false;
+            for (uint32_t j = 0; j < ne && !have; j++) have = !strcmp(ep[j].extensionName, known[i]);
+            if (have) add_unique(ext, n_ext, room, known[i]);
+            have_all &= have;
+        }
+        g_live_exts = have_all;
+        return;
+    }
     for (int f = 0; f < 2; f++) {
         NVSDK_NGX_FeatureDiscoveryInfo d;
         discovery(&d, k_features[f]);
@@ -166,8 +198,20 @@ static unsigned cap_u(const char *name, unsigned dflt) {
 // After vkCreateDevice: Init on our device, then the capability map (what the driver, GPU and DLLs agree can run).
 // On this thread, before the game starts: NGX on a thread of its own while the game booted crashed in the driver
 // under nvngx_dlss's feature creation, as the render thread imported the guest heap.
+static int fg_frames(void);   // (DLSS-G section)
+
+// Turned on in game (vk_ngx_prepare, the render thread between frames, the thread every feature is made on): ~1 s, once.
+static bool ngx_init(void);
 void vk_ngx_device_ready(void) {
-    if (!vk_ngx_on()) return;
+    if (ngx_env()) ngx_init();
+    // (FSR: its DLL loaded here, on this thread, before the render and game threads ask vk_ngx_sr_on / fg_on)
+    if (!rt_fleet() && (dlss_env("TOTK_FSR_SR") == 1 || dlss_env("TOTK_FSR_FG") == 1)) (void)vk_ffx_sr_ready();
+}
+
+static bool ngx_init(void) {
+    static bool tried;
+    if (tried) return g_ready;
+    tried = true;
     NVSDK_NGX_FeatureDiscoveryInfo d;
     discovery(&d, NVSDK_NGX_Feature_SuperSampling);
     uint64_t t0 = SDL_GetTicksNS();
@@ -175,9 +219,9 @@ void vk_ngx_device_ready(void) {
                                                               g_data, g_vk.inst, g_vk.phys, g_vk.dev,
                                                               vkGetInstanceProcAddr, vkGetDeviceProcAddr, &g_common,
                                                               NVSDK_NGX_Version_API);
-    if (NVSDK_NGX_FAILED(r)) { LOG("[dlss] NGX init failed (0x%x): DLSS off\n", (unsigned)r); return; }
+    if (NVSDK_NGX_FAILED(r)) { LOG("[dlss] NGX init failed (0x%x): DLSS off\n", (unsigned)r); return false; }
     r = NVSDK_NGX_VULKAN_GetCapabilityParameters(&g_caps);
-    if (NVSDK_NGX_FAILED(r)) { LOG("[dlss] capability parameters failed (0x%x): DLSS off\n", (unsigned)r); return; }
+    if (NVSDK_NGX_FAILED(r)) { LOG("[dlss] capability parameters failed (0x%x): DLSS off\n", (unsigned)r); return false; }
     g_ready = true;
     int sr = cap_i(NVSDK_NGX_Parameter_SuperSampling_Available, 0);
     int fg = cap_i(NVSDK_NGX_Parameter_FrameGeneration_Available, 0);
@@ -188,6 +232,8 @@ void vk_ngx_device_ready(void) {
         fg ? "available" : "unavailable", (unsigned)cap_i(NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult, 0),
         cap_i(NVSDK_NGX_Parameter_FrameGeneration_NeedsUpdatedDriver, 0) ? ", needs a newer driver" : "",
         cap_u(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, 1));
+    if (vk_ngx_fg_on()) fg_frames();   // (the count and its line here, on this thread: the pacer reads it from the start)
+    return true;
 }
 
 // ================================================================== foundation: camera and depth (logged only so far)
@@ -250,9 +296,11 @@ static uint32_t g_sr_minw, g_sr_minh;     // the feature's smallest render size 
 static uint32_t g_sr_seen_w, g_sr_seen_h; // the smallest scene seen for this output
 static bool g_sr_exact;                   // a subrect was refused: no more subrects
 
-// Halton (2,3), 1-based, over 8 * (output / render)^2 phases (at least 8): DLSS's recommended sequence length. Returns
-// the subpixel offset the frame is rendered with, in render pixels, in [-0.5, 0.5); vk_ngx_sr_evaluate reports it to DLSS
-// negated (our earlier Rust renderer measured that sign on its renderer; to verify here on a still camera: a wrong sign smears).
+// Halton (2,3), 1-based, over 8 * (output / render)^2 phases (at least 8): DLSS's recommended sequence length. Returns the subpixel
+// offset the frame is rendered with, in render pixels, in [-0.5, 0.5): exec.c moves the scene's viewport by it (+x right, +y down the
+// image), and vk_ngx_sr_evaluate reports that same shift to DLSS. DLSS takes the shift of the drawn geometry: our earlier Rust renderer
+// shifts its projection by -j and reports -j, the sign its dlss_probe measured best (RMSE 0.043 against 0.118 for +j: the wrong sign
+// smears a still image by up to a pixel). This port first copied the negation alone and reported -j for a +j shift.
 static float halton(uint32_t i, uint32_t b) {
     float f = 1.f, r = 0.f;
     for (; i; i /= b) { f /= (float)b; r += f * (float)(i % b); }
@@ -271,6 +319,45 @@ void vk_ngx_sr_jitter(uint64_t frame, uint32_t render_w, uint32_t out_w, float *
 // Texture LOD bias for the jittered render (our earlier Rust renderer: log2(render / output) - 1; 0 when not upscaling = DLAA, minus 1).
 float vk_ngx_sr_mip_bias(uint32_t render_w, uint32_t out_w) {
     return log2f(out_w ? (float)render_w / (float)out_w : 1.f) - 1.f;
+}
+
+// The bias textures.c adds to the game's material textures with SR on (sampler_make's PC bias: CPU-uploaded 2D / 2D-array
+// mipmapped textures only, never render targets, like the Options' texture LOD bias). Without it the scene's textures were
+// sampled at the mips of the render size and DLSS had no finer detail to accumulate: soft textures under SR. From the
+// scales as they are now (the ones vk_ngx_prepare makes the features with): the game's 1600x900 scene at the render
+// scale in its 1920x1080 canvas at the output canvas scale (Auto: log2(900 / 1080) - 1 = -1.26; a lower Render
+// resolution more). The samplers are re-made when it moves: SR turned on / off and the start's sizes (sr_bias_update),
+// a render scale change (live-settings' samplers_tick on vk_render_epoch). None where DLSS will not run, as
+// without DLSS a negative bias only aliases: a scene larger than the output (the game's pass draws it,
+// vk_ngx_sr_upscale) or an SR feature that failed. TOTK_DLSS_MIP_BIAS=<x> sets it (0: none). FG alone (no jitter): none.
+static bool g_sr_want;   // SR itself (g_sr_mode: the upscale pass is taken over, for SR or for FG's inputs; vk_ngx_sr_on)
+uint64_t renderer_present_count(void);
+void renderer_get_scale(float *sx, float *sy);
+float renderer_out_scale(void);
+int renderer_out_scale_peek(void);   // textures.c: the canvas decision if made (on), never making it
+// (live-settings' samplers_tick re-asks after a vk_render_epoch move, at that present: answered from the sizes as they
+// are now, not from the last vk_ngx_prepare's)
+static float g_sr_bias_told;   // (the last value reported: sr_bias_update re-makes the samplers when it moves)
+float vk_ngx_sr_lod_bias(void) {
+    if (!vk_ngx_sr_on() || !g_sr_want || g_sr_fails > 3) return 0;
+    static int env = -1;
+    static float env_v;
+    if (env < 0) { const char *e = getenv("TOTK_DLSS_MIP_BIAS"); env = e && *e; env_v = env ? (float)atof(e) : 0; }
+    if (env) return env_v;
+    float rx, ry;
+    renderer_get_scale(&rx, &ry);
+    // (renderer_out_scale_peek: never the canvas decision itself from a sampler, a few draws early; until it is made, x1,
+    // and vk_ngx_prepare's sr_bias_update corrects it from the start's second present)
+    const float os = renderer_out_scale_peek() ? renderer_out_scale() : 1.f;
+    uint32_t rh = (uint32_t)ceilf(900.f * ry - 1e-3f), oh = (uint32_t)ceilf(1080.f * os - 1e-3f);
+    return rh > oh ? 0 : vk_ngx_sr_mip_bias(rh, oh);
+}
+static void sr_bias_update(void) {   // (vk_ngx_prepare: SR turned on / off, the start's sizes known)
+    float v = vk_ngx_sr_lod_bias();
+    if (v == g_sr_bias_told) return;
+    LOG("[dlss] SR texture LOD bias %+.2f (was %+.2f): samplers re-made\n", v, g_sr_bias_told);
+    g_sr_bias_told = v;
+    vk_samplers_rebuild();
 }
 
 static NVSDK_NGX_PerfQuality_Value sr_quality(uint32_t rw, uint32_t ow) {
@@ -418,8 +505,8 @@ bool vk_ngx_sr_evaluate(VkCommandBuffer cb, const VkNgxImage *color, const VkNgx
     ep.Feature.pInOutput = &ro;
     ep.pInDepth = &rd;
     ep.pInMotionVectors = &rm;
-    ep.InJitterOffsetX = -jx;
-    ep.InJitterOffsetY = -jy;
+    ep.InJitterOffsetX = jx;   // (the geometry's shift: see halton above)
+    ep.InJitterOffsetY = jy;
     ep.InRenderSubrectDimensions.Width = color->w;
     ep.InRenderSubrectDimensions.Height = color->h;
     ep.InReset = reset;
@@ -508,21 +595,32 @@ static float g_fg_jx, g_fg_jy;
 static bool g_fg_reset, g_fg_inv, g_fg_flip, g_fg_zminus;
 static float g_cam_eval_prev[CAM_FLOATS];
 static VkFormat fg_storage_format(VkFormat f);   // (DLSS-G section)
-
-static bool g_sr_want;   // SR itself (g_sr_mode: the upscale pass is taken over, for SR or for FG's inputs)
+static bool sr_ready(void) { return g_sr_ffx ? vk_ffx_sr_ready() : g_ready; }   // (the chosen backend is up)
 
 bool vk_ngx_sr_on(void) {
     if (g_sr_mode < 0) {
         int sr = dlss_env("TOTK_DLSS_SR");
-        bool fg = dlss_mode("fg") || dlss_mode("fgtest") || dlss_env("TOTK_DLSS_FG") == 1;
-        g_sr_want = sr != 0 && (dlss_mode("sr") || dlss_mode("fg") || dlss_mode("fgtest") || sr == 1);
+        bool fg = dlss_mode("fg") || dlss_mode("fgtest") || dlss_env("TOTK_DLSS_FG") == 1 || dlss_env("TOTK_FSR_FG") == 1;
+        g_sr_ffx = !rt_fleet() && dlss_env("TOTK_FSR_SR") == 1;
+        g_sr_dlaa = !g_sr_ffx && dlss_env("TOTK_DLSS_DLAA") == 1;
+        g_sr_want = g_sr_ffx || (sr != 0 && (dlss_mode("sr") || dlss_mode("fg") || dlss_mode("fgtest") || sr == 1));
         g_sr_mode = g_sr_want || fg;
+        if (g_sr_ffx) LOG("[dlss] SR through AMD FSR 3.1 (TOTK_FSR_SR, ffx.c)\n");
         const char *js = getenv("TOTK_DLSS_JSIGN");
         if (js) sscanf(js, "%f,%f", &g_jsx, &g_jsy);
         if (g_sr_want) LOG("[dlss] SR on: the game's upscale pass becomes DLSS Super Resolution (DLAA at 1:1); jitter sign %+g %+g\n", g_jsx, g_jsy);
         else if (g_sr_mode) LOG("[dlss] SR off (TOTK_DLSS_SR=0 or frame generation alone): the game's upscale pass draws; motion vectors and depth are made for FG\n");
     }
-    return g_sr_mode == 1 && g_ready;
+    return g_sr_mode == 1 && ((g_sr_want && sr_ready()) || (vk_ngx_fg_on()));
+}
+
+// DLAA (the Upscaler row's "dlaa", TOTK_DLSS_DLAA=1): the render scale DLSS wants, polled by totk_hooks.c output_scale at
+// every present (live-settings): the game's 1600x900 scene drawn at its 1920x1080 canvas's output size, 1.2 x the canvas
+// scale (at 1440p 1.6: the scene 2560x1440 = the output, and sr_quality picks DLAA). 0: no opinion, the Render resolution
+// row's (its saved choice is untouched and comes back with DLAA off). Plain reads: the render thread, every present.
+float vk_ngx_scene_scale(float out_scale) {
+    if (g_sr_mode < 0) (void)vk_ngx_sr_on();
+    return g_sr_dlaa && g_sr_want && !g_sr_ffx && g_ready ? 1.2f * out_scale : 0.f;
 }
 
 // The sub-pixel offset this frame's scene geometry is drawn with (render pixels, +x right, +y down the image); zero when
@@ -641,7 +739,19 @@ static bool depth_inverted(const float *c, bool zminus) {   // reversed Z: a far
 // out = the pass's target (copied from our RGBA16F output). Called outside any render pass on vk_cmd(); false = draw the
 // game's pass instead (sizes disagree, no camera, NGX failure). A scene larger than the output (render scale above 1) is
 // no upscale, which DLSS refuses (0xbad00005): the game's pass draws it, and the motion vectors and depth are still made
-// for frame generation.
+// for frame generation. The camera as FSR (and DLSS-G) takes it: the image's projection, near / far / vertical fov /
+// aspect from it
+static void cam_peff(const float *c, bool flip, bool zminus, double pe[4][4]);
+static void cam_lens(const float *c, bool flip, bool zminus, VkTemporalInputs *ti) {
+    cam_peff(c, flip, zminus, ti->view_to_clip);
+    const float *P = c + 16;
+    ti->near_ = fabsf(P[10] != 1.f ? P[11] / (P[10] - 1.f) : 0.1f);
+    ti->far_ = fabsf(P[10] != -1.f ? P[11] / (P[10] + 1.f) : 10000.f);
+    ti->fovy = P[5] ? 2.f * atanf(1.f / fabsf(P[5])) : 1.f;
+    ti->aspect = P[0] ? fabsf(P[5] / P[0]) : 1.7778f;
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) ti->clip_to_prev_clip[i][j] = i == j;
+}
+
 bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, TexBackend *out, uint64_t frame,
                        bool flip_y, bool zminus) {
     if (!vk_ngx_sr_on() || !color || !depth || !out) return false;
@@ -656,7 +766,7 @@ bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth,
     if (!mv_pipeline()) { sr_reject(2, NULL); return false; }
     const float *c = g_cam[g_cam_n & 1];
     bool reset = g_cam_cut || !g_in_last || g_cam_n != g_cam_eval_n + 1;
-    bool sr_can = g_sr_want && color->width <= out->width && color->height <= out->height && g_sr_fails <= 3;
+    bool sr_can = g_sr_want && sr_ready() && color->width <= out->width && color->height <= out->height && g_sr_fails <= 3;
     static int told_off;
     if (!sr_can && g_sr_want && !told_off++)
         LOG("[dlss] SR off (scene %ux%u, output %ux%u%s): the game's pass draws; FG still gets motion vectors and depth\n",
@@ -724,7 +834,19 @@ bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth,
     VkNgxImage ic = {color->image, cview, color->format, w, h}, idp = {depth->image, dview, depth->format, w, h};
     VkNgxImage im = {g_mv.img, g_mv.view, g_mv.fmt, w, h}, io = {g_out.img, g_out.view, g_out.fmt, g_out.w, g_out.h};
     VkNgxImage ib = {g_bias.img, g_bias.view, g_bias.fmt, w, h};
-    if (!vk_ngx_sr_evaluate(cb, &ic, &idp, &im, &io, g_jsx * jx, g_jsy * jy, 1.f, 1.f, reset, inv, false, g_bias_mode ? &ib : NULL)) {
+    bool ok;
+    if (g_sr_ffx) {   // (AMD FSR 3.1, ffx.c: the same inputs)
+        VkTemporalInputs ti;
+        memset(&ti, 0, sizeof ti);
+        ti.color = ic, ti.depth = idp, ti.mv = im, ti.out = io;
+        if (g_bias_mode) ti.bias = ib;
+        ti.jx = g_jsx * jx, ti.jy = g_jsy * jy, ti.mv_sx = ti.mv_sy = 1.f;
+        ti.reset = reset, ti.depth_inverted = inv, ti.frame = frame;
+        cam_lens(c, flip_y, zminus, &ti);
+        ok = vk_ffx_sr_evaluate(cb, &ti);
+        if (!ok) g_sr_fails++;
+    } else ok = vk_ngx_sr_evaluate(cb, &ic, &idp, &im, &io, g_jsx * jx, g_jsy * jy, 1.f, 1.f, reset, inv, false, g_bias_mode ? &ib : NULL);
+    if (!ok) {
         sr_reject(4, NULL);
         return false;
     }
@@ -777,19 +899,51 @@ static NVSDK_NGX_Parameter *g_fg_par;
 static uint32_t g_fg_w, g_fg_h, g_fg_rw, g_fg_rh;
 static VkFormat g_fg_fmt;
 static bool g_fg_hl;                   // the live feature was created with the HUD-less image
-// TOTK_DLSS_FG_FRAMES=n (1-3, at most what the GPU offers; default 1): n generated frames per real one (DLSS 4 multi frame generation:
-// one evaluate per MultiFrameIndex), shown at k / (n + 1) of the real interval
+// TOTK_DLSS_FG_FRAMES=n (1-3, at most what the GPU offers; default 1; the Options row graphics.frame_gen's x2 / x3 / x4): n
+// generated frames per real one (DLSS 4 multi frame generation: one evaluate per MultiFrameIndex), shown at k / (n + 1) of
+// the real interval. The pacer (hle_vi.cpp) may ask for fewer: the frame cap counts the frames shown, and real frames stay at
+// 30 or more (vk_ngx_fg_set_active)
 #define FG_MAX 3
 static OwnImage g_fg_in, g_fg_out[FG_MAX], g_fg_hud;
 static int g_fg_n = -1;
+static volatile LONG g_fg_active;   // (the pacer's count, 1..g_fg_n; 0: g_fg_n)
 static int g_fg_fails, g_fg_hl_mode = -1, g_fg_show = -1;
 static uint64_t g_fg_id, g_fg_sr_evals;
 static uint64_t g_fg_hud_frame = UINT64_MAX, g_fg_last_frame = UINT64_MAX;   // (present counts: HUD-less copy, last FG frame)
 static VkImage g_fg_hud_src;           // the canvas the HUD-less copy came from
 
+// The generated frames per real one the player asked for, at most what the GPU offers (x3 / x4 need multi frame
+// generation: RTX 50; NGX says 1 elsewhere, and x2 is used). Once NGX is up (its capability map).
+static void fg_set_frames(int want) {   // (NGX up: its capability map)
+    int max = (int)cap_u(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, 1);
+    g_fg_n = want < 1 ? 1 : want > FG_MAX ? FG_MAX : want;
+    if (g_fg_n > max) g_fg_n = max < 1 ? 1 : max;
+    LOG("[dlss] FG: %d generated frame%s per real frame (x%d; asked %d, GPU up to %d)%s\n", g_fg_n, g_fg_n > 1 ? "s" : "",
+        g_fg_n + 1, want, max, g_fg_n < want ? ": this GPU has no multi frame generation for more" : "");
+}
+static int fg_frames(void) {
+    if (g_fg_ffx) return 1;   // (FSR 3.1: one generated frame)
+    if (g_fg_n < 0 && g_ready) {
+        const char *e = getenv("TOTK_DLSS_FG_FRAMES");
+        fg_set_frames(e && *e ? atoi(e) : 1);
+    }
+    return g_fg_n < 1 ? 1 : g_fg_n;
+}
+
+// hle_vi.cpp's pacer: how many to generate now (the frame cap counts the frames shown; fewer than asked only where the
+// real frames would fall under 30)
+int vk_ngx_fg_frames(void) { return vk_ngx_fg_on() ? fg_frames() : 0; }
+void vk_ngx_fg_set_active(int n) { InterlockedExchange(&g_fg_active, n); }
+static int fg_frames_now(void) {
+    int n = fg_frames(), a = (int)InterlockedCompareExchange(&g_fg_active, 0, 0);
+    return a >= 1 && a < n ? a : n;
+}
+
 bool vk_ngx_fg_on(void) {
     if (g_fg_mode < 0) {
-        g_fg_mode = dlss_mode("fgtest") ? 2 : dlss_mode("fg") || dlss_env("TOTK_DLSS_FG") == 1 ? 1 : 0;
+        g_fg_ffx = !rt_fleet() && dlss_env("TOTK_FSR_FG") == 1 && !dlss_mode("fgtest");
+        g_fg_mode = dlss_mode("fgtest") ? 2 : dlss_mode("fg") || dlss_env("TOTK_DLSS_FG") == 1 || g_fg_ffx ? 1 : 0;
+        if (g_fg_ffx) LOG("[dlss] frame generation through AMD FSR 3.1 (TOTK_FSR_FG, ffx.c): x2\n");
         const char *h = getenv("TOTK_DLSS_HUDLESS"), *s = getenv("TOTK_DLSS_SHOW");
         g_fg_hl_mode = !(h && !strcmp(h, "0"));
         g_fg_show = s && !strcmp(s, "hudless");
@@ -798,7 +952,7 @@ bool vk_ngx_fg_on(void) {
         if (g_fg_mode) LOG("[dlss] FG HUD-less image %s%s\n", g_fg_hl_mode ? "on" : "off (TOTK_DLSS_HUDLESS=0)",
                            g_fg_show ? "; TOTK_DLSS_SHOW=hudless: real frames show it" : "");
     }
-    return g_fg_mode && g_ready;
+    return g_fg_mode && (g_fg_ffx ? vk_ffx_fg_ready() : g_ready);
 }
 
 static void copy_image(VkCommandBuffer cb, VkImage src, VkImage dst, uint32_t w, uint32_t h);
@@ -926,6 +1080,197 @@ static void copy_image(VkCommandBuffer cb, VkImage src, VkImage dst, uint32_t w,
     vkCmdCopyImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
 }
 
+// ================================================================== the game's FXAA under DLSS SR TotK's FXAA is two
+// full-screen passes after the bloom (the rival totk-pc-recomp v0.3.1 found them by diffing frames with the game's own
+// switch, ModelSceneExtensionParam EnableFXAA: runtime/vk_dlaa.c): one copies the scene into a scratch target, the other
+// (fs 6dc5011326ac42a2 here) draws the anti-aliased result back from it. At the 1280x720 tier that draw also scales the
+// scene into the canvas, and SR takes it whole (exec.c); at the 1600x900 tier it runs 1:1 before EASU, so DLSS was handed
+// an FXAA'd scene: edges and sub-pixel detail already smeared, which the jittered history can no longer recover. DLSS
+// anti-aliases by itself (the rival turns FXAA off with DLAA), so while SR runs that draw becomes a copy of its input: the
+// scene as it was before FXAA, the same bytes the target already holds (the first pass copied it from there).
+// TOTK_DLSS_FXAA=1 keeps the game's FXAA. false: draw it (other sizes or formats, SR not running).
+bool vk_ngx_sr_fxaa_bypass(VkCommandBuffer cb, TexBackend *src, TexBackend *dst) {
+    static int keep = -1;
+    if (keep < 0) {
+        const char *e = getenv("TOTK_DLSS_FXAA");
+        keep = e && *e && strcmp(e, "0");
+        if (keep) LOG("[dlss] TOTK_DLSS_FXAA=1: the game's FXAA stays under SR\n");
+    }
+    if (keep || !vk_ngx_sr_on() || !g_sr_want || !g_sr_last || !src || !dst || src == dst) return false;
+    if (src->width != dst->width || src->height != dst->height || src->samples > 1 || dst->samples > 1 ||
+        src->aspect != VK_IMAGE_ASPECT_COLOR_BIT || dst->aspect != VK_IMAGE_ASPECT_COLOR_BIT)
+        return false;
+    // (another format: FXAA draws. A blit would re-quantise the scene through the scratch's format)
+    if (src->format != dst->format) return false;
+    vk_full_barrier(cb);
+    copy_image(cb, src->image, dst->image, dst->width, dst->height);
+    vk_full_barrier(cb);
+    static int told;
+    if (!told++) LOG("[dlss] the game's FXAA (fs 6dc5011326ac42a2, %ux%u) left out while SR runs: DLSS gets the scene before it "
+                     "(copied; TOTK_DLSS_FXAA=1 keeps it)\n", dst->width, dst->height);
+    return true;
+}
+
+// ================================================================== the features made before the first scene Made at
+// their first use, they stalled that frame: SR 501 ms + FG 979 ms on the title's first 3D frame. They are made instead
+// at an early present, on the start's black screens, at the sizes the scene will have: output = the game's 1920x1080
+// canvas at the output canvas scale (textures.c kind 3), scene, depth and motion = the game's 1600x900 scene at the
+// render scale (kind 1), both rounded up like the targets (textures.c create_image_); forward depth (TotK's) and the
+// presented RGBA8 image. A smaller (dynamic-resolution) scene is a subrect of these; anything else (another canvas: an
+// ultrawide TOTK_OUTPUT_RES, a scene larger than 1600x900) makes its own at first use, as before. backend_present,
+// outside any pass, once, from its third present (the scales are set at each present). TOTK_DLSS_PREPARE=0: at first use
+// only.
+static uint32_t scaled_up(uint32_t n, float s) {   // (textures.c create_image_'s rounding)
+    uint32_t v = (uint32_t)ceilf((float)n * s - 1e-3f);
+    return v ? v : 1;
+}
+
+// Live rows (pc_dlss.cpp: graphics.dlss, graphics.frame_gen and its x2 / x3 / x4): a row's apply posts the new state
+// (vk_ngx_request, any thread) and the render thread takes it here, between frames, where every feature is made: NGX
+// started if it was not (~1 s, once; DLSS off at the start, the NVIDIA extensions it needs were enabled anyway,
+// vk_ngx_device_exts), a feature turned off released with its images, one turned on made at once at the scene's sizes
+// (below), the texture bias and the samplers following SR. A render scale change (live-settings: vk_render_epoch) makes
+// them again at the new sizes here too, not on the scene's frame. TOTK_DLSS=fgtest is not live.
+static volatile LONG g_req_sr = -1, g_req_fg = -1;   // (-1: nothing asked; vk_ngx_request's values)
+// sr: 0 off, 1 DLSS, 2 FSR; fg: 0 off, 1..3 DLSS generated frames, VK_NGX_FG_FSR FSR x2 (-1: unchanged)
+void vk_ngx_request(int sr, int fg) {
+    if (sr >= 0) InterlockedExchange(&g_req_sr, sr > 3 ? 1 : sr);
+    if (fg >= 0) InterlockedExchange(&g_req_fg, fg == VK_NGX_FG_FSR ? fg : fg > FG_MAX ? FG_MAX : fg);
+}
+
+static void own_free(OwnImage *im) {
+    if (im->img) { vk_defer_view(im->view); vk_defer_image(im->img, im->mem); }
+    memset(im, 0, sizeof *im);
+}
+
+// (vk_ngx_prepare runs in backend_present, after this frame's SR evaluate went into the open submission: sr_release waits
+// for the last submitted one only, so that submission goes out first. FG evaluates after prepare.)
+void renderer_submit(void);
+static void sr_release_live(NVSDK_NGX_Handle *h) {
+    if (!h) return;
+    renderer_submit();
+    sr_release(h);
+}
+
+// A path's backend can only be one its machine has: DLSS needs NGX (started with the device, or started now if the
+// NVIDIA extensions it needs were enabled at the start), FSR needs FidelityFX's DLL. A choice that cannot run is off, said.
+static bool ngx_can(void) {
+    if (g_ready) return true;
+    if (!ngx_env() && !g_live_exts) {
+        static int told;
+        if (!told++) LOG("[dlss] DLSS turned on in game, but this GPU started without what NGX needs (not NVIDIA, or extensions missing)\n");
+        return false;
+    }
+    return ngx_init();
+}
+
+static bool apply_request(void) {   // true: a feature was turned on or off, its backend or the count changed
+    int sr = (int)InterlockedExchange(&g_req_sr, -1), fg = (int)InterlockedExchange(&g_req_fg, -1);
+    if (sr < 0 && fg < 0) return false;
+    (void)vk_ngx_on(), (void)vk_ngx_sr_on(), (void)vk_ngx_fg_on();   // (the start's state first)
+    if (g_fg_mode == 2) fg = -1;
+    bool want_sr = sr >= 0 ? sr != 0 : g_sr_want, sr_ffx = sr >= 0 ? sr == 2 : g_sr_ffx, dlaa = sr >= 0 ? sr == 3 : g_sr_dlaa;
+    bool fg_ffx = fg >= 0 ? fg == VK_NGX_FG_FSR : g_fg_ffx;
+    int want_fg = fg >= 0 ? (fg == VK_NGX_FG_FSR ? 1 : fg) : g_fg_mode ? fg_frames() : 0;
+    if (want_sr && !(sr_ffx ? vk_ffx_sr_ready() : ngx_can())) want_sr = false;
+    if (want_fg && !(fg_ffx ? vk_ffx_fg_ready() : ngx_can())) want_fg = 0;
+    bool changed = false, ffx_off = false;
+    if (want_sr != g_sr_want || (want_sr && sr_ffx != g_sr_ffx)) {   // (the old backend's SR goes)
+        if (g_sr_want && !g_sr_ffx) {
+            sr_release_live(g_sr);
+            sr_release_live(g_sr_spare.h);
+            g_sr = NULL, g_sr_flags = -1, g_sr_exact = false, g_sr_seen_w = g_sr_seen_h = 0;
+            memset(&g_sr_spare, 0, sizeof g_sr_spare);
+        }
+        ffx_off |= g_sr_want && g_sr_ffx;
+        if (!want_sr) own_free(&g_out);
+        g_sr_want = want_sr, g_sr_ffx = want_sr && sr_ffx, g_sr_fails = 0, changed = true;
+        g_sr_last = false;   // (no jitter until the upscaler has run again)
+        LOG("[dlss] SR turned %s in game\n", !want_sr ? "off" : sr_ffx ? "on (FSR)" : dlaa ? "on (DLAA)" : "on (DLSS)");
+    }
+    dlaa = dlaa && g_sr_want && !g_sr_ffx;
+    if (dlaa != g_sr_dlaa) {   // (the render scale follows at the next present: totk_hooks.c output_scale, vk_render_epoch)
+        g_sr_dlaa = dlaa, changed = true;
+        LOG("[dlss] DLAA %s in game: the scene %s\n", dlaa ? "on" : "off", dlaa ? "at the output's size" : "back at Render resolution");
+    }
+    if ((want_fg != 0) != (g_fg_mode != 0) || (want_fg && (fg_ffx != g_fg_ffx || (!fg_ffx && want_fg != g_fg_n)))) {
+        if (g_fg && (!want_fg || fg_ffx)) { vk_wait_seq(vk_pending_seq() - 1); NVSDK_NGX_VULKAN_ReleaseFeature(g_fg); g_fg = NULL; }
+        ffx_off |= g_fg_mode && g_fg_ffx && (!want_fg || !fg_ffx);
+        if (!want_fg) {
+            own_free(&g_fg_in), own_free(&g_fg_hud);
+            for (int i = 0; i < FG_MAX; i++) own_free(&g_fg_out[i]);
+            g_fg_hud_frame = UINT64_MAX;
+        }
+        g_fg_ffx = want_fg && fg_ffx;
+        if (want_fg && !fg_ffx) fg_set_frames(want_fg);
+        g_fg_mode = want_fg ? 1 : 0, g_fg_fails = 0, g_fg_last_frame = UINT64_MAX, changed = true;   // (the next FG frame: reset)
+        LOG("[dlss] frame generation turned %s in game\n", !want_fg ? "off" : fg_ffx ? "on (FSR x2)" : "on (DLSS)");
+    }
+    if (ffx_off) {   // (FidelityFX's contexts, both: the one still wanted is made again below; the open frame out first)
+        renderer_submit();
+        vk_ffx_release();
+        g_fg_ffx_hl = false;
+    }
+    g_sr_mode = g_sr_want || g_fg_mode;
+    g_on = g_sr_mode;
+    if (!g_sr_mode) {   // (nothing left that reads the motion vectors and depth)
+        own_free(&g_mv), own_free(&g_dz[0]), own_free(&g_dz[1]), own_free(&g_bias);
+        g_in_last = false, g_fg_depth = NULL;
+    }
+    return changed;
+}
+
+void vk_ngx_prepare(VkCommandBuffer cb, const TexBackend *b) {
+    static int off = -1;
+    static bool pending = true;   // (the start's; then each change)
+    static uint32_t epoch;
+    if (off < 0) {
+        const char *e = getenv("TOTK_DLSS_PREPARE"), *wide = getenv("TOTK_OUTPUT_RES");
+        off = (e && !strcmp(e, "0")) || (wide && *wide && strcmp(wide, "0"));
+        epoch = vk_render_epoch();
+    }
+    if (apply_request()) pending = true, cb = vk_cmd();   // (it may have submitted the frame so far: sr_release_live)
+    uint32_t ep = vk_render_epoch();
+    if (ep != epoch) epoch = ep, pending = true;
+    bool sr = vk_ngx_sr_on() && g_sr_want, fg = vk_ngx_fg_on();
+    if (!pending || (!sr && !fg) || renderer_present_count() < 2) return;
+    pending = false;
+    float rx, ry, os = renderer_out_scale();
+    renderer_get_scale(&rx, &ry);
+    uint32_t ow = scaled_up(1920, os), oh = scaled_up(1080, os), rw = scaled_up(1600, rx), rh = scaled_up(900, ry);
+    uint64_t t0 = SDL_GetTicksNS();
+    bool sr_ok = false, fg_ok = false, made = false;
+    if (!off && sr && g_sr_ffx && rw <= ow && rh <= oh) {
+        renderer_submit();   // (a remade context releases the old one, which this frame's upscale used: out first)
+        cb = vk_cmd();
+        sr_ok = vk_ffx_sr_prepare(cb, rw, rh, ow, oh), made = true;
+    }
+    else if (!off && sr && rw <= ow && rh <= oh && !(g_sr && g_sr_rw == rw && g_sr_rh == rh && g_sr_ow == ow && g_sr_oh == oh)) {
+        g_sr_seen_w = rw, g_sr_seen_h = rh;   // (a scene larger than the output is not upscaled: vk_ngx_sr_upscale)
+        if (g_sr) {   // (sr_create releases the live feature or the spare: the open submission evaluated it, out first)
+            renderer_submit();
+            cb = vk_cmd();
+        }
+        sr_ok = sr_create(cb, rw, rh, ow, oh, sr_flags(false, false)), made = true;
+    }
+    // (the presented image's own format: the last FG frame's, this present's when canvas-sized, else TotK's RGBA8)
+    VkFormat fmt = g_fg_pres_fmt;
+    if (!fmt && b && b->width == ow && b->height == oh && b->samples <= 1) fmt = fg_storage_format(b->format);
+    if (fmt == VK_FORMAT_UNDEFINED) fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    if (!off && fg && g_fg_ffx) {
+        fg_ok = vk_ffx_fg_prepare(cb, ow, oh, rw, rh, fmt, g_fg_hl_mode ? fmt : VK_FORMAT_UNDEFINED), made = true;
+        g_fg_ffx_hl = fg_ok && g_fg_hl_mode;
+    }
+    else if (!off && fg && !(g_fg && g_fg_w == ow && g_fg_h == oh && g_fg_rw >= rw && g_fg_rh >= rh))
+        fg_ok = fg_create(cb, ow, oh, fmt, rw, rh, g_fg_hl_mode), made = true;
+    if (made)
+        LOG("[dlss] features made between frames (present %llu): output %ux%u (x%.3f), scene %ux%u (x%.3f)%s%s (FG format %d) in "
+            "%.0f ms\n", (unsigned long long)renderer_present_count(), ow, oh, os, rw, rh, rx,
+            sr ? sr_ok ? g_sr_ffx ? ", SR (FSR)" : ", SR" : ", SR failed" : "",
+            fg ? fg_ok ? g_fg_ffx ? ", FG (FSR)" : ", FG" : ", FG failed" : "", (int)fmt, (SDL_GetTicksNS() - t0) / 1e6);
+    sr_bias_update();
+}
+
 // backend_present, outside any pass, before the swapchain frame: b = the game's final image of this frame.
 int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) {
     if (!vk_ngx_fg_on() || !b || g_fg_fails > 3) return 0;
@@ -966,17 +1311,18 @@ int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) {
     // 300 ms recreation; only when it stays missing is the feature made without it
     static int hl_miss;
     if (hl) hl_miss = 0;
-    else if (g_fg && g_fg_hl && ++hl_miss < 30) { g_fg_last_frame = UINT64_MAX; return 0; }
-    if (!fg_create(cb, w, h, fmt, rw, rh, hl)) return 0;
+    // (FSR too: ffx.c remakes its context, a device wait, whenever the HUD-less image comes or goes)
+    else if ((g_fg_ffx ? g_fg_ffx_hl : g_fg && g_fg_hl) && ++hl_miss < 30) { g_fg_last_frame = UINT64_MAX; return 0; }
+    if (!g_fg_ffx && !fg_create(cb, w, h, fmt, rw, rh, hl)) return 0;   // (FSR: ffx.c makes its context at the evaluate)
     own_image(cb, &g_fg_in, w, h, fmt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
-    if (g_fg_n < 0) {
-        const char *e = getenv("TOTK_DLSS_FG_FRAMES");
-        int want = e ? atoi(e) : 1, max = (int)cap_u(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, 1);
-        g_fg_n = want < 1 ? 1 : want > FG_MAX ? FG_MAX : want;
-        if (g_fg_n > max) g_fg_n = max < 1 ? 1 : max;
-        LOG("[dlss] FG: %d generated frame%s per real frame (asked %d, GPU up to %d)\n", g_fg_n, g_fg_n > 1 ? "s" : "", want, max);
+    const int nact = fg_frames_now();   // (a new count, after a frame cap change: the history starts over)
+    static int nlast;
+    if (nact != nlast) {
+        if (nlast) LOG("[dlss] FG: %d generated frame%s per real frame now (the frame cap)\n", nact, nact > 1 ? "s" : "");
+        reset = true;
+        nlast = nact;
     }
-    for (int i = 0; i < g_fg_n; i++)
+    for (int i = 0; i < fg_frames(); i++)   // (FSR: g_fg_n unset, one)
         own_image(cb, &g_fg_out[i], w, h, fmt, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     vk_full_barrier(cb);
     copy_image(cb, b->image, g_fg_in.img, w, h);
@@ -991,14 +1337,36 @@ int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) {
     if (!mat_inv(pe, pei) || !mat_inv(A, Ai)) return 0;
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { double s = 0; for (int k = 0; k < 4; k++) s += B[i][k] * Ai[k][j]; R[i][j] = s; }
     if (!mat_inv(R, Ri)) return 0;
+    const float *P = c + 16;
+    float n = P[10] != 1.f ? P[11] / (P[10] - 1.f) : 0.1f, f = P[10] != -1.f ? P[11] / (P[10] + 1.f) : 10000.f;
+    if (g_fg_ffx) {   // (AMD FSR 3.1 frame generation, ffx.c: one frame into g_fg_out[0] from the same inputs)
+        VkTemporalInputs ti;
+        memset(&ti, 0, sizeof ti);
+        VkComponentMapping fidm = {0};
+        VkImageView fdv = vk_image_view(g_fg_depth, VK_IMAGE_VIEW_TYPE_2D, g_fg_depth->format, 0, 1, 0, 1, fidm, VK_IMAGE_ASPECT_DEPTH_BIT);
+        ti.depth = (VkNgxImage){g_fg_depth->image, fdv, g_fg_depth->format, rw, rh};
+        ti.mv = (VkNgxImage){g_mv.img, g_mv.view, g_mv.fmt, rw, rh};
+        ti.backbuffer = (VkNgxImage){g_fg_in.img, g_fg_in.view, fmt, w, h};
+        if (hl) ti.hudless = (VkNgxImage){g_fg_hud.img, g_fg_hud.view, g_fg_hud.fmt, w, h};
+        ti.jx = g_fg_jx, ti.jy = g_fg_jy, ti.mv_sx = ti.mv_sy = 1.f;
+        ti.reset = reset, ti.depth_inverted = g_fg_inv, ti.frame = g_fg_id + 1;
+        cam_lens(c, g_fg_flip, g_fg_zminus, &ti);
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) ti.clip_to_prev_clip[i][j] = R[i][j];
+        for (int i = 0; i < 3; i++) ti.cam_pos[i] = c[116 + i], ti.cam_right[i] = c[i], ti.cam_up[i] = c[4 + i], ti.cam_fwd[i] = -c[8 + i];
+        VkNgxImage fo = {g_fg_out[0].img, g_fg_out[0].view, g_fg_out[0].fmt, w, h};
+        vkq_drain();
+        // (0: a failure, which ffx.c counts and logs itself, or a frame it skipped: no frame, and the next one resets)
+        if (vk_ffx_fg_evaluate(cb, &ti, &fo, 1) < 1) { g_fg_last_frame = UINT64_MAX; return 0; }
+        g_fg_ffx_hl = hl;
+        ++g_fg_id;
+        goto generated;
+    }
     NVSDK_NGX_Parameter *p = g_fg_par;
     fg_set_mat(NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, pe, m_v2c);
     fg_set_mat(NVSDK_NGX_DLSSG_Parameter_ClipToCameraView, pei, m_c2v);
     fg_set_mat(NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip, R, m_c2p);
     fg_set_mat(NVSDK_NGX_DLSSG_Parameter_PrevClipToClip, Ri, m_p2c);
     fg_set_mat(NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, I, m_lens);
-    const float *P = c + 16;
-    float n = P[10] != 1.f ? P[11] / (P[10] - 1.f) : 0.1f, f = P[10] != -1.f ? P[11] / (P[10] + 1.f) : 10000.f;
     NVSDK_NGX_Parameter_SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraNear, fabsf(n));
     NVSDK_NGX_Parameter_SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraFar, fabsf(f));
     NVSDK_NGX_Parameter_SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraFOV, P[5] ? 2.f * atanf(1.f / fabsf(P[5])) : 1.f);
@@ -1022,7 +1390,7 @@ int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) {
     NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_DLSSG_Parameter_DepthInverted, g_fg_inv);
     NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, 1);
     NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, 0);
-    NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, (unsigned)g_fg_n);
+    NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, (unsigned)nact);
     NVSDK_NGX_Parameter_SetULL(p, NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, ++g_fg_id);
     NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectWidth, w);
     NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectHeight, h);
@@ -1045,17 +1413,18 @@ int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) {
     NVSDK_NGX_Parameter_SetVoidPointer(p, NVSDK_NGX_DLSSG_Parameter_HUDLess, hl ? &rhl : NULL);
     NVSDK_NGX_Parameter_SetVoidPointer(p, NVSDK_NGX_DLSSG_Parameter_UI, NULL);
     vkq_drain();
-    for (int i = 0; i < g_fg_n; i++) {   // (generated frame i + 1 of n; the reset with the first only)
+    for (int i = 0; i < nact; i++) {   // (generated frame i + 1 of n; the reset with the first only)
         NVSDK_NGX_Resource_VK ro = NVSDK_NGX_Create_ImageView_Resource_VK(g_fg_out[i].view, g_fg_out[i].img, cr, fmt, w, h, true);
         NVSDK_NGX_Parameter_SetVoidPointer(p, NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, &ro);
         NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, (unsigned)i + 1);
         NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_DLSSG_Parameter_Reset, reset && i == 0);
         NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_EvaluateFeature_C(cb, g_fg, p, NULL);
         if (NVSDK_NGX_FAILED(r)) {
-            if (g_fg_fails++ < 4) LOG("[dlss] FG evaluate %d of %d failed (0x%x)\n", i + 1, g_fg_n, (unsigned)r);
+            if (g_fg_fails++ < 4) LOG("[dlss] FG evaluate %d of %d failed (0x%x)\n", i + 1, nact, (unsigned)r);
             return 0;
         }
     }
+generated:
     if (g_fg_mode == 2 || (g_fg_show && hl)) {   // fgtest: shown instead of the real frame; TOTK_DLSS_SHOW=hudless
         vk_full_barrier(cb);
         copy_image(cb, g_fg_mode == 2 ? g_fg_out[0].img : g_fg_hud.img, b->image, w, h);
@@ -1066,7 +1435,7 @@ int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) {
     if ((nlog++ % 300 == 0 || reset) && nprinted++ < 200)
         LOG("[dlss] FG frame %llu: %ux%u from motion %ux%u, near %.3f far %.0f, jitter %+.3f %+.3f%s%s\n", (unsigned long long)g_fg_id, w, h, rw, rh,
             fabsf(n), fabsf(f), g_fg_jx, g_fg_jy, reset ? ", reset" : "", hl ? ", HUD-less" : "");
-    return g_fg_mode == 1 ? g_fg_n : 0;
+    return g_fg_mode == 1 ? nact : 0;
 }
 
 #else   // !_WIN32: no NGX; every query answers "unavailable" and nothing is replaced
@@ -1086,6 +1455,7 @@ void vk_ngx_sr_jitter(uint64_t frame, uint32_t render_w, uint32_t out_w, float *
     (void)frame; (void)render_w; (void)out_w; *jx = *jy = 0;
 }
 float vk_ngx_sr_mip_bias(uint32_t render_w, uint32_t out_w) { (void)render_w; (void)out_w; return 0; }
+float vk_ngx_sr_lod_bias(void) { return 0; }
 bool vk_ngx_sr_evaluate(VkCommandBuffer cb, const VkNgxImage *color, const VkNgxImage *depth, const VkNgxImage *mv,
                         const VkNgxImage *out, float jx, float jy, float mv_scale_x, float mv_scale_y, bool reset,
                         bool depth_inverted, bool hdr, const VkNgxImage *bias) {
@@ -1104,7 +1474,13 @@ bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth,
     return false;
 }
 bool vk_ngx_fg_on(void) { return false; }
+int vk_ngx_fg_frames(void) { return 0; }
+void vk_ngx_fg_set_active(int n) { (void)n; }
+void vk_ngx_prepare(VkCommandBuffer cb, const TexBackend *b) { (void)cb; (void)b; }
+void vk_ngx_request(int sr, int fg) { (void)sr; (void)fg; }
+float vk_ngx_scene_scale(float out_scale) { (void)out_scale; return 0.f; }
 int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) { (void)cb; (void)b; return 0; }
 void vk_ngx_fg_show(VkCommandBuffer cb, TexBackend *b, int generated) { (void)cb; (void)b; (void)generated; }
 void vk_ngx_fg_keep_hudless(VkCommandBuffer cb, TexBackend *out, uint64_t frame) { (void)cb; (void)out; (void)frame; }
+bool vk_ngx_sr_fxaa_bypass(VkCommandBuffer cb, TexBackend *src, TexBackend *dst) { (void)cb; (void)src; (void)dst; return false; }
 #endif

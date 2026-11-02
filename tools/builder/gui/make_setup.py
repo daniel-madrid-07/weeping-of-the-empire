@@ -128,6 +128,22 @@ def llvm_zip(dest):
     return sha256(dest)
 
 
+MANIFEST = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="{name}" version="{ver}" processorArchitecture="*"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false"/></requestedPrivileges></security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application><supportedOS Id="{{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}}"/></application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings><dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware></windowsSettings>
+  </application>
+</assembly>
+"""
+
+
 def cs_string(s):
     return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
@@ -180,6 +196,7 @@ def main():
         ver = '.'.join((nums + ['0'] * 4)[:4]) if re.fullmatch(r'v?\d+(\.\d+){1,3}', a.tag or '') else '0.0.0.0'
         what = 'Setup' if a.tag else 'Builder'
         attrs = {'AssemblyTitle': f'{a.product} {what}', 'AssemblyProduct': a.product,
+                 'AssemblyDescription': f'{a.product} {what}: builds the game on this PC from your own console dump',
                  'AssemblyCompany': f'{a.product} project (open source)',
                  'AssemblyCopyright': f'Open source: github.com/{a.repo}', 'AssemblyVersion': ver,
                  'AssemblyFileVersion': ver, 'AssemblyInformationalVersion': a.tag or 'main'}
@@ -194,9 +211,14 @@ def main():
                     + ''.join(f'    public const string {k}Sha256 = {cs_string(v["sha256"])};\n'
                               f'    public const string {k}Asset = {cs_string(v["name"])};\n'
                               f'    public const string {k}Tag = {cs_string(v["tag"])};\n' for k, v in pins.items()) + '}\n')
-        cmd = [CSC, '/nologo', '/target:winexe', '/optimize+', f'/out:{exe}', '/r:System.Windows.Forms.dll',
-               '/r:System.Drawing.dll', '/r:System.IO.Compression.dll', '/r:System.IO.Compression.FileSystem.dll',
-               os.path.join(HERE, 'Builder.cs'), rel]
+        # an explicit application manifest, as an ordinary installer carries (the compiler's default has no supportedOS
+        # and no DPI line): runs as the user (asInvoker, no administrator), Windows 10 / 11, system DPI aware as Main sets
+        man = os.path.join(tmp, 'Setup.manifest')
+        with open(man, 'w', encoding='utf-8') as f:
+            f.write(MANIFEST.format(name=re.sub(r'[^A-Za-z0-9.]', '', a.product.title()) + '.' + what, ver=ver))
+        cmd = [CSC, '/nologo', '/target:winexe', '/optimize+', f'/out:{exe}', f'/win32manifest:{man}',
+               '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.IO.Compression.dll',
+               '/r:System.IO.Compression.FileSystem.dll', os.path.join(HERE, 'Builder.cs'), rel]
         r = subprocess.run(cmd, capture_output=True, text=True)
         sys.stdout.write(r.stdout + r.stderr)
         if r.returncode:

@@ -14,7 +14,8 @@ typedef struct ContactPass {      // a render pass as it begins (exec.c begin_pa
     uint64_t c4_addr, c4_size;    // the fragment stage's constant buffer 4 bound now (guest address = host pointer)
 } ContactPass;
 
-int contact_strength(void);                 // TOTK_CONTACT_SHADOWS 0..100 (0: off)
+int contact_strength(void);                 // TOTK_CONTACT_SHADOWS 0..100 (0: off), then the live row's
+void contact_set_strength(const char *v);   // graphics.contact_shadows, live (pc_settings.cpp): from the next pass
 bool contact_wants_storage(VkFormat f);     // textures.c: a colour image the march writes (B10G11R11 while on)
 bool contact_pass_begin(const ContactPass *p);   // true: call contact_flush before this pass begins
 bool contact_flush(VkCommandBuffer cb);     // outside a pass: the pending march (also before dispatches and copies);

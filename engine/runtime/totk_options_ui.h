@@ -1,12 +1,12 @@
 // totk_options_ui.h: the game's Options screen (System > Options) as totk_options_menu.cpp's hooks see it: the row list
 // OptionsMgr::initialize builds, the two row controllers (a toggle, a selection), and the UI calls the hooks make. Field
 // offsets and call addresses are 1.0.0's (main+...; another version goes through totk_version.h, as every guest call);
-// the names are ours.
+// the names are ours. 1.4.3: OptionSelect grew by 8 before its type, ChoicesAlloc is inlined; the rest is unchanged.
 #pragma once
 
 #include <cstddef>
 
-#include "guest/guest.h"
+#include "guest/guest.h"   // (and totk_version.h)
 
 namespace totk_options_ui {
 
@@ -57,6 +57,12 @@ static_assert(offsetof(OptionToggle, parts) == 0x18 && offsetof(OptionToggle, ty
               "OptionToggle");
 constexpr size_t kToggleState = 0x89;   // a toggle button's on / off byte
 
+// 1.4.3's selection controller has 8 more bytes (a pointer) before its type (0x58 bytes): the field table
+// (totk_version.h) says where the type is, 1.0.0's 0x40 where it cannot (a diagnostic table that could not place it).
+// The 1.0.0 build keeps the plain struct.
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+constexpr size_t kSelectTypeOff = totk_field_known(OptionSelect, 0x40) ? totk_field(OptionSelect, 0x40) : 0x40;
+#endif
 // A selection row's controller (0x50 bytes): < choice >
 struct OptionSelect {
     u8 _0[0x18];
@@ -65,14 +71,23 @@ struct OptionSelect {
     u8 _28[8];
     void *arrowNext;   // the > arrow
     void *arrowPrev;   // the < arrow
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    u8 _40[kSelectTypeOff - 0x40];
+#endif
     s32 type;
     s32 choice;        // the shown choice, 0 .. choiceCount - 1
     u32 index;
     u32 nameHash;
 };
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+static_assert(offsetof(OptionSelect, arrowNext) == 0x30 && offsetof(OptionSelect, type) == kSelectTypeOff &&
+                  offsetof(OptionSelect, choice) == kSelectTypeOff + 4 && sizeof(OptionSelect) == kSelectTypeOff + 0x10,
+              "OptionSelect");
+#else
 static_assert(offsetof(OptionSelect, arrowNext) == 0x30 && offsetof(OptionSelect, type) == 0x40 &&
                   offsetof(OptionSelect, choice) == 0x44 && sizeof(OptionSelect) == 0x50,
               "OptionSelect");
+#endif
 
 // sead::FixedSafeString<32> after its formatting constructor, and eui's 0x18-byte MessageString
 struct FixedSafeString32 {
@@ -89,7 +104,11 @@ struct MessageString {
 // The OptionsMgr the open screen uses; null before there is one
 inline OptionsMgr *options_mgr() {
     const u64 owner = **guest_mem::guest_data<u64 *>(0x1004558440);
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    return *reinterpret_cast<OptionsMgr *const *>(static_cast<uintptr>(owner + totk_field(OptionsOwner, 0x5a0)));
+#else
     return *reinterpret_cast<OptionsMgr *const *>(static_cast<uintptr>(owner + 0x5a0));
+#endif
 }
 
 namespace guest {
@@ -109,8 +128,26 @@ GUEST_FN(SelectShowChoice, 1001a85d84, void(OptionSelect *self));   // "10%02d_%
 // OptionsMgr's entry array: count entries of 0x28 bytes from the heap, each a separator ({-1, 3, 0...}); count and
 // entries are set only when the allocation succeeds
 GUEST_FN(EntriesAlloc, 1001a067c8, void(OptionsMgr *mgr, u32 count, u64 heap));
+#if !defined(TOTK_GAME_VERSION) || TOTK_GAME_VERSION == 100
 // a {u32 count; u32 *data} array of count zeros (an entry's choices)
 GUEST_FN(ChoicesAlloc, 1000f6105c, void(void *array, u32 count, u64 heap));
+#else
+// The heap allocation 1.0.0's ChoicesAlloc (0xf6105c) makes: size bytes aligned to align from heap (null: the current
+// heap), or null
+GUEST_FN(HeapAlloc, 100098c090, void *(u64 heap, u64 size, u32 align, u32 flags));
+// 1.4.3 inlines ChoicesAlloc into OptionsMgr::initialize: its code, the same as the inlined copy (count zeros from
+// HeapAlloc(heap, count * 4, 8, 0), the array set only when the allocation succeeds)
+inline void ChoicesAlloc(void *array, u32 count, u64 heap) {
+    if (!count) return;  // (1.0.0's loop never ends on 0; no caller asks for it)
+    u32 *const data = static_cast<u32 *>(HeapAlloc(heap, u64{count} * 4, 8, 0));
+    if (!data) return;
+    for (u32 i = 0; i < count; i++) data[i] = 0;
+    struct Array { u32 count; u32 _4; u32 *data; };
+    Array *const a = static_cast<Array *>(array);
+    a->count = count;
+    a->data = data;
+}
+#endif
 }  // namespace guest
 
 }  // namespace totk_options_ui

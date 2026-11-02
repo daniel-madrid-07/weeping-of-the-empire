@@ -41,7 +41,7 @@ class PatchError(Exception):
 
 
 def layout_v100():
-    return sites_v100.Layout(text_end=sites_v100.TEXT_END_V100, data_off=DATA_PAGE_OFFSET)
+    return sites_v100.Layout(text_end=sites_v100.TEXT_END_V100, data_off=DATA_PAGE_OFFSET, span=MAIN_SPAN)
 
 
 # ---------------------------------------------------------------------------------------------------------- the table
@@ -92,7 +92,8 @@ def game_v100(lay=None):
     """The [game] section of v100.toml: what `load_main_image` checks an image against."""
     lay = lay or layout_v100()
     return dict(title_id=TITLE_ID, version=VERSION, build_id=MAIN_BUILD_ID, nso_sha256=MAIN_NSO_SHA256,
-                image_sha256=MAIN_IMAGE_SHA256, text_end=lay.text_end, span=MAIN_SPAN, data_page=lay.data_off)
+                image_sha256=MAIN_IMAGE_SHA256, text_end=lay.text_end, span=MAIN_SPAN, data_page=lay.data_off,
+                **({'extra_area': list(lay.extra)} if lay.extra else {}))
 
 
 def generate_toml(image, lay=None):
@@ -122,7 +123,8 @@ def table_toml(game, patches, header, image, features=None):
            f'text_end = {game["text_end"]:#x}',
            f'span = {game["span"]:#x}',
            f'data_page = {game["data_page"]:#x}',
-           f'data_page_size = {sites_v100.DATA_PAGE_SIZE:#x}',
+           f'data_page_size = {sites_v100.DATA_PAGE_SIZE:#x}'] + (
+           [f'extra_area = [{game["extra_area"][0]:#x}, {game["extra_area"][1]:#x}]'] if game.get('extra_area') else []) + [
            '']
     words = {}
     for p in patches:
@@ -235,7 +237,10 @@ def load_main_image(path, game=None):
     if hashlib.sha256(raw).hexdigest() != g['image_sha256']:
         raise PatchError(f'{path}: not the {g["version"]} main image (SHA-256 {hashlib.sha256(raw).hexdigest()}); '
                          f'expected {g["image_sha256"]}')
-    return bytearray(raw)
+    image = bytearray(raw)
+    if g.get('extra_area') and len(image) < g['extra_area'][1]:   # (zeros: .bss, then the extra veneer area)
+        image += bytes(g['extra_area'][1] - len(image))
+    return image
 
 
 def apply(image, table, features):
@@ -253,8 +258,12 @@ def apply(image, table, features):
         if off + n > len(image):
             mismatches.append(dict(offset=hex(off), feature=p['feature'], problem='outside the image'))
             continue
-        if off < g['text_end'] <= off + n - 1 or (off >= g['text_end'] and off + n > ((g['text_end'] + 0xfff) & ~0xfff)):
-            mismatches.append(dict(offset=hex(off), feature=p['feature'], problem='veneer outside the text padding'))
+        extra = g.get('extra_area') or (0, 0)
+        in_extra = extra[0] <= off and off + n <= extra[1]
+        if off < g['text_end'] <= off + n - 1 or (off >= g['text_end'] and not in_extra
+                                                 and off + n > ((g['text_end'] + 0xfff) & ~0xfff)):
+            mismatches.append(dict(offset=hex(off), feature=p['feature'],
+                                   problem='veneer outside the text padding and the extra veneer area'))
         if off in seen and seen[off] != p['feature']:
             mismatches.append(dict(offset=hex(off), feature=p['feature'], problem=f'also patched by {seen[off]}'))
         seen[off] = p['feature']

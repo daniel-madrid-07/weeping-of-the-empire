@@ -5,6 +5,12 @@
 #include "launcher.c"
 #undef wWinMain
 
+/* The early window of a check whose fake game ends at once (or after 100 ms): the launcher's wait returns as that game
+ * exits, so a long window costs no time, and on a PC a gate loads (a process start of several seconds; 3 s windows
+ * failed there) the exit still lands inside it. The late checks keep 100 / 300 ms windows: their game lives 600 ms or
+ * more after it starts, so load only makes them later, never early. */
+#define EARLY_GENEROUS 120000
+
 static int g_fail;
 #define CHECK(c) do { if (!(c)) { g_fail++; fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
 
@@ -56,6 +62,15 @@ static int vp9_none(void) { return 0; }
 static int vp9_no_mf(void) { return -1; }
 static int vp9_here(void) { return 1; }
 static int answer_update(const wchar_t *name) { (void)name; g_asked++; return g_answer; }
+/* dump_source_ready's "pick it again": the files in g_picks, in turn, then none (the player closes the dialog) */
+static const wchar_t *g_picks[4];
+static int g_npick;
+static int pick_script(const wchar_t *was, wchar_t *out, size_t n) {
+    (void)was;
+    if (g_npick >= 4 || !g_picks[g_npick]) return 0;
+    swprintf(out, n, L"%ls", g_picks[g_npick++]);
+    return 1;
+}
 
 static int log_has(const char *text) {
     wchar_t p[MAX_PATH]; swprintf(p, MAX_PATH, L"%ls\\launcher.log", g_local);
@@ -117,18 +132,18 @@ int main(int argc, char **argv) {
     /* run_package: each start prunes to KEEP_GAME_LOGS - 1 and adds its own log, so 8 stay */
     wchar_t why[768];
     HANDLE game;
-    int r = run(fake, "0,0", 5000, why, &game);
+    int r = run(fake, "0,0", EARLY_GENEROUS, why, &game);
     CHECK(r == QUIT);   /* exit 0 inside the window: the player quit, no fallback */
     CHECK(count(logs, L"totk-*.log") == KEEP_GAME_LOGS);
 
     /* an error exit inside the window: FAILED (the next package is tried), the reason names the code and the log */
-    r = run(fake, "3,100", 5000, why, &game);
+    r = run(fake, "3,100", EARLY_GENEROUS, why, &game);
     CHECK(r == FAILED);
     CHECK(wcsstr(why, L"0x00000003") != NULL);
     CHECK(wcsstr(why, L"Registro:") != NULL);
 
     /* an illegal instruction inside the window (a CPU without what totk.exe was built for): said so, with the log */
-    r = run(fake, "-1073741795,100", 5000, why, &game);
+    r = run(fake, "-1073741795,100", EARLY_GENEROUS, why, &game);
     CHECK(r == FAILED);
     CHECK(wcsstr(why, L"0xC000001D") != NULL && wcsstr(why, L"procesador") != NULL);
     CHECK(wcsstr(why, L"Registro:") != NULL);
@@ -138,7 +153,7 @@ int main(int argc, char **argv) {
     { wchar_t miss[256]; cpu_missing(miss, 256, 2); CHECK(miss[0] == 0); }
 
     /* a crash inside the window: the reason points at the report the game wrote (was: only the log) */
-    r = run(fake, "5,100,crash", 5000, why, &game);
+    r = run(fake, "5,100,crash", EARLY_GENEROUS, why, &game);
     CHECK(r == FAILED);
     CHECK(wcsstr(why, L"Informe del fallo:") != NULL && wcsstr(why, L"crash-") != NULL);
     CHECK(count(crashes, L"crash-*.txt") == 1);
@@ -263,7 +278,7 @@ int main(int argc, char **argv) {
         wchar_t pkg[MAX_PATH], why[768];
         swprintf(pkg, MAX_PATH, L"%ls\\rstr-early", g_root);
         make_package(pkg, fake, "0,0,rstr");
-        g_early_ms = 3000;
+        g_early_ms = EARLY_GENEROUS;
         CHECK(play_package(pkg, L"early", why, 768) == QUIT);   /* RSTR at once, then the restarted game quits */
         CHECK(log_has("early asked for a restart within"));
         CHECK(log_has("early asked for a restart: starting it again"));
@@ -278,14 +293,14 @@ int main(int argc, char **argv) {
         SetEnvironmentVariableW(L"FAKE_GAME_RESTARTED", NULL);
         swprintf(pkg, MAX_PATH, L"%ls\\rstr-loop", g_root);
         make_package(pkg, fake, "1381192786,0");   /* RSTR at every start */
-        g_early_ms = 3000;
+        g_early_ms = EARLY_GENEROUS;
         CHECK(play_package(pkg, L"loop", why, 768) == QUIT);
         CHECK(log_has("loop restarted 5 times within 60 s: not again"));
         /* a GPU that cannot run the game (device.c gpu_unsupported: its own box, code GPU0): no second message, no older
            package (early: QUIT, not FAILED), and none after a late one either */
         swprintf(pkg, MAX_PATH, L"%ls\\gpu-early", g_root);
         make_package(pkg, fake, "1196447024,0");   /* GPU_UNSUPPORTED_CODE */
-        g_early_ms = 3000;
+        g_early_ms = EARLY_GENEROUS;
         CHECK(play_package(pkg, L"gpuearly", why, 768) == QUIT);
         CHECK(log_has("gpuearly: this GPU cannot run the game"));
         swprintf(pkg, MAX_PATH, L"%ls\\gpu-late", g_root);
@@ -303,7 +318,7 @@ int main(int argc, char **argv) {
         swprintf(user, MAX_PATH, L"%ls\\mods", g_base);
         SetEnvironmentVariableW(L"TOTK_USER_MODS", L"stale");
         int two = _wcsicmp(local, user) != 0;
-        CHECK(mods_env() == (two ? 2 : 1));
+        CHECK(mods_env(L"", L"") == (two ? 2 : 1));
         CHECK(GetEnvironmentVariableW(L"TOTK_MODS_DIR", v, 4096) > 0);
         if (two) swprintf(want, 4096, L"%ls;%ls", local, user); else swprintf(want, 4096, L"%ls", local);
         CHECK(!wcscmp(v, want));
@@ -311,6 +326,92 @@ int main(int argc, char **argv) {
         swprintf(m, MAX_PATH, L"%ls\\LEEME-README.txt", user); CHECK(exists(m));
         swprintf(m, MAX_PATH, L"%ls\\LEEME-README.txt", local); CHECK(exists(m));
         CHECK(log_has("mods: TOTK_MODS_DIR="));
+        /* another game version (player.txt version=1.4.3): mods-v143 in both places, its readme naming the version */
+        swprintf(local, MAX_PATH, L"%ls\\mods-v143", g_dir);
+        swprintf(user, MAX_PATH, L"%ls\\mods-v143", g_base);
+        CHECK(mods_env(L"1.4.3", L"143") == (two ? 2 : 1));
+        if (two) swprintf(want, 4096, L"%ls;%ls", local, user); else swprintf(want, 4096, L"%ls", local);
+        CHECK(GetEnvironmentVariableW(L"TOTK_MODS_DIR", v, 4096) > 0 && !wcscmp(v, want));
+        swprintf(m, MAX_PATH, L"%ls\\LEEME-README.txt", user);
+        FILE *rf = _wfopen(m, L"r, ccs=UTF-8");
+        wchar_t first[256] = L"";
+        if (rf) { fgetws(first, 256, rf); fclose(rf); }
+        CHECK(wcsstr(first, L"1.4.3") != NULL);
+    }
+    {   /* a mod dropped on the launcher (install_paths: the command line's paths): a RomFS folder for 1.0.0 goes into
+           the game folder's mods with one message; a folder without mod files is refused, said, nothing written */
+        wchar_t mod[MAX_PATH], p[MAX_PATH], junk[MAX_PATH], dest[MAX_PATH];
+        swprintf(mod, MAX_PATH, L"%ls\\drop\\Better Rain", g_root);
+        swprintf(p, MAX_PATH, L"%ls\\romfs\\Pack", mod); mkdirs(p);
+        swprintf(p, MAX_PATH, L"%ls\\romfs\\Pack\\Rain.Product.100.sarc.zs", mod); touch(p);
+        swprintf(junk, MAX_PATH, L"%ls\\drop\\Just Notes", g_root); mkdirs(junk);
+        swprintf(p, MAX_PATH, L"%ls\\readme.txt", junk); touch(p);
+        /* (an existing file that is no archive, e.g. the .exe on a test's command line, is no dropped mod) */
+        wchar_t *args[] = {L"launcher.exe", L"--saves", mod, junk, L"C:\\no\\such\\mod.zip", fake};
+        CHECK(install_paths(args, 6) == 2);
+        swprintf(dest, MAX_PATH, L"%ls\\mods\\Better Rain\\romfs\\Pack\\Rain.Product.100.sarc.zs", g_dir);
+        CHECK(exists(dest) && exists(mod));   /* (the dropped folder is copied, never moved) */
+        CHECK(log_has("message: Mod installed: Better Rain (RomFS, for 1.0.0)") || log_has("message: Mod instalado: Better Rain (RomFS, para 1.0.0)"));
+        CHECK(log_has("message: The mod was not installed") || log_has("message: No he instalado el mod"));
+        swprintf(dest, MAX_PATH, L"%ls\\mods\\Just Notes", g_dir);
+        CHECK(!exists(dest));
+    }
+    {   /* amiibo_env (rival-parity 2026-11-02): TOTK_AMIIBO_DIR = <launcher folder>\amiibo, made; <g_base>\amiibo is
+           added only when the player made it */
+        wchar_t local[MAX_PATH], user[MAX_PATH], v[4096], want[4096];
+        swprintf(local, MAX_PATH, L"%ls\\amiibo", g_dir);
+        swprintf(user, MAX_PATH, L"%ls\\amiibo", g_base);
+        int two = _wcsicmp(local, user) != 0;
+        amiibo_env();
+        CHECK(exists(local));
+        CHECK(GetEnvironmentVariableW(L"TOTK_AMIIBO_DIR", v, 4096) > 0 && !wcscmp(v, local));
+        if (two) {
+            mkdirs(user);
+            amiibo_env();
+            swprintf(want, 4096, L"%ls;%ls", local, user);
+            CHECK(GetEnvironmentVariableW(L"TOTK_AMIIBO_DIR", v, 4096) > 0 && !wcscmp(v, want));
+        }
+        CHECK(log_has("amiibo: TOTK_AMIIBO_DIR="));
+    }
+    {   /* the game's data in the player's dump (romfs-source.txt, v0.1.8): there -> ready, nothing asked; moved -> picked
+           again (another file refused, the moved one taken: dump= rewritten, the other lines kept, the record gone, a
+           path with a non-ASCII letter); not picked -> not ready, said. No dialog, no registry write (a missing key). */
+        wchar_t d[MAX_PATH], moved[MAX_PATH], other[MAX_PATH], src[MAX_PATH], rec[MAX_PATH];
+        char u8[4 * MAX_PATH];
+        swprintf(d, MAX_PATH, L"%ls\\dump.nsp", g_root);
+        swprintf(moved, MAX_PATH, L"%ls\\moved dump \x00f1.nsp", g_root);
+        swprintf(other, MAX_PATH, L"%ls\\other.nsp", g_root);
+        swprintf(src, MAX_PATH, L"%ls\\romfs-source.txt", g_root);
+        swprintf(rec, MAX_PATH, L"%ls\\romfs-source.txt.verified.json", g_root);
+        unsigned char zeros[100] = {0}, ones[100];
+        memset(ones, 1, sizeof ones);
+        FILE *f = _wfopen(d, L"wb"); fwrite(zeros, 1, 100, f); fclose(f);
+        f = _wfopen(other, L"wb"); fwrite(ones, 1, 100, f); fclose(f);
+        WideCharToMultiByte(CP_UTF8, 0, d, -1, u8, sizeof u8, NULL, NULL);
+        f = _wfopen(src, L"wb");   /* (the image: 50 bytes at 10; check = sha256 of 50 zero bytes) */
+        fprintf(f, "# test\nversion=1\ndump=%s\ndump_size=100\nimage_offset=10\nimage_size=50\ncrypt=ctr\n"
+                   "check=cc2786e1f9910a9d811400edcddaf7075195f7a16b216dcbefba3bc7c4f2ae51\n", u8);
+        fclose(f);
+        touch(rec);
+        g_setup_key = L"Software\\nxrecomp-launcher-test-no-such-key";
+        g_pick_dump = pick_script;
+        g_npick = 0; g_picks[0] = NULL;
+        CHECK(dump_source_ready(src) == 1 && g_npick == 0 && exists(rec));
+        CHECK(MoveFileW(d, moved));
+        g_npick = 0; g_picks[0] = other; g_picks[1] = moved; g_picks[2] = NULL;
+        CHECK(dump_source_ready(src) == 1 && g_npick == 2);
+        CHECK(log_has("message: That file is not the game dump Setup read") || log_has("message: Ese archivo no es la copia"));
+        CHECK(log_has("game dump picked again"));
+        CHECK(!exists(rec));
+        DumpSource ds;
+        CHECK(read_dump_source(src, &ds) && !wcscmp(ds.dump, moved) && ds.dump_size == 100 && ds.image_offset == 10);
+        g_npick = 0; g_picks[0] = NULL;
+        CHECK(dump_source_ready(src) == 1 && g_npick == 0);   /* (found where it was picked) */
+        DeleteFileW(moved);
+        CHECK(dump_source_ready(src) == 0);
+        CHECK(log_has("game dump: not picked again"));
+        g_pick_dump = pick_dump;
+        g_setup_key = UPD_SETUP_KEY;
     }
     {   /* a package's processor level: player.txt cpu= (package.py), none = x86-64-v3 (this test PC has both) */
         wchar_t pkg[MAX_PATH], p[MAX_PATH], why[768];
@@ -321,7 +422,7 @@ int main(int argc, char **argv) {
         FILE *f = _wfopen(p, L"a"); fprintf(f, "cpu=x86-64-v2\n"); fclose(f);
         Sleep(1100);
         HANDLE game = NULL; FILETIME st;
-        g_early_ms = 3000;
+        g_early_ms = EARLY_GENEROUS;
         CHECK(run_package(pkg, L"cpuv2", why, 768, &game, &st) == QUIT);
         CHECK(log_has("cpuv2: cpu level x86-64-v2"));
     }
@@ -337,7 +438,7 @@ int main(int argc, char **argv) {
         { FILE *f = _wfopen(p, L"a"); fprintf(f, "version=1.4.3\nbeta=1\n"); fclose(f); }
         Sleep(1100);
         HANDLE game = NULL; FILETIME st;
-        g_early_ms = 3000;
+        g_early_ms = EARLY_GENEROUS;
         CHECK(run_package(pkg, L"v143", why, 768, &game, &st) == QUIT);
         swprintf(s143, MAX_PATH, L"%ls\\userdata-v143\\save\\slot_00\\progress.sav", g_base);
         CHECK(exists(s143));

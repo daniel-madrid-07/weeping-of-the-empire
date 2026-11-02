@@ -14,6 +14,7 @@ Code from other projects keeps its licence. The licence texts are in the files n
 | `engine/runtime/linux/stb_truetype.h` | [nothings/stb](https://github.com/nothings/stb) | MIT, "Copyright (c) 2017 Sean Barrett", or public domain | the end of the file |
 | `engine/runtime/nvn/maxwell/soft_f64.h` (software binary64 for GPUs without shaderFloat64: the algorithms reimplemented in GLSL) | Berkeley SoftFloat Release 3e (John R. Hauser) | BSD-3-Clause, "Copyright 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018 The Regents of the University of California" | `licenses/SoftFloat-3e.txt` |
 | The FSR 1 EASU / RCAS passes in `engine/runtime/nvn/vulkan/exec.c` (GLSL port) | [GPUOpen-Effects/FidelityFX-FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR) | MIT, "Copyright (c) 2021 Advanced Micro Devices, Inc." | `licenses/FidelityFX-FSR.txt` |
+| `engine/third_party/fidelityfx/` (the FidelityFX API C headers, unmodified; used by `engine/runtime/nvn/vulkan/ffx.c` for FSR 3.1 super resolution and frame generation) | [GPUOpen-LibrariesAndSDKs/FidelityFX-SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) v1.1.4 | MIT, "Copyright (C) 2024 Advanced Micro Devices, Inc." | `engine/third_party/fidelityfx/LICENSE.txt` |
 | `pipeline/extract.py`, `pipeline/nx/container.py`, `romfs.py`, `fonts.py`, `nso.py` (NSP / NCA / PFS0 / IVFC / RomFS / shared fonts / NSO to ELF); `tools/xlate/prepare_seed.py` (shader discovery); `games/totk/patches/sites_v100.py`, `arm64.py`, `games/totk/runtime/totk_patches.c`, `games/totk/overlays/*.py`, `games/totk/tests/verify_*.py` (1.0.0 patch sites and veneers, frame step, output size, heap formula, RomFS overlays, UI layouts, verifiers); `engine/tools/make_gameover_fix.py`, `make_quickmenu_fix.py` | [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames) (`games/totk/scripts`, `games/totk/runtime`) | MIT, "Copyright (c) 2026 MacNativeGames contributors" | `licenses/MacNativeGames.txt` |
 | The alpha-to-coverage dither in `engine/runtime/nvn/maxwell/translate.c` (the 2x2 coverage mask) | [Ryujinx](https://github.com/Ryujinx/Ryujinx) `EmitterContext.GenerateAlphaToCoverageDitherDiscard` | MIT, "Copyright (c) Ryujinx Team and Contributors" | `licenses/Ryujinx.txt` |
 | `games/totk/overlays/ultrawide_layout.py`, `tall_layout.py`: which UI panes move and by how much for 21:9 and 16:10 (measurements of the game's layouts; the code is ours and MacNativeGames') | [TOTK-Ultrawide](https://github.com/Fruithapje21/TOTK-Ultrawide) (Fruithapje21) | GPL-3.0 project; facts only, no code or files | credit only |
@@ -40,9 +41,16 @@ Fetched or found at build and run time, each under its own licence:
   from [github.com/NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) by `tools/engine/build.py`, every file checked against a
   pinned SHA-256, under the NVIDIA RTX SDKs licence (its `LICENSE.txt` is downloaded with it). NVIDIA, DLSS and RTX are
   trademarks of NVIDIA Corporation.
+- **AMD FidelityFX SDK** v1.1.4 runtime (`amd_fidelityfx_vk.dll`, FSR 3.1): downloaded from
+  [github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+  (`PrebuiltSignedDLL/`) by `tools/engine/build.py`, checked against a pinned SHA-256, under the SDK's MIT licence (its
+  `LICENSE.txt` is downloaded with it). Setup takes the same two files, unmodified and checked against the same SHA-256s,
+  from this project's release asset `setup-ffx.zip`. AMD, FidelityFX and FSR are trademarks of Advanced Micro Devices,
+  Inc.
 - The Vulkan SDK (LunarG), LLVM / clang, the Microsoft C++ build tools and Windows SDK, Git for Windows (its
   libzstd.dll), Python, the Python packages you install for the Builder (zstandard, pillow, fonttools, numpy,
-  cryptography, lz4, skia-pathops) and the ones the build installs in its own environment (capstone, lz4, ninja).
+  cryptography, lz4, skia-pathops) and the ones the build installs in its own environment (capstone, lz4, ninja,
+  zstandard, cryptography).
 
 ## Behaviour references (no code copied)
 

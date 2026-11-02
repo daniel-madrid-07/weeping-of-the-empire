@@ -32,6 +32,7 @@ static bool vs_nocontract(void) {
 static uint64_t src_hash(const char *src, int stage) {
     uint64_t h = (0xcbf29ce484222325ull ^ (uint64_t)stage) + 3;  // + version of the post-processing (no_contraction)
     if (stage == STAGE_VERTEX && !vs_nocontract()) h ^= 0x5bd1e995ull;
+    if (SPVGEN_REV != 1) h ^= (uint64_t)SPVGEN_REV * 0x9E3779B97F4A7C15ull;   // (spvgen.h: keys of revision 1 unchanged)
     for (const char *p = src; *p; p++) { h ^= (uint8_t)*p; h *= 0x100000001B3ull; }
     return h;
 }
@@ -424,6 +425,33 @@ static const char *builtin_src(const char *name, int *stage) {
                "  for (int y = 0; y < int(n.y); y++)\n"
                "    for (int x = 0; x < int(n.x); x++) s += textureLod(t, p0 + d * vec2(x, y), 0.0).rgb;\n"
                "  o = vec4(s / (n.x * n.y), 1.0);\n"
+               "}\n";
+    }
+    if (!strcmp(name, "present_color.frag")) {
+        *stage = STAGE_FRAGMENT;
+        // present.frag's taps, then the colour adjustment (exec.c display.color; only drawn when it is not identity, so
+        // the default present stays present.frag): k = brightness (added), contrast (around mid grey), saturation (from
+        // Rec. 709 luma), gamma (an exponent: below 1 brightens dark tones), on the gamma-encoded image the game drew.
+        // Fragment push constants at offset 32 (the vertex stage has 0-31).
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform C { layout(offset = 32) vec4 k; } pc;\n"
+               "layout(location = 0) in vec2 uv;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 adj(vec3 c) {\n"
+               "  c = pow(clamp(c, 0.0, 1.0), vec3(pc.k.w));\n"
+               "  c = (c - 0.5) * pc.k.y + 0.5 + pc.k.x;\n"
+               "  c = mix(vec3(dot(c, vec3(0.2126, 0.7152, 0.0722))), c, pc.k.z);\n"
+               "  return clamp(c, 0.0, 1.0);\n"
+               "}\n"
+               "void main() {\n"
+               "  vec2 sz = vec2(textureSize(t, 0)), fp = fwidth(uv) * sz;\n"
+               "  if (fp.x <= 2.01 && fp.y <= 2.01) { o = vec4(adj(texture(t, uv).rgb), 1.0); return; }\n"
+               "  vec2 n = clamp(ceil(fp * 0.5), 1.0, 8.0), d = fp / n / sz, p0 = uv - d * (n - 1.0) * 0.5;\n"
+               "  vec3 s = vec3(0.0);\n"
+               "  for (int y = 0; y < int(n.y); y++)\n"
+               "    for (int x = 0; x < int(n.x); x++) s += textureLod(t, p0 + d * vec2(x, y), 0.0).rgb;\n"
+               "  o = vec4(adj(s / (n.x * n.y)), 1.0);\n"
                "}\n";
     }
     // ---- post passes before the present (Video tab "Anti-aliasing" / "Upscaler"): exec.c vk_present_draw.

@@ -1,6 +1,7 @@
 // HLE: nn::os memory (heap, memory blocks, pages, QueryMemoryInfo) and nn::mem::StandardAllocator.
 #include "hle.h"
 #include "nxr_game.h"   // (NXR_GAME_TOTK: forms TotK's build leaves out)
+#include "host_wine.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
@@ -42,9 +43,13 @@ HLE_AS(os_QueryMemoryInfo, "_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE") {
 // write access after every PTE change in its range, which fails (EPERM / EFAULT) on read-only pages and costs a walk of the whole range
 // (2-3 GB) at the next submit when it succeeds. Off: heap_ww_changed() answers "unknown" (textures.c falls back to its sampled /
 // periodic hashing) and exec.c binds the alias window's host import directly (no VRAM mirror: nothing to gain on the Deck's unified memory).
+// Windows under Wine / Proton (ntdll exports wine_get_version) is that same Linux kernel and driver below: Wine's write watch and
+// VirtualProtect are mprotect too, so OFF there as well (TOTK_WW=1 turns it on, as on Linux).
 static bool ww_default() {
 #ifdef _WIN32
-    return true;
+    if (!host_is_wine()) return true;
+    const char* e = getenv("TOTK_WW");
+    return e && *e == '1';
 #else
     const char* e = getenv("TOTK_WW");
     return e && *e == '1';
@@ -239,9 +244,22 @@ static bool in_alias(u64 a, u64 n) { return g_alias_base && a >= g_alias_base &&
 // Vulkan backend can import them as one GPU buffer (VK_EXT_external_memory_host: ~100k vertex copies (~5 GB) per 2 s came
 // from alias regions (high-water 518 MB). An import pins its pages, so FreeMemoryPages must not decommit inside the
 // window; instead a per-4 KiB "mapped" bitmap keeps the kernel's MapPhysicalMemory semantics: pages that become mapped
-// again read as zero, mapped pages keep data.
-extern "C" u64 g_alias_import_base, g_alias_import_size;
+// again read as zero, mapped pages keep data. Committed as carved (ram-diet 2026-11-02 Windows, TOTK_ALIAS_GROW_MB,
+// default 128, 0 = the whole window at once as before): the window used to be committed whole at the first region, and its
+// import pins every page, so all 2048 MB were resident from the title on while the game's regions reached 1103 MB
+// (totk-20261102-112823: ~945 MB of zero pages held per session; the user's save 1377 MB). Now it commits in steps as
+// AllocateAddressRegion carves past what is committed (regions are carved lowest address first and the window starts at
+// the region's base, so the carved part is a prefix), and exec.c imports each new step on its import thread as a buffer of
+// its own (alias_import_extent below). Until a step is imported the draws that bind it copy their data, as for data past
+// the window. A page past the committed prefix is in no carved region, so the game never reaches it.
+extern "C" u64 g_alias_import_base, g_alias_import_size, g_alias_import_committed;
 u64 g_alias_import_base, g_alias_import_size;
+u64 g_alias_import_committed;                    // window bytes committed so far (a prefix; grows; exec.c reads it unlocked)
+static u64 g_alias_grow;                         // its step (= the window: committed whole at once)
+// The first commit is TOTK_ALIAS_GROW_FIRST_MB (default 1024): what nearly every session carves, so it is imported once
+// on the thread at the title as before, and a session grows by a step or two after it, not ~9 times: each later import
+// pins its step while the game runs (a driver call on the import thread).
+static u64 g_alias_first;
 static u8* g_alias_mapped;                       // 1 bit per 4 KiB page of the window
 static u64 g_alias_hw;                           // high-water offset of carved regions (bounds the write-watch scan)
 static bool g_alias_ww;                          // reserved with MEM_WRITE_WATCH (exec.c keeps a VRAM mirror of the window)
@@ -276,6 +294,9 @@ static int g_sw_nio;
 // Re-arming waits for exec.c's first take (the probe, made once the window's Vulkan import is done: a driver that locks the
 // pages for write access must not meet read-only ones), and stops again at alias_soft_pause (vk_exec_reset: a re-import).
 static bool g_sw_armable;                // (g_sw_mu)
+// ... and only pages exec.c has imported (alias_import_extent): a step committed later is imported on its own, after the
+// first probe, so its pages stay unarmed until that import is done
+static std::atomic<u64> g_sw_arm_end{0};    // window offset: pages at or past it are never armed
 // Hot pages: a page found written at SW_HOT takes in a row is left writable (DIRTY, so reported at every take) for SW_COOL
 // takes, then armed again; a page the game rewrites every frame would otherwise fault at every take.
 static u8* g_sw_heat;
@@ -285,7 +306,8 @@ static void sw_panic() {
     if (g_sw_off.exchange(true)) return;
     DWORD o;
     DWORD err = GetLastError();
-    BOOL rw = VirtualProtect((void*)g_alias_import_base, (SIZE_T)g_alias_import_size, PAGE_READWRITE, &o);
+    BOOL rw = VirtualProtect((void*)g_alias_import_base, (SIZE_T)__atomic_load_n(&g_alias_import_committed, __ATOMIC_ACQUIRE),
+                             PAGE_READWRITE, &o);
     printf("[os] alias soft write watch: VirtualProtect failed (err %lu), off for good: the window is copied when bound%s\n", err,
            rw ? "" : "; making it writable failed too: pages still read-only are made writable one by one as they fault");
 }
@@ -321,6 +343,7 @@ static int sw_take(u64 off, u64 len, u64* offs, u64* lens, int max, u64* bytes) 
     u64 p = off >> 12, pe = (off + len + 0xFFF) >> 12, run0 = 0, run1 = 0;
     int n = 0;
     std::lock_guard<std::mutex> l(g_sw_mu);
+    const u64 arm_end = g_sw_arm_end.load(std::memory_order_acquire) >> 12;
     auto flush = [&] {
         DWORD o;
         if (run1 > run0 && !VirtualProtect((void*)(g_alias_import_base + (run0 << 12)), (SIZE_T)((run1 - run0) << 12), PAGE_READONLY, &o)) sw_panic();
@@ -335,7 +358,7 @@ static int sw_take(u64 off, u64 len, u64* offs, u64* lens, int max, u64* bytes) 
         if (n && offs[n - 1] + lens[n - 1] == o) lens[n - 1] += 0x1000;
         else if (n == max) lens[n - 1] = o + 0x1000 - offs[n - 1];
         else { offs[n] = o; lens[n] = 0x1000; n++; }
-        bool arm = g_sw_armable && s != SW_PENDING && !sw_in_io(p);
+        bool arm = g_sw_armable && p < arm_end && s != SW_PENDING && !sw_in_io(p);
         if (arm && s == SW_DIRTY) {   // written since it was armed: count the streak, leave a hot page writable for a while
             u8 h = g_sw_heat[p];
             g_sw_heat[p] = h + 1 >= SW_HOT + SW_COOL ? 0 : h + 1;
@@ -414,16 +437,28 @@ extern "C" void alias_soft_pause(void) {
     if (!g_alias_soft || g_sw_off.load()) return;
     std::lock_guard<std::mutex> l(g_sw_mu);
     g_sw_armable = false;
+    g_sw_arm_end.store(0, std::memory_order_release);   // (the re-import says again how far it reached)
     DWORD o;
-    if (!VirtualProtect((void*)g_alias_import_base, (SIZE_T)g_alias_import_size, PAGE_READWRITE, &o)) { sw_panic(); return; }
+    if (!VirtualProtect((void*)g_alias_import_base, (SIZE_T)__atomic_load_n(&g_alias_import_committed, __ATOMIC_ACQUIRE), PAGE_READWRITE, &o)) {
+        sw_panic();
+        return;
+    }
     for (u64 i = 0, np = g_alias_import_size >> 12; i < np; i++) {
         u8 exp = SW_ARMED;   // (PENDING: its handler stores DIRTY itself)
         __atomic_compare_exchange_n(&g_sw_st[i], &exp, (u8)SW_DIRTY, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     }
 }
+// exec.c: its imports of the window now reach `end` bytes (each committed step is imported on the import thread)
+extern "C" void alias_import_extent(u64 end) {
+    if (!g_alias_soft) return;
+    if (end > g_alias_import_size) end = g_alias_import_size;
+    u64 cur = g_sw_arm_end.load(std::memory_order_acquire);
+    while (end > cur && !g_sw_arm_end.compare_exchange_weak(cur, end, std::memory_order_acq_rel)) {}
+}
 #else
 extern "C" void alias_soft_io(const void*, size_t, int) {}
 extern "C" void alias_soft_pause(void) {}
+extern "C" void alias_import_extent(u64) {}
 #endif
 // Dirty ranges of the window since the previous call (GetWriteWatch with reset), as (offset, length) pairs from the
 // window base, coalesced; at most `max` ranges (the last one widens to cover the rest). Returns -1 without write watch.
@@ -499,6 +534,25 @@ static void window_map(u64 a, u64 n, bool map) {
         if (map) g_alias_mapped[p >> 3] |= (u8)(1u << (p & 7)); else g_alias_mapped[p >> 3] &= (u8)~(1u << (p & 7));
     }
 }
+// The window committed through offset `end` (g_alias_mtx held), rounded up to the step, at most the whole window. false =
+// the commit failed (no commit charge left): the region is refused, as a commit of its pages outside the window would fail.
+static bool window_grow(u64 end) {
+    if (end > g_alias_import_size) end = g_alias_import_size;
+    const u64 c = g_alias_import_committed;
+    if (end <= c) return true;
+    u64 to = (end + g_alias_grow - 1) / g_alias_grow * g_alias_grow;
+    if (!c && to < g_alias_first) to = g_alias_first;
+    if (to > g_alias_import_size) to = g_alias_import_size;
+    if (!VirtualAlloc((void*)(g_alias_import_base + c), to - c, MEM_COMMIT, PAGE_READWRITE)) {
+        printf("[os] alias import window: commit %llu -> %llu MB failed (err %lu)\n", (unsigned long long)(c >> 20),
+               (unsigned long long)(to >> 20), (unsigned long)GetLastError());
+        return false;
+    }
+    __atomic_store_n(&g_alias_import_committed, to, __ATOMIC_RELEASE);
+    printf("[os] alias import window: %llu of %llu MB committed (regions reach %llu MB)\n", (unsigned long long)(to >> 20),
+           (unsigned long long)(g_alias_import_size >> 20), (unsigned long long)(end >> 20));
+    return true;
+}
 HLE_AS(os_AllocateAddressRegion, "_ZN2nn2os21AllocateAddressRegionEPmm") {
     std::lock_guard<std::mutex> l(g_alias_mtx);
     if (!g_alias_base) {
@@ -518,7 +572,17 @@ HLE_AS(os_AllocateAddressRegion, "_ZN2nn2os21AllocateAddressRegionEPmm") {
         const char* e = getenv("TOTK_ALIAS_IMPORT_MB");
         u64 w = (e ? strtoull(e, nullptr, 0) : 2048) << 20;  // (1024 until 10-15 23:10: the user's save reached 1377 MB -> 3.7 GB of vertex copies per 2 s)
         if (w > g_alias_size) w = g_alias_size;
-        if (w && VirtualAlloc((void*)g_alias_base, w, MEM_COMMIT, PAGE_READWRITE)) {
+#ifdef _WIN32
+        const char* ge = getenv("TOTK_ALIAS_GROW_MB");
+        g_alias_grow = (ge && *ge ? strtoull(ge, nullptr, 0) : 128) << 20;
+        g_alias_grow = (g_alias_grow + 0xFFFFFF) & ~0xFFFFFFull;   // (whole 16 MB mirror blocks in each import)
+        const char* fe = getenv("TOTK_ALIAS_GROW_FIRST_MB");
+        g_alias_first = (((fe && *fe ? strtoull(fe, nullptr, 0) : 1024) << 20) + 0xFFFFFF) & ~0xFFFFFFull;
+        if (g_alias_first > w) g_alias_first = w;
+#endif
+        if (!g_alias_grow || g_alias_grow >= w) g_alias_grow = w;   // (Linux: whole, the window is one GPU buffer object)
+        if (w && (g_alias_grow < w || VirtualAlloc((void*)g_alias_base, w, MEM_COMMIT, PAGE_READWRITE))) {
+            if (g_alias_grow == w) g_alias_import_committed = w;
 #ifndef _WIN32
             if (!g_alias_ww) rt_gpu_bo_map((void*)g_alias_base, w, PROT_READ | PROT_WRITE);   // (nothing written there yet)
 #endif
@@ -535,12 +599,20 @@ HLE_AS(os_AllocateAddressRegion, "_ZN2nn2os21AllocateAddressRegionEPmm") {
             }
 #endif
             g_alias_import_base = g_alias_base; g_alias_import_size = w;   // (published last: exec.c reads it unlocked)
-            printf("[os] alias import window %llx + %llu MB committed\n", g_alias_base, (unsigned long long)(w >> 20));
+            if (g_alias_grow < w)
+                printf("[os] alias import window %llx + %llu MB, committed as regions are carved: %llu MB first, then %llu MB steps "
+                       "(TOTK_ALIAS_GROW_FIRST_MB, TOTK_ALIAS_GROW_MB)\n", g_alias_base, (unsigned long long)(w >> 20),
+                       (unsigned long long)(g_alias_first >> 20), (unsigned long long)(g_alias_grow >> 20));
+            else printf("[os] alias import window %llx + %llu MB committed\n", g_alias_base, (unsigned long long)(w >> 20));
         } else if (w) printf("[os] alias import window: commit of %llu MB failed, vertex data there is copied\n", (unsigned long long)(w >> 20));
     }
     u64 size = (c->x[1] + kRegionAlign - 1) & ~(kRegionAlign - 1), got = 0;
     for (auto it = g_alias_free.begin(); it != g_alias_free.end(); ++it) {
         if (it->second < size) continue;
+        if (g_alias_import_size && it->first < g_alias_import_base + g_alias_import_size && !window_grow(it->first + size - g_alias_base)) {
+            c->x[0] = 0x1A01;   // (window_grow said why)
+            return;
+        }
         got = it->first; u64 rest = it->second - size;
         g_alias_free.erase(it);
         if (rest) g_alias_free[got + size] = rest;

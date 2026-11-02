@@ -74,8 +74,11 @@ def main(argv=None):
     e.add_argument('--new', required=True, type=Path, help="the other build's exefs/main (NSO)")
     e.add_argument('--version', required=True, help='its display version, e.g. 1.4.3')
     e.add_argument('--report', type=Path, help='every address and function with its placement (JSON)')
-    e.add_argument('--fields', type=Path, help='struct field map {"Struct": {"0x<1.0.0 off>": "0x<off>"}} (JSON, '
-                   'private like the table): totk_fields_v<NNN>.inc')
+    e.add_argument('--fields', type=Path, help='private flat struct field map {"Struct": {"0x<1.0.0 off>": "0x<off>"}} '
+                   '(JSON): totk_fields_v<NNN>.inc; default: games/totk/patches/fields_v<NNN>.json, gated by its pins')
+    e.add_argument('--pins', type=Path, help='hand pairs {"0x<1.0.0 fn>": {"new", "body", "why", "checked"}} (JSON): places a '
+                   'pair the porter could not confirm and keeps a hook whose body changed (its C++ checked against that '
+                   'build, moved fields through --fields); default: games/totk/patches/pins_v<NNN>.json if present')
     e.add_argument('--diagnostic', action='store_true', help='never shipped: unplaced addresses get the '
                    'sentinel, unplaced names trap stubs, lost required hooks are only reported '
                    '(build.py: TOTK_VERSION_DIAGNOSTIC=1)')
@@ -133,11 +136,20 @@ def main(argv=None):
         elif args.cmd in ('engine', 'sigma'):
             from . import engine
             table = read_table(args.table)
-            features = resolve_features(engine.engine_spec(args.features, {f['name'] for f in table['feature']}), table)
             try:
                 safe = engine.safe_mode(args.table, table)
+                kept = engine.kept_hooks(args.table, table)
+                fknown = engine.known_fields(args.table, table)
             except engine.EngineError as e:
                 raise PatchError(str(e))
+            known = {f['name'] for f in table['feature']}
+            features = resolve_features(engine.engine_spec(args.features, known, kept, fknown), table)
+            for f in engine.ENGINE_DEFAULT:   # (said: a default engine feature its build's map left without its hook)
+                if f in known and kept is not None and f not in features and 'default' in (args.features or 'default'):
+                    lost = [h for h in engine.HOOKS_NEEDED.get(f, ()) if h not in kept] + \
+                           [x for x in engine.FIELDS_NEEDED.get(f, ()) if x not in (fknown or set())]
+                    print(f'[engine] {f} off: {table["game"]["version"]} lacks {", ".join(lost)} (its engine map)',
+                          file=sys.stderr)
             if 'cap30' in safe and 'fps60' in features:
                 raise PatchError(f"{table['game']['version']} lost hooks that keep a frame rate above 30 right "
                                  '(its engine map: safe_mode cap30): export with --features default,-fps60')

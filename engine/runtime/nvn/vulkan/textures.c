@@ -192,7 +192,15 @@ static bool format_supports(VkFormat f, VkFormatFeatureFlags want) {
 // Same rules as metal.m (see the comments there).
 static float g_rs_x = 1, g_rs_y = 1;
 void renderer_get_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }
-void renderer_set_scale(float sx, float sy) { g_rs_x = sx; g_rs_y = sy; }
+// vk_render_epoch (the dlss worker's SR features): moves on, monotonically, each time the render scale really changes, and
+// only after renderer_get_scale returns the new one; also when graphics.native_ui changes the canvas (renderer_out_scale)
+static uint32_t g_render_epoch;
+void renderer_set_scale(float sx, float sy) {
+    if (sx == g_rs_x && sy == g_rs_y) return;
+    g_rs_x = sx; g_rs_y = sy;
+    __atomic_add_fetch(&g_render_epoch, 1, __ATOMIC_RELEASE);
+}
+uint32_t vk_render_epoch(void) { return __atomic_load_n(&g_render_epoch, __ATOMIC_ACQUIRE); }
 uint64_t renderer_present_count(void);
 
 // Output canvas (TOTK_OUT_SCALE, 2026-10-17): TotK's 1920x1080 targets (the canvas its upscale pass writes and the UI draws on,
@@ -202,12 +210,14 @@ uint64_t renderer_present_count(void);
 // window's 16:9 picture is taller than 1080 lines when first asked (the game's first 1920x1080 target or the upscale program,
 // after the start's window mode is applied): at 1080 or less the canvas is the game's own size anyway, and every target and the
 // upscale pass stay exactly as they were. Decided once, like the textures' sizes: a window made larger later keeps the start's
-// choice until a restart.
+// choice until a restart, or until the row changes: graphics.native_ui is live (renderer_set_native_ui, applied at the next
+// present: renderer_set_out_scale), the canvas targets remade between two frames with their contents (tex_live_check), the
+// upscale program in the form a start would give it (exec.c knobs).
 static float g_out_s = 1;
+static int g_out_on = -1;   // TOTK_OUT_SCALE, then the live row (render thread)
 static int out_scale_on(void) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("TOTK_OUT_SCALE"); on = !(e && !strcmp(e, "0")); }
-    return on;
+    if (g_out_on < 0) { const char *e = getenv("TOTK_OUT_SCALE"); g_out_on = !(e && !strcmp(e, "0")); }
+    return g_out_on;
 }
 // shim_win.c / shim_sdl3.c: the monitor's in fullscreen, else the client; false until the start's window mode is applied
 // (waiting up to wait_ms; a borderless start reads as the blank 1280 x 720 window before that)
@@ -247,21 +257,73 @@ int renderer_out_scale_active(void) {   // (exec.c: the upscale pass resamples t
     while ((s = __atomic_load_n(&g_out_state, __ATOMIC_ACQUIRE)) == 3) SDL_Delay(1);
     return s == 2;
 }
-// device.c, every present: the decision by the first one at the latest (the scale stays the start's: above)
-void renderer_set_out_scale(float s) { (void)s; renderer_out_scale_active(); }
-
-// Shadow maps: square depth render targets (TotK: the 800x800 x4 sun cascades, D32) rendered at TOTK_SHADOW_SCALE x
-// their size (default 2; 1 = the game's own). The user: "theres still alot of shimmering on the shadows". Shaders see
-// the guest size through the rscale table like every scaled target (translate.c).
-static float shadow_scale(void) {
-    static float s = -1;
-    if (s < 0) {
-        const char *e = getenv("TOTK_SHADOW_SCALE");
-        s = e && *e ? (float)atof(e) : 2.0f;
-        if (!(s >= 1.0f && s <= 4.0f)) s = 1.0f;
+// ngx.c (DLSS features made ahead): the canvas scale, 1 when off
+float renderer_out_scale(void) { return renderer_out_scale_active() ? g_out_s : 1.0f; }
+// Live settings that change how targets are made (graphics.native_ui and graphics.shadow_scale here,
+// graphics.contact_shadows' STORAGE usage in contact.c): g_tex_gen moves on at a present, and each image is checked
+// against the new state at its next use (tex_live_check, tex_backend). The recycle pool is emptied then: its images
+// were made for the old state.
+static uint32_t g_tex_gen;
+static int g_tex_bump;      // (any thread: renderer_tex_remake) a remake check from the next present
+static int g_out_req = -1;  // (settings thread) graphics.native_ui's new value: -1 none, 0 off, 1 on
+static void recycle_flush(void);
+static void samplers_tick(void);
+static float g_shadow_s;   // (graphics.shadow_scale, below)
+static int g_shadow_req;
+static float shadow_scale(void);
+// (exec.c, the drawing thread's knobs: the decision if made, never waiting for it: off until then)
+int renderer_out_scale_peek(void) { return __atomic_load_n(&g_out_state, __ATOMIC_ACQUIRE) == 2; }
+void renderer_tex_remake(void) { __atomic_store_n(&g_tex_bump, 1, __ATOMIC_RELEASE); }
+void renderer_set_native_ui(int on) { __atomic_store_n(&g_out_req, on ? 1 : 0, __ATOMIC_RELEASE); }
+// device.c, every present (render thread): the decision by the first one at the latest; then the live row's change,
+// decided as out_scale_decide does at a start, in this window (s: its 16:9 picture height / 1080, clamped to 1 .. 4)
+void renderer_set_out_scale(float s) {
+    const int was = renderer_out_scale_active();
+    const int req = __atomic_exchange_n(&g_out_req, -1, __ATOMIC_ACQ_REL);
+    if (req >= 0) {
+        out_scale_on();
+        g_out_on = req;
+        const char *wide = getenv("TOTK_OUTPUT_RES");
+        const int a = req && !(wide && *wide && strcmp(wide, "0")) && s > 1.0005f;   // (vh > 1080.5, as at a start)
+        if (a) g_out_s = s > 4.0f ? 4.0f : s;
+        __atomic_store_n(&g_out_state, a ? 2 : 1, __ATOMIC_RELEASE);
+        LOG("[tex] output canvas at the window's resolution (graphics.native_ui, live): %s (x%.3f)\n", a ? "on" : "off", g_out_s);
+        if (a || was) {
+            __atomic_store_n(&g_tex_bump, 1, __ATOMIC_RELEASE);
+            __atomic_add_fetch(&g_render_epoch, 1, __ATOMIC_RELEASE);   // (vk_render_epoch: DLSS's output, the canvas, too)
+        }
     }
-    return s;
+    {
+        const float sr = __atomic_exchange_n(&g_shadow_req, 0, __ATOMIC_ACQ_REL) / 1000.0f;
+        if (sr > 0 && sr != shadow_scale()) {
+            LOG("[tex] shadow maps at x%.0f (graphics.shadow_scale, live; was x%.0f)\n", sr, g_shadow_s);
+            g_shadow_s = sr;
+            __atomic_store_n(&g_tex_bump, 1, __ATOMIC_RELEASE);   // (maps at 1 are no scaled kind: tex_live_check)
+        }
+    }
+    if (__atomic_exchange_n(&g_tex_bump, 0, __ATOMIC_ACQ_REL)) {
+        g_tex_gen++;
+        recycle_flush();
+    }
+    samplers_tick();
 }
+
+// Shadow maps: square depth render targets (TotK: the 800x800 x4 sun cascades, D32) rendered at TOTK_SHADOW_SCALE x their
+// size (default 2; 1 = the game's own). The user: "theres still alot of shimmering on the shadows". Shaders see the guest
+// size through the rscale table like every scaled target (translate.c). Live (graphics.shadow_scale,
+// renderer_set_shadow_scale): applied at the next present like the render scale, each shadow map remade at its next use
+// with its contents (rescale_image; maps at 1 are no scaled kind: tex_live_check).
+static float g_shadow_s = -1;   // (render thread)
+static int g_shadow_req;        // (settings thread) the new scale x 1000; 0: none
+static float shadow_parse(const char *e) {
+    const float s = e && *e ? (float)atof(e) : 2.0f;
+    return s >= 1.0f && s <= 4.0f ? s : 1.0f;
+}
+static float shadow_scale(void) {
+    if (g_shadow_s < 0) g_shadow_s = shadow_parse(getenv("TOTK_SHADOW_SCALE"));
+    return g_shadow_s;
+}
+void renderer_set_shadow_scale(const char *v) { __atomic_store_n(&g_shadow_req, (int)lroundf(shadow_parse(v) * 1000.0f), __ATOMIC_RELEASE); }
 // Promoted targets: TotK renders some non-compressible targets in one pass with a scaled one of the same size (fs
 // dd9edc34: an R8 1600x900 mask with the scene's depth buffer, every frame; fs 7e405a3d: R11G11B10F + R8 800x450 while
 // loading). begin_pass renders the smallest attachment extent, so at TOTK_RES_SCALE=2 the pass used a quarter of the
@@ -525,6 +587,10 @@ static void vk_collect_dead_(bool all) {
 
 uint64_t prof_img_n, prof_img_ns;  // (exec.c LARECOMP_VK_PROF) images created and the time spent creating them
 uint64_t cum_img_n, cum_img_ns;    // the same, never reset (exec.c hitch log)
+// This frame's slowest image creation and texture upload (identify + hash + deswizzle / decode / staging), what they were:
+// exec.c's hitch log names them (stream-hitch: player logs gave only the frame's sums), then resets them each frame.
+uint64_t hf_img_worst_ns, hf_up_worst_tk;
+char hf_img_worst[112], hf_up_worst[112];
 static void create_image_(NvnTexture *t, TexBackend *b);
 // CUBE_COMPATIBLE on square 2D arrays of 6+ layers that are no cube textures. kak.cap on the RDNA2 iGPU: 12+ such arrays
 // (the terrain material arrays, 1024x1024 x121, 128x128 x118, 512x512 x12...) and no cube view of any 2D array. Off
@@ -546,11 +612,18 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     uint64_t t0 = SDL_GetTicksNS();
     create_image_(t, b);
     uint64_t dt = SDL_GetTicksNS() - t0;
+    if (dt > hf_img_worst_ns) {
+        extern VkDeviceSize vma_shim_size(VmaAllocation al);
+        hf_img_worst_ns = dt;
+        snprintf(hf_img_worst, sizeof hf_img_worst, "%ux%ux%u fmt %#x levels %u layers %u, %.1f MB", b->width, b->height, b->depth,
+                 t->format, b->levels, b->layers, vma_shim_size(b->mem) / 1048576.0);
+    }
     __atomic_add_fetch(&cum_img_n, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&cum_img_ns, dt, __ATOMIC_RELAXED);
     if (prof_up_ns != ~0ull) { prof_img_n++; prof_img_ns += dt; }
 }
 static void create_image_(NvnTexture *t, TexBackend *b) {
     b->snap_tag = 0;   // (exec.c snapshot delta: a new image is no snapshot's mirror)
+    b->parked = false;
     VkFmt mf = fmt_of(t->format);
     b->sx = b->scalable ? kind_sx(b->scale_kind) : 1;
     b->sy = b->scalable ? kind_sy(b->scale_kind) : 1;
@@ -652,6 +725,8 @@ static void create_image_(NvnTexture *t, TexBackend *b) {
         flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     // 3D render targets (TotK renders mips / slices of 3D volumes): slices are drawn through 2D views
     if (type == VK_IMAGE_TYPE_3D && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+    // (and sampled through a 2D view of slice 0 where a shader's lookup is 2D: vk_view, device.c view2d_of_3d)
+    if (type == VK_IMAGE_TYPE_3D && g_vk.view2d_of_3d && (usage & VK_IMAGE_USAGE_SAMPLED_BIT)) flags |= VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = vf,
                             .extent = {tw, th, depth}, .mipLevels = levels, .arrayLayers = layers,
                             .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
@@ -711,8 +786,10 @@ void vk_dl_note_upload(void *img, uint32_t w, uint32_t h, uint32_t lv);  // (exe
 static uint32_t level_w(const TexBackend *b, uint32_t lv) { uint32_t v = b->width >> lv; return v ? v : 1; }
 static uint32_t level_h(const TexBackend *b, uint32_t lv) { uint32_t v = b->height >> lv; return v ? v : 1; }
 
+static uint64_t park_bytes, park_live;   // (residency park_move: rendered images in system memory now)
 static void destroy_image(TexBackend *b) {
     views_forget(b);
+    if (b->parked) { park_bytes -= vma_shim_size(b->mem); park_live--; b->parked = false; }
     if (b->image || b->mem) defer((Dead){.img = b->image, .mem = b->mem});  // (never the same allocation twice)
     b->image = VK_NULL_HANDLE;
     b->mem = VK_NULL_HANDLE;
@@ -828,6 +905,7 @@ void vk_depth_twin_check_poll(void) {   // (also each stats window, device.c: a 
 }
 void vk_depth_twin_copy(VkCommandBuffer cb, TexBackend *b) {
     TexBackend *d = b->twin;
+    if (b->base_type == VK_IMAGE_VIEW_TYPE_3D) return;   // (a 3D image's twin is its slice copy: slice_twin_view)
     if (!d || !d->image || !b->image || d->width != b->width || d->height != b->height || d->levels != b->levels || d->layers != b->layers) return;
     uint64_t off[16], n = twin_layout(b, off);
     if (n > twin_buf_size) {
@@ -1122,7 +1200,7 @@ static void live_remove(TexBackend *b) {
 // texture's image goes to a pool; a new texture of the same shape takes it with its views. Contents are undefined,
 // as with reused pool memory on hardware. LARECOMP_VK_NO_RECYCLE=1 disables.
 #define RECYCLE_MAX 512
-typedef struct { TexBackend *b; uint32_t format, target, w, h, d, levels, samples; bool scalable; float sx, sy; uint64_t seq, addr; bool gpu_owned; } Recycled;
+typedef struct { TexBackend *b; uint32_t format, target, w, h, d, levels, samples; bool scalable; float sx, sy; uint64_t seq, addr; bool gpu_owned; uint64_t put_ns; } Recycled;
 static Recycled g_recycle[RECYCLE_MAX];
 static int g_nrecycle;
 static uint64_t g_recycle_bytes;   // (device memory held by pooled images: "[vram]" line)
@@ -1137,6 +1215,47 @@ static int recycle_off(void) {
     return off;
 }
 static void free_backend(TexBackend *b) { destroy_image(b); free(b->pending_rgba); free(b); }
+// Pool byte cap. A fixed 512 MB could not hold what aiming the bow makes, each aim added ~1.6-2.1 GB of render targets in
+// 44-172 new images (rendered 1163 -> 3309 MB at the 4th aim, 172 images created), the game finalized them minutes later,
+// the pool kept 512 MB of them, and the next aim created them all again (104 / 59 ms aim frames). With room under the VRAM
+// budget the pool may hold 3/4 of that room (at least 512 MB, at most LARECOMP_VK_RECYCLE_MAX_MB, default 3072); the
+// residency tick recomputes it, and short of VRAM or commit it is 512 MB again.
+static uint64_t g_recycle_cap = 512ull << 20;
+static int recycle_cap_fixed(void) {   // 1: LARECOMP_VK_RECYCLE_MB set (g_recycle_cap is it)
+    static int f = -1;
+    if (f < 0) {
+        const char *e = getenv("LARECOMP_VK_RECYCLE_MB");
+        f = e != NULL;
+        if (e) g_recycle_cap = (uint64_t)atol(e) << 20;
+    }
+    return f;
+}
+static uint64_t recycle_cap(void) { recycle_cap_fixed(); return g_recycle_cap; }
+static void recycle_cap_update(uint64_t usage, uint64_t budget, uint64_t headroom, bool short_) {
+    if (recycle_cap_fixed()) return;
+    static uint64_t cmax;
+    if (!cmax) { const char *e = getenv("LARECOMP_VK_RECYCLE_MAX_MB"); cmax = (uint64_t)(e ? atol(e) : 3072) << 20; if (cmax < (512ull << 20)) cmax = 512ull << 20; }
+    uint64_t pool = g_recycle_bytes;
+    pthread_mutex_lock(&g_recycle_lock);   // (pooled parked images are system memory: not part of the driver's VRAM usage)
+    for (int i = 0; i < g_nrecycle; i++) if (g_recycle[i].b->parked) pool -= vma_shim_size(g_recycle[i].b->mem);
+    pthread_mutex_unlock(&g_recycle_lock);
+    uint64_t rest = usage > pool ? usage - pool : 0, top = budget > 2 * headroom ? budget - 2 * headroom : 0;
+    uint64_t c = !short_ && top > rest ? (top - rest) / 4 * 3 : 0;
+    g_recycle_cap = c < (512ull << 20) ? 512ull << 20 : c > cmax ? cmax : c;
+    static uint64_t logged;
+    static int nlog;
+    if ((g_recycle_cap > logged + (256ull << 20) || g_recycle_cap + (256ull << 20) < logged) && (nlog++ < 50 || nlog % 100 == 0)) {
+        LOG("[vram] recycle pool cap %llu MB (pool %llu MB, usage %llu of budget %llu MB%s)\n", (unsigned long long)(g_recycle_cap >> 20),
+            (unsigned long long)(pool >> 20), (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20), short_ ? ", short" : "");
+        logged = g_recycle_cap;
+    }
+}
+// LARECOMP_VK_RECYCLE_KEEP_MS (default 1000; 0 = the old rule): pooled images younger than that stay through a residency round
+static uint64_t recycle_keep_ns(void) {
+    static int64_t k = -1;
+    if (k < 0) { const char *e = getenv("LARECOMP_VK_RECYCLE_KEEP_MS"); k = (int64_t)(e ? atol(e) : 1000) * 1000000; }
+    return (uint64_t)k;
+}
 static bool recycle_put(NvnTexture *t, TexBackend *b) {
     if (recycle_off() || !b->image || b->pending_rgba) return false;
     // Allocation pressure: every pooled image is one vkAllocateMemory of the VMA stand-in, and the Windows driver fails
@@ -1170,9 +1289,9 @@ static bool recycle_put(NvnTexture *t, TexBackend *b) {
     }
     extern uint32_t vk_view_gen;
     vk_view_gen++;   // exec.c's per-frame view memo is keyed by the NvnTexture pointer, which the guest may reuse
-    // Byte cap. Oldest go first. LARECOMP_VK_RECYCLE_MB=<n> (default 512; 0 = no cap).
-    static int64_t cap = -1;
-    if (cap < 0) { const char *e = getenv("LARECOMP_VK_RECYCLE_MB"); cap = (int64_t)(e ? atol(e) : 512) << 20; }
+    // Byte cap. Oldest go first. The cap follows the VRAM budget's free room (recycle_cap_update, residency tick);
+    // LARECOMP_VK_RECYCLE_MB=<n>: a fixed cap (0 = none; 512 = the old default).
+    const uint64_t cap = recycle_cap();
     TexBackend *evict[8];
     int nev = 0;
     pthread_mutex_lock(&g_recycle_lock);
@@ -1184,7 +1303,7 @@ static bool recycle_put(NvnTexture *t, TexBackend *b) {
         g_recycle_bytes -= vma_shim_size(evict[nev++]->mem);
     }
     g_recycle[g_nrecycle++] = (Recycled){b, t->format, t->target, t->width, t->height, t->depth, t->levels, t->samples, b->scalable, b->sx, b->sy,
-                                         vk_pending_seq(), t->addr, b->gpu_owned};
+                                         vk_pending_seq(), t->addr, b->gpu_owned, SDL_GetTicksNS()};
     pthread_mutex_unlock(&g_recycle_lock);
     for (int i = 0; i < nev; i++) free_backend(evict[i]);
     return true;
@@ -1223,7 +1342,8 @@ static TexBackend *recycle_get(NvnTexture *t) {
             int i = any ? g_nrecycle - 1 - k : k;   // (old behaviour: newest first)
             Recycled *r = &g_recycle[i];
             if (!recycle_shape(r, t, sc) ||
-                r->seq >= cur)   // finalized in the open submission: its last uses may still be recorded after our uploads run
+                r->seq >= cur ||   // finalized in the open submission: its last uses may still be recorded after our uploads run
+                r->b->parked)      // (in system memory: only its own storage takes it back, for its contents; residency park)
                 continue;
             pick = i;
             break;
@@ -1250,6 +1370,7 @@ static TexBackend *recycle_get(NvnTexture *t) {
     // fresh texture state on the same image and views
     b->wb_frame = 0; b->wb_state = 0;
     b->gpu_owned = b->uploaded = b->dynamic = b->cpu_dirty = b->presented = false;
+    b->b2t_levels = 0;
     b->data_hash = b->sample_hash = b->checked_frame = b->full_frame = b->touched_frame = b->frame_cleared = 0;
     b->level_gen = 0; b->tp = 0; b->tp_gen = 0; b->reg = 0;
     vk_full_barrier(vk_upload_cmd());
@@ -1266,6 +1387,57 @@ static void recycle_flush(void) {
     for (int i = 0; i < n; i++) free_backend(g_recycle[i].b);
 }
 
+// A target whose size changed (graphics.render_scale / native_ui live, "auto" following the window) or whose usage a
+// live setting changed (contact shadows' STORAGE): a new image, the old one's contents carried over by a blit (filtered
+// colour, nearest depth / integer) on the upload command buffer, which runs ahead of this submission's draws. So the
+// paused scene behind the menus and the temporal history survive a change made in the Options. Images a blit cannot
+// carry (multisampled, block-compressed shadows, depth / colour alternates, 3D, formats without blit support) start
+// blank, as every remake did before. LARECOMP_RESCALE_CARRY=0: never carried.
+static void rescale_image(NvnTexture *t, TexBackend *b) {
+    static int carry_on = -1;
+    if (carry_on < 0) { const char *e = getenv("LARECOMP_RESCALE_CARRY"); carry_on = !e || *e != '0'; }
+    const VkFormat of = b->format;
+    const VkImageAspectFlags oa = b->aspect;
+    const VkImage oi = b->image;
+    const uint32_t ow = b->width, oh = b->height, ol = b->levels, oly = b->layers;
+    const bool carry = carry_on && oi && b->samples <= 1 && !b->blk && !b->alt.image && b->depth <= 1 &&
+                       format_supports(of, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT);
+    destroy_image(b);   // (the old image is freed after this submission, which holds the copy: defer)
+    create_image(t, b);
+    if (!carry || !b->image || b->format != of || b->aspect != oa || b->samples > 1) return;
+    const bool depth = (oa & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+    const bool linear = !depth && format_supports(of, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+                        (ow != b->width || oh != b->height);
+    const uint32_t nl = ol < b->levels ? ol : b->levels, nly = oly < b->layers ? oly : b->layers;
+    VkImageBlit bl[16];
+    uint32_t n = 0;
+    for (uint32_t lv = 0; lv < nl && n < 16; lv++) {
+        const int32_t sw = (int32_t)(ow >> lv ? ow >> lv : 1), sh = (int32_t)(oh >> lv ? oh >> lv : 1);
+        bl[n++] = (VkImageBlit){.srcSubresource = {oa, lv, 0, nly}, .srcOffsets = {{0, 0, 0}, {sw, sh, 1}},
+                                .dstSubresource = {oa, lv, 0, nly},
+                                .dstOffsets = {{0, 0, 0}, {(int32_t)level_w(b, lv), (int32_t)level_h(b, lv), 1}}};
+    }
+    VkCommandBuffer cb = vk_upload_cmd();
+    vk_full_barrier(cb);   // (the old image's last writes, earlier submissions; the new image's start-up clear)
+    vkCmdBlitImage(cb, oi, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, n, bl, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    vk_full_barrier(cb);
+    static int nlog;
+    if (nlog++ < 16)
+        LOG("[tex] remade %ux%u -> %ux%u f%#x, contents carried (%s)\n", ow, oh, b->width, b->height, (unsigned)of, linear ? "filtered" : "nearest");
+}
+// Once per g_tex_gen (a live setting changed how targets are made): the 1920x1080 targets in or out of the output
+// canvas (graphics.native_ui), the shadow maps in or out of kind 2 (graphics.shadow_scale to or from 1), the scene
+// colour with or without STORAGE (graphics.contact_shadows)
+static void tex_live_check(NvnTexture *t, TexBackend *b) {
+    b->remake_gen = g_tex_gen;
+    const int k = tex_scale_kind(t);
+    if ((k == 3) != (b->scale_kind == 3) || (k == 2) != (b->scale_kind == 2)) { b->scale_kind = (uint8_t)k; b->scalable = k != 0; }
+    const bool st_want = (b->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && contact_wants_storage(b->format) &&
+                         format_supports(b->format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+    const float wx = b->scalable ? kind_sx(b->scale_kind) : 1.0f, wy = b->scalable ? kind_sy(b->scale_kind) : 1.0f;
+    if (b->image && (b->sx != wx || b->sy != wy || st_want != ((b->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0))) rescale_image(t, b);
+}
+
 bool tex_watched(uint64_t addr);
 static void residency_restore(NvnTexture *t, TexBackend *b);
 static TexBackend *tex_backend(NvnTexture *t) {
@@ -1273,10 +1445,9 @@ static TexBackend *tex_backend(NvnTexture *t) {
     if (b) {
         b->last_use = vk_frame_counter();
         if (b->evicted) residency_restore(t, b);
-        if (b->scalable && (b->sx != kind_sx(b->scale_kind) || b->sy != kind_sy(b->scale_kind))) {  // output resolution changed: reallocate
-            destroy_image(b);
-            create_image(t, b);
-        }
+        if (b->remake_gen != g_tex_gen) tex_live_check(t, b);
+        else if (b->scalable && (b->sx != kind_sx(b->scale_kind) || b->sy != kind_sy(b->scale_kind)))  // output resolution changed: reallocate
+            rescale_image(t, b);
         return b;
     }
     g_recycle_same = false;
@@ -1287,6 +1458,7 @@ static TexBackend *tex_backend(NvnTexture *t) {
         b = calloc(1, sizeof *b);
         b->scale_kind = (uint8_t)tex_scale_kind(t);
         b->scalable = b->scale_kind != 0;
+        b->remake_gen = g_tex_gen;
         create_image(t, b);
     }
     t->backend = b;
@@ -1452,6 +1624,21 @@ void vk_tex_vram_split(uint64_t idle_frames, uint64_t bytes[3], uint32_t count[4
         if (s && now - b->last_use >= idle_frames) { bytes[1] += sz; count[1]++; }
     }
 }
+// "[vram] slack" line (vram-fit): of the rendered kind (not evictable), the images unused for idle_frames frames
+uint64_t vk_tex_rendered_idle(uint64_t idle_frames, uint32_t *count) {
+    uint64_t now = vk_frame_counter(), bytes = 0;
+    *count = 0;
+    for (int i = 0; i < g_nlive; i++) {
+        TexBackend *b = g_live[i]->backend;
+        if (!b || b->evicted || b->parked || now - b->last_use < idle_frames) continue;
+        bool s = b->image && b->uploaded && !b->gpu_owned && !b->blk && !b->presented && b->samples == 1 &&
+                 !(b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
+        if (s) continue;
+        bytes += vma_shim_size(b->mem) + (b->blk ? vma_shim_size(b->blk->mem) : 0);
+        ++*count;
+    }
+    return bytes;
+}
 uint64_t vk_residency_idle_frames(void);   // (below: frames in the last LARECOMP_VRAM_IDLE_MS)
 // Memory pressure as residency last measured it (every 250 ms, render thread): bytes still to free to get back under the
 // VRAM budget's headroom or above twice the commit floor once this round's pool frees and evictions are counted; 0 = none,
@@ -1480,6 +1667,217 @@ uint64_t vk_residency_idle_frames(void) {
         if (now - res_hist_ns[i] >= (uint64_t)idle_ns) return fr - res_hist_frame[i];
     return ~0ull;   // not enough history yet: nothing is idle
 }
+static uint64_t res_frames_in(uint64_t ns) {   // frames presented in the last ns (~0: not enough history)
+    uint64_t now = SDL_GetTicksNS(), fr = vk_frame_counter();
+    for (int i = res_hist_n - 1; i >= 0; i--)
+        if (now - res_hist_ns[i] >= ns) return fr - res_hist_frame[i];
+    return ~0ull;
+}
+// ---- parking (vram-fit 2026-11-02; the 4K reports: an 8-10 GB card whose rendered images alone pass the budget). Rendered
+// images (render targets, GPU-written) cannot be evicted: their contents exist only in VRAM. When the budget is short and
+// nothing sampled is left to evict, WDDM demotes allocations of its own choosing to system memory, hot ones included
+// (the frame rate drops and stays down). Instead the least recently used rendered images idle for LARECOMP_VRAM_IDLE_MS
+// are moved there by us: a copy of the image in system memory (a memory type the GPU samples and renders through PCIe:
+// NVIDIA's type 0, AMD's GTT) replaces it in place, same format, size and contents, so nothing drawn changes and the
+// next use costs no wait (no copy back on the critical path; the reads are slower over PCIe while it stays there). Once
+// the budget has room again (5 s after the last shortage, 3 x headroom free) park_return moves the recently used ones
+// back, at most 64 MB a round. Colour, single-sample images only, not presented / block shadows / video / write-back
+// pending / a depth texture's other kind. LARECOMP_VRAM_PARK=0: off.
+static uint64_t park_n, park_nbytes, park_ret_n, park_ret_bytes;
+static bool park_ok(void) {   // (an integrated GPU: system memory is all it has, nothing to gain)
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_VRAM_PARK"); on = !(e && *e == '0') && g_vk.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU; }
+    return on;
+}
+static bool res_parkable(const NvnTexture *t, const TexBackend *b) {
+    return b->image && b->mem && b->gpu_owned && !b->parked && !b->blk && !b->pending_rgba && !b->presented && b->samples == 1 &&
+           b->aspect == VK_IMAGE_ASPECT_COLOR_BIT && b->wb_state != 1 && !b->fbl_in && !b->alt.image && t->addr;
+}
+static uint32_t mem_types(bool vram) {   // the memory types on device-local heaps (vram) or the others
+    static uint32_t bits[2];
+    static bool got;
+    if (!got) {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+        for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+            bits[(mp.memoryHeaps[mp.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0] |= 1u << i;
+        got = true;
+    }
+    return bits[vram];
+}
+static uint64_t park_refused;   // (images no memory type of the other side takes, or none free)
+// b's image copied into a new one in system memory (to_host) or VRAM, which takes its place; the old one is freed once this
+// submission (the copy) completed. The copy is in the upload command buffer, which runs before the open submission's other
+// work: safe because b has been idle for LARECOMP_VRAM_IDLE_MS (the real guarantee), and because the round runs after the
+// frame's submissions (device.c), with the fronts and the vkq record thread joined by then. true: moved; false: no memory
+// type of that side takes this image, or none had room (nothing changed)
+static bool park_move(TexBackend *b, bool to_host) {
+    VkImageType ty = b->base_type == VK_IMAGE_VIEW_TYPE_1D || b->base_type == VK_IMAGE_VIEW_TYPE_1D_ARRAY ? VK_IMAGE_TYPE_1D
+                   : b->base_type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = b->cflags, .imageType = ty, .format = b->format,
+                            .extent = {b->width, b->height, b->depth}, .mipLevels = b->levels, .arrayLayers = b->layers,
+                            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = b->usage,
+                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    // (the side's types only: AMD's GTT types carry more flags than its VRAM one, so a preference alone would pick VRAM)
+    VmaAllocationCreateInfo ai = {.usage = to_host ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                                  .memoryTypeBits = mem_types(!to_host)};
+    VkImage img;
+    VmaAllocation mem;
+    extern _Thread_local int vma_shim_tag;
+    vma_shim_tag = 2;
+    VkResult r = ai.memoryTypeBits ? vmaCreateImage(g_vk.vma, &ci, &ai, &img, &mem, NULL) : VK_ERROR_FEATURE_NOT_PRESENT;
+    vma_shim_tag = 0;
+    if (r != VK_SUCCESS) {
+        if (park_refused++ < 8)
+            LOG("[vram] park: no %s memory for a %ux%u format %d image (%d): it stays\n", to_host ? "system" : "device-local", b->width,
+                b->height, b->format, r);
+        return false;
+    }
+    VkCommandBuffer cb = vk_upload_cmd();
+    vk_image_init_layout(cb, img, b->aspect);
+    vk_full_barrier(cb);
+    VkImageCopy rg[32];
+    const uint32_t nl = b->levels < 32 ? b->levels : 32;
+    for (uint32_t lv = 0; lv < nl; lv++) {
+        uint32_t d = ty == VK_IMAGE_TYPE_3D && b->depth >> lv ? b->depth >> lv : 1;
+        rg[lv] = (VkImageCopy){.srcSubresource = {b->aspect, lv, 0, b->layers}, .dstSubresource = {b->aspect, lv, 0, b->layers},
+                               .extent = {level_w(b, lv), level_h(b, lv), d}};
+    }
+    vkCmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, img, VK_IMAGE_LAYOUT_GENERAL, nl, rg);
+    vk_full_barrier(cb);
+    defer((Dead){.img = b->image, .mem = b->mem});
+    if (b->parked) { park_bytes -= vma_shim_size(b->mem); park_live--; }
+    b->image = img; b->mem = mem; b->parked = to_host;
+    if (to_host) { park_bytes += vma_shim_size(mem); park_live++; }
+    b->snap_tag = 0;      // (exec.c snapshot delta: the new image is no snapshot's mirror)
+    b->smark_ok = false;
+    return true;          // (twin_valid stays: the twin holds the same contents)
+}
+static void views_forget_moved(void);   // (views section: one scan of the view table for a round's moved images)
+static void park_forget_moved(int n, uint64_t bytes) {
+    for (int i = 0; i < g_nlive; i++) {
+        TexBackend *b = g_live[i]->backend;
+        if (b && b->park_moved) contact_forget(b);   // (contact.c keeps G-buffer image pointers: told, as views_forget does)
+    }
+    views_forget_moved();
+    static uint64_t nlog;
+    if (n > 0) { park_n += (uint64_t)n; park_nbytes += bytes; }
+    else { park_ret_n += (uint64_t)-n; park_ret_bytes += bytes; }
+    if (nlog++ < 50 || nlog % 50 == 0)
+        LOG("[vram] park: %d rendered images (%llu MB) %s; in system memory now %llu (%llu MB); since start parked %llu (%llu MB), "
+            "returned %llu (%llu MB)\n", n > 0 ? n : -n, (unsigned long long)(bytes >> 20),
+            n > 0 ? "idle, moved to system memory (VRAM short, nothing sampled left to evict)" : "moved back to VRAM (room again)",
+            (unsigned long long)park_live, (unsigned long long)(park_bytes >> 20), (unsigned long long)park_n,
+            (unsigned long long)(park_nbytes >> 20), (unsigned long long)park_ret_n, (unsigned long long)(park_ret_bytes >> 20));
+}
+// Room again (no pressure in this measurement, none in the last 5 s, and the image fits with 3 x headroom to spare): the
+// parked images used since parking go back first (most recently used first), then the others; at most 64 MB of copies a
+// round (one image at least)
+static void park_return(uint64_t usage, uint64_t budget, uint64_t headroom, uint64_t now) {
+    if (!budget || (res_need_ns && now - res_need_ns < 5000000000ull)) return;
+    static NvnTexture **pc;
+    static int cap_pc;
+    int np = 0;
+    for (int i = 0; i < g_nlive; i++) {
+        TexBackend *b = g_live[i]->backend;
+        if (!b || !b->parked || b->wb_state == 1 || b->fbl_in) continue;
+        if (np == cap_pc) { cap_pc = cap_pc ? cap_pc * 2 : 256; pc = realloc(pc, cap_pc * sizeof *pc); }
+        pc[np++] = g_live[i];
+    }
+    if (np > 1) qsort(pc, np, sizeof *pc, res_cmp);   // (oldest use first: taken from the end)
+    int n = 0;
+    uint64_t moved = 0;
+    for (int i = np - 1; i >= 0 && (!n || moved < (64ull << 20)); i--) {
+        TexBackend *b = pc[i]->backend;
+        uint64_t sz = vma_shim_size(b->mem);
+        if (usage + moved + sz + 3 * headroom > budget) break;
+        if (!park_move(b, false)) break;
+        b->park_moved = true;
+        moved += sz; n++;
+    }
+    if (n) park_forget_moved(-n, moved);
+}
+// "[vram] slack" line (device.c): parked now, and since the start
+uint64_t vk_park_bytes(uint32_t *n, uint64_t *parked, uint64_t *returned, uint32_t *used_n, uint64_t *used_bytes) {
+    *n = (uint32_t)park_live; *parked = park_n; *returned = park_ret_n;
+    *used_n = 0; *used_bytes = 0;
+    const uint64_t idle = vk_residency_idle_frames(), fr = vk_frame_counter();   // (used since parked: within the idle window)
+    for (int i = 0; park_live && idle != ~0ull && i < g_nlive; i++) {
+        TexBackend *b = g_live[i]->backend;
+        if (b && b->parked && fr - b->last_use < idle) { ++*used_n; *used_bytes += vma_shim_size(b->mem); }
+    }
+    return park_bytes;
+}
+// A shortage that lasts: parked images used in the last second (hot again: read over PCIe every frame) go back to VRAM
+// within the round, paid for by the round's other frees: their bytes are added to what the round frees (pool, idle
+// sampled, idle rendered parked), and they move back once the round freed that much. At most 64 MB a round, most
+// recently used first. Returns their bytes (0: none); hot[] / *nhot: which.
+static uint64_t park_hot(NvnTexture **hot, int cap, int *nhot) {
+    *nhot = 0;
+    const uint64_t f1 = res_frames_in(1000000000ull), fr = vk_frame_counter();
+    if (!park_live || f1 == ~0ull) return 0;
+    uint64_t bytes = 0;
+    for (int i = 0; i < g_nlive && *nhot < cap; i++) {
+        TexBackend *b = g_live[i]->backend;
+        if (!b || !b->parked || fr - b->last_use >= f1 || b->wb_state == 1 || b->fbl_in) continue;
+        hot[(*nhot)++] = g_live[i];
+    }
+    if (*nhot > 1) qsort(hot, *nhot, sizeof *hot, res_cmp);   // (oldest use first)
+    for (int i = 0, j = *nhot - 1; i < j; i++, j--) { NvnTexture *t = hot[i]; hot[i] = hot[j]; hot[j] = t; }   // (most recent first)
+    int k = 0;
+    while (k < *nhot && (!k || bytes < (64ull << 20))) bytes += vma_shim_size(((TexBackend *)hot[k++]->backend)->mem);
+    *nhot = k;
+    return bytes;
+}
+#ifdef _WIN32
+// The OS budget follows window focus, not the memory (vram-fit 2026-11-02: 15.2 GB while the game window is active, 11.5
+// then 8.6 GB a few lines after each "window inactive", back on activation, so the game runs on the background budget).
+// With DLSS SR + FG the game's usage (8.4 GB) crossed the 8.6 GB background budget: 60 residency rounds evicted and
+// re-uploaded textures mid-play, 44 GPU-wait hitches, with half the card free. Measured instead: the adapter's dedicated
+// memory minus what the other processes hold resident (D3DKMT statistics, as Task Manager), less a margin of 1/32 of it
+// (at least 512 MB), and never above the largest budget the OS gave (the active window's) or 15/16 of the memory. That is
+// used when it is above the OS budget and the video memory manager held no more than 64 MB of ours demoted in the last 10
+// s (demotion = real contention: the OS budget counts then). LARECOMP_VRAM_REAL_BUDGET=0: the OS budget alone (old).
+static uint64_t res_real_budget(uint64_t budget, uint64_t usage) {
+    static int on = -1, luid_ok;
+    static uint8_t luid[8];
+    static uint64_t bmax, logged_eff, contended_ns;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_VRAM_REAL_BUDGET");
+        on = !(e && *e == '0');
+        VkPhysicalDeviceIDProperties id = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &id};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        luid_ok = id.deviceLUIDValid;
+        memcpy(luid, id.deviceLUID, sizeof luid);
+    }
+    if (budget > bmax) bmax = budget;
+    if (!on || !luid_ok) return budget;
+    extern bool shim_adapter_vram(const uint8_t luid[8], uint64_t *resident, uint64_t *size, uint64_t *ours, uint64_t *demoted);
+    uint64_t all, size, ours, demoted;
+    if (!shim_adapter_vram(luid, &all, &size, &ours, &demoted)) return budget;
+    if (ours < usage) ours = usage;   // (the driver's count of ours may run ahead of the OS statistics)
+    const uint64_t others = all > ours ? all - ours : 0, margin = size / 32 > (512ull << 20) ? size / 32 : 512ull << 20;
+    uint64_t room = size > others + margin ? size - others - margin : 0;
+    const uint64_t cap = bmax > size / 16 * 15 ? bmax : size / 16 * 15;   // (a session that never had the focus: 15/16)
+    if (room > cap) room = cap;
+    // (ours in system memory now for lack of room; a cumulative count would only keep the OS budget: the old behaviour).
+    // Held 10 s: evictions bring the demoted bytes down at once, and the next reading would flip back
+    const uint64_t now = SDL_GetTicksNS();
+    if (demoted > (64ull << 20)) contended_ns = now;
+    const bool contended = contended_ns && now - contended_ns < 10000000000ull;
+    const uint64_t eff = !contended && room > budget ? room : budget;
+    if (eff > logged_eff + (256ull << 20) || eff + (256ull << 20) < logged_eff) {
+        static int nlog;
+        if (nlog++ < 100)
+            LOG("[vram] budget: the OS gives %llu MB, the adapter has %llu MB with %llu MB held by other processes%s: residency uses "
+                "%llu MB (LARECOMP_VRAM_REAL_BUDGET)\n", (unsigned long long)(budget >> 20), (unsigned long long)(size >> 20),
+                (unsigned long long)(others >> 20), contended ? ", ours being demoted (contention)" : "", (unsigned long long)(eff >> 20));
+        logged_eff = eff;
+    }
+    return eff;
+}
+#endif
 // Once a frame on the render thread (device.c, after the frame's submissions).
 void vk_residency_tick(void) {
     static int on = -1;
@@ -1520,10 +1918,25 @@ void vk_residency_tick(void) {
         vma_shim_heaps(g_vk.vma, hb, hc, hs, hf);
         usage = hb[h]; budget = mp.memoryProperties.memoryHeaps[h].size / 100 * 85;
     }
+    // An integrated GPU has no VRAM of its own: its device-local heap is either the shared RAM (this PC's RDNA2 iGPU: 22
+    // GB) or, on some drivers, only the BIOS carve-out (512 MB - 2 GB) beside a host heap that is the same RAM at the same
+    // speed. Measured against a carve-out the residency would evict and re-upload (re-decode) textures every round, and
+    // the mirrors would release and re-make their blocks, at no gain. There the VRAM test is off: the commit floor below
+    // (the real limit on a shared-memory PC) stays. (Reddit, Ryzen 7 4700U / Vega 7, 16 GB: 1-2 s per frame; whether
+    // this was it needs that log.) LARECOMP_VRAM_UMA_BUDGET=1: measure the device-local heap there too.
+    if (g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && !budget_override) {
+        static int uma_heap = -1;
+        if (uma_heap < 0) { const char *e = getenv("LARECOMP_VRAM_UMA_BUDGET"); uma_heap = e && *e == '1'; }
+        if (!uma_heap) budget = 0;
+    }
     if (budget_override) budget = budget_override;
+#ifdef _WIN32
+    if (budget && !budget_override && g_vk.mem_budget) budget = res_real_budget(budget, usage);
+#endif
     uint64_t headroom = budget / 16 > (256ull << 20) ? budget / 16 : 256ull << 20;
     uint64_t need = budget && usage + headroom > budget ? usage - (budget > 2 * headroom ? budget - 2 * headroom : 0) : 0, freed = 0;
-    uint64_t cneed = 0, cavail = 0;
+    const uint64_t vneed = need;
+    uint64_t cneed = 0, cavail = 0, cfloor_b = 0;
 #ifdef _WIN32
     // System commit (Windows): WDDM charges every MB of device memory to the process commit too, so on a 16 GB PC VRAM
     // competes with RAM. When the commit headroom drops under LARECOMP_COMMIT_FLOOR_MB (default: the larger of 2 GB and
@@ -1536,30 +1949,67 @@ void vk_residency_tick(void) {
         shim_commit_room(&cavail, &lim);
         uint64_t fl = cfloor >= 0 ? (uint64_t)cfloor : lim / 16 > (2048ull << 20) ? lim / 16 : 2048ull << 20;
         if (fl && cavail < fl) cneed = 2 * fl - cavail;
+        cfloor_b = fl;
     }
 #endif
     if (cneed > need) need = cneed;
+    recycle_cap_update(usage, budget, headroom, vneed || cneed);
     res_pressure = need;
     if (need) res_need_ns = now;
     res_pressure_commit = cneed != 0;
-    if (!need) return;
+    if (!need) { if (park_live) park_return(usage, budget, headroom, now); return; }
     extern void vma_shim_drop_spares(void);
     vma_shim_drop_spares();   // (idle spare blocks first: 256 MB each held for nothing while short)
-    // 1. the recycle pool, oldest first
+    const uint64_t need0 = need;
+    NvnTexture *hot[16];
+    int nhot = 0;
+    uint64_t hotb = vneed && !cneed && park_ok() ? park_hot(hot, 16, &nhot) : 0;
+    need += hotb;
+    // 1. the recycle pool, oldest first, at most 256 MB a round, and not the images pooled in the last second: those are the
+    // transient targets the game finalizes and makes again every frame, so freeing them only moved their creation (on the
+    // render thread, under the same pressure) to the next frame. Only pooled images that give memory back go
+    // (vma_shim_free_gain, as for the textures in 2.): one of its own, or a block whose live images are all pooled ones, as a
+    // group. One whose block keeps live neighbours stays pooled (freeing it returned nothing and lost the next creation its
+    // image). LARECOMP_VRAM_EVICT_ALL=1: oldest first.
+    static int evict_all = -1;
+    if (evict_all < 0) { const char *e = getenv("LARECOMP_VRAM_EVICT_ALL"); evict_all = e && *e == '1'; }
+    extern uint32_t vma_shim_free_gain(VmaAllocator a, VmaAllocation const *al, int n, uint32_t *grp, uint64_t *gain);
     int npool = 0;
-    while (freed < need) {
+    uint64_t pfreed = 0;
+    const uint64_t keep_ns = recycle_keep_ns();
+    {
+        static TexBackend *pold[RECYCLE_MAX];
+        static VmaAllocation pal[RECYCLE_MAX];
+        static uint32_t pgrp[RECYCLE_MAX];
+        static uint64_t pgain[RECYCLE_MAX];
+        static bool ptake[RECYCLE_MAX];
+        int np = 0;
         pthread_mutex_lock(&g_recycle_lock);
-        TexBackend *old = g_nrecycle ? g_recycle[0].b : NULL;
-        if (old) {
-            memmove(g_recycle, g_recycle + 1, (size_t)(g_nrecycle - 1) * sizeof *g_recycle);
-            g_nrecycle--;
-            g_recycle_bytes -= vma_shim_size(old->mem);
+        int na = 0;   // (the aged ones: the oldest first, g_recycle's order)
+        while (na < g_nrecycle && now - g_recycle[na].put_ns >= keep_ns) pal[na] = g_recycle[na].b->mem, ptake[na] = false, na++;
+        if (na && freed < need) {
+            if (!evict_all) vma_shim_free_gain(g_vk.vma, pal, na, pgrp, pgain);
+            for (int i = 0; i < na && freed < need && pfreed < (256ull << 20); i++) {
+                if (ptake[i] || !(evict_all || pgrp[i] || pgain[i])) continue;
+                for (int j = i; j < na; j++) {
+                    if (j != i && (evict_all || !pgrp[i] || pgrp[j] != pgrp[i])) continue;   // (a group: all its images)
+                    TexBackend *b = g_recycle[j].b;
+                    ptake[j] = true;
+                    if (!b->parked) freed += evict_all ? vma_shim_size(b->mem) : pgain[j];   // (a parked one: system memory)
+                    pfreed += vma_shim_size(b->mem);
+                    if (evict_all || !pgrp[i]) break;
+                }
+            }
+            int k = 0;
+            for (int i = 0; i < g_nrecycle; i++) {
+                if (i < na && ptake[i]) { pold[np++] = g_recycle[i].b; g_recycle_bytes -= vma_shim_size(g_recycle[i].b->mem); continue; }
+                g_recycle[k++] = g_recycle[i];
+            }
+            g_nrecycle = k;
         }
         pthread_mutex_unlock(&g_recycle_lock);
-        if (!old) break;
-        freed += vma_shim_size(old->mem);
-        free_backend(old);
-        npool++;
+        for (int i = 0; i < np; i++) free_backend(pold[i]);
+        npool = np;
     }
     // 2. idle sampled textures, least recently used first: at most 128 textures / 256 MB a round (one view-table scan),
     // a round every 250 ms while still short (was 512 / 512 MB a second: the frees and the re-creations after them came
@@ -1577,18 +2027,51 @@ void vk_residency_tick(void) {
             cand[nc++] = t;
         }
     if (nc > 1) qsort(cand, nc, sizeof *cand, res_cmp);
+    // Only what gives device memory back (shim_vma.c vma_shim_free_gain): a texture with its own allocation, or every
+    // texture of an image block whose textures are all idle (the block goes, as a group, past the round's 128 if it must).
+    // A texture whose block keeps live neighbours returns nothing when freed: the usage stayed flat while every round
+    // evicted 128 more and they came back on use. LARECOMP_VRAM_EVICT_ALL=1: every idle texture, least recently used
+    // first.
+    static VmaAllocation *cal;
+    static uint32_t *cgrp;
+    static uint64_t *cgain;
+    static int *ev, cap_g;
+    if (nc > cap_g) {
+        cap_g = cap_cand;
+        cal = realloc(cal, cap_g * sizeof *cal); cgrp = realloc(cgrp, cap_g * sizeof *cgrp);
+        cgain = realloc(cgain, cap_g * sizeof *cgain); ev = realloc(ev, cap_g * sizeof *ev);
+    }
+    int nleft = 0;   // (idle ones that would give nothing back: left in place)
+    if (!evict_all && nc) {
+        for (int i = 0; i < nc; i++) cal[i] = ((TexBackend *)cand[i]->backend)->mem;
+        vma_shim_free_gain(g_vk.vma, cal, nc, cgrp, cgain);
+    }
     int nev = 0;
     uint64_t evb = 0;
-    for (int i = 0; i < nc && freed < need && nev < 128 && evb < (256ull << 20); i++) {
+    bool gain_left = false;   // (an idle texture that would give memory back is still in place after the round)
+    for (int i = 0; i < nc; i++) {
         TexBackend *b = cand[i]->backend;
-        uint64_t sz = vma_shim_size(b->mem);
-        b->evicted = true;   // (marks it for the view scan below)
-        freed += sz; evb += sz; nev++;
+        if (b->evicted) continue;   // (taken with its block below)
+        const bool gives = evict_all || cgrp[i] || cgain[i];
+        if (!gives) { nleft++; continue; }
+        if (freed >= need || nev >= 128 || evb >= (256ull << 20)) { gain_left = true; continue; }
+        if (evict_all || !cgrp[i]) {
+            uint64_t sz = vma_shim_size(b->mem);
+            b->evicted = true;   // (marks it for the view scan below)
+            freed += evict_all ? sz : cgain[i]; evb += sz; ev[nev++] = i;
+            continue;
+        }
+        for (int j = i; j < nc; j++)   // (the whole block: its gain once, every texture in it)
+            if (cgrp[j] == cgrp[i]) {
+                TexBackend *bj = cand[j]->backend;
+                bj->evicted = true;
+                freed += cgain[j]; evb += vma_shim_size(bj->mem); ev[nev++] = j;
+            }
     }
     if (nev) {
         views_forget_evicted();
-        for (int i = 0; i < nev; i++) {
-            TexBackend *b = cand[i]->backend;
+        for (int k = 0; k < nev; k++) {
+            TexBackend *b = cand[ev[k]]->backend;
             defer((Dead){.img = b->image, .mem = b->mem});
             b->image = VK_NULL_HANDLE; b->mem = VK_NULL_HANDLE;
             b->uploaded = false; b->data_hash = b->sample_hash = 0;
@@ -1596,23 +2079,88 @@ void vk_residency_tick(void) {
         }
         res_evicted_n += nev; res_evicted_bytes += evb;
     }
+    // 3. rendered images idle as long (vram-fit): moved to system memory, see park_move. Only for a VRAM shortage (system
+    // memory is commit too: under the commit floor it would only move the problem, never below twice the floor, within
+    // the round's 128 images and at most 64 MB of copies a round (PCIe time on the GPU: ~2.5 ms a round).
+    int npk = 0;
+    uint64_t pkb = 0;
+    if (freed < need && vneed && !cneed && !gain_left && park_ok() && idle != ~0ull && nev < 128) {   // (no idle sampled one left that gives memory back)
+        nc = 0;
+        int refused = 0;
+        for (int i = 0; i < g_nlive; i++) {
+            NvnTexture *t = g_live[i];
+            TexBackend *b = t->backend;
+            if (!b || b->evicted || fr - b->last_use < idle || !res_parkable(t, b)) continue;
+            if (nc == cap_cand) { cap_cand = cap_cand ? cap_cand * 2 : 1024; cand = realloc(cand, cap_cand * sizeof *cand); }
+            cand[nc++] = t;
+        }
+        if (nc > 1) qsort(cand, nc, sizeof *cand, res_cmp);
+        // (only what gives VRAM back, as in 2.: a moved image whose big block keeps live neighbours freed nothing and was
+        // then read from system memory; a block's images move together, a group of at most 64 MB of copies.
+        // LARECOMP_VRAM_EVICT_ALL=1: least recently used first, as before)
+        if (nc > cap_g) {
+            cap_g = cap_cand;
+            cal = realloc(cal, cap_g * sizeof *cal); cgrp = realloc(cgrp, cap_g * sizeof *cgrp);
+            cgain = realloc(cgain, cap_g * sizeof *cgain); ev = realloc(ev, cap_g * sizeof *ev);
+        }
+        if (!evict_all && nc) {
+            for (int i = 0; i < nc; i++) cal[i] = ((TexBackend *)cand[i]->backend)->mem;
+            vma_shim_free_gain(g_vk.vma, cal, nc, cgrp, cgain);
+        }
+        for (int i = 0; i < nc && freed < need && nev + npk < 128 && (!npk || pkb < (64ull << 20)); i++) {
+            TexBackend *b = cand[i]->backend;
+            if (b->park_moved || !(evict_all || cgrp[i] || cgain[i])) continue;
+            int ng = 0;   // (this one, or its block's group)
+            uint64_t gb = 0;
+            for (int j = i; j < nc; j++)
+                if (j == i || (!evict_all && cgrp[i] && cgrp[j] == cgrp[i])) ev[ng++] = j, gb += vma_shim_size(((TexBackend *)cand[j]->backend)->mem);
+            if (ng > 1 && pkb + gb > (64ull << 20)) continue;   // (a block too large to copy this round)
+            if (cfloor_b && cavail < 2 * cfloor_b + pkb + gb) break;
+            uint64_t fg = 0;
+            int moved = 0;
+            for (int k = 0; k < ng; k++, moved++) {
+                TexBackend *bj = cand[ev[k]]->backend;
+                if (!park_move(bj, true)) { refused++; break; }
+                bj->park_moved = true;
+                fg += evict_all ? vma_shim_size(bj->mem) : cgain[ev[k]]; pkb += vma_shim_size(bj->mem); npk++;
+            }
+            if (moved == ng) freed += fg;   // (a group cut short by a refusal: its block stays, nothing back)
+            if (refused >= 2) break;
+        }
+        if (npk) park_forget_moved(npk, pkb);
+    }
+    if (nhot && freed >= need) {   // (the round paid for them: back to VRAM)
+        int nb = 0;
+        uint64_t bb = 0;
+        for (int i = 0; i < nhot; i++) {
+            TexBackend *b = hot[i]->backend;
+            uint64_t sz = vma_shim_size(b->mem);
+            if (!park_move(b, false)) break;
+            b->park_moved = true;
+            bb += sz; nb++;
+        }
+        if (nb) park_forget_moved(-nb, bb);
+        freed -= bb;
+    }
+    need = need0;
     res_pressure = freed < need ? need - freed : 0;   // (what this round could not free: the mirrors' share, vk_mirror_release_tick)
-    if (npool || nev) {
+    if (npool || nev || npk) {
         res_rounds++;
         cool_until = now + (freed < need ? 250000000ull : 1000000000ull);   // (still short: the next tick goes on)
         if (res_rounds <= 50 || res_rounds % 50 == 0)
             LOG("[vram] residency: heap %d usage %llu MB of budget %llu MB, commit headroom %llu MB%s: freed %d pooled images, evicted %d "
-                "idle textures (%llu MB, idle >= %llu frames); since start evicted %llu (%llu MB), re-created on use %llu (%llu MB)\n", h,
+                "idle textures (%llu MB, idle >= %llu frames; %d idle left: their blocks hold live ones); since start evicted %llu "
+                "(%llu MB), re-created on use %llu (%llu MB)\n", h,
                 (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20), (unsigned long long)(cavail >> 20),
-                cneed ? " (low)" : "", npool, nev, (unsigned long long)(evb >> 20), (unsigned long long)idle,
+                cneed ? " (low)" : "", npool, nev, (unsigned long long)(evb >> 20), (unsigned long long)idle, nleft,
                 (unsigned long long)res_evicted_n, (unsigned long long)(res_evicted_bytes >> 20), (unsigned long long)res_restored_n,
                 (unsigned long long)(res_restored_bytes >> 20));
     } else {
         static uint64_t nlog_short;
         if (nlog_short++ % 40 == 0)
             LOG("[vram] residency: heap %d usage %llu MB of budget %llu MB, commit headroom %llu MB%s, and nothing idle to evict "
-                "(rendered / recent images)\n", h, (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20),
-                (unsigned long long)(cavail >> 20), cneed ? " (low)" : "");
+                "(rendered / recent images; %d idle ones share blocks with live ones)\n", h, (unsigned long long)(usage >> 20),
+                (unsigned long long)(budget >> 20), (unsigned long long)(cavail >> 20), cneed ? " (low)" : "", nleft);
         cool_until = now + 2000000000ull;
     }
 }
@@ -1709,7 +2257,14 @@ static void tex_watch_note(NvnTexture *t, TexBackend *b, const char *what);
 // (decode was 244 ms of a 121-layer 1024x1024 8x8 array's 340). =check: each level also decodes on the CPU and the two are
 // compared byte for byte once the GPU is done ("[astc-gpu] check"; at most 64 levels / 256 MB in flight, the rest go
 // unchecked).
-static uint64_t up_tk_hash, up_ns_alloc, up_ns_decode;   // (LARECOMP_UPLOAD_LOG, below; the hash in TSC ticks)
+static uint64_t up_tk_hash, up_ns_alloc, up_ns_decode;
+// (a level's CPU-side copy that could not be allocated, the PC out of memory: the level keeps its old contents and the
+// game goes on, instead of a write through NULL; rival-parity, their #347 / #94 low-memory crashes: the RGB8 expand
+// copy too)
+static void level_skipped(const char *what, uint32_t w, uint32_t h) {
+    static int n;
+    if (n++ < 8) LOG("[tex] %s level %ux%u: no memory for its CPU copy, skipped (the PC is out of memory)\n", what, w, h);
+}   // (LARECOMP_UPLOAD_LOG, below; the hash in TSC ticks)
 // upload_texture_'s render-thread time, never reset (exec.c [hitch] "uploads" line: the spawn frame's 97.6 MB): write-watch
 // queries, identify + hash (sampled and full), deswizzle / staging copy / decode records; textures fully hashed, textures
 // sent. The times are TSC ticks (up_ns_per_tick converts): upload_texture_ runs for every bound texture every frame,
@@ -2025,6 +2580,12 @@ static void upload_texture_(NvnTexture *t, TexBackend *b) {
         uint64_t w0 = __rdtsc();
         int ch = heap_ww_changed(t->addr, total, &b->ww_seen);
         cum_up_ww_tk += __rdtsc() - w0;
+        // (a pre-uploaded texture's first use: shaders write the heap in play and the CPU write watch cannot see it, so a
+        // shader write since the pre-upload's hash is a full check too)
+        if (ch == 0 && pre_first && b->full_seq) {
+            extern bool vk_heap_gpu_written_since(uint64_t addr, uint64_t size, uint64_t since);
+            if (vk_heap_gpu_written_since(t->addr, total, b->full_seq)) ch = 1;
+        }
         if (ch == 0 && !(b->tp > 0 && b->tp_gen != texpatch_generation())) { prof_tex_ww_clean++; return; }
         if (ch > 0) full = true;   // written: hash it now (dynamic or not)
         if (ch < 0 && pre_first) full = true;  // (no watch here: a full check, as the first upload it stands for)
@@ -2146,6 +2707,7 @@ static void upload_texture_(NvnTexture *t, TexBackend *b) {
                         continue;
                     }
                     uint8_t *blocks = malloc((uint64_t)l.wb * l.hb * 16);
+                    if (!blocks) { level_skipped("ASTC", l.w, l.h); continue; }
                     if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, l.wb * 16);
                     else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
                     astc_decode_par(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
@@ -2158,6 +2720,7 @@ static void upload_texture_(NvnTexture *t, TexBackend *b) {
                     continue;
                 }
                 uint8_t *blocks = malloc((uint64_t)l.wb * l.hb * 16);
+                if (!blocks) { level_skipped("ASTC", l.w, l.h); continue; }
                 if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, l.wb * 16);
                 else if (!deswizzle_par(src, blocks, l.wb, l.hb, 16, l.block_height_log2, l.block_depth_log2))
                     tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
@@ -2178,6 +2741,7 @@ static void upload_texture_(NvnTexture *t, TexBackend *b) {
             uint32_t out_row = expand ? l.wb * 4 : row;
             vk_up_kind = 4; VkSpan s = vk_transient((uint64_t)out_row * l.hb * l.d, 16); vk_up_kind = 0;
             uint8_t *lin = expand ? malloc(sz) : s.ptr;
+            if (!lin) { level_skipped("RGB8", l.w, l.h); continue; }
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
                 for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * t->stride, row);
@@ -2220,8 +2784,14 @@ static void upload_texture_(NvnTexture *t, TexBackend *b) {
         }
     }
     ag_flush(cb, &agb, b);
-    cum_up_copy_tk += __rdtsc() - uc0;
+    const uint64_t uc1 = __rdtsc();
+    cum_up_copy_tk += uc1 - uc0;
     cum_up_sent++;
+    if (uc1 - uh0 > hf_up_worst_tk) {
+        hf_up_worst_tk = uc1 - uh0;
+        snprintf(hf_up_worst, sizeof hf_up_worst, "%ux%ux%u fmt %#x levels %u layers %u, %.1f MB%s", t->width, t->height, t->depth,
+                 t->format, levels, layers, total / 1048576.0, b->astc_bw ? (ag_mode ? ", ASTC on the GPU" : ", ASTC on the CPU") : "");
+    }
 }
 
 // LARECOMP_TEX_WATCH=<addr hex>[,<addr hex>...]: log uploads, render-target use, copies and samples of the textures
@@ -2305,8 +2875,10 @@ static int wb_on(void) {
     if (on < 0) { const char *e = getenv("LARECOMP_VK_WRITEBACK"); on = !(e && *e == '0'); }
     return on;
 }
+static bool rb_candidate(NvnTexture *t, TexBackend *b);
 static bool wb_candidate(NvnTexture *t, TexBackend *b) {
     const FormatInfo *fi = t->layout.fmt;
+    if (rb_candidate(t, b)) return false;   // (a CPU-read target: written back after each pass, without a wait, below)
     if (!t->addr || (t->flags & (0x1 | 0x8)) || t->target != 1 || t->samples > 1) return false;
     if (!b->image || b->samples > 1 || b->astc_bw || b->blk || b->pending_rgba || b->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return false;
     if (b->layers > 1 || b->depth > 1) return false;
@@ -2397,6 +2969,112 @@ void vk_writeback_flush(void) {
     g_wb_npending = 0;
 }
 
+// ---- CPU-read targets (public #16: the Purah Pad camera recognised nothing, on every GPU). The camera's compendium
+// target comes from a GPU pick: ModelSceneExtension's analyze passes reduce the picture-book models under the reticle
+// into three 4x4 targets (4x16-bit uint slot pointer, two float screen boxes), and the next frame the CPU invalidates
+// their pool range and reads texel (0,0) from their storage, without a wait. Our rendering lived only in the VkImage,
+// so the CPU read zeros = no target. They are rendered every frame (double-buffered), so the one-shot write-back above
+// drops them. A small colour target in a CPU-mapped pool (CPU_UNCACHED 0x2 / CPU_CACHED 0x4) instead gets its texels
+// copied into its guest storage, in the guest layout, right after each pass that rendered it: a GPU copy into the
+// imported guest heap, no wait (the CPU sees it once the submission completed, as on hardware; the game reads the other
+// frame's block). Only whole small targets, one level: the copy is a few dozen bytes per pass. OFF by default (v0.1.8
+// blocker, B's Havok crash: a 16-byte guest record all zero). The copy runs when the GPU gets to it, and SyncWait's lag
+// + ticket lag (objects.c) return the game's wait on frame N's fence once only frame N-1 is done on the GPU: the game
+// may free or reuse frame N's pool memory while that frame's copy is still queued, which then writes the target's
+// texels (zeros when cleared, in 16-byte runs) into whatever lives there now. Nothing here proves the storage still
+// belongs to the target when the copy lands. LARECOMP_VK_CPU_READ_RT=1: on (A/B only).
+#define RB_MAX_TEXELS 256u
+#define RB_MAX_REGIONS 256
+typedef struct { TexBackend *b; VkImage image; VkBuffer buf; uint32_t first, n; } RbCopy;
+static RbCopy g_rb[8];
+static VkBufferImageCopy g_rb_reg[RB_MAX_REGIONS];
+static int g_rb_n;
+static uint32_t g_rb_nreg;
+static uint64_t g_rb_copies;
+static int rb_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_VK_CPU_READ_RT");
+        on = e && *e && *e != '0';
+        if (on) LOG("[cpu-read] LARECOMP_VK_CPU_READ_RT=1: small CPU-pool targets copied to guest storage after each pass "
+                    "(unsafe with the SyncWait lag: A/B only)\n");
+    }
+    return on;
+}
+static bool rb_candidate(NvnTexture *t, TexBackend *b) {
+    const FormatInfo *fi = t->layout.fmt;
+    if (!rb_on() || !t->addr || !t->pool || !(t->pool->flags & (0x2 | 0x4)) || t->target != 1 || t->samples > 1) return false;
+    if (!b->image || b->samples > 1 || b->astc_bw || b->blk || b->pending_rgba || b->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return false;
+    if (b->layers > 1 || b->depth > 1 || t->layout.levels != 1 || (uint64_t)t->width * t->height > RB_MAX_TEXELS) return false;
+    if (!fi || !fi->bpb || fi->bpb > 16 || (fi->bpb & (fi->bpb - 1)) || fi->bw != 1 || fi->bh != 1 || b->format != fmt_of(t->format).vf)
+        return false;
+    if (b->scalable && (b->sx != 1 || b->sy != 1)) return false;
+    LevelLayout l = tegra_level(&t->layout, 0);
+    return !nvn_flags_linear(t->flags) || (t->stride % fi->bpb == 0 && t->stride >= (uint64_t)l.wb * fi->bpb);
+}
+void vk_cpu_read_begin(void) { g_rb_n = 0; g_rb_nreg = 0; }
+void vk_cpu_read_note(NvnTexture *t, TexBackend *b) {
+    if (g_rb_n == (int)(sizeof g_rb / sizeof *g_rb) || !rb_candidate(t, b)) return;
+    const FormatInfo *fi = t->layout.fmt;
+    const uint32_t bpb = fi->bpb;
+    LevelLayout l = tegra_level(&t->layout, 0);
+    VkBuffer buf;
+    VkDeviceSize go;
+    if (!vk_gmem_range(t->addr, tegra_total_size(&t->layout), &buf, &go) || go % 16) {
+        static int said;
+        if (!said++) LOG("[cpu-read] %llx %ux%u f%#x outside the imported guest heap: not written back (the camera finds no target)\n",
+                         (unsigned long long)t->addr, t->width, t->height, t->format);
+        return;
+    }
+    const uint32_t w = l.w < level_w(b, 0) ? l.w : level_w(b, 0), h = l.h < level_h(b, 0) ? l.h : level_h(b, 0);
+    const bool linear = nvn_flags_linear(t->flags);
+    const uint32_t first = g_rb_nreg, chunk = 16 / bpb;   // (block-linear: runs of 16 contiguous bytes, one region each)
+    if (linear) {
+        if (g_rb_nreg == RB_MAX_REGIONS) return;
+        g_rb_reg[g_rb_nreg++] = (VkBufferImageCopy){.bufferOffset = go, .bufferRowLength = (uint32_t)(t->stride / bpb), .bufferImageHeight = h,
+                                                    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+    } else {
+        if (g_rb_nreg + h * ((w + chunk - 1) / chunk) > RB_MAX_REGIONS) return;
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x += chunk) {
+                const uint64_t o = tegra_block_linear_offset(x * bpb, y, l.wb, bpb, l.block_height_log2);
+                g_rb_reg[g_rb_nreg++] = (VkBufferImageCopy){.bufferOffset = go + o, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                                            .imageOffset = {(int32_t)x, (int32_t)y, 0},
+                                                            .imageExtent = {w - x < chunk ? w - x : chunk, 1, 1}};
+            }
+    }
+    g_rb[g_rb_n++] = (RbCopy){b, b->image, buf, first, g_rb_nreg - first};
+    static uint64_t seen[16];
+    static int nseen;
+    bool known = false;
+    for (int i = 0; i < nseen; i++) known |= seen[i] == t->addr;
+    if (!known && nseen < 16) {
+        seen[nseen++] = t->addr;
+        LOG("[cpu-read] %llx %ux%u f%#x flags %#x pool flags %#x %s: texels to its guest storage after each pass (LARECOMP_VK_CPU_READ_RT)\n",
+            (unsigned long long)t->addr, t->width, t->height, t->format, t->flags, t->pool->flags, linear ? "linear" : "block-linear");
+    }
+}
+void vk_cpu_read_flush(VkCommandBuffer cb) {
+    if (!g_rb_n) return;
+    vk_full_barrier(cb);   // (the pass's attachment writes -> the copies' reads)
+    for (int i = 0; i < g_rb_n; i++) {
+        const RbCopy *r = &g_rb[i];
+        if (r->b->image != r->image || r->b->fbl_in) continue;   // (re-created since the pass began / still in the feedback layout)
+        vkCmdCopyImageToBuffer(cb, r->image, VK_IMAGE_LAYOUT_GENERAL, r->buf, r->n, g_rb_reg + r->first);
+        if (!(g_rb_copies++ & 0x3FFF)) LOG("[cpu-read] %llu target copies so far (frame %llu)\n", (unsigned long long)g_rb_copies,
+                                           (unsigned long long)vk_frame_counter());
+    }
+    // (the copies -> the host's reads once the submission completed; and the image's next writes after these reads)
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    g_rb_n = 0;
+    g_rb_nreg = 0;
+}
+
 TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     if (for_render) rt_first_note(t, "render");
     if (tex_watched(t->addr)) {   // every render; each sampled object's first sample (was: the first 20 samples of the run)
@@ -2463,6 +3141,12 @@ static void views_forget(TexBackend *b) {
         if (view_tab[i].b == b) { defer((Dead){.view = view_tab[i].view}); view_tab[i].b = NULL; view_tab[i].view = VK_NULL_HANDLE; }
 }
 
+static void views_forget_moved(void) {   // (residency park_move: the images moved this round, flag cleared)
+    vk_view_gen++;
+    for (int i = 0; i < VIEW_TAB; i++)
+        if (view_tab[i].b && view_tab[i].b->park_moved) { defer((Dead){.view = view_tab[i].view}); view_tab[i].b = NULL; view_tab[i].view = VK_NULL_HANDLE; }
+    for (int i = 0; i < g_nlive; i++) { TexBackend *b = g_live[i]->backend; if (b) b->park_moved = false; }
+}
 static void views_forget_evicted(void) {
     vk_view_gen++;
     for (int i = 0; i < VIEW_TAB; i++)
@@ -2563,6 +3247,49 @@ static bool first_defer(NvnTexture *t) {
 // render: attachment view (one level, one layer). Otherwise a sampled view of type want_textype (TEXTYPE_*),
 // with the NVN component swizzle, converting between compatible types the way renderer.m does.
 static _Thread_local TexBackend *g_view_on;   // (vk_view_on: the image to view instead of the texture's own)
+// A 2D lookup on a 3D texture where the device has no VK_EXT_image_2d_view_of_3d (older AMD / Intel Windows drivers, some
+// iGPUs; public #16, Link's warp dissolve): a 2D copy of slice 0, base level, in the 3D image's twin slot (depth twins
+// skip 3D images) and refreshed whenever a write left it stale (twin_valid: uploads, renders, copies, clears and
+// re-creation already clear it). The copy goes into the upload command buffer, which runs before the submission's
+// draws: a CPU-uploaded pattern (the dissolve's) is current; a 3D image the GPU writes is one submission behind.
+static VkImageView slice_twin_view(NvnTexture *t, TexBackend *b, VkFormat fmt, VkComponentMapping sw, VkImageAspectFlags aspect) {
+    if (!b->image || b->samples != 1 || (b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) return VK_NULL_HANDLE;
+    TexBackend *d = b->twin;
+    if (d && (d->width != b->width || d->height != b->height || d->format != b->format)) {   // (re-created at another shape)
+        destroy_image(d);
+        free(d);
+        d = b->twin = NULL;
+        b->twin_valid = false;
+    }
+    if (!d) {
+        d = calloc(1, sizeof *d);
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = b->cflags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                                .imageType = VK_IMAGE_TYPE_2D, .format = b->format, .extent = {b->width, b->height, 1}, .mipLevels = 1,
+                                .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL) != VK_SUCCESS) { free(d); return VK_NULL_HANDLE; }
+        d->format = b->format; d->width = b->width; d->height = b->height; d->depth = 1; d->layers = 1; d->levels = 1;
+        d->samples = 1; d->aspect = b->aspect; d->base_type = VK_IMAGE_VIEW_TYPE_2D; d->usage = ci.usage; d->cflags = ci.flags;
+        d->gpu_owned = true;
+        vk_image_init_layout(vk_upload_cmd(), d->image, d->aspect);
+        b->twin = d;
+        b->twin_valid = false;
+        static int nlog;
+        if (nlog++ < 16) LOG("[tex] 2D lookup on a 3D texture (%ux%ux%u fmt %#x): slice 0 through a 2D copy (no VK_EXT_image_2d_view_of_3d)\n",
+                             t->width, t->height, t->depth, t->format);
+    }
+    if (!b->twin_valid) {
+        VkCommandBuffer cb = vk_upload_cmd();
+        vk_full_barrier(cb);   // (the upload's writes -> this read)
+        VkImageCopy c = {.srcSubresource = {b->aspect, 0, 0, 1}, .dstSubresource = {d->aspect, 0, 0, 1}, .extent = {b->width, b->height, 1}};
+        vkCmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        vk_full_barrier(cb);   // (-> the draws' samples)
+        b->twin_valid = true;
+    }
+    return vk_image_view(d, VK_IMAGE_VIEW_TYPE_2D, fmt, 0, 1, 0, 1, sw, aspect);
+}
+
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype) {
     bool first = !g_view_on && !render && !t->backend && g_title_phase && first_budget_ns() && !alias_writer(t);
     if (first && first_defer(t)) return vk_dummy_view(want_textype);
@@ -2719,6 +3446,20 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     }
     if (want == VK_IMAGE_VIEW_TYPE_1D_ARRAY && have == VK_IMAGE_VIEW_TYPE_1D)
         return vk_image_view(b, want, fmt, lv0, nlv, 0, 1, sw, aspect);
+    // A 2D lookup on a 3D texture (public #16: Link's warp dissolve discards against an 8x8x8 pattern sampled so; the
+    // dummy view made him vanish at once): Maxwell's 2D instruction leaves the third coordinate 0 = slice 0. A 2D view of
+    // a 3D image holds one level (the base level of the binding).
+    if (want == VK_IMAGE_VIEW_TYPE_2D && have == VK_IMAGE_VIEW_TYPE_3D && (b->cflags & VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT)) {
+        static int said;
+        if (!said++) LOG("[tex] 2D lookup on a 3D texture (%ux%ux%u fmt %#x): slice 0 through a 2D view\n", t->width, t->height, t->depth, t->format);
+        return vk_image_view(b, want, fmt, lv0, 1, 0, 1, sw, aspect);
+    }
+    static int slice_copy = -1;   // (LARECOMP_NO_2D_OF_3D=1: neither form, the dummy view as before)
+    if (slice_copy < 0) slice_copy = !getenv("LARECOMP_NO_2D_OF_3D");
+    if (want == VK_IMAGE_VIEW_TYPE_2D && have == VK_IMAGE_VIEW_TYPE_3D && lv0 == 0 && slice_copy) {
+        VkImageView sv = slice_twin_view(t, b, fmt, sw, aspect);
+        if (sv) return sv;
+    }
     static int nlog;
     if (nlog++ < 30) LOG("[tex] type mismatch: want %d have %d (%ux%ux%u target %u fmt %#x layers %u)\n", want, have, t->width,
                          t->height, t->depth, t->target, t->format, b->layers);
@@ -3106,16 +3847,66 @@ bool tex_hash_selftest(void) {
 /* PC filtering: TOTK_ANISO=<n> raises anisotropic filtering to n (at most 16) on mipmapped samplers with linear
  * minification (never on depth-compare, nearest or mipless ones; never below the guest's own); TOTK_LOD_BIAS=<x> adds x
  * to the guest's LOD bias on mipmapped samplers (negative = sharper; a temporal upscaler wants -log2(out/render)). Both
- * are read once: samplers made before a change keep theirs.*/
+ * read at the start, then live (graphics.anisotropy / graphics.lod_bias, renderer_set_aniso / _lod_bias): a change is
+ * taken at the next present, where every sampler is re-made at its next use (g_samp_gen, vk_sampler) and every cached
+ * descriptor dropped (exec.c vk_exec_descriptors_stale). vk_samplers_rebuild asks the same for a term of another area
+ * (the dlss worker's SR bias).*/
+static float g_aniso = -1, g_lod_bias = -1e9f;   // (render thread after the start)
+static int g_aniso_req = -1, g_bias_req = -1000000, g_samp_req;   // (settings thread: x 1000; -1 / -1000000: none)
+static uint32_t g_samp_gen;
 static float pc_aniso(void) {
-    static float v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_ANISO"); v = e ? (float)atof(e) : 16; if (v > 16) v = 16; if (v > 1) LOG("[smp] TOTK_ANISO=%.0f\n", (double)v); }
-    return v;
+    if (g_aniso < 0) { const char *e = getenv("TOTK_ANISO"); float v = e ? (float)atof(e) : 16; if (v > 16) v = 16; g_aniso = v; if (v > 1) LOG("[smp] TOTK_ANISO=%.0f\n", (double)v); }
+    return g_aniso;
 }
 static float pc_lod_bias(void) {
-    static int read; static float v;
-    if (!read) { const char *e = getenv("TOTK_LOD_BIAS"); v = e ? (float)atof(e) : 0; read = 1; if (v != 0) LOG("[smp] TOTK_LOD_BIAS=%.2f\n", (double)v); }
-    return v;
+    if (g_lod_bias < -1e8f) { const char *e = getenv("TOTK_LOD_BIAS"); g_lod_bias = e ? (float)atof(e) : 0; if (g_lod_bias != 0) LOG("[smp] TOTK_LOD_BIAS=%.2f\n", (double)g_lod_bias); }
+    // DLSS SR (ngx.c): the jittered scene's material textures sampled finer, so DLSS has the detail to accumulate. A
+    // live read (NAN before the start's scales are known: no term yet); ngx.c calls vk_samplers_rebuild when it changes.
+    // The total is kept per g_samp_gen once the term is known: every change of either part re-makes the samplers, which
+    // moves g_samp_gen
+    static uint32_t gen_cached = ~0u;
+    static float total;
+    const uint32_t g = __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&gen_cached, __ATOMIC_ACQUIRE) == g) return total;
+    const float d = vk_ngx_sr_lod_bias();
+    if (isnan(d)) return g_lod_bias;   // (not kept: asked again until known)
+    total = g_lod_bias + d;
+    __atomic_store_n(&gen_cached, g, __ATOMIC_RELEASE);
+    return total;
+}
+void renderer_set_aniso(const char *v) {
+    float a = v ? (float)atof(v) : 16;
+    if (a > 16) a = 16;
+    if (a < 0) a = 0;
+    __atomic_store_n(&g_aniso_req, (int)lroundf(a * 1000.0f), __ATOMIC_RELEASE);
+}
+void renderer_set_lod_bias(const char *v) { __atomic_store_n(&g_bias_req, (int)lroundf((v ? (float)atof(v) : 0) * 1000.0f), __ATOMIC_RELEASE); }
+void vk_samplers_rebuild(void) { __atomic_store_n(&g_samp_req, 1, __ATOMIC_RELEASE); }
+// (renderer_set_out_scale, each present: the sampler rows' changes)
+static void samplers_tick(void) {
+    bool remake = __atomic_exchange_n(&g_samp_req, 0, __ATOMIC_ACQ_REL) != 0;
+    const int a = __atomic_exchange_n(&g_aniso_req, -1, __ATOMIC_ACQ_REL), lb = __atomic_exchange_n(&g_bias_req, -1000000, __ATOMIC_ACQ_REL);
+    pc_lod_bias();   // (the start's values read)
+    static uint32_t epoch_seen;   // (a live render scale or canvas change: DLSS SR's part of the bias follows the new ratio,
+    static float d_made;          // to 0 too, e.g. a scene now larger than the output; ngx.c answers from the current sizes)
+    const uint32_t ep = vk_render_epoch();
+    if (ep != epoch_seen) {
+        epoch_seen = ep;
+        float d = vk_ngx_sr_lod_bias();
+        if (isnan(d)) d = 0;
+        if (d != d_made) d_made = d, remake = true;
+    }
+    if (a >= 0 && a / 1000.0f != pc_aniso()) g_aniso = a / 1000.0f, remake = true;
+    if (lb != -1000000 && lb / 1000.0f != g_lod_bias) g_lod_bias = lb / 1000.0f, remake = true;
+    if (!remake) return;
+    __atomic_add_fetch(&g_samp_gen, 1, __ATOMIC_RELEASE);
+    {   // (the term these samplers get: a re-make asked by ngx.c itself counts too)
+        const float d = vk_ngx_sr_lod_bias();
+        d_made = isnan(d) ? 0 : d;
+    }
+    extern void vk_exec_descriptors_stale(void);
+    vk_exec_descriptors_stale();
+    LOG("[smp] samplers re-made (live): aniso %.0f, LOD bias %.2f (the setting's)\n", (double)pc_aniso(), (double)g_lod_bias);
 }
 /* VkSamplers by translated content: pool entries with the same parameters share one, and an entry re-registered with
  * new parameters no longer leaks the one it had (samplers are never destroyed; the distinct contents are few). */
@@ -3160,7 +3951,7 @@ static VkSampler samp_get(const VkSamplerCreateInfo *ci, const VkSamplerCustomBo
 }
 
 // cmp = false: the same sampler without the depth compare (vk_sampler_plain)
-static VkSampler sampler_make(const NvnSamplerDesc *d, bool cmp, VkSamplerCreateInfo *out) {
+static VkSampler sampler_make(const NvnSamplerDesc *d, bool cmp, VkSamplerCreateInfo *out, bool pc_over) {
     VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = d->mag_filter == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     uint32_t mf = d->min_filter;
@@ -3193,8 +3984,8 @@ static VkSampler sampler_make(const NvnSamplerDesc *d, bool cmp, VkSamplerCreate
     if (stest && mf > 1) { si.minLod = 0; si.maxLod = VK_LOD_CLAMP_NONE; si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = 16; }
     if (mf > 1) {
         float an = pc_aniso();
-        if (an > 1 && si.minFilter == VK_FILTER_LINEAR && !d->compare_mode && (!si.anisotropyEnable || si.maxAnisotropy < an)) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = an; }
-        si.mipLodBias += pc_lod_bias();
+        if (pc_over && an > 1 && si.minFilter == VK_FILTER_LINEAR && !d->compare_mode && (!si.anisotropyEnable || si.maxAnisotropy < an)) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = an; }
+        if (pc_over) si.mipLodBias += pc_lod_bias();
     }
     // (only where the device enabled anisotropy, and up to its limit: VUID-VkSamplerCreateInfo-anisotropyEnable-01070 / 01071;
     // every desktop GPU has 16x, so nothing changes there)
@@ -3219,11 +4010,41 @@ static VkSampler sampler_make(const NvnSamplerDesc *d, bool cmp, VkSamplerCreate
     if (out) *out = si;
     return samp_get(&si, &cb);
 }
+// Which descriptors' cached samplers were made since the last live sampler change (g_samp_gen > 0 only): an open-addressed
+// set of NvnSamplerDesc pointers, emptied at each change, so NvnSamplerDesc keeps its size. A freed and reused address
+// comes back with backend NULL; a full set re-makes through the content table (same VkSampler, a hash slower). Before any
+// live change: the old path, untouched.
+#define SAMP_SEEN 16384
+static NvnSamplerDesc **g_samp_seen;
+static uint32_t g_samp_seen_n, g_samp_seen_gen;
+static bool samp_seen(NvnSamplerDesc *d, bool add) {   // (g_samp_mu held)
+    if (g_samp_seen_gen != g_samp_gen) {
+        if (!g_samp_seen) g_samp_seen = calloc(SAMP_SEEN, sizeof *g_samp_seen);
+        else memset(g_samp_seen, 0, SAMP_SEEN * sizeof *g_samp_seen);
+        g_samp_seen_n = 0, g_samp_seen_gen = g_samp_gen;
+    }
+    if (!g_samp_seen) return false;
+    uint32_t i = (uint32_t)(((uintptr_t)d * 0x9E3779B97F4A7C15ull) >> 50) & (SAMP_SEEN - 1);
+    for (; g_samp_seen[i]; i = (i + 1) & (SAMP_SEEN - 1)) if (g_samp_seen[i] == d) return true;
+    if (add && g_samp_seen_n < SAMP_SEEN * 3 / 4) g_samp_seen[i] = d, g_samp_seen_n++;
+    return false;
+}
 VkSampler vk_sampler(NvnSamplerDesc *d) {
-    if (d->backend) return (VkSampler)d->backend;
+    if (d->backend) {
+        if (!__atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE)) return (VkSampler)d->backend;
+        pthread_mutex_lock(&g_samp_mu);
+        const bool seen = samp_seen(d, false);
+        pthread_mutex_unlock(&g_samp_mu);
+        if (seen) return (VkSampler)d->backend;
+    }
     VkSamplerCreateInfo si;
-    VkSampler s = sampler_make(d, true, &si);
-    d->backend = (void *)s;
+    VkSampler s = sampler_make(d, true, &si, true);
+    d->backend = (void *)s;   // (the old one stays in the content table: samplers are never destroyed, their contents few)
+    if (__atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_lock(&g_samp_mu);
+        samp_seen(d, true);
+        pthread_mutex_unlock(&g_samp_mu);
+    }
     {   // measurement (blurry ground, 2026-10-14): the guest's LOD settings per sampler, first 64
         static int nlog;
         if (nlog++ < 64)
@@ -3239,7 +4060,31 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
 // first.
 VkSampler vk_sampler_plain(NvnSamplerDesc *d) {
     if (!d->compare_mode) return vk_sampler(d);
-    return sampler_make(d, false, NULL);
+    return sampler_make(d, false, NULL, true);
+}
+// The PC LOD bias (TOTK_LOD_BIAS, Options' texture LOD bias) is for the game's material textures, whose whole mip chain
+// is uploaded from the game's files. On textures the GPU renders or encodes (render targets, block-compressed images the
+// game encodes on the GPU, 3D / cube ones) it moves the sampling to levels the game never wrote for that use: public issue
+// #20 (+2: Great Sky Island grass pure red, G = B = 0; a GPU-encoded BC4 3D texture of 6 levels where only level 0 is
+// encoded). exec.c texture_info_ takes this twin there: the same sampler without the PC bias (plain: without the compare).
+bool vk_pc_lod_bias_on(void) { return pc_lod_bias() != 0; }
+// The PC anisotropy floor (TOTK_ANISO, default 16) is scoped the same way: on render targets, depth, half-resolution
+// particle buffers and other GPU-written images the game samples them with its own filtering only (public issue #19:
+// hard squares on torch embers at 1.0 scale, 3080 and 9070 XT; #17 mist flicker and shadow flicker reports of the same
+// class). vk_sampler_nobias's twin drops both PC overrides.
+bool vk_pc_sampler_override_on(void) { return pc_lod_bias() != 0 || pc_aniso() > 1; }
+// Memoised by the biased sampler, which stands for the entry's content (samp_get: one VkSampler per content, never
+// destroyed), so a bind is two loads, not sampler_make's hash and lock on every bind of a render target. Not in
+// NvnSamplerDesc itself: capture.c writes the pools' entries as they are, and replays read that layout. The render
+// thread's (exec.c texture_info_).
+VkSampler vk_sampler_nobias(NvnSamplerDesc *d, bool plain) {
+    static struct { VkSampler key, twin[2]; } memo[1024];
+    VkSampler k = vk_sampler(d);
+    uintptr_t u = (uintptr_t)k;
+    size_t i = (u >> 4 ^ u >> 14) & 1023;
+    if (memo[i].key != k) memo[i].key = k, memo[i].twin[0] = memo[i].twin[1] = VK_NULL_HANDLE;
+    if (!memo[i].twin[plain]) memo[i].twin[plain] = sampler_make(d, !plain, NULL, false);
+    return memo[i].twin[plain];
 }
 
 VkSampler vk_default_sampler(bool linear) {

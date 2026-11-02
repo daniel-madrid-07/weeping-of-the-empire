@@ -1,5 +1,5 @@
-// exefs_scan.h: the mods' ExeFS patches (.ips, IPS32, IPSwitch .pchtxt) and Atmosphere cheat files for main of TotK 1.0.0,
-// parsed and sorted into what the port can apply. Pure (no runtime, no file system) so tools/engine/test_exefs.py runs it
+// exefs_scan.h: the mods' ExeFS patches (.ips, IPS32, IPSwitch .pchtxt) and Atmosphere cheat files for main of TotK (the
+// version this build is: MAIN_BIDS), parsed and sorted into what the port can apply. Pure (no runtime, no file system) so tools/engine/test_exefs.py runs it
 // without the game; mods_exefs.cpp feeds it the files and the image.
 //
 // The formats, the build-id match and the offset rule (IPS offsets count the 0x100-byte NSO header; a pchtxt offset adds
@@ -25,7 +25,13 @@ namespace exefs {
 
 constexpr uint32_t NSO_HEADER = 0x100;
 #define EXEFS_TITLE "0100F2C0115B6000"
-constexpr const char* MAIN_BID = "082ce09b06e33a123cb1e2770f5f9147709033db";   // main 1.0.0 (games/totk/patches/__init__.py)
+// main's build id per game version the port builds (games/totk/patches/__init__.py, sites_v143.py MAIN_BUILD_ID;
+// tools/engine/test_exefs.py checks they agree). Each version is its own recompile with main at the same base, so a mod's
+// files for that version (named by its id) apply as they are: no address translation.
+constexpr const char* MAIN_BIDS[] = {"082ce09b06e33a123cb1e2770f5f9147709033db",    // 1.0.0
+                                     "277178b7dba1b6d4949a84778d4abc58b31b34f5"};   // 1.4.3
+constexpr const char* MAIN_BID = MAIN_BIDS[0];
+inline const char* g_bid = MAIN_BID;   // this run's (mods_exefs_start: img/main.json's id, one of MAIN_BIDS)
 // where a mod keeps its exefs folder, first that exists (rival runtime/mods.c find_root); plus atmosphere/exefs_patches/*/
 constexpr const char* PLACES[] = {"exefs", "atmosphere/contents/" EXEFS_TITLE "/exefs", "contents/" EXEFS_TITLE "/exefs",
                                   EXEFS_TITLE "/exefs"};
@@ -38,12 +44,27 @@ inline int hexv(char c) { return c <= '9' ? c - '0' : lower(c) - 'a' + 10; }
 
 // name (hex, any case) is main's build id: the 32-byte form with its zero padding, the 20 bytes, or a cut-down id of at
 // least 8 bytes (cheat files use 8, some pchtxt files 16)
-inline bool same_build(const std::string& name, const char* bid = MAIN_BID) {
+inline bool same_build(const std::string& name, const char* bid = g_bid) {
     if (name.size() < 16 || name.size() > 64) return false;
     std::string a, b(bid);
     for (char c : name) { if (!is_hex(c)) return false; a += lower(c); }
     b.resize(64, '0');
     return b.compare(0, a.size(), a) == 0;
+}
+
+// the entry of MAIN_BIDS that id (img/main.json's: the 40 digits, or its 64-digit padded form) is, nullptr for another
+inline const char* known_build(const std::string& id) {
+    if (id.size() < 40) return nullptr;
+    for (const char* b : MAIN_BIDS)
+        if (same_build(id.substr(0, 40), b)) return b;
+    return nullptr;
+}
+
+// the cheat file name of this run's build: the first 8 bytes of its id, as Atmosphere writes them
+inline std::string cheat_file_of_build() {
+    std::string s(g_bid, 16);
+    for (char& c : s) if (c >= 'a' && c <= 'f') c = char(c - 32);
+    return s + ".txt";
 }
 
 // ---- formats
@@ -181,6 +202,7 @@ struct File {
     enum Kind { CODE, DATA, OTHER, EMPTY, BAD, OVERLAP } kind = EMPTY;
     Writes code, data;                    // bytes that differ from the image: code needs the rebuild (.text, .rodata)
     std::string note, arg;                // why BAD / OVERLAP: an English text (a %s takes arg), for pc_tr
+    int slot = -1;                        // a code cheat's: its switch flag (built in on or off, switched live)
 };
 
 // one file's writes against the image: drops the game's own bytes, splits code / data, refuses what we cannot apply
@@ -199,24 +221,32 @@ inline void classify(File& f, const Writes& w, const Image& im, const std::vecto
     f.kind = !f.code.empty() ? File::CODE : !f.data.empty() ? File::DATA : File::EMPTY;
 }
 
-// files in mod order (top wins): a file writing a byte an earlier file wrote is left out as a whole
+// files in mod order (top wins): a file writing a byte an earlier file wrote is left out as a whole. Two code cheats may
+// write the same bytes (each is its own switch; the first one on wins), never a cheat and a file
 inline void resolve(std::vector<File>& files) {
-    std::map<int64_t, size_t> owner;
+    std::map<int64_t, size_t> owner, cheat_owner;
     for (size_t i = 0; i < files.size(); i++) {
         File& f = files[i];
         if (f.kind != File::CODE && f.kind != File::DATA) continue;
         const File* hit = nullptr;
         for (auto* w : {&f.code, &f.data})
-            for (auto& [off, b] : *w) { auto o = owner.find(off); if (o != owner.end()) { hit = &files[o->second]; break; } }
+            for (auto& [off, b] : *w) {
+                auto o = owner.find(off);
+                if (o != owner.end() || (f.slot < 0 && (o = cheat_owner.find(off)) != cheat_owner.end())) {
+                    hit = &files[o->second]; break;
+                }
+            }
         if (hit) { f.kind = File::OVERLAP; f.note = "It overlaps %s, higher in the list."; f.arg = hit->mod + "/" + hit->rel; continue; }
-        for (auto* w : {&f.code, &f.data}) for (auto& [off, b] : *w) owner[off] = i;
+        for (auto* w : {&f.code, &f.data}) for (auto& [off, b] : *w) (f.slot < 0 ? owner : cheat_owner).emplace(off, i);
     }
 }
 
-// the code writes of the usable files, merged
+// the code writes of the usable files, merged; a code cheat's apart (key + (slot + 1) << 40: built in as its switch)
 inline Writes code_set(const std::vector<File>& files) {
     Writes out;
-    for (auto& f : files) if (f.kind == File::CODE) out.insert(f.code.begin(), f.code.end());
+    for (auto& f : files)
+        if (f.kind == File::CODE)
+            for (auto& [off, b] : f.code) out[f.slot < 0 ? off : off + (int64_t(f.slot + 1) << 40)] = b;
     return out;
 }
 
@@ -249,7 +279,7 @@ inline std::string hex(const uint8_t* p, size_t n) {
 
 // the rebuild request for tools/engine/mods_exefs.py: the exact writes and the bytes they replace
 inline std::string request_json(const std::vector<File>& files, const Image& im) {
-    std::string j = "{\"build_id\": \"" + std::string(MAIN_BID) + "\", \"set\": \"" + set_hash(code_set(files)) + "\", \"patches\": [";
+    std::string j = "{\"build_id\": \"" + std::string(g_bid) + "\", \"set\": \"" + set_hash(code_set(files)) + "\", \"patches\": [";
     bool first = true;
     for (auto& f : files) {
         if (f.kind != File::CODE) continue;
@@ -257,7 +287,7 @@ inline std::string request_json(const std::vector<File>& files, const Image& im)
             j += first ? "\n  " : ",\n  "; first = false;
             j += "{\"module\": \"main\", \"offset\": " + std::to_string(off) + ", \"bytes\": \""
                + hex((const uint8_t*)bytes.data(), bytes.size()) + "\", \"expect\": \"" + hex(im.bytes + off, bytes.size())
-               + "\", \"from\": \"";
+               + "\"" + (f.slot < 0 ? std::string() : ", \"switch\": " + std::to_string(f.slot)) + ", \"from\": \"";
             for (char c : f.mod + "/" + f.rel) { if (c == '"' || c == '\\') j += '\\'; j += (unsigned char)c < ' ' ? '?' : c; }
             j += "\"}";
         }

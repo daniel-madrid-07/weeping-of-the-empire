@@ -40,6 +40,7 @@ typedef struct {
     uint32_t max_wg_subgroups;       // maxComputeWorkgroupSubgroups: a pinned compute workgroup holds at most this many subgroups
     bool maint5;  // VK_KHR_maintenance5 enabled (device.c: unwritten point sizes are 1.0)
     bool maint8;  // VK_KHR_maintenance8 enabled: vkCmdCopyImage between depth and matching colour formats (textures.c)
+    bool view2d_of_3d;  // VK_EXT_image_2d_view_of_3d enabled: sampled 2D views of a 3D texture's slice (textures.c vk_view)
     bool astc_ldr;   // textureCompressionASTC_LDR enabled: ASTC images are created natively (textures.c), else decoded to RGBA8
     bool fill_nonsolid, dual_src_blend, depth_clamp;  // core features the device has (device.c; exec.c falls back without)
     bool storage_ext;   // shaderStorageImageExtendedFormats (contact.c: the B10G11R11 scene colour as a storage image)
@@ -47,6 +48,7 @@ typedef struct {
     bool fbl_layout;     // the feedback-loop LAYOUT extension alone (AMD Windows): live reads in FEEDBACK_LOOP_OPTIMAL (exec.c)
     bool depth_unrestricted;  // VK_EXT_depth_range_unrestricted enabled (textures.c depth twins: D32 values outside [0,1])
     bool host_qreset;     // Vulkan 1.2 hostQueryReset enabled (exec.c: occlusion queries reset from the CPU)
+    bool oq_precise;      // occlusionQueryPrecise enabled (exec.c oq_draw: exact sample counts)
     bool sep_ds_layouts;  // Vulkan 1.2 separateDepthStencilLayouts enabled (textures.c: S8_UINT substitute)
     bool sampler_aniso, mirror_clamp;  // samplerAnisotropy / samplerMirrorClampToEdge enabled (textures.c samplers fall back)
     bool mem_budget;  // VK_EXT_memory_budget enabled: per-heap budget / usage readable (device.c [vram], residency)
@@ -115,6 +117,8 @@ typedef struct TexBackend {
     uint32_t wr_epoch;       // exec.c LARECOMP_BARRIERS=tracked: barrier epoch in which a pass last wrote it
     uint64_t last_use;       // vk_frame_counter() of its last use (tex_backend): VRAM residency's LRU order (textures.c)
     bool evicted;            // image dropped by VRAM residency; tex_backend re-creates it and the next use re-uploads it
+    bool parked;             // VRAM residency moved this rendered image (same contents) to system memory (textures.c park_move)
+    bool park_moved;         // (textures.c residency round: its views are dropped by one scan of the view table)
     bool fbl_in;             // exec.c g_vk.fbl_layout: in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL for the open pass (else GENERAL)
     struct TexBackend *twin; // a colour target sampled with depth compare: its depth-format copy (textures.c vk_depth_twin)
     bool twin_valid;         // the twin holds this image's latest rendering (copied after each pass that drew into it)
@@ -126,6 +130,8 @@ typedef struct TexBackend {
     int32_t snap_box[4];     // draws wrote in it since (level 0, x0 y0 x1 y1; empty when x1 <= x0)
     bool preuploaded;        // preupload.c: uploaded on the loading screen; its first real use checks it (upload_texture_)
     bool smark_ok;           // exec.c LARECOMP_SNAP_MARK: every draw into it since that copy marked its tiles
+    uint32_t b2t_levels;     // exec.c copy_buffer_to_texture: the levels buffer copies wrote (bit 31: counted, texture_info_)
+    uint32_t remake_gen;     // textures.c g_tex_gen when its scale kind / usage was last checked against the live settings
 } TexBackend;
 VkImageView vk_depth_twin_view(TexBackend *b, const NvnTextureView *v, bool has_view, int textype);  // textures.c: twin view once filled
 bool vk_depth_twin_stale(TexBackend *b);  // textures.c: b is compare-sampled through a twin that needs a copy now (outside a pass)
@@ -133,8 +139,14 @@ uint64_t vk_residency_need_ns(void);  // textures.c: time of the last measuremen
 uint64_t vk_residency_pressure(bool *commit);  // textures.c: bytes over the VRAM budget / under the commit floor (0 = none)
 void vk_depth_twin_copy(VkCommandBuffer cb, TexBackend *b);  // after a pass into b: refresh its twin (exec.c blk_copy_back)
 void vk_writeback_flush(void);  // textures.c: rendered CPU-movable textures' texels -> their guest storage (end of execute)
+void vk_cpu_read_begin(void);  // textures.c: pass begin: drops notes of a pass that never ended (a device reset)
+void vk_cpu_read_note(NvnTexture *t, TexBackend *b);  // textures.c: pass begin, colour target t: a CPU-read target?
+void vk_cpu_read_flush(VkCommandBuffer cb);  // textures.c: after the pass (outside it): their texels -> guest storage, no wait
+bool vk_gmem_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off);  // exec.c: guest range in the imported heap
 TexBackend *vk_render_backend(NvnTexture *t);  // the image a pass on t really draws into (t's own, or its block shadow)
 
+uint32_t vk_render_epoch(void);   // textures.c: +1 each time the render scale changes (after renderer_get_scale has it)
+void vk_samplers_rebuild(void);   // textures.c: every sampler re-made at the next present (a live bias / filtering term)
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
 VkFormat vk_format(uint32_t nvn_format);
 bool vk_format_alpha_one(uint32_t nvn_format);
@@ -154,6 +166,11 @@ void vk_defer_image(VkImage img, VmaAllocation mem);
 void vk_defer_view(VkImageView v);
 void vk_views_forget(TexBackend *b);  // drop (deferred) the cached views of an image being replaced
 uint64_t vk_frame_counter(void);
+// device.c backend_present's split, this frame (exec.c's hitch line resets it): submits, FG pacing, the frame slot's fence
+// (GPU-bound), image acquire, swapchain re-creation, the pacer's wait (cap / game interval), the present call and its limits
+enum { PR_SUBMIT, PR_FG, PR_SLOT, PR_ACQ, PR_RECREATE, PR_PACE, PR_PRESENT, PR_N };
+extern uint64_t g_pr_ns[PR_N];
+extern bool g_pr_paused;
 
 // ---- shaders / pipelines (shaders.c)
 VkShaderModule vk_compile_glsl(const char *src, int stage, const char *name);  // NULL on failure (logged)
@@ -182,8 +199,32 @@ void vk_ngx_device_exts(const VkExtensionProperties *ep, uint32_t ne, const char
 void vk_ngx_device_ready(void);                                 // after vkCreateDevice
 void vk_ngx_gbuffer_draw(const float *cb8, uint64_t size, uint32_t depth_w, uint32_t depth_h, uint64_t frame);
 typedef struct { VkImage image; VkImageView view; VkFormat format; uint32_t w, h; } VkNgxImage;
+// The temporal upscaler / frame generation inputs ngx.c makes from the game's upscale pass, for either backend (dlss's
+// interface, 2026-11-02): images in GENERAL; jitter = the geometry's shift in render pixels, +x right, +y down (exec.c
+// moves the viewport by +j; DLSS and FSR both take it as is); mv = render pixels, prev - cur, unjittered, camera only;
+// bias = 1 trusts the current frame (FSR's reactive mask); an image with image == VK_NULL_HANDLE is absent
+typedef struct VkTemporalInputs {
+    VkNgxImage color, depth, mv, out, bias;
+    float jx, jy, mv_sx, mv_sy;
+    bool reset, depth_inverted;
+    double view_to_clip[4][4], clip_to_prev_clip[4][4];
+    float near_, far_, fovy, aspect;
+    uint64_t frame;
+    // frame generation: this real frame's presented image, its HUD-less twin (may be absent), the camera in world space
+    VkNgxImage backbuffer, hudless;
+    float cam_pos[3], cam_right[3], cam_up[3], cam_fwd[3];
+} VkTemporalInputs;
+// ffx.c: AMD FSR 3.1 (FidelityFX SDK v1.1.4, any Vulkan GPU) behind that interface; ngx.c picks the backend
+bool vk_ffx_sr_ready(void);   // the FidelityFX runtime is loaded (amd_fidelityfx_vk.dll)
+bool vk_ffx_sr_prepare(VkCommandBuffer cb, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh);   // the context, between frames
+bool vk_ffx_sr_evaluate(VkCommandBuffer cb, const VkTemporalInputs *in);
+bool vk_ffx_fg_ready(void);
+bool vk_ffx_fg_prepare(VkCommandBuffer cb, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, VkFormat fmt, VkFormat hudless_fmt);
+int vk_ffx_fg_evaluate(VkCommandBuffer cb, const VkTemporalInputs *in, VkNgxImage *out, int n);   // frames made (x2: n = 1)
+void vk_ffx_release(void);   // both contexts (device teardown, a backend switch)
 void vk_ngx_sr_jitter(uint64_t frame, uint32_t render_w, uint32_t out_w, float *jx, float *jy);  // render pixels
 float vk_ngx_sr_mip_bias(uint32_t render_w, uint32_t out_w);
+float vk_ngx_sr_lod_bias(void);   // textures.c: the material textures' bias with SR on (0: none)
 bool vk_ngx_sr_evaluate(VkCommandBuffer cb, const VkNgxImage *color, const VkNgxImage *depth, const VkNgxImage *mv,
                         const VkNgxImage *out, float jx, float jy, float mv_scale_x, float mv_scale_y, bool reset,
                         bool depth_inverted, bool hdr, const VkNgxImage *bias);   // bias: the bias-current-colour mask or NULL
@@ -192,9 +233,16 @@ bool vk_ngx_sr_frame_jitter(uint64_t frame, uint32_t render_w, uint32_t out_w, f
 bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, TexBackend *out, uint64_t frame,
                        bool flip_y, bool zminus);
 bool vk_ngx_fg_on(void);                                   // TOTK_DLSS=fg / fgtest
+int vk_ngx_fg_frames(void);                                // generated frames per real one asked (0: FG off)
+void vk_ngx_fg_set_active(int n);                          // the pacer's count for now (1..vk_ngx_fg_frames())
 int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b);    // backend_present: b = the frame's final image; returns how
                                                            // many generated frames wait (fg), shown with vk_ngx_fg_show
 void vk_ngx_fg_show(VkCommandBuffer cb, TexBackend *b, int generated);   // generated k (1..n) or 0: the real frame
+void vk_ngx_prepare(VkCommandBuffer cb, const TexBackend *b);   // backend_present: SR / FG features made between frames
+#define VK_NGX_FG_FSR 16   // vk_ngx_request: frame generation through FSR 3.1 (x2)
+float vk_ngx_scene_scale(float out_scale);   // totk_hooks.c output_scale: DLAA's render scale (0: the row's)
+void vk_ngx_request(int sr, int fg);   // the live rows (pc_dlss.cpp): SR 0 off / 1 DLSS / 2 FSR / 3 DLAA, FG 0 / DLSS generated frames / VK_NGX_FG_FSR (-1: unchanged)
+bool vk_ngx_sr_fxaa_bypass(VkCommandBuffer cb, TexBackend *src, TexBackend *dst);   // exec.c: the game's FXAA draw while SR runs
 void vk_ngx_fg_keep_hudless(VkCommandBuffer cb, TexBackend *out, uint64_t frame);   // the canvas right after the scene
                                                                                   // went in (outside a render pass)
 uint32_t vk_present_image_count(const VkSurfaceCapabilitiesKHR *caps);

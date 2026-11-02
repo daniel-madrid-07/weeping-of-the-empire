@@ -165,6 +165,57 @@ class Row : Painted
     }
 }
 
+// One switch under the intake list, drawn as a Row: a check where the index goes, a title, and a line under it that says
+// what the current choice does (it changes with the choice).
+class OptionRow : Painted
+{
+    readonly string title; readonly Func<bool, string> says;
+    bool on;
+    public bool Locked;
+    public bool Touched { get; private set; }   // the player chose (the default no longer follows the dump)
+    public event Action Changed;
+
+    public OptionRow(string title, Func<bool, string> says)
+    {
+        this.title = title; this.says = says;
+        Cursor = Cursors.Hand; TabStop = true;
+        MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) Set(!on, true); };
+        KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) Set(!on, true); };
+    }
+
+    public bool Checked { get { return on; } }
+
+    public void Set(bool value, bool byPlayer)
+    {
+        if (Locked && byPlayer) return;
+        on = value; if (byPlayer) Touched = true;
+        Invalidate(); if (Changed != null) Changed();
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics; T.Hq(g);
+        if (hot && !Locked) using (var b = new SolidBrush(T.RowHot)) g.FillRectangle(b, 0, 0, Width, Height - 1);
+        using (var pen = new Pen(T.Rule)) g.DrawLine(pen, 0, Height - 1, Width, Height - 1);
+        int mid = Height / 2;
+        float d = T.D(16), bx = T.S2 + T.D(1), by = mid - d / 2;   // the check, in the rows' index column
+        using (var path = T.Round(new RectangleF(bx, by, d, d), T.D(3)))
+        {
+            if (!on) using (var pen = new Pen(Focused ? T.TextDim : T.Ring, 1.5f * T.K)) g.DrawPath(pen, path);
+            else
+            {
+                using (var b = new SolidBrush(Locked ? T.Ring : T.Accent)) g.FillPath(b, path);
+                using (var pen = new Pen(T.AccentInk, 1.8f * T.K) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                    g.DrawLines(pen, new[] { new PointF(bx + d * .26f, by + d * .53f), new PointF(bx + d * .43f, by + d * .70f), new PointF(bx + d * .75f, by + d * .33f) });
+            }
+        }
+        int x = T.S2 + T.S8 + T.S2;
+        TextRenderer.DrawText(g, title, T.Label, new Point(x, mid - T.D(19)), Locked ? T.TextDim : T.Text, TextFormatFlags.NoPadding);
+        TextRenderer.DrawText(g, says(on), T.Small, new Rectangle(x, mid + T.D(3), Width - x - T.S4, T.D(18)),
+            on ? T.TextDim : T.TextFaint, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+    }
+}
+
 class PrimaryButton : Painted
 {
     bool down;
@@ -205,6 +256,7 @@ class StatusView : Painted
 
     public void Add(string line) { lines.Add(line); if (lines.Count > Keep) lines.RemoveAt(0); Invalidate(); }
     public void Clear() { lines.Clear(); Invalidate(); }
+    public void Remove(string line) { if (lines.Remove(line)) Invalidate(); }
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -273,62 +325,118 @@ static class Fetch
         catch { return null; }
     }
 
-    // Download url to path with progress(done, total); resumes a .part file, retries with a pause, checks the sha256.
-    public static void Download(Item it, string path, Action<long, long> progress, Func<bool> cancelled)
+    // Download url to path with progress(done, total, bytes a second); resumes a .part file after a cut, with a growing
+    // pause (2, 4, 8 ... 60 s, said through note) between tries, and gives up only after 6 failures in a row that gained
+    // no byte (a slow line that keeps dropping still finishes). path exists only once complete and its sha256 checked:
+    // a half file is never used; a resumed .part whose checksum fails (another version's file of the same name) is
+    // fetched once more from the start.
+    public static void Download(Item it, string path, Action<long, long, double> progress, Func<bool> cancelled, Action<string> note)
     {
         ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;   // TLS 1.2 (.NET 4.x defaults lower)
         string part = path + ".part";
-        for (int attempt = 1; ; attempt++)
+        int fails = 0; bool refetched = false;
+        while (true)
         {
+            long start = File.Exists(part) ? new FileInfo(part).Length : 0;
+            Exception err = null;
+            bool complete = false;
             try
             {
-                long have = File.Exists(part) ? new FileInfo(part).Length : 0;
+                long have = start;
                 var req = (HttpWebRequest)WebRequest.Create(it.Url);
                 req.UserAgent = "Setup"; req.Timeout = 30000; req.ReadWriteTimeout = 60000;
                 if (have > 0) req.AddRange(have);
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 {
                     bool partial = resp.StatusCode == HttpStatusCode.PartialContent;
-                    if (!partial) have = 0;   // (the server ignored the range: start over)
+                    if (!partial) have = start = 0;   // (the server ignored the range: start over)
                     long total = resp.ContentLength < 0 ? -1 : resp.ContentLength + have;
                     using (var src = resp.GetResponseStream())
                     using (var dst = new FileStream(part, partial ? FileMode.Append : FileMode.Create, FileAccess.Write))
                     {
-                        var buf = new byte[1 << 16]; int n; long done = have, last = 0;
+                        var buf = new byte[1 << 16]; int n; long done = have, markDone = have; double rate = 0;
+                        var clock = Stopwatch.StartNew(); double last = 0, markT = 0;
                         while ((n = src.Read(buf, 0, buf.Length)) > 0)
                         {
                             if (cancelled()) throw new OperationCanceledException();
                             dst.Write(buf, 0, n); done += n;
-                            if (done - last > (1 << 20)) { progress(done, total); last = done; }
+                            double now = clock.Elapsed.TotalSeconds;
+                            if (now - last >= 1.5)
+                            {
+                                double inst = (done - markDone) / Math.Max(now - markT, 1e-3);
+                                rate = rate == 0 ? inst : 0.7 * rate + 0.3 * inst;
+                                markDone = done; markT = now; last = now;
+                                progress(done, total, rate);
+                            }
                         }
+                        if (total > 0 && done < total) throw new IOException("the connection closed early");
                     }
                 }
+                complete = true;
+            }
+            catch (WebException e)
+            {
+                var r = e.Response as HttpWebResponse;
+                int code = r == null ? 0 : (int)r.StatusCode;
+                if (code == 416) complete = true;   // (a stale .part at least as long as the file: checked as it is)
+                else if (code >= 400 && code < 500 && code != 408 && code != 429)   // (no retry helps: said at once)
+                    throw new IOException(string.Format("Could not download {0}: {1} answered {2} for it. Press Install again later; if it stays " +
+                                                        "like this, report it.", it.Name, new Uri(it.Url).Host, code));
+                else err = e;
+            }
+            catch (IOException e)   // (a connection cut mid-body, or the disk)
+            {
+                int hr = Marshal.GetHRForException(e);
+                if (hr == unchecked((int)0x80070070) || hr == unchecked((int)0x80070027))   // ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL
+                    throw new IOException(string.Format("Could not download {0}: the disk is full ({1}). Free some space, then press Install " +
+                                                        "again: the download continues where it stopped.", it.Name, Path.GetDirectoryName(path)));
+                err = e;
+            }
+            if (complete)
+            {
                 string sum = Sha256(part);
                 if (!string.Equals(sum, it.Sha256, StringComparison.OrdinalIgnoreCase))
                 {
                     File.Delete(part);
+                    if (start > 0 && !refetched) { refetched = true; note(it.Name + ": the resumed file does not match its checksum: from the start"); continue; }
                     throw new InvalidDataException(string.Format("{0}: the download does not match its checksum (got {1}); press Install again", it.Name, sum));
                 }
                 if (File.Exists(path)) File.Delete(path);
                 File.Move(part, path);
                 return;
             }
-            catch (Exception e)
+            bool gained = File.Exists(part) && new FileInfo(part).Length > start;
+            fails = gained ? 1 : fails + 1;
+            if (fails >= 6)
             {
-                // a refused request (WebException) or a connection cut mid-body (IOException from Read): retry from the
-                // .part; a bad checksum or a cancel are final
-                if (!(e is WebException || e is IOException)) throw;
-                var r = (e is WebException) ? ((WebException)e).Response as HttpWebResponse : null;
-                if (r != null && (int)r.StatusCode == 416) { File.Delete(part); }   // (a stale .part longer than the file)
-                if (attempt >= 6)
-                {
-                    string host = new Uri(it.Url).Host;
-                    throw new IOException(string.Format("Could not download {0} from {1} ({2}). Check the internet connection; a firewall, proxy or " +
-                        "school / work network can block {1}. Then press Install again: it continues where it stopped.", it.Name, host, e.Message));
-                }
-                Thread.Sleep(2000 * attempt);
+                string host = new Uri(it.Url).Host;
+                var we = err as WebException;
+                bool offline = we != null && (we.Status == WebExceptionStatus.NameResolutionFailure || we.Status == WebExceptionStatus.ConnectFailure ||
+                                              we.Status == WebExceptionStatus.ProxyNameResolutionFailure || we.Status == WebExceptionStatus.Timeout);
+                throw new IOException(string.Format("Could not download {0}: {1} cannot be reached ({2}). {3}Then press Install again: it continues where it stopped.",
+                    it.Name, host, err == null ? "?" : err.Message,
+                    offline ? "Check that this PC is connected to the internet; a firewall, proxy or school / work network can block " + host + ". "
+                            : "Check the internet connection. "));
             }
+            int pause = Math.Min(60, 1 << fails);
+            note(string.Format("{0}: {1}; retrying in {2} s", it.Name, err == null ? "?" : err.Message, pause));
+            for (long w = 0; w < (long)pause * PauseMs; w += 250) { if (cancelled()) throw new OperationCanceledException(); Thread.Sleep((int)Math.Min(250, (long)pause * PauseMs - w)); }
         }
+    }
+
+    public static int PauseMs = 1000;   // (a second of the retry pause; the tests make it 0)
+
+    // ', 2.1 MB/s, 3 min left' for the progress line ('' before there is a speed)
+    public static string RateText(long done, long total, double rate)
+    {
+        if (rate <= 0) return "";
+        string s = rate >= 1048576 / 10.0 ? string.Format(System.Globalization.CultureInfo.InvariantCulture, ", {0:0.0} MB/s", rate / 1048576) : string.Format(System.Globalization.CultureInfo.InvariantCulture, ", {0:0} KB/s", rate / 1024);
+        if (total > 0 && done < total)
+        {
+            double left = (total - done) / rate;
+            s += left >= 90 ? string.Format(System.Globalization.CultureInfo.InvariantCulture, ", {0:0} min left", left / 60) : string.Format(System.Globalization.CultureInfo.InvariantCulture, ", {0:0} s left", left);
+        }
+        return s;
     }
 
     public static string Sha256(string path)
@@ -358,15 +466,145 @@ static class Fetch
     }
 }
 
+// Wine / Proton (Linux, Steam Deck): its ntdll exports wine_get_version, Windows' never does (Proton keeps it too).
+// Setup takes another path where Wine differs from Windows: no kill-on-close job (Wine honours it, and its explorer.exe
+// is a new process in the job, so the game Play starts through it would die with this window), the game and the
+// uninstall started directly (no job to leave), free space asked of the folder itself (Z:\ is the Linux root, often
+// another partition than /home), the default folder in the Linux home (C: is the Proton prefix, gone when Steam
+// deletes it), no desktop shortcut (the prefix's Desktop, which no Linux desktop shows). SETUP_WINE=1 / 0 forces the
+// answer (a test on Windows).
+static class Wine
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandleW(string name);
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, BestFitMapping = false)] static extern IntPtr GetProcAddress(IntPtr module, string name);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate IntPtr VersionFn();
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool GetDiskFreeSpaceExW(string dir, out ulong freeToCaller, out ulong total, out ulong free);
+
+    // null on Windows, else the Wine version ("9.0", "10.0-rc", or "forced")
+    public static readonly string Version = Detect();
+    public static bool Active { get { return Version != null; } }
+
+    static string Detect()
+    {
+        string force = Environment.GetEnvironmentVariable("SETUP_WINE");
+        if (force == "0") return null;
+        try
+        {
+            IntPtr f = GetProcAddress(GetModuleHandleW("ntdll.dll"), "wine_get_version");
+            if (f != IntPtr.Zero) return Marshal.PtrToStringAnsi(((VersionFn)Marshal.GetDelegateForFunctionPointer(f, typeof(VersionFn)))()) ?? "?";
+        }
+        catch { }
+        return force == "1" ? "forced" : null;
+    }
+
+    // Steam's Proton (STEAM_COMPAT_DATA_PATH: the prefix's folder, set for every game it starts) rather than plain Wine
+    public static bool Proton { get { return Active && !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("STEAM_COMPAT_DATA_PATH")); } }
+
+    // Free bytes where dir really is (its nearest folder that exists): Windows' answer for a drive root, Wine's statfs()
+    // of that very folder (a drive letter's root can sit on another Linux partition). -1: unknown
+    public static long FreeBytes(string dir)
+    {
+        try
+        {
+            string at = Path.GetFullPath(dir);
+            while (at != null && !Directory.Exists(at)) at = Path.GetDirectoryName(at);
+            ulong caller, total, free;
+            if (at != null && GetDiskFreeSpaceExW(at.EndsWith("\\") ? at : at + "\\", out caller, out total, out free)) return (long)caller;
+        }
+        catch { }
+        try { return new DriveInfo(Path.GetPathRoot(Path.GetFullPath(dir))).AvailableFreeSpace; } catch { return -1; }
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "wine_get_unix_file_name")] static extern IntPtr UnixName(string dos);
+    [DllImport("kernel32.dll")] static extern IntPtr GetProcessHeap();
+    [DllImport("kernel32.dll")] static extern bool HeapFree(IntPtr heap, uint flags, IntPtr mem);
+
+    // A Windows path as Linux sees it (what a player types into Steam's "Add a Non-Steam Game"), else the path as is
+    public static string LinuxPath(string p)
+    {
+        if (!Active || p == null) return p;
+        try
+        {
+            IntPtr s = UnixName(p);   // (UTF-8, from the process heap)
+            if (s == IntPtr.Zero) return p;
+            int n = 0;
+            while (Marshal.ReadByte(s, n) != 0) n++;
+            var b = new byte[n];
+            Marshal.Copy(s, b, 0, n);
+            HeapFree(GetProcessHeap(), 0, s);
+            return Encoding.UTF8.GetString(b);
+        }
+        catch { return p; }   // (SETUP_WINE=1 on Windows: no such export)
+    }
+
+    // A Linux symbolic link at link to the folder dir: Setup's junction under Wine (Proton 10's Wine makes no junctions;
+    // a Linux link works with every Wine, which shows it as a folder and as a reparse point, so Uninstall removes the
+    // link alone). ln runs as an exe would: Wine starts a Linux program it is asked to run (ntdll's fork_and_exec), but
+    // with no process handle to wait on, so the link's arrival is the answer. link's folder must exist (the Linux name
+    // of a path that does not exist yet is not asked for)
+    public static bool LinkFolder(string link, string dir)
+    {
+        if (!Active) return false;
+        string parent = LinuxPath(Path.GetDirectoryName(link)), ud = LinuxPath(dir);
+        if (parent == null || ud == null || !parent.StartsWith("/") || !ud.StartsWith("/")) return false;
+        string ln = new[] { @"Z:\usr\bin\ln", @"Z:\bin\ln" }.FirstOrDefault(File.Exists);
+        if (ln == null) return false;
+        try
+        {
+            var p = Process.Start(new ProcessStartInfo(ln, "-s -- \"" + ud + "\" \"" + parent.TrimEnd('/') + "/" + Path.GetFileName(link) + "\"")
+                                  { UseShellExecute = false, CreateNoWindow = true });
+            if (p != null) p.Dispose();
+        }
+        catch { }   // (a Process without a handle may throw after ln started: the folder below says)
+        for (int i = 0; i < 100 && !Directory.Exists(link); i++) Thread.Sleep(100);
+        return Directory.Exists(link);
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool GetVolumeInformationW(string root, StringBuilder name, int nameSize, IntPtr serial, IntPtr maxComponent, IntPtr flags,
+                                             StringBuilder fs, int fsSize);
+
+    // Under Wine the file system of the folder itself (its nearest folder that exists), as builder.py's filesystem():
+    // Wine answers with the statfs() of the Linux file system holding it (a FAT32 SD card below /run/media), the drive
+    // root (Z:\ = /) for /. null: not Wine, or no answer (then the drive's)
+    public static string FileSystem(string dir)
+    {
+        if (!Active) return null;
+        try
+        {
+            string at = Path.GetFullPath(dir);
+            while (at != null && !Directory.Exists(at)) at = Path.GetDirectoryName(at);
+            var fs = new StringBuilder(64);
+            return at != null && GetVolumeInformationW(at.EndsWith("\\") ? at : at + "\\", null, 0, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, fs, 64) ? fs.ToString() : null;
+        }
+        catch { return null; }
+    }
+
+    // The Linux home as a Windows path (Wine maps / to Z:), or null: HOME comes through from Linux under Wine
+    public static string Home()
+    {
+        string h = Environment.GetEnvironmentVariable("HOME");
+        if (!Active || string.IsNullOrEmpty(h) || !h.StartsWith("/")) return null;
+        string p = "Z:" + h.TrimEnd('/').Replace('/', '\\');
+        return Directory.Exists(p) ? p : null;
+    }
+}
+
 // What the PC must have before Setup downloads anything (the first seconds, not after 30 minutes of building): each
 // problem is one sentence saying what to do. builder.py checks the same again (and the keys, the dump) once it runs.
 static class Preflight
 {
     const double MinRamGb = 7.5;                       // (builder.py MIN_RAM_GB: an "8 GB" PC reports ~7.8)
-    const int FirstRunGb = 25, ResumeGb = 9, ToolsGb = 5, UpdateUnpackGb = 18;   // (builder.py FIRST_RUN_GB, RESUME_GB, TOOLS_GB, UPDATE_UNPACK_GB)
+    // (builder.py FIRST_RUN_GB, COPY_ROMFS_GB, RESUME_GB, TOOLS_GB, UPDATE_UNPACK_GB)
+    const int FirstRunGb = 8, CopyRomfsGb = 17, ResumeGb = 9, ToolsGb = 5, UpdateUnpackGb = 18;
 
-    // What a first install asks for, as the window says it (Builder mode: no tools; the 1.4.3 update: its RomFS too)
-    public static int FirstInstallGb(bool tools, bool update) { return FirstRunGb + (tools ? ToolsGb : 0) + (update ? UpdateUnpackGb : 0); }
+    // What a first install asks for, as the window says it (Builder mode: no tools; copy: the game's data copied out of
+    // the dump, romfs.bin; the 1.4.3 update: always copied, and its RomFS unpacked too)
+    public static int FirstInstallGb(bool tools, bool update, bool copy = false)
+    {
+        return FirstRunGb + (copy || update ? CopyRomfsGb : 0) + (tools ? ToolsGb : 0) + (update ? UpdateUnpackGb : 0);
+    }
     const uint Vk13 = (1u << 22) | (3u << 12);
 
     [DllImport("kernel32.dll")] static extern bool IsProcessorFeaturePresent(int feature);
@@ -376,7 +614,8 @@ static class Preflight
 
     // Problems (the install cannot work: Setup stops) and notes (said once, the install goes on); details: for setup.log
     // only (each GPU the check saw, for support). dir: the install folder (null in Builder mode: builder.py checks it).
-    public static void Check(string dir, List<string> problems, List<string> notes, List<string> details = null, bool update = false)
+    public static void Check(string dir, List<string> problems, List<string> notes, List<string> details = null, bool update = false,
+                             bool copy = false)
     {
         if (!Environment.Is64BitOperatingSystem)
             problems.Add("This is 32-bit Windows; the game needs 64-bit Windows 10 or 11.");
@@ -387,10 +626,14 @@ static class Preflight
         var m = new MemoryStatus { Length = (uint)Marshal.SizeOf(typeof(MemoryStatus)) };
         if (GlobalMemoryStatusEx(ref m) && m.Total / 1073741824.0 < MinRamGb)
             problems.Add(string.Format("This PC has {0:0.0} GB of memory; building the game needs at least 8 GB.", m.Total / 1073741824.0));
-        if (dir != null) Disk(dir, update, problems);
+        if (dir != null) Disk(dir, update, copy, problems);
+        if (dir != null && NoHardLinks(dir))
+            notes.Add("This drive is exFAT: the install works, but each update rebuilds the game from scratch (25 to 45 minutes: " +
+                      "exFAT has no hard links, so no build cache is kept). A folder on an NTFS drive updates in minutes.");
         Vulkan(problems, notes, details ?? new List<string>());
         notes.Add(Vp9Note(Vp9Mft()));
         notes.Add("Visual C++ runtime in Windows: " + (CrtVersion() ?? "none"));
+        if (Wine.Active) notes.Add("Running under Wine " + Wine.Version + (Wine.Proton ? " (Steam's Proton)" : "") + ": Setup takes its Linux paths (README, Linux and Steam Deck).");
     }
 
     // The cutscene movies are VP9: Windows decodes them with the Store's "VP9 Video Extensions" (a Media Foundation
@@ -426,27 +669,52 @@ static class Preflight
                "the processor. To decode them on the graphics card, install \"VP9 Video Extensions\" from the Microsoft Store.";
     }
 
-    // The same sum as builder.py's, a run whose game files (of the version built: v100, or v143 with the update dump)
-    // are already extracted 15, the update's unpacked RomFS 18 more until it is, the tools 5
-    public static int NeedGb(string dir, bool update = false)
+    // The same sum as builder.py's: a first run 8 GB, a run whose game files (of the version built: v100, or v143 with
+    // the update dump) are already extracted 9; romfs.bin 17 more when the data is copied out of the dump (copy: the
+    // window's switch, always with the update) and not yet there; the update's unpacked RomFS 18 until it is; the tools 5
+    public static int NeedGb(string dir, bool update = false, bool copy = false)
     {
-        bool resume = File.Exists(Path.Combine(dir, "work", "extracted", update ? "v143" : "v100", "READY.json"));
-        return (resume ? ResumeGb : FirstRunGb) + (update && !resume ? UpdateUnpackGb : 0)
+        string extracted = Path.Combine(dir, "work", "extracted");
+        bool resume = File.Exists(Path.Combine(extracted, update ? "v143" : "v100", "READY.json"));
+        bool copied = File.Exists(Path.Combine(extracted, "v100", "romfs.bin"));   // (switching an in-place install over)
+        return (resume ? ResumeGb : FirstRunGb) + ((copy || update) && (!resume || (!update && !copied)) ? CopyRomfsGb : 0)
+             + (update && !resume ? UpdateUnpackGb : 0)
              + (File.Exists(Path.Combine(dir, "tools", "llvm", ".toolchain.json")) ? 0 : ToolsGb);
     }
 
-    static void Disk(string dir, bool update, List<string> problems)
+    static void Disk(string dir, bool update, bool copy, List<string> problems)
+    {
+        string p = DiskProblem(dir, update, copy);
+        if (p != null) problems.Add(p);
+    }
+
+    // An exFAT drive (FAT32 is refused: BuilderForm.FolderProblem): the build copies instead of linking there
+    // (tools/engine/build.py since 57feee4c) and keeps no object cache, so every update compiles every object again
+    public static bool NoHardLinks(string dir)
     {
         try
         {
-            int need = NeedGb(dir, update);
-            var d = new DriveInfo(Path.GetPathRoot(dir));
-            double free = d.AvailableFreeSpace / 1073741824.0;
-            if (free < need)
-                problems.Add(string.Format("Drive {0} has {1:0} GB free; this install needs about {2} GB. Free some space or choose a folder on another drive.",
-                                           d.Name.TrimEnd('\\'), free, need));
+            string format = Wine.FileSystem(dir) ?? new DriveInfo(Path.GetPathRoot(Path.GetFullPath(dir))).DriveFormat;
+            return string.Equals(format, "exFAT", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    // The install's free-space sentence, or null (the window says it again when the folder, the update or the copy
+    // switch changes it)
+    public static string DiskProblem(string dir, bool update, bool copy)
+    {
+        try
+        {
+            int need = NeedGb(dir, update, copy);
+            long bytes = Wine.FreeBytes(dir);   // (the folder's own: under Wine Z:\ is / and the folder often on /home)
+            double free = bytes / 1073741824.0;
+            if (bytes >= 0 && free < need)
+                return string.Format("Drive {0} has {1:0} GB free; this install needs about {2} GB. Free some space or choose a folder on another drive.",
+                                     Wine.Active ? dir : Path.GetPathRoot(dir).TrimEnd('\\'), free, need);
         }
         catch { }   // (builder.py checks again)
+        return null;
     }
 
     // A GPU must be able to run the game (Vulkan 1.3 and the rest of device.c's device_unfit). Asked in a child process
@@ -628,17 +896,18 @@ static class Preflight
 
     // A folder that would break the install although its drive is fine (null: none). OneDrive uploads what lands in it
     // (the build files, FirstRunGb) and turns files into online-only stubs; Windows Security's Controlled folder access blocks
-    // unknown programs (our compilers) from writing into Documents, Desktop, Pictures, Videos and Music.
-    public static string FolderProblem(string f)
+    // unknown programs (our compilers) from writing into Documents, Desktop, Pictures, Videos and Music. built: a game
+    // is already built there (an update): only what stops a build counts, not what the first install was allowed under.
+    public static string FolderProblem(string f, bool built = false)
     {
         string full;
         try { full = Path.GetFullPath(f).TrimEnd('\\') + "\\"; } catch { return null; }
-        foreach (var v in new[] { "OneDrive", "OneDriveConsumer", "OneDriveCommercial" })
-        {
-            string od = Environment.GetEnvironmentVariable(v);
-            if (!string.IsNullOrEmpty(od) && full.StartsWith(od.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))
-                return "This folder is inside OneDrive, which would upload the " + FirstRunGb + " GB of build files. Choose a folder outside OneDrive.";
-        }
+        if (!built && InOneDrive(full))
+            return "This folder is inside OneDrive, which would upload the " + FirstRunGb + " GB of build files. Choose a folder outside OneDrive.";
+        // Steam's Proton: C: is the entry's prefix (steamapps/compatdata/<n>/pfx), which Steam deletes with the entry
+        if (!built && Wine.Proton && string.Equals(Path.GetPathRoot(full), @"C:\", StringComparison.OrdinalIgnoreCase))
+            return "Under Proton drive C: is this Steam entry's own folder, which Steam deletes with the entry. Choose a folder on a Linux drive" +
+                   (Wine.Home() != null ? ", for example " + Path.Combine(Wine.Home(), BuilderForm.FolderName) : " (drive Z:)") + ".";
         if (ControlledFolderAccess())
             foreach (var sf in new[] { Environment.SpecialFolder.MyDocuments, Environment.SpecialFolder.DesktopDirectory, Environment.SpecialFolder.MyPictures,
                                        Environment.SpecialFolder.MyVideos, Environment.SpecialFolder.MyMusic })
@@ -667,6 +936,19 @@ static class Preflight
         catch { return null; }
     }
 
+    // A path in one of this account's OneDrive folders (builder.py's in_onedrive)
+    public static bool InOneDrive(string path)
+    {
+        string full;
+        try { full = Path.GetFullPath(path).TrimEnd('\\') + "\\"; } catch { return false; }
+        foreach (var v in new[] { "OneDrive", "OneDriveConsumer", "OneDriveCommercial" })
+        {
+            string od = Environment.GetEnvironmentVariable(v);
+            if (!string.IsNullOrEmpty(od) && full.StartsWith(od.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
+    }
+
     // Controlled folder access in block mode (1; 2 = audit only), as set by the user or by a policy
     public static bool ControlledFolderAccess()
     {
@@ -682,11 +964,585 @@ static class Preflight
     }
 }
 
+// The dump, the update and the keys, read in their headers before anything is downloaded (a second, not after the
+// tools and step 0): pipeline/nx/container.py's program_sections / update_program up to the title key, and builder.py's
+// check_keys and dump_problem sentences, which builder.py's check_dump says again before step 1 (test_preflight.py
+// compares the two on synthetic dumps). Key values are only used, never written anywhere.
+static class Inputs
+{
+    const ulong Title = 0x0100F2C0115B6000, UpdateTitle = Title | 0x800;   // (container.py TOTK_TITLE_ID, TOTK_UPDATE_TITLE_ID)
+    const string KeysFix = "dump prod.keys again on the console the game was dumped from, with a current key dumper (one that " +
+                           "knows that console's firmware), and choose that file";
+
+    class Bad : Exception { public Bad(string why) : base(why) { } }
+    static void Require(bool ok, string why) { if (!ok) throw new Bad(why); }
+
+    struct Entry { public string Name; public long Offset, Size; }
+    class Nca { public byte[] Hdr; public int Type; public ulong Title; public bool Bktr; }
+
+    // null when the files open; else one sentence saying what to do (update: null without the update)
+    public static string Check(string dump, string keys, string update)
+    {
+        string name = Path.GetFileName(keys);
+        Dictionary<string, byte[]> keyset;
+        try
+        {
+            var lines = File.ReadAllLines(keys);
+            var names = new HashSet<string>(lines.Where(l => l.Contains('=')).Select(l => l.Split('=')[0].Trim().ToLowerInvariant()));
+            if (!new[] { "header_key", "key_area_key_application_00", "titlekek_00" }.All(names.Contains))
+                return name + " does not look like a complete keys file. Use the one from your own console.";
+            keyset = LoadKeys(lines);
+        }
+        catch (Bad e) { return name + " cannot be read as a keys file (" + e.Message + "): " + KeysFix + "."; }
+        catch (Exception e) { return name + " cannot be read (" + e.Message + "): " + keys; }
+        foreach (var x in new[] { Tuple.Create(dump, "the dump", false), Tuple.Create(update, "the update dump", true) })
+        {
+            if (x.Item1 == null) continue;
+            try
+            {
+                using (var f = new FileStream(x.Item1, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 4096, FileOptions.RandomAccess))
+                    Open(f, keyset, x.Item3);
+            }
+            catch (Bad e) { return Problem(x.Item2, e.Message); }
+            catch (Exception e) { return Cap(x.Item2) + " cannot be read (" + e.Message + "): " + x.Item1; }
+        }
+        return null;
+    }
+
+    static string Cap(string s) { return char.ToUpperInvariant(s[0]) + s.Substring(1); }
+
+    // builder.py's dump_problem: the reason a dump / update could not be opened, as one sentence with what to do
+    public static string Problem(string what, string msg)
+    {
+        if (msg.Contains("prod.keys") || msg.Contains("NCA3") || msg.Contains("titlekek") || msg.Contains("key_area_key"))
+            return "Your prod.keys cannot open " + what + " (" + msg + "): " + KeysFix + ".";
+        if (msg.Contains("FS header hash") || msg.Contains("NCA key area"))
+            return Cap(what) + " could not be read correctly (" + msg + "): either your prod.keys is not the one from the console it was " +
+                   "dumped on (" + KeysFix + "), or the file is damaged (copy or dump it again).";
+        if (msg.Contains("Personalized"))
+            return Cap(what) + " has a personalized ticket (tied to one console account), which Setup cannot use: dump the game again " +
+                   "so that it carries a common ticket.";
+        if (msg.ToLowerInvariant().Contains("ticket"))
+            return Cap(what) + " has no usable ticket (" + msg + "): dump the game again with its ticket (a common ticket).";
+        if (msg.Contains("Expected an XCI or NSP") || msg.Contains("Truncated") || msg.Contains("does not match") || msg.Contains("out of bounds"))
+            return Cap(what) + " is not a complete .nsp / .xci file (" + msg + "): copy or dump it again (an interrupted copy or download " +
+                   "leaves it short).";
+        if (what == "the dump")
+            return "The dump is not Tears of the Kingdom's base game, version 1.0.0 (title 0100F2C0115B6000): choose the base game's " +
+                   ".nsp / .xci. The " + BuilderForm.UpdateVersion + " update goes in the Update row, and DLC is not used (" + msg + ").";
+        return "The update dump is not Tears of the Kingdom's update: choose its own .nsp, or leave the Update row empty (" + msg + ").";
+    }
+
+    // container.py load_keys: name = hex value lines, '#' starts a comment
+    static Dictionary<string, byte[]> LoadKeys(string[] lines)
+    {
+        var keys = new Dictionary<string, byte[]>();
+        for (int i = 0; i < lines.Length; i++)
+        {
+            string line = lines[i].Split('#')[0].Trim();
+            int eq = line.IndexOf('=');
+            if (eq < 0) continue;
+            string hex = new string(line.Substring(eq + 1).Where(c => !char.IsWhiteSpace(c)).ToArray());
+            if (hex.Length % 2 != 0 || !hex.All(Uri.IsHexDigit)) throw new Bad("Invalid key encoding at line " + (i + 1));
+            var v = new byte[hex.Length / 2];
+            for (int j = 0; j < v.Length; j++) v[j] = Convert.ToByte(hex.Substring(2 * j, 2), 16);
+            keys[line.Substring(0, eq).Trim().ToLowerInvariant()] = v;
+        }
+        return keys;
+    }
+
+    static void Open(Stream f, Dictionary<string, byte[]> keys, bool update)
+    {
+        var entries = Entries(f, f.Length);
+        var tickets = Tickets(f, entries);
+        var ncas = entries.Where(e => e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)).Select(e => Header(f, e, keys)).ToList();
+        var meta = ncas.Where(n => n.Type == 1).ToList();
+        var programs = ncas.Where(n => n.Type == 0).ToList();
+        Nca program;
+        if (!update)   // (program_nca)
+        {
+            Require(meta.Count <= 1 && meta.All(n => n.Title == Title), "Expected base game metadata; updates, DLC and combined packages are unsupported");
+            Require(programs.Count == 1, "Expected one base Program NCA; updates, DLC and combined packages are unsupported");
+            program = programs[0];
+            Require(program.Title == Title, string.Format("Expected base game {0:X16}; updates, DLC and other games are unsupported", Title));
+            Require(!program.Bktr, "Expected a base game, not a BKTR update");
+        }
+        else   // (update_program: its Program NCA carries the base title's id or the update's)
+        {
+            Require(meta.Count == 1 && meta[0].Title == UpdateTitle,
+                    string.Format("Expected the update {0:X16} (one metadata NCA); base games, DLC and combined packages go elsewhere", UpdateTitle));
+            Require(programs.Count == 1 && (programs[0].Title == Title || programs[0].Title == UpdateTitle),
+                    string.Format("Expected one Program NCA of {0:X16} / {1:X16}", Title, UpdateTitle));
+            program = programs[0];
+            Require(program.Bktr, "Expected an update (BKTR) Program NCA");
+        }
+        TitleKeyPresent(program.Hdr, keys, tickets);
+        if (update) return;
+        using (var sha = SHA256.Create())   // (program_sections' NcaSection: each used section's FS header hash)
+            for (int i = 0; i < 4; i++)
+                if (BitConverter.ToUInt32(program.Hdr, 0x240 + 16 * i) != 0)
+                    Require(sha.ComputeHash(program.Hdr, 0x400 + 512 * i, 512).SequenceEqual(program.Hdr.Skip(0x280 + 32 * i).Take(32)),
+                            "FS header hash mismatch");
+    }
+
+    static byte[] ReadAt(Stream f, long offset, long length)
+    {
+        Require(offset >= 0 && length >= 0 && length <= 512L << 20, "Invalid/big read");
+        var b = new byte[length];
+        f.Seek(offset, SeekOrigin.Begin);
+        int got = 0, n;
+        while (got < length && (n = f.Read(b, got, (int)length - got)) > 0) got += n;
+        Require(got == length, "Truncated input");
+        return b;
+    }
+
+    // container_entries: an NSP's files, or those of an XCI's secure partition
+    static List<Entry> Entries(Stream f, long size)
+    {
+        if (Encoding.ASCII.GetString(ReadAt(f, 0, 4)) == "PFS0") return Partition(f, 0, size, "PFS0", 24);
+        Require(size >= 0x138 && Encoding.ASCII.GetString(ReadAt(f, 0x100, 4)) == "HEAD", "Expected an XCI or NSP (PFS0) game file");
+        ulong at = BitConverter.ToUInt64(ReadAt(f, 0x130, 8), 0);
+        long root = at > (ulong)size ? size + 1 : (long)at;   // (past the end: the bound below is negative, as in Python)
+        var secure = Partition(f, root, size - root, "HFS0", 64).Where(e => e.Name == "secure").ToList();
+        Require(secure.Count == 1, "Expected one XCI secure partition");
+        return Partition(f, secure[0].Offset, secure[0].Size, "HFS0", 64);
+    }
+
+    // partition_entries: a bounded PFS0 / HFS0 table, [(name, absolute offset, size)]
+    static List<Entry> Partition(Stream f, long offset, long bound, string magic, int stride)
+    {
+        Require(bound >= 16, "Truncated partition header");
+        var hdr = ReadAt(f, offset, 16);
+        Require(Encoding.ASCII.GetString(hdr, 0, 4) == magic, "Expected " + magic);
+        uint count = BitConverter.ToUInt32(hdr, 4), stringsSize = BitConverter.ToUInt32(hdr, 8);
+        Require(count <= 4096 && stringsSize <= 1024 * 1024, "Invalid partition table");
+        long size = 16 + count * stride + stringsSize;
+        Require(size <= bound, "Partition table out of bounds");
+        var raw = ReadAt(f, offset, size);
+        int strings = 16 + (int)count * stride;
+        var entries = new List<Entry>();
+        var names = new HashSet<string>();
+        for (int i = 0; i < count; i++)
+        {
+            ulong off = BitConverter.ToUInt64(raw, 16 + i * stride), length = BitConverter.ToUInt64(raw, 24 + i * stride);
+            uint nameOff = BitConverter.ToUInt32(raw, 32 + i * stride);
+            Require(nameOff < stringsSize, "Invalid partition filename offset");
+            int end = Array.IndexOf(raw, (byte)0, strings + (int)nameOff);
+            Require(end >= 0, "Unterminated partition filename");
+            string name = Encoding.UTF8.GetString(raw, strings + (int)nameOff, end - strings - (int)nameOff);
+            Require(name != "" && name != "." && name != ".." && name.IndexOfAny(new[] { '/', '\\' }) < 0, "Unsafe partition filename");
+            Require(names.Add(name), "Duplicate partition filename");
+            Require(off <= (ulong)bound && length <= (ulong)bound && (ulong)size + off + length <= (ulong)bound, "Partition entry out of bounds");
+            entries.Add(new Entry { Name = name, Offset = offset + size + (long)off, Size = (long)length });
+        }
+        long last = offset + size;
+        foreach (var e in entries.OrderBy(e => e.Offset))
+        {
+            Require(e.Offset >= last, "Overlapping partition entries");
+            last = e.Offset + e.Size;
+        }
+        return entries;
+    }
+
+    // common_tickets: the rights ids of the container's common tickets (the title keys themselves are not needed here)
+    static HashSet<string> Tickets(Stream f, List<Entry> entries)
+    {
+        var bodies = new Dictionary<uint, int> { { 0x10000, 0x240 }, { 0x10001, 0x140 }, { 0x10002, 0x80 },
+                                                 { 0x10003, 0x240 }, { 0x10004, 0x140 }, { 0x10005, 0x80 } };
+        var keys = new Dictionary<string, string>();
+        foreach (var e in entries.Where(e => e.Name.EndsWith(".tik", StringComparison.OrdinalIgnoreCase)))
+        {
+            Require(e.Size >= 4, "Truncated NSP ticket");
+            uint sig = BitConverter.ToUInt32(ReadAt(f, e.Offset, 4), 0);
+            Require(bodies.ContainsKey(sig), "Unsupported NSP ticket signature type");
+            Require(e.Size >= bodies[sig] + 0x180, "Truncated NSP ticket body");
+            var data = ReadAt(f, e.Offset + bodies[sig], 0x180);
+            Require(data[0x141] == 0, "Personalized NSP tickets are unsupported; a common ticket is required");
+            string rights = BitConverter.ToString(data, 0x160, 16), key = BitConverter.ToString(data, 0x40, 16);
+            Require(!keys.ContainsKey(rights) || keys[rights] == key, "Conflicting NSP tickets");
+            keys[rights] = key;
+        }
+        return new HashSet<string>(keys.Keys);
+    }
+
+    // read_nca_header: the 0xC00-byte header, AES-XTS with header_key, sectors numbered big-endian (Nintendo's tweak)
+    static Nca Header(Stream f, Entry e, Dictionary<string, byte[]> keys)
+    {
+        Require(e.Size >= 0xc00, "Truncated NCA header");
+        Require(keys.ContainsKey("header_key"), "Missing header_key in prod.keys");
+        Require(keys["header_key"].Length == 32, "header_key in prod.keys is not 32 bytes");
+        var hdr = XtsDecrypt(keys["header_key"], ReadAt(f, e.Offset, 0xc00));
+        Require(Encoding.ASCII.GetString(hdr, 0x200, 4) == "NCA3", "Expected NCA3 (check prod.keys and the game file)");
+        Require(BitConverter.ToInt64(hdr, 0x208) == e.Size, "NCA size does not match container entry");
+        for (int i = 0; i < 4; i++)
+        {
+            long start = BitConverter.ToUInt32(hdr, 0x240 + i * 16) * 512L, end = BitConverter.ToUInt32(hdr, 0x244 + i * 16) * 512L;
+            Require((start == 0 && end == 0) || (0xc00 <= start && start < end && end <= e.Size), "NCA section out of bounds");
+        }
+        bool bktr = false;
+        for (int i = 0; i < 4; i++) bktr |= hdr[0x400 + i * 512 + 4] == 4;   // (an FS header of crypt type 4: an update's patch)
+        return new Nca { Hdr = hdr, Type = hdr[0x205], Title = BitConverter.ToUInt64(hdr, 0x210), Bktr = bktr };
+    }
+
+    // nca_ctr_key, short of decrypting: the key it needs is in prod.keys (and, rights-managed, its ticket in the file)
+    static void TitleKeyPresent(byte[] hdr, Dictionary<string, byte[]> keys, HashSet<string> tickets)
+    {
+        int generation = Math.Max(Math.Max(hdr[0x206], hdr[0x220]) - 1, 0);
+        if (hdr.Skip(0x230).Take(16).Any(b => b != 0))
+        {
+            Require(tickets.Contains(BitConverter.ToString(hdr, 0x230, 16)), "Missing common ticket for rights-managed NCA in the NSP");
+            string name = string.Format("titlekek_{0:x2}", generation);
+            Require(keys.ContainsKey(name), "Missing " + name + " in prod.keys");
+            return;
+        }
+        Require(hdr[0x207] < 3, "Unsupported NCA key area");
+        string area = string.Format("key_area_key_{0}_{1:x2}", new[] { "application", "ocean", "system" }[hdr[0x207]], generation);
+        Require(keys.ContainsKey(area), "Missing " + area + " in prod.keys");
+    }
+
+    public static byte[] XtsDecrypt(byte[] key, byte[] data)
+    {
+        var plain = new byte[data.Length];
+        using (var aes = Aes.Create())
+        {
+            aes.Mode = CipherMode.ECB; aes.Padding = PaddingMode.None;
+            using (var dec = aes.CreateDecryptor(key.Take(16).ToArray(), new byte[16]))
+            using (var enc = aes.CreateEncryptor(key.Skip(16).ToArray(), new byte[16]))
+                for (int s = 0; s * 512 < data.Length; s++)
+                {
+                    byte[] sector = new byte[16], t = new byte[16], block = new byte[16], clear = new byte[16];
+                    for (int i = 0; i < 8; i++) sector[15 - i] = (byte)((long)s >> (8 * i));
+                    enc.TransformBlock(sector, 0, 16, t, 0);
+                    for (int b = s * 512; b < (s + 1) * 512 && b + 16 <= data.Length; b += 16)
+                    {
+                        for (int i = 0; i < 16; i++) block[i] = (byte)(data[b + i] ^ t[i]);
+                        dec.TransformBlock(block, 0, 16, clear, 0);
+                        for (int i = 0; i < 16; i++) plain[b + i] = (byte)(clear[i] ^ t[i]);
+                        int carry = t[15] >> 7;   // (the tweak times x in GF(2^128), little-endian)
+                        for (int i = 15; i > 0; i--) t[i] = (byte)((t[i] << 1) | (t[i - 1] >> 7));
+                        t[0] = (byte)((t[0] << 1) ^ (carry != 0 ? 0x87 : 0));
+                    }
+                }
+        }
+        return plain;
+    }
+}
+
+// Uninstall (Setup --uninstall: Windows' Settings > Apps entry, or the window's Uninstall link). What Setup made goes:
+// its folders in the install folder (tools, src, work, game, setup.log, .setup-root, its own copy Setup.exe), the
+// ProgramData junction to it (the link only, never what it leads to), the desktop shortcuts that point into it, the
+// game's caches and logs (%LOCALAPPDATA%\nxrecomp\TotK-engine) and Setup's registry keys. Anything else in the install
+// folder (a dump or keys the player keeps there) stays, and so does the folder then; links inside are removed as links,
+// never followed. The saves, settings and mods (%APPDATA%\nxrecomp\TotK-engine, and a game folder's mods\) go only when
+// the player says so (asked separately, default No).
+static class Uninstaller
+{
+    public static readonly string AppsKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\" + BuilderForm.FolderName;
+    static readonly string[] Ours = { "tools", "src", "work", "game", "setup.log", ".setup-root", "Setup.exe" };
+
+    public class Result { public long Freed; public string Refused; public List<string> Kept = new List<string>(); public List<string> Failed = new List<string>(); }
+
+    // Setup's own install folder, proven before anything is deleted (a wrong InstallDir, or a Setup.exe copy run from a
+    // home or Documents folder, must never take that folder's own src / work / game): its .setup-root names the folder
+    // (Setup writes it at every install) AND one of Setup's stamps is there (a tool's .setup.json, a TotK-PC-* build).
+    // null when it is, else why not
+    public static string NotOurs(string root)
+    {
+        string mark;
+        try { mark = File.ReadAllText(Path.Combine(root, ".setup-root")).Trim(); }
+        catch { return root + " has no .setup-root (the mark Setup leaves in its install folder)"; }
+        Func<string, string> norm = p => { try { return Path.GetFullPath(p).TrimEnd('\\'); } catch { return p; } };
+        if (!string.Equals(norm(mark), norm(root), StringComparison.OrdinalIgnoreCase))
+            return root + "'s .setup-root names another folder (" + mark + ")";
+        bool stamp = false;
+        try
+        {
+            string tools = Path.Combine(root, "tools"), game = Path.Combine(root, "game");
+            stamp = (Directory.Exists(tools) && Directory.GetDirectories(tools).Any(d => File.Exists(Path.Combine(d, ".setup.json")))) ||
+                    (Directory.Exists(game) && Directory.GetDirectories(game, "TotK-PC-*").Length > 0);
+        }
+        catch { }
+        return stamp ? null : root + " holds none of Setup's tools or builds";
+    }
+
+    public static string JunctionName(string root)
+    {
+        using (var h = SHA256.Create())
+            return "j" + BitConverter.ToString(h.ComputeHash(Encoding.UTF8.GetBytes(root.ToLowerInvariant()))).Replace("-", "").Substring(0, 10).ToLowerInvariant();
+    }
+
+    static bool IsLink(string p) { try { return (File.GetAttributes(p) & FileAttributes.ReparsePoint) != 0; } catch { return false; } }
+
+    // a tree, bottom up, links removed as links; keep(p) true: p stays (and so do its parents)
+    static bool Delete(string p, Result r, Func<string, bool> keep)
+    {
+        if (keep != null && keep(p)) { r.Kept.Add(p); return false; }
+        try
+        {
+            if (IsLink(p))
+            {
+                if (Directory.Exists(p)) Directory.Delete(p); else File.Delete(p);   // (a junction or symlink: the link alone)
+                return true;
+            }
+            if (File.Exists(p)) { File.SetAttributes(p, FileAttributes.Normal); File.Delete(p); return true; }   // (git's read-only objects)
+            if (!Directory.Exists(p)) return true;
+            bool all = true;
+            foreach (var e in Directory.GetFileSystemEntries(p)) all &= Delete(e, r, keep);
+            if (!all) return false;
+            File.SetAttributes(p, FileAttributes.Normal); Directory.Delete(p);
+            return true;
+        }
+        catch (Exception e) { r.Failed.Add(p + " (" + e.Message + ")"); return false; }
+    }
+
+    static long Free(IEnumerable<string> paths)
+    {
+        long n = 0;
+        foreach (var d in paths.Where(p => !string.IsNullOrEmpty(p)).Select(p => Path.GetPathRoot(Path.GetFullPath(p)).ToUpperInvariant()).Distinct())
+            try { n += new DriveInfo(d).AvailableFreeSpace; } catch { }
+        return n;
+    }
+
+    // The desktop shortcuts named after the game whose target is in the install folder (or reached through its junction)
+    public static IEnumerable<string> Shortcuts(string desktop, string product, IEnumerable<string> roots, Func<string, string> target)
+    {
+        if (desktop == null || !Directory.Exists(desktop)) yield break;
+        var inside = roots.Select(x => x.TrimEnd('\\') + "\\").ToList();
+        foreach (var lnk in Directory.GetFiles(desktop, product + "*.lnk"))
+        {
+            string t = target(lnk);
+            if (t != null && inside.Any(i => t.StartsWith(i, StringComparison.OrdinalIgnoreCase))) yield return lnk;
+        }
+    }
+
+    public static string ShortcutTarget(string lnk) { return Win32.ShortcutTarget(lnk); }
+
+    // root: the install folder; linkParents: where Setup puts its junctions (ProgramData\<name>, C:\<name>); local /
+    // roaming: the game's %LOCALAPPDATA% / %APPDATA% folders (roaming null: the saves, settings and mods stay)
+    public static Result Run(string root, IEnumerable<string> linkParents, string desktop, string product, string local, string roaming,
+                             Func<string, string> target, string keepFile = null)
+    {
+        var r = new Result();
+        root = Path.GetFullPath(root).TrimEnd('\\');
+        r.Refused = NotOurs(root);
+        if (r.Refused != null) return r;   // (nothing deleted)
+        var drives = new List<string> { root, local, roaming };
+        long before = Free(drives);
+        var parents = (linkParents ?? new string[0]).ToList();
+        var roots = new List<string> { root };
+        roots.AddRange(parents.Select(x => Path.Combine(x, JunctionName(root))));
+        foreach (var lnk in Shortcuts(desktop, product, roots, target).ToList()) Delete(lnk, r, null);
+        foreach (var parent in parents)
+        {
+            string link = Path.Combine(parent, JunctionName(root));
+            if (Directory.Exists(link) && IsLink(link)) { try { Directory.Delete(link); } catch (Exception e) { r.Failed.Add(link + " (" + e.Message + ")"); } }
+            try { if (Directory.Exists(parent) && !Directory.EnumerateFileSystemEntries(parent).Any()) Directory.Delete(parent); } catch { }
+        }
+        // a game folder's mods\ (the player's, beside the launcher) stays with the saves
+        Func<string, bool> keepMods = p => roaming == null && Path.GetFileName(p).Equals("mods", StringComparison.OrdinalIgnoreCase) &&
+            Directory.Exists(p) && Directory.EnumerateFileSystemEntries(p).Any() &&
+            Path.GetFileName(Path.GetDirectoryName(Path.GetDirectoryName(p)) ?? "").Equals("game", StringComparison.OrdinalIgnoreCase);
+        // (keepFile: the running Setup.exe when it is the install folder's own copy: it cannot delete itself)
+        Func<string, bool> keep = p => (keepFile != null && string.Equals(Path.GetFullPath(p), keepFile, StringComparison.OrdinalIgnoreCase)) || keepMods(p);
+        foreach (var name in Ours) Delete(Path.Combine(root, name), r, keep);
+        if (Directory.Exists(root))
+        {
+            var left = Directory.GetFileSystemEntries(root);
+            if (left.Length == 0) Delete(root, r, null);
+            else r.Kept.AddRange(left.Where(p => !r.Kept.Any(k => k.StartsWith(p, StringComparison.OrdinalIgnoreCase))));
+        }
+        foreach (var d in new[] { local, roaming }.Where(d => d != null))
+        {
+            Delete(d, r, null);
+            string parent = Path.GetDirectoryName(d);   // (%...%\nxrecomp, when nothing else lives there)
+            try { if (Directory.Exists(parent) && !Directory.EnumerateFileSystemEntries(parent).Any()) Directory.Delete(parent); } catch { }
+        }
+        r.Freed = Math.Max(0, Free(drives) - before);
+        return r;
+    }
+
+    public static void Register(string root, string setupCopy, string launcher)
+    {
+        try
+        {
+            using (var k = Registry.CurrentUser.CreateSubKey(AppsKey))
+            {
+                k.SetValue("DisplayName", Release.Product); k.SetValue("DisplayVersion", Release.Tag);
+                k.SetValue("Publisher", Release.Product); k.SetValue("InstallLocation", root);
+                if (launcher != null) k.SetValue("DisplayIcon", launcher);
+                k.SetValue("UninstallString", "\"" + setupCopy + "\" --uninstall");
+                k.SetValue("NoModify", 1, RegistryValueKind.DWord); k.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+            }
+        }
+        catch { }
+    }
+}
+
+// The Windows calls Setup used to reach through system tools (cmd mklink, taskkill, explorer.exe, WScript.Shell): the
+// same results from the API directly. A small unsigned exe that starts those tools from strings is what antivirus
+// heuristics weigh as a downloader / dropper; the behaviour is the same.
+static class Win32
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool DeviceIoControl(IntPtr h, uint code, byte[] inBuf, int inSize, IntPtr outBuf, int outSize, out int returned, IntPtr overlapped);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+    // A junction (mount point) at `link` to `target`, as `mklink /J`: no administrator needed. link must not exist.
+    public static bool Junction(string link, string target)
+    {
+        string full = Path.GetFullPath(target).TrimEnd('\\');
+        if (full.Length == 2 && full[1] == ':') full += "\\";
+        byte[] sub = Encoding.Unicode.GetBytes(@"\??\" + full), print = Encoding.Unicode.GetBytes(full);
+        // REPARSE_DATA_BUFFER, MountPointReparseBuffer: tag, data length, reserved; the two names' offsets and lengths;
+        // then "\??\<target>" NUL "<target>" NUL
+        int data = 8 + sub.Length + 2 + print.Length + 2;
+        var buf = new byte[8 + data];
+        BitConverter.GetBytes(0xA0000003u).CopyTo(buf, 0);                         // IO_REPARSE_TAG_MOUNT_POINT
+        BitConverter.GetBytes((ushort)data).CopyTo(buf, 4);
+        BitConverter.GetBytes((ushort)0).CopyTo(buf, 8);                           // substitute name: offset
+        BitConverter.GetBytes((ushort)sub.Length).CopyTo(buf, 10);
+        BitConverter.GetBytes((ushort)(sub.Length + 2)).CopyTo(buf, 12);          // print name: offset
+        BitConverter.GetBytes((ushort)print.Length).CopyTo(buf, 14);
+        sub.CopyTo(buf, 16);
+        print.CopyTo(buf, 16 + sub.Length + 2);
+        Directory.CreateDirectory(link);
+        IntPtr h = CreateFileW(link, 0x40000000, 0, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero);   // GENERIC_WRITE, OPEN_EXISTING, BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        bool ok = false;
+        if (h != new IntPtr(-1))
+        {
+            int got;
+            ok = DeviceIoControl(h, 0x000900A4, buf, buf.Length, IntPtr.Zero, 0, out got, IntPtr.Zero);   // FSCTL_SET_REPARSE_POINT
+            CloseHandle(h);
+        }
+        if (!ok) try { Directory.Delete(link); } catch { }   // (the empty folder made above)
+        return ok;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct ProcessEntry
+    {
+        public uint Size, Usage, Pid; public IntPtr HeapId; public uint ModuleId, Threads, ParentPid; public int PriClassBase; public uint Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string ExeFile;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32FirstW(IntPtr snap, ref ProcessEntry e);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32NextW(IntPtr snap, ref ProcessEntry e);
+
+    // A process and everything below it, ended as `taskkill /T /F /PID` does (the tree as one snapshot sees it)
+    public static void KillTree(int pid)
+    {
+        var kids = new Dictionary<int, List<int>>();
+        IntPtr snap = CreateToolhelp32Snapshot(2, 0);   // TH32CS_SNAPPROCESS
+        if (snap != new IntPtr(-1))
+        {
+            var e = new ProcessEntry { Size = (uint)Marshal.SizeOf(typeof(ProcessEntry)) };
+            for (bool more = Process32FirstW(snap, ref e); more; more = Process32NextW(snap, ref e))
+            {
+                List<int> l;
+                if (!kids.TryGetValue((int)e.ParentPid, out l)) kids[(int)e.ParentPid] = l = new List<int>();
+                if ((int)e.Pid != (int)e.ParentPid) l.Add((int)e.Pid);
+            }
+            CloseHandle(snap);
+        }
+        // the parent first: once it is gone it starts no new step, and the snapshot already holds the children's ids
+        // (still theirs: a child outlives its parent's end)
+        var order = new List<int>();
+        var seen = new HashSet<int>();
+        Action<int> walk = null;
+        walk = p => { if (!seen.Add(p)) return; order.Add(p); List<int> l; if (kids.TryGetValue(p, out l)) foreach (var c in l) walk(c); };
+        walk(pid);
+        foreach (var p in order)
+            try { using (var x = Process.GetProcessById(p)) x.Kill(); } catch { }   // (gone already, or not ours to end)
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct StartupInfo
+    {
+        public int Cb; public string Reserved, Desktop, Title; public int X, Y, XSize, YSize, XChars, YChars, Fill, Flags;
+        public short ShowWindow, Reserved2; public IntPtr Reserved3, StdIn, StdOut, StdErr;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct ProcessInfo { public IntPtr Process, Thread; public int Pid, Tid; }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env,
+                                      string dir, ref StartupInfo si, out ProcessInfo pi);
+
+    // `exe` started outside this process's job (CREATE_BREAKAWAY_FROM_JOB: Setup's job allows it, Main), so closing
+    // Setup leaves it running, as a start through Explorer did. Its process id; 0: no breakaway here (a job above ours
+    // forbids it)
+    public static int StartOutsideJob(string exe, string args)
+    {
+        var si = new StartupInfo { Cb = Marshal.SizeOf(typeof(StartupInfo)) };
+        ProcessInfo pi;
+        var cmd = new StringBuilder("\"" + exe + "\"" + (string.IsNullOrEmpty(args) ? "" : " " + args));
+        if (!CreateProcessW(null, cmd, IntPtr.Zero, IntPtr.Zero, false, 0x01000000, IntPtr.Zero, Path.GetDirectoryName(exe), ref si, out pi))
+            return 0;
+        CloseHandle(pi.Thread); CloseHandle(pi.Process);
+        return pi.Pid;
+    }
+
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")] class ShellLinkObject { }
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")]
+    interface IShellLinkW
+    {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder file, int max, IntPtr findData, uint flags);
+        void GetIDList(out IntPtr pidl);
+        void SetIDList(IntPtr pidl);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder name, int max);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string name);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder dir, int max);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string dir);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder args, int max);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string args);
+        void GetHotkey(out short key);
+        void SetHotkey(short key);
+        void GetShowCmd(out int cmd);
+        void SetShowCmd(int cmd);
+        void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int max, out int index);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string path, int index);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string rel, uint reserved);
+        void Resolve(IntPtr hwnd, uint flags);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string file);
+    }
+
+    // A .lnk at `lnk` that starts `target` in `dir` with its icon (IShellLink, as WScript.Shell's CreateShortcut did)
+    public static void SaveShortcut(string lnk, string target, string dir, string args = null)
+    {
+        var sl = (IShellLinkW)new ShellLinkObject();
+        try
+        {
+            sl.SetPath(target);
+            sl.SetWorkingDirectory(dir);
+            if (args != null) sl.SetArguments(args);
+            sl.SetIconLocation(target, 0);
+            ((System.Runtime.InteropServices.ComTypes.IPersistFile)sl).Save(lnk, true);
+        }
+        finally { Marshal.FinalReleaseComObject(sl); }
+    }
+
+    // What a .lnk starts (its target path), or null
+    public static string ShortcutTarget(string lnk)
+    {
+        var sl = (IShellLinkW)new ShellLinkObject();
+        try
+        {
+            ((System.Runtime.InteropServices.ComTypes.IPersistFile)sl).Load(lnk, 0);
+            var sb = new StringBuilder(1024);
+            sl.GetPath(sb, sb.Capacity, IntPtr.Zero, 0);
+            return sb.Length > 0 ? sb.ToString() : null;
+        }
+        catch { return null; }
+        finally { Marshal.FinalReleaseComObject(sl); }
+    }
+}
+
 class BuilderForm : Form
 {
     readonly Row dump, keys, update, firmware, install;
     readonly Row[] rows;
     readonly PrimaryButton build;
+    readonly LinkLabel uninstall;
     readonly StatusView status;
     readonly string repo;          // Builder mode: the clone this exe sits in; null in Setup mode
     Process proc;
@@ -719,6 +1575,69 @@ class BuilderForm : Form
 
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int value, int size);
 
+    OptionRow copy;
+    string copyWhy;   // the line under "Copy the game files" when the dump's drive chose it
+
+    // The switch follows the install and the dump until the player chooses (then it is remembered: CopyGameFiles): an
+    // install that has the copy already keeps it (v0.1.4-v0.1.7 said the install stands alone; many deleted the dump),
+    // else copied when the dump is on a drive that can go away. An update build always copies (its data is the update
+    // merged over the game's)
+    void CopyDefault()
+    {
+        if (copy == null) return;
+        copy.Locked = update.FilePath != null || Busy;
+        if (update.FilePath != null) { copy.Set(true, false); return; }
+        if (copy.Touched) { copy.Invalidate(); return; }
+        bool had = install != null && install.FilePath != null &&
+                   File.Exists(Path.Combine(install.FilePath, "work", "extracted", "v100", "romfs.bin"));
+        string kind = had ? null : DumpDriveCanGo(dump.FilePath);
+        copyWhy = had ? "Kept from your earlier install, which runs without the dump"
+                : kind == null ? null
+                : kind == "OneDrive" ? "Your dump is in OneDrive, which can turn it into an online-only file, so they are copied"
+                : "Your dump is on a " + kind + " drive, which can be unplugged, so they are copied";
+        copy.Set(had || kind != null, false);
+    }
+
+    // The kind of drive a dump is on when that drive can go away (removable, USB, network, disc, or OneDrive, which
+    // frees space by leaving an online-only stub of a file), else null; the same test as builder.py's dump_drive
+    public static string DumpDriveCanGo(string path)
+    {
+        try
+        {
+            if (path == null) return null;
+            if (path.StartsWith(@"\\")) return "network";
+            if (Preflight.InOneDrive(path)) return "OneDrive";
+            string root = Path.GetPathRoot(Path.GetFullPath(path));
+            var t = new DriveInfo(root).DriveType;
+            if (t == DriveType.Removable) return "removable";
+            if (t == DriveType.Network) return "network";
+            if (t == DriveType.CDRom) return "disc";
+            return t == DriveType.Fixed && UsbBus(root.TrimEnd('\\')) ? "USB" : null;
+        }
+        catch { return null; }
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool DeviceIoControl(Microsoft.Win32.SafeHandles.SafeFileHandle h, uint code, byte[] inBuf, int inSize, byte[] outBuf, int outSize, out uint got, IntPtr overlapped);
+
+    // an external disk on USB reports itself fixed: the storage bus says what it is (IOCTL_STORAGE_QUERY_PROPERTY, no
+    // admin rights needed)
+    static bool UsbBus(string drive)
+    {
+        using (var h = CreateFile(@"\\.\" + drive, 0, 3, IntPtr.Zero, 3, 0, IntPtr.Zero))
+        {
+            if (h.IsInvalid) return false;
+            var query = new byte[12]; var desc = new byte[1024]; uint got;
+            if (!DeviceIoControl(h, 0x2D1400, query, query.Length, desc, desc.Length, out got, IntPtr.Zero) || got < 32) return false;
+            uint bus = BitConverter.ToUInt32(desc, 28);   // STORAGE_DEVICE_DESCRIPTOR.BusType
+            return bus == 7 || bus == 0xC || bus == 0xD;   // USB, SD, MMC
+        }
+    }
+
+    string CopyArg() { return copy.Checked ? " --copy-romfs" : " --no-copy-romfs"; }
+
     BuilderForm()
     {
         repo = FindRepo();
@@ -742,7 +1661,9 @@ class BuilderForm : Form
         firmware = new Row(ShowUpdate ? 4 : 3, "Firmware (optional)",
             CjkWindows ? "Recommended: Korean and Chinese text looks right with its fonts" : "Only Korean and Chinese text needs it: its folder or .zip",
             f => Directory.Exists(f) ||
-            (File.Exists(f) && f.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)));
+            (File.Exists(f) && f.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)))
+            // (optional, and remembered from the last run: a firmware the keys cannot open must be removable, #26)
+            { Clearable = true, Describe = f => Path.GetFileName(f) + "   (right-click to remove)" };
         install = new Row(ShowUpdate ? 5 : 4, "Install to", "A folder with about " + Preflight.FirstInstallGb(true, false) + " GB free", f => IsFolderTarget(f)) { FolderOnly = true, Describe = DescribeFolder };
         rows = (repo != null ? new[] { dump, keys, update, firmware } : new[] { dump, keys, update, firmware, install })
             .Where(r => ShowUpdate || r != update).ToArray();
@@ -757,8 +1678,17 @@ class BuilderForm : Form
             status.Add(string.Format("With the {0} update the first build needs about {1} GB free (its game files are unpacked).",
                                      UpdateVersion, Preflight.FirstInstallGb(repo == null, true)));
         };
+        // the game's files: read from the dump in place (no 17 GB copy), or copied out so the dump can go; by default
+        // copied only when the dump is on a drive that can go away (builder.py dump_drive), an update's always
+        copy = new OptionRow("Copy the game files (17 GB)", on => update.FilePath != null ? "Version " + UpdateVersion + " always copies them"
+            : on ? (copyWhy ?? "Uses 17 GB more; afterwards the dump can be moved or deleted")
+            : "The game reads them from your dump: keep it where it is")
+        { Bounds = new Rectangle(pad, rowY + rows.Length * rowH, inner, rowH) };
+        dump.Changed += CopyDefault;
+        update.Changed += CopyDefault;
+        install.Changed += CopyDefault;
 
-        build = new PrimaryButton { Text = repo != null ? "Build" : "Install", Bounds = new Rectangle(pad, rowY + rows.Length * rowH + T.S6, inner, T.D(42)), Enabled = false };
+        build = new PrimaryButton { Text = repo != null ? "Build" : "Install", Bounds = new Rectangle(pad, copy.Bottom + T.S6, inner, T.D(42)), Enabled = false };
         build.Click += (s, e) => { if (!build.Enabled) return; if (launcher != null && proc == null && worker == null) Play(); else Start(); };
         status = new StatusView { Bounds = new Rectangle(pad, build.Bottom + T.S6, inner, T.D(28) + T.S3 + 5 * (T.Log.Height + T.D(2))) };
 
@@ -771,7 +1701,27 @@ class BuilderForm : Form
         };
         ClientSize = new Size(W, notice.Bottom + T.S5);
         Controls.AddRange(new Control[] { title, sub, top, build, status, rule, notice });
+        // Uninstall: a faint secondary link on the title line, only when an install exists, hidden while building
+        string installed = InstalledDir();
+        if (repo == null && installed != null)
+        {
+            uninstall = new LinkLabel { Text = "Uninstall", Font = T.Small, AutoSize = true, BackColor = T.Bg, LinkColor = T.TextFaint,
+                                        ActiveLinkColor = T.TextDim, VisitedLinkColor = T.TextFaint, LinkBehavior = LinkBehavior.HoverUnderline, TabStop = true };
+            uninstall.Location = new Point(W - pad - uninstall.PreferredWidth, title.Top + (title.PreferredHeight - uninstall.PreferredHeight) / 2);
+            uninstall.MouseEnter += (s, e) => uninstall.LinkColor = T.TextDim;
+            uninstall.MouseLeave += (s, e) => uninstall.LinkColor = T.TextFaint;
+            uninstall.GotFocus += (s, e) => { uninstall.LinkColor = T.Accent; uninstall.LinkBehavior = LinkBehavior.AlwaysUnderline; };
+            uninstall.LostFocus += (s, e) => { uninstall.LinkColor = T.TextFaint; uninstall.LinkBehavior = LinkBehavior.HoverUnderline; };
+            uninstall.LinkClicked += (s, e) =>
+            {
+                if (Busy) return;
+                if (log != null) { log.Dispose(); log = null; }   // (setup.log is in the install folder: never held open while it goes)
+                if (UninstallMain(new[] { "--uninstall", "--install-to=" + installed }) != 2) Close();   // (in this process: no helper copy or child)
+            };
+            Controls.Add(uninstall);
+        }
         Controls.AddRange(rows);
+        Controls.Add(copy);
 
         AllowDrop = true;   // dropping all three anywhere on the window fills the rows
         DragEnter += (s, e) => e.Effect = !Busy && e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
@@ -792,7 +1742,9 @@ class BuilderForm : Form
         // Files dropped onto the exe's icon, and options for an unattended run (tests, scripted installs):
         //   --install-to=DIR  --accept-terms  --auto (press Install)  --hidden (no window; exits 0 / 1 at the end)  --no-shortcut
         //   --source=<git url or path>: fetch the tag from another repository (testing a Setup before its release)
-        //   --no-preflight: skip the PC check (processor, memory, disk, graphics driver) that runs before any download
+        //   --no-preflight: skip the checks that run before any download (processor, memory, disk, graphics driver, the
+        //     install folder, the dump / update / keys headers)
+        //   --play: start the installed game instead (Main, PlayInstalled); with nothing installed yet, this window
         var files = new List<string>();
         string to = null;
         var argv = Environment.GetCommandLineArgs().Skip(1).ToList();
@@ -806,6 +1758,7 @@ class BuilderForm : Form
             else if (a == "--hidden") hidden = true;
             else if (a == "--no-shortcut") noShortcut = true;
             else if (a == "--no-preflight") noPreflight = true;   // (support: a PC check that is wrong about this PC)
+            else if (a == "--play") { }   // (nothing installed yet: Main showed this window instead)
             else files.Add(a);
         Distribute(files.ToArray());
         if (to != null && repo == null) install.Set(Path.GetFullPath(to));
@@ -823,14 +1776,27 @@ class BuilderForm : Form
     // What the PC lacks, shown as the window opens (before the three files are even chosen); Install checks again
     void EarlyCheck()
     {
-        string dir = install.FilePath;
-        bool withUpdate = update.FilePath != null;   // (the 1.4.3 update unpacks 18 GB more)
         new Thread(() =>
         {
             var problems = new List<string>();
-            try { Preflight.Check(dir, problems, new List<string>(), null, withUpdate); } catch { return; }
+            try { Preflight.Check(null, problems, new List<string>()); } catch { return; }   // (the disk: DiskRecheck)
             if (problems.Count > 0) Post(() => { if (!Busy) foreach (var p in problems) status.Add(p); });
         }) { IsBackground = true }.Start();
+        DiskRecheck();
+        install.Changed += DiskRecheck; update.Changed += DiskRecheck; copy.Changed += DiskRecheck;
+    }
+
+    // The free-space sentence for the folder, the update and the copy switch as they are now, in place of the last one
+    // (a switch flipped to copy needs 17 GB more; flipped back, the sentence goes)
+    string diskLine;
+    void DiskRecheck()
+    {
+        if (Busy || install.FilePath == null) return;
+        string now = Preflight.DiskProblem(install.FilePath, update.FilePath != null, copy.Checked);
+        if (now == diskLine) return;
+        if (diskLine != null) status.Remove(diskLine);
+        diskLine = now;
+        if (now != null) status.Add(now);
     }
 
     bool Busy { get { return proc != null || worker != null; } }
@@ -857,8 +1823,8 @@ class BuilderForm : Form
                 firmware.Offer(f);
     }
 
-    const string UpdateVersion = "1.4.3";   // (builder.py's UPDATE_VERSION)
-    // v0.1.7 ships without the 1.4.3 row: the row is not shown, a dropped or remembered update dump is not taken;
+    public const string UpdateVersion = "1.4.3";   // (builder.py's UPDATE_VERSION)
+    // v0.1.8 ships without the 1.4.3 row: the row is not shown, a dropped or remembered update dump is not taken;
     // builder.py's --update stays (Setup... -- --update <nsp>)
     static readonly bool ShowUpdate = false;
     const string SavesNote = UpdateVersion + " keeps its own saves: the first time it starts it copies your 1.0.0 saves once. " +
@@ -918,17 +1884,35 @@ class BuilderForm : Form
 
     static bool IsFolderTarget(string f) { return FolderProblem(f) == null; }
 
+    // An install Setup already set up there (an update reuses it where it is): by Setup's own files, never a folder name
+    // a player's drive may hold anyway (a D:\tools of their own): its .setup-root naming this folder, or the LLVM stamp
+    // NeedGb trusts (an install from before .setup-root)
+    public static bool Built(string dir)
+    {
+        try
+        {
+            string full = Path.GetFullPath(dir).TrimEnd('\\');
+            string mark = Path.Combine(full, ".setup-root");
+            return (File.Exists(mark) && string.Equals(Path.GetFullPath(File.ReadAllText(mark).Trim()).TrimEnd('\\'), full, StringComparison.OrdinalIgnoreCase))
+                || File.Exists(Path.Combine(full, "tools", "llvm", ".toolchain.json"));
+        }
+        catch { return false; }
+    }
+
     // Why a folder cannot take the install (null: it can): a local drive whose file system holds files over 4 GB
-    // (the game's romfs.bin is 17 GB; FAT32 cannot)
-    public static string FolderProblem(string f)
+    // (the game's romfs.bin is 17 GB; FAT32 cannot). built: see Preflight.FolderProblem.
+    public static string FolderProblem(string f, bool built = false)
     {
         try
         {
             if (!Path.IsPathRooted(f) || File.Exists(f)) return "Choose a folder.";
+            if (built) return Preflight.FolderProblem(f, true);
             var d = new DriveInfo(Path.GetPathRoot(f));
             if (d.DriveType != DriveType.Fixed) return "Choose a folder on a local drive (not a removable or network one).";
-            if (d.DriveFormat.StartsWith("FAT", StringComparison.OrdinalIgnoreCase))
-                return string.Format("{0} is formatted {1}, which cannot hold files over 4 GB (the game's data needs one of 17 GB). Choose a folder on an NTFS drive.", d.Name, d.DriveFormat);
+            string format = Wine.FileSystem(f) ?? d.DriveFormat;
+            if (format.StartsWith("FAT", StringComparison.OrdinalIgnoreCase))
+                return string.Format("{0} is formatted {1}, which cannot hold files over 4 GB (the game's data needs one of 17 GB). Choose a folder on an NTFS drive.",
+                                     Wine.Active ? f : d.Name, format);
             return Preflight.FolderProblem(f);
         }
         catch (Exception e) { return e.Message; }
@@ -936,16 +1920,21 @@ class BuilderForm : Form
 
     static string DescribeFolder(string f)
     {
-        try { return string.Format("{0}   ({1:0} GB free)", f, new DriveInfo(Path.GetPathRoot(f)).AvailableFreeSpace / 1073741824.0); }
-        catch { return f; }
+        long free = Wine.FreeBytes(f);
+        string exfat = Preflight.NoHardLinks(f) ? "exFAT: each update rebuilds from scratch" : null;
+        return free < 0 ? (exfat == null ? f : f + "   (" + exfat + ")")
+             : string.Format("{0}   ({1:0} GB free{2})", f, free / 1073741824.0, exfat == null ? "" : ", " + exfat);
     }
 
     // The product's name as one word ("WeepingOfTheEmpire"): folder names without spaces
-    static readonly string FolderName = string.Concat(Release.Product.Split(' ').Where(w => w.Length > 0).Select(w => char.ToUpperInvariant(w[0]) + w.Substring(1)));
+    internal static readonly string FolderName = string.Concat(Release.Product.Split(' ').Where(w => w.Length > 0).Select(w => char.ToUpperInvariant(w[0]) + w.Substring(1)));
 
     // The fixed drive with the most free space, in a folder named after the product (no spaces: fewer surprises)
     static string DefaultFolder()
     {
+        // Wine: the Linux home (Z:\home\<user>), not C: (Proton's prefix, deleted with it) nor Z:\ (/, not writable)
+        string home = Wine.Home();
+        if (home != null && FolderProblem(home) == null) return Path.Combine(home, FolderName);
         DriveInfo best = null;
         foreach (var d in DriveInfo.GetDrives())
             try { if (d.IsReady && FolderProblem(d.RootDirectory.FullName) == null && (best == null || d.AvailableFreeSpace > best.AvailableFreeSpace)) best = d; }
@@ -982,7 +1971,7 @@ class BuilderForm : Form
             Func<string, string> get = n => k == null ? null : k.GetValue(n) as string;
             string dir = get("InstallDir");
             // (an install made before a folder rule existed, e.g. in OneDrive, stays where it is: an update reuses its build)
-            install.Set(dir != null && (IsFolderTarget(dir) || Directory.Exists(Path.Combine(dir, "tools"))) ? dir : DefaultFolder());
+            install.Set(dir != null && (IsFolderTarget(dir) || Built(dir)) ? dir : DefaultFolder());
             foreach (var r in new[] { new { Row = dump, Name = "Dump" }, new { Row = keys, Name = "Keys" }, new { Row = update, Name = "Update" },
                                       new { Row = firmware, Name = "Firmware" } })
             {
@@ -991,6 +1980,8 @@ class BuilderForm : Form
             }
             string tag = get("Tag");
             if (tag != null) build.Text = tag == Release.Tag ? "Rebuild" : "Update";
+            object copied = k == null ? null : k.GetValue("CopyGameFiles");   // (the player's own choice, once made)
+            if (copied is int) copy.Set((int)copied != 0, true);
         }
     }
 
@@ -1003,7 +1994,9 @@ class BuilderForm : Form
                 k.SetValue("InstallDir", install.FilePath); k.SetValue("Dump", dump.FilePath);
                 k.SetValue("Keys", keys.FilePath); if (firmware.FilePath != null) k.SetValue("Firmware", firmware.FilePath); else k.DeleteValue("Firmware", false);
                 if (update.FilePath != null) k.SetValue("Update", update.FilePath); else k.DeleteValue("Update", false);
+                if (copy.Touched && update.FilePath == null) k.SetValue("CopyGameFiles", copy.Checked ? 1 : 0, RegistryValueKind.DWord);
                 if (done) k.SetValue("Tag", Release.Tag);
+                if (done && launcher != null) k.SetValue("Launcher", launcher);   // (what --play starts)
             }
         }
         catch { }
@@ -1040,13 +2033,14 @@ class BuilderForm : Form
                     if (Marks(link, dir)) return link;
                     Directory.Delete(link);   // (a junction to another folder: removes the link only, never its contents)
                 }
-                // (the paths through variables: cmd expands them once, so a % in a folder name stays literal)
-                Run("cmd.exe", "/d /c mklink /J \"%SETUP_LINK%\" \"%SETUP_DIR%\"", null,
-                    new Dictionary<string, string> { { "SETUP_LINK", link }, { "SETUP_DIR", dir } });
-                if (Marks(link, dir)) return link;
+                // (Wine: a Linux symbolic link instead, Wine.LinkFolder; Proton's cmd makes no junctions)
+                if (Wine.Active) { if (Wine.LinkFolder(link, dir) && Marks(link, dir)) return link; continue; }
+                if (Win32.Junction(link, dir) && Marks(link, dir)) return link;   // (as mklink /J, through the API)
             }
             catch { }
         }
+        if (Wine.Active)   // (no Linux link either: the folder itself must be plain)
+            throw new IOException("Could not reach " + dir + " through a plain-named folder (Wine could not make the Linux link Setup uses). Choose a folder whose path uses only English letters, digits and - _ . and has at most " + MaxRoot + " characters, for example " + (Wine.Home() != null ? Path.Combine(Wine.Home(), FolderName) : @"C:\" + FolderName) + ".");
         throw new IOException("Could not reach " + dir + " through a plain-named folder. Choose a folder whose name uses only English letters and digits.");
     }
 
@@ -1098,7 +2092,60 @@ class BuilderForm : Form
         return 0;
     }
 
-    void Lock(bool on) { foreach (var r in rows) r.Locked = on; }
+    void Lock(bool on)
+    {
+        foreach (var r in rows) r.Locked = on; copy.Locked = on || update.FilePath != null; copy.Invalidate();
+        if (uninstall != null) uninstall.Visible = !on;   // (never mid-build)
+    }
+
+    // The newest 1.0.0 build's launcher in an install folder (game\TotK-PC-<date>-<time>-<commit>: by name, not by
+    // when a folder was last written, which a mod edited in an older kept folder changes; a 1.4.3 build, -v143, only
+    // when there is no other), or null
+    public static string NewestLauncher(string root)
+    {
+        try
+        {
+            var all = new DirectoryInfo(Path.Combine(root, "game")).GetDirectories("TotK-PC-*")
+                .Where(d => !d.Name.EndsWith(".tmp") && File.Exists(Path.Combine(d.FullName, "TotK Launcher.exe")))
+                .OrderByDescending(d => d.Name, StringComparer.Ordinal).ToList();
+            var pick = all.FirstOrDefault(d => !Regex.IsMatch(d.Name, @"-v\d{3}(-beta)?$")) ?? all.FirstOrDefault();
+            return pick == null ? null : Path.Combine(pick.FullName, "TotK Launcher.exe");
+        }
+        catch { return null; }
+    }
+
+    // Setup --play: the installed game starts and Setup ends (no window); nothing installed yet: Setup's window. One
+    // Steam shortcut (one Proton prefix: the registry, saves and settings Setup and the game share) then runs both:
+    // Setup itself the first time, the game with the launch option --play (README, Linux and Steam Deck)
+    static bool PlayInstalled()
+    {
+        string root = InstalledDir(), exe = null;
+        if (root == null) return false;
+        try   // (the launcher the last install finished with, while it is still in this install folder)
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(RegKey)) exe = k == null ? null : k.GetValue("Launcher") as string;
+            if (exe != null && (!File.Exists(exe) || !Path.GetFullPath(exe).StartsWith(Path.GetFullPath(root).TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))) exe = null;
+        }
+        catch { exe = null; }
+        exe = exe ?? NewestLauncher(root);
+        if (exe == null) return false;
+        try { Process.Start(new ProcessStartInfo(exe) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(exe) }); return true; }
+        catch { return false; }
+    }
+
+    // the install folder Setup remembers, when it still holds an install (its tools); else null
+    static string InstalledDir()
+    {
+        try
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(RegKey))
+            {
+                string d = k == null ? null : k.GetValue("InstallDir") as string;
+                return d != null && Directory.Exists(Path.Combine(d, "tools")) ? d : null;
+            }
+        }
+        catch { return null; }
+    }
 
     void Start()
     {
@@ -1107,15 +2154,22 @@ class BuilderForm : Form
         Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_0", "safe.directory");
         Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_0", "*");
         build.Enabled = false; Lock(true); stopping = false; launcher = null; scanNote = false;
-        status.Clear(); status.Failed = false; status.Running = true; status.Value = 0; status.Step = "Starting"; status.Invalidate();
-        if (repo != null) { RunBuilder(repo, "py", "-3 ", null); return; }
+        status.Clear(); diskLine = null; status.Failed = false; status.Running = true; status.Value = 0; status.Step = "Starting"; status.Invalidate();
+        if (repo != null) { RunBuilder(repo, "py", "-3 ", null, CopyArg()); return; }
         SaveChoices(false);
         string dir = install.FilePath.TrimEnd('\\');
         bool withUpdate = update.FilePath != null;
+        string copyArg = CopyArg();   // (read here: the worker thread must not touch the controls)
+        string dumpFile = dump.FilePath, keysFile = keys.FilePath, updateFile = update.FilePath;
+        bool copyRomfs = copy.Checked;
         worker = new Thread(() =>
         {
             try
             {
+                // the folder as when it is picked: one given by --install-to (the launcher's updates) or remembered from
+                // an earlier run was never checked by this Setup (a game already built there: only what stops a build)
+                string folder = noPreflight ? null : FolderProblem(dir, Built(dir));
+                if (folder != null) throw new IOException(folder);
                 Directory.CreateDirectory(dir);
                 var w = new StreamWriter(Path.Combine(dir, "setup.log"), true, new UTF8Encoding(false)) { AutoFlush = true };
                 w.WriteLine("---- " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " Setup " + Release.Tag);
@@ -1123,7 +2177,9 @@ class BuilderForm : Form
                 if (!noPreflight)
                 {
                     var problems = new List<string>(); var notes = new List<string>(); var details = new List<string>();
-                    Preflight.Check(dir, problems, notes, details, withUpdate);
+                    Preflight.Check(dir, problems, notes, details, withUpdate, copyRomfs);
+                    string files = Inputs.Check(dumpFile, keysFile, updateFile);   // (a wrong dump or keys: before the downloads)
+                    if (files != null) problems.Add(files);
                     Post(() => { if (log != null) foreach (var d in details) log.WriteLine(d); });   // (the log only: support)
                     foreach (var n in notes) Append("[Builder] " + n);
                     foreach (var p in problems) Append("[Builder] " + p);
@@ -1144,7 +2200,7 @@ class BuilderForm : Form
                     worker = null;
                     var env = new Dictionary<string, string> { { "PATH", Path.Combine(tools, "git", "cmd") + ";" + Environment.GetEnvironmentVariable("PATH") } };
                     RunBuilder(src, Path.Combine(tools, "python", "python.exe"), "-E -s -X utf8 ", env,
-                               string.Format(" --install \"{0}\"{1}", root, builderArgs));
+                               string.Format(" --install \"{0}\"{1}{2}", root, copyArg, builderArgs));
                 });
             }
             catch (Exception ex)
@@ -1174,9 +2230,11 @@ class BuilderForm : Form
         else
         {
             Append("[Builder] downloading " + it.Name);
-            Fetch.Download(it, zip, (done, total) => Append(total > 0
-                ? string.Format("[Builder] download {0}: {1}% ({2:0}/{3:0} MB)", it.Name, done * 100 / total, done / 1048576.0, total / 1048576.0)
-                : string.Format("[Builder] download {0}: {1:0} MB", it.Name, done / 1048576.0)), () => stopping);
+            Fetch.Download(it, zip, (done, total, rate) => Append(total > 0
+                ? string.Format("[Builder] download {0}: {1}% ({2:0}/{3:0} MB{4})", it.Name, done * 100 / total, done / 1048576.0, total / 1048576.0,
+                                Fetch.RateText(done, total, rate))
+                : string.Format("[Builder] download {0}: {1:0} MB{2}", it.Name, done / 1048576.0, Fetch.RateText(done, 0, rate))), () => stopping,
+                m => Append("[Builder] download " + m));
         }
         Append("[Builder] unpacking " + it.Name);
         Fetch.Unzip(it, zip, dir);
@@ -1315,6 +2373,7 @@ class BuilderForm : Form
             proc.ErrorDataReceived += (s, e) => { if (e.Data != null) Append(e.Data); };
             proc.Exited += (s, e) => Post(() => { if (proc == null) return; bool ok = proc.ExitCode == 0; proc = null; Finish(ok); });
             proc.Start();
+            BuildJob(proc);   // (Stop ends the whole build through it)
             proc.BeginOutputReadLine(); proc.BeginErrorReadLine();
         }
         catch (Exception ex)
@@ -1332,9 +2391,12 @@ class BuilderForm : Form
         Lock(false);
         if (ok && launcher != null && File.Exists(launcher))
         {
-            if (repo == null) SaveChoices(true);
+            if (repo == null) { SaveChoices(true); RegisterUninstall(); }
             // (Controlled folder access blocks an unknown program's shortcut on the desktop: then Play is the way in)
-            status.Step = noShortcut || Shortcut(launcher) ? "Done: the game is on your desktop"
+            // (Wine: a desktop shortcut lands in the prefix's own Desktop folder, which no Linux desktop shows: Steam's
+            // "Add a Non-Steam Game" with the launcher is the way in, README)
+            status.Step = Wine.Active ? "Done: press Play, or add " + Wine.LinuxPath(launcher) + " to Steam (README, Linux and Steam Deck)"
+                        : noShortcut || Shortcut(launcher) ? "Done: the game is on your desktop"
                         : "Done: press Play (Windows did not let Setup put a shortcut on the desktop)";
             status.Value = 1f; build.Text = "Play";
         }
@@ -1354,10 +2416,34 @@ class BuilderForm : Form
         if (hidden) { Environment.ExitCode = ok ? 0 : 1; Close(); }
     }
 
+    // Windows' Settings > Apps entry: a copy of this Setup in the install folder (the downloaded one may be deleted)
+    // runs as the uninstaller; written again by every install and update (no admin: the user's own registry)
+    void RegisterUninstall()
+    {
+        try
+        {
+            string root = Path.GetFullPath(install.FilePath).TrimEnd('\\'), copyTo = Path.Combine(root, "Setup.exe");
+            if (!string.Equals(Path.GetFullPath(Application.ExecutablePath), copyTo, StringComparison.OrdinalIgnoreCase))
+                File.Copy(Application.ExecutablePath, copyTo, true);
+            Uninstaller.Register(root, copyTo, launcher);
+        }
+        catch (Exception e) { Append("[Builder] Windows' Apps list entry not written (" + e.Message + "): Setup --uninstall still works"); }
+    }
+
     void Play()
     {
-        // through Explorer: the game is then its child, not ours, so closing this window (and its job) leaves it running
-        try { Process.Start(new ProcessStartInfo("explorer.exe", "\"" + launcher + "\"") { UseShellExecute = false }); }
+        // outside this window's job (it allows breakaway), so closing the window leaves the game running; where a job above
+        // ours forbids that, the game starts in ours and ours stops killing on close (the build is over by then).
+        // (Wine: no job to leave, Main; the launcher starts directly)
+        try
+        {
+            if (Wine.Active) Process.Start(new ProcessStartInfo(launcher) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(launcher) });
+            else if (Win32.StartOutsideJob(launcher, null) == 0)
+            {
+                KeepChildrenOnClose();
+                Process.Start(new ProcessStartInfo(launcher) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(launcher) });
+            }
+        }
         catch (Exception ex) { status.Add("Could not start the game: " + ex.Message); }
     }
 
@@ -1371,32 +2457,44 @@ class BuilderForm : Form
             var v = Regex.Match(Path.GetFileName(Path.GetDirectoryName(target)), @"-v(\d)(\d)(\d)(-beta)?$");
             string name = Release.Product + (v.Success ? string.Format(" {0}.{1}.{2}", v.Groups[1], v.Groups[2], v.Groups[3]) : "");
             string lnk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), name + ".lnk");
-            var shellType = Type.GetTypeFromProgID("WScript.Shell");
-            object shell = Activator.CreateInstance(shellType);
-            object sc = shellType.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { lnk });
-            var t = sc.GetType();
-            t.InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, sc, new object[] { target });
-            t.InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, sc, new object[] { Path.GetDirectoryName(target) });
-            t.InvokeMember("IconLocation", System.Reflection.BindingFlags.SetProperty, null, sc, new object[] { target + ",0" });
-            t.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, sc, null);
-            Marshal.FinalReleaseComObject(sc); Marshal.FinalReleaseComObject(shell);
+            Win32.SaveShortcut(lnk, target, Path.GetDirectoryName(target));
             return File.Exists(lnk);
         }
         catch { return false; }
     }
 
-    // Stop: the build is python (builder.py) -> build.py -> compilers, all below the process we started, so the whole
-    // tree goes (taskkill /T). The job object below catches whatever outlives its parent.
+    // Stop: the build is python (builder.py) -> build.py -> compilers, all below the process we started. They run in a
+    // job of their own (BuildJob, nested in Setup's): ending it ends every one at once, so nothing between a snapshot
+    // and the parent's end can start a next step that outlives the stop. Without that job (old Windows, Wine): the tree,
+    // parent first (Win32.KillTree, as taskkill /T did). Setup's own job catches anything left at exit.
     void Stop()
     {
         stopping = true;
         try
         {
             if (proc == null || proc.HasExited) return;
-            using (var k = Process.Start(new ProcessStartInfo("taskkill", "/T /F /PID " + proc.Id) { UseShellExecute = false, CreateNoWindow = true }))
-                k.WaitForExit(15000);
+            if (buildJob != IntPtr.Zero && TerminateJobObject(buildJob, 1)) return;
+            Win32.KillTree(proc.Id);
         }
         catch { }
+    }
+
+    IntPtr buildJob;   // (one per build: closed with the next, or at exit, which ends whatever is still in it)
+    [DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr job, uint code);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+    void BuildJob(Process p)
+    {
+        if (buildJob != IntPtr.Zero) { CloseHandle(buildJob); buildJob = IntPtr.Zero; }
+        IntPtr j = CreateJobObject(IntPtr.Zero, null);
+        if (j == IntPtr.Zero) return;
+        var info = new ExtendedLimits();
+        info.Basic.Flags = 0x2000;   // KILL_ON_JOB_CLOSE (python starts right away, its first child well after this)
+        if (SetInformationJobObject(j, 9, ref info, Marshal.SizeOf(typeof(ExtendedLimits))) &&
+            AssignProcessToJobObject(j, p.Handle))
+            buildJob = j;
+        else
+            CloseHandle(j);
     }
 
     // The exe sits in a job object that kills every process in it when it exits (closed, stopped or crashed), so no
@@ -1418,20 +2516,90 @@ class BuilderForm : Form
         job = CreateJobObject(IntPtr.Zero, null);
         if (job == IntPtr.Zero) return;
         var info = new ExtendedLimits();
-        info.Basic.Flags = 0x2000;   // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        info.Basic.Flags = 0x2000 | 0x800;   // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _BREAKAWAY_OK (Play starts the game outside it)
         if (SetInformationJobObject(job, 9, ref info, Marshal.SizeOf(typeof(ExtendedLimits))))   // JobObjectExtendedLimitInformation
-            AssignProcessToJobObject(job, Process.GetCurrentProcess().Handle);   // (fails only on old Windows in a job: Stop's taskkill still works)
+            AssignProcessToJobObject(job, Process.GetCurrentProcess().Handle);   // (fails only on old Windows in a job: Stop's KillTree still works)
+    }
+
+    // the job no longer ends its processes when Setup exits (Play, where the game could not leave the job)
+    static void KeepChildrenOnClose()
+    {
+        if (job == IntPtr.Zero) return;
+        var info = new ExtendedLimits();
+        info.Basic.Flags = 0x800;
+        SetInformationJobObject(job, 9, ref info, Marshal.SizeOf(typeof(ExtendedLimits)));
     }
 
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
     [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int value);
+
+    // Setup --uninstall [--install-to=DIR] (Windows' Settings > Apps runs the install folder's Setup.exe so): asks, then
+    // removes what Setup made (Uninstaller), the saves only on a second Yes (default No), and says how much was freed.
+    // 0 done, 1 nothing there / failed, 2 the player said No
+    static int UninstallMain(string[] args)
+    {
+        string root = args.Where(a => a.StartsWith("--install-to=")).Select(a => a.Substring("--install-to=".Length).Trim('"')).FirstOrDefault();
+        if (root == null)
+            using (var k = Registry.CurrentUser.OpenSubKey(RegKey)) root = k == null ? null : k.GetValue("InstallDir") as string;
+        string title = Release.Product + " Setup";
+        if (string.IsNullOrEmpty(root) || !Directory.Exists(root))
+        {
+            MessageBox.Show("Nothing to uninstall: no install folder was found" + (string.IsNullOrEmpty(root) ? "." : " at " + root + "."), title);
+            try { Registry.CurrentUser.DeleteSubKeyTree(Uninstaller.AppsKey, false); } catch { }
+            return 1;
+        }
+        root = Path.GetFullPath(root).TrimEnd('\\');
+        // (run from the install folder's own Setup.exe, the copy Windows' Apps entry starts: everything else goes, that one
+        //  running file stays and so does the folder, said at the end; no helper copy, no child process)
+        string self = Path.GetFullPath(Application.ExecutablePath);
+        string keepSelf = self.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase) ? self : null;
+        string why = Uninstaller.NotOurs(root);
+        if (why != null)
+        {
+            MessageBox.Show("Nothing was removed: " + why + ", so it does not look like a folder Setup installed into.", title,
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return 1;
+        }
+        if (Process.GetProcessesByName("totk").Length > 0 || Process.GetProcessesByName("TotK Launcher").Length > 0)
+        {
+            MessageBox.Show("A game window is open (TotK Launcher or totk.exe, from any folder). Close it, then uninstall again.", title,
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return 1;
+        }
+        if (MessageBox.Show(string.Format("Uninstall {0} from {1}?\n\nThis removes the game build, its tools, the desktop shortcut, and the " +
+                                          "game's caches and logs (shared by every build of the game on this PC). Your dump and keys are not touched.", Release.Product, root), title,
+                            MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            return 2;   // (the player said No)
+        string roaming = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "nxrecomp", "TotK-engine");
+        string local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "nxrecomp", "TotK-engine");
+        bool saves = Directory.Exists(roaming) &&
+            MessageBox.Show("Also delete your saves, settings and mods?\n\n" + roaming + "\n\nNo keeps them: a later install finds them again.",
+                            title, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+        var parents = new[] { Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), Path.GetPathRoot(Environment.SystemDirectory) }
+            .Select(x => Path.Combine(x, FolderName));
+        var r = Uninstaller.Run(root, parents, Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), Release.Product,
+                                local, saves ? roaming : null, Uninstaller.ShortcutTarget, keepSelf);
+        try { Registry.CurrentUser.DeleteSubKeyTree(RegKey, false); } catch { }
+        try { Registry.CurrentUser.DeleteSubKeyTree(Uninstaller.AppsKey, false); } catch { }
+        if (r.Refused != null) { MessageBox.Show("Nothing was removed: " + r.Refused + ".", title); return 1; }
+        string msg = string.Format("{0} is uninstalled: about {1:0.0} GB freed.", Release.Product, Math.Max(0, r.Freed) / 1e9);
+        if (!saves && Directory.Exists(roaming)) msg += "\n\nYour saves and settings stay in " + roaming + ".";
+        if (keepSelf != null) msg += "\n\nThis Setup (" + keepSelf + ") is still running, so it stays: delete " + root + " once this window is closed.";
+        var others = r.Kept.Where(k => keepSelf == null || !string.Equals(k, keepSelf, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (others.Count > 0) msg += "\n\nLeft in place (not made by Setup):\n" + string.Join("\n", others.Take(6)) + (others.Count > 6 ? "\n..." : "");
+        if (r.Failed.Count > 0) msg += "\n\nCould not remove (in use?):\n" + string.Join("\n", r.Failed.Take(4)) + (r.Failed.Count > 4 ? "\n..." : "");
+        MessageBox.Show(msg, title, MessageBoxButtons.OK, r.Failed.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+        return r.Failed.Count == 0 ? 0 : 1;
+    }
 
     [STAThread]   // (drag and drop needs a single-threaded apartment)
     static void Main()
     {
         if (Environment.GetCommandLineArgs().Skip(1).FirstOrDefault() == "--vkcheck") { Environment.Exit(Preflight.VulkanChild()); return; }
         try { SetProcessDpiAwareness(1); } catch { SetProcessDPIAware(); }   // DPI aware: drawn at the real resolution, sharp text
-        JoinKillOnCloseJob();
+        if (Environment.GetCommandLineArgs().Contains("--uninstall")) { Environment.Exit(UninstallMain(Environment.GetCommandLineArgs())); return; }
+        if (Environment.GetCommandLineArgs().Contains("--play") && PlayInstalled()) return;   // (before the job: the game outlives us)
+        if (!Wine.Active) JoinKillOnCloseJob();   // (Wine: none; builder.py's --gui-pid still ends a build when we go)
         Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false); Application.Run(new BuilderForm());
     }
 }

@@ -4,10 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
+#include <SDL3/SDL_timer.h>
 #include <vma/vk_mem_alloc.h>
 
 typedef struct SubBlock SubBlock;
-struct VmaAllocator_T { VkDevice dev; VkPhysicalDeviceMemoryProperties mp; uint64_t vram_cap; uint32_t vram_heap; SubBlock *blocks; };
+struct VmaAllocator_T { VkDevice dev; VkPhysicalDeviceMemoryProperties mp; uint64_t vram_cap; uint32_t vram_heap; SubBlock *blocks; bool uma; };
 // sub: the block it was carved from (at offset), NULL for a resource with its own vkAllocateMemory
 struct VmaAllocation_T { VkDeviceMemory mem; void *mapped; uint32_t type; VkDeviceSize size, offset; uint32_t tag; SubBlock *sub; };
 // Live bytes per caller tag (Deck d16 2026-10-16: 3 GB asked for in a 1 GB VRAM carve-out; which kind of image holds it?).
@@ -24,8 +25,10 @@ static _Atomic uint32_t live_count;  // all live vkAllocateMemory allocations
 uint32_t vma_shim_live(void) { return live_count; }
 static _Atomic uint32_t sub_count;    // live resources carved from blocks (in heap_count, not in live_count)
 uint32_t vma_shim_sub(void) { return sub_count; }
-static uint64_t spare_made, spare_used, spare_dropped;   // (blocks the helper made, taken by an allocation, given back short)
+static uint64_t spare_made, spare_used, spare_dropped, spare_kept;   // (blocks the helper made, taken by an allocation, given
+                                                                     // back short, emptied blocks kept as spares)
 void vma_shim_spares(uint64_t *made, uint64_t *used) { *made = spare_made; *used = spare_used; }
+uint64_t vma_shim_spares_kept(void) { return spare_kept; }   // (device.c [vram] line)
 uint32_t vma_shim_heaps(VmaAllocator a, uint64_t *bytes, uint32_t *count, uint64_t *size, uint32_t *flags) {
     for (uint32_t h = 0; h < a->mp.memoryHeapCount; h++) {
         bytes[h] = heap_bytes[h]; count[h] = heap_count[h];
@@ -54,6 +57,7 @@ VkResult vmaCreateAllocator(const VmaAllocatorCreateInfo *ci, VmaAllocator *out)
     if (e) cap = strtoull(e, NULL, 0) << 20;
     else if (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && hs) cap = hs - (hs / 2 < (384ull << 20) ? hs / 2 : 384ull << 20);
     a->vram_cap = cap;
+    a->uma = pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     if (cap) fprintf(stderr, "[vma] VRAM cap %llu MB of the %llu MB device-local heap %u (LARECOMP_VRAM_CAP_MB): allocations past it go to the other heap\n",
                      (unsigned long long)(cap >> 20), (unsigned long long)(hs >> 20), a->vram_heap);
     *out = a;
@@ -84,6 +88,7 @@ struct SubBlock {
     VkDeviceMemory mem;
     uint8_t *mapped;
     uint32_t type, kind, nfree, capfree, nlive;
+    uint32_t cand, gid;   // (vma_shim_free_gain's scratch, under sub_mu)
     VkDeviceSize live_bytes;
     struct { VkDeviceSize off, size; } *fr;   // free ranges, by offset
 };
@@ -120,7 +125,8 @@ static void *spare_main(void *arg) {
         VkResult r = vkAllocateMemory(spare_a->dev, &mi, NULL, &mem);
         pthread_mutex_lock(&sub_mu);
         if (r != VK_SUCCESS) continue;
-        if (vk_residency_tight()) { vkFreeMemory(spare_a->dev, mem, NULL); continue; }   // (became short meanwhile)
+        // (became short meanwhile; or an emptied block took the slot meanwhile: sub_free)
+        if (vk_residency_tight() || spare[wt][wk].mem) { vkFreeMemory(spare_a->dev, mem, NULL); continue; }
         spare[wt][wk].mem = mem;
         live_count++;
         spare_made++;
@@ -140,6 +146,35 @@ void vma_shim_drop_spares(void) {
             }
     pthread_mutex_unlock(&sub_mu);
 }
+// textures.c vk_residency_tick: of n idle allocations, which give device memory back when freed. One of its own: grp 0,
+// gain its size. A block's: only when all its live allocations are among the n and the emptied block then goes to the
+// driver (sub_free: another block of its class remains, or a big one while short): grp = that block's number from 1,
+// gain = the block's size on the first of them, 0 on the others. Any other one (a block that keeps live neighbours:
+// freeing it returns nothing): grp 0, gain 0. Returns the groups numbered.
+uint32_t vma_shim_free_gain(VmaAllocator a, VmaAllocation const *al, int n, uint32_t *grp, uint64_t *gain) {
+    pthread_mutex_lock(&sub_mu);
+    for (SubBlock *b = a->blocks; b; b = b->next) b->cand = b->gid = 0;
+    for (int i = 0; i < n; i++)
+        if (al[i] && al[i]->sub) al[i]->sub->cand++;
+    uint32_t ng = 0;
+    for (SubBlock *b = a->blocks; b; b = b->next) {
+        if (!b->nlive || b->cand < b->nlive) continue;
+        SubBlock *o = a->blocks;
+        for (; o && (o == b || o->type != b->type || o->kind != b->kind); o = o->next) {}
+        if (o || (b->kind == 2 && vk_residency_tight())) b->gid = ++ng;
+    }
+    for (int i = 0; i < n; i++) {
+        SubBlock *b = al[i] ? al[i]->sub : NULL;
+        grp[i] = 0, gain[i] = 0;
+        if (!al[i]) continue;
+        if (!b) { gain[i] = al[i]->size; continue; }
+        if (!b->gid) continue;
+        grp[i] = b->gid;
+        if (b->cand) { gain[i] = block_size(b->kind); b->cand = 0; }   // (the first of the block's: its whole size)
+    }
+    pthread_mutex_unlock(&sub_mu);
+    return ng;
+}
 // big blocks (kind 2) for the [vram] line: how many, their bytes, the bytes live in them; spares held and dropped
 void vma_shim_big(VmaAllocator a, uint32_t *n, uint64_t *bytes, uint64_t *live, uint64_t *spare_bytes, uint64_t *dropped) {
     *n = 0; *bytes = *live = *spare_bytes = 0;
@@ -152,11 +187,42 @@ void vma_shim_big(VmaAllocator a, uint32_t *n, uint64_t *bytes, uint64_t *live, 
     *dropped = spare_dropped;
     pthread_mutex_unlock(&sub_mu);
 }
+// every block of one kind (0 buffers / linear images, 1 optimal images up to SUB_MAX, 2 big; -1 any) on device-local heaps
+// (vram) or the others, for the "[vram] slack" line: how many, their bytes, the bytes live in them (the difference is free
+// ranges the driver still counts as ours)
+void vma_shim_blocks(VmaAllocator a, int kind, bool vram, uint32_t *n, uint64_t *bytes, uint64_t *live) {
+    *n = 0; *bytes = *live = 0;
+    pthread_mutex_lock(&sub_mu);
+    for (SubBlock *b = a->blocks; b; b = b->next)
+        if ((kind < 0 || b->kind == (uint32_t)kind) &&
+            ((a->mp.memoryHeaps[a->mp.memoryTypes[b->type].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) == vram)
+            ++*n, *bytes += block_size(b->kind), *live += b->live_bytes;
+    pthread_mutex_unlock(&sub_mu);
+}
+// Device memory allocated where a resource is created (not pre-made by spare_main): for the hitch log (exec.c), with a
+// line for each slow one and why it was not carved from a block (stream-hitch, 1 image 77.5 ms).
+static _Atomic uint64_t sync_n, sync_ns, sync_bytes;
+void vma_shim_sync_allocs(uint64_t *n, uint64_t *ns, uint64_t *bytes) { *n = sync_n; *ns = sync_ns; *bytes = sync_bytes; }
+static VkResult alloc_timed(VkDevice dev, const VkMemoryAllocateInfo *mi, VkDeviceMemory *mem, const char *why) {
+    const uint64_t t0 = SDL_GetTicksNS();
+    const VkResult r = vkAllocateMemory(dev, mi, NULL, mem);
+    const uint64_t dt = SDL_GetTicksNS() - t0;
+    sync_n++; sync_ns += dt; sync_bytes += mi->allocationSize;
+    static _Atomic int logged;
+    if (dt > 8000000ull && logged < 64) {
+        logged++;
+        fprintf(stderr, "[vma] slow device allocation: %llu MB of type %u in %.1f ms at creation (%s)\n",
+                (unsigned long long)(mi->allocationSize >> 20), mi->memoryTypeIndex, dt / 1e6, why);
+    }
+    return r;
+}
+static bool spare_type(VmaAllocator a, uint32_t t, uint32_t kind) {   // (device-local, not host-visible; kinds 1 and 2)
+    return kind >= 1 && kind < 3 && spare_on() && !(a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+           (a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
 static void spare_ask(VmaAllocator a, uint32_t t, uint32_t kind) {   // (sub_mu held)
     static bool started;
-    if (kind < 1 || !spare_on() || (a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
-        !(a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
-        return;
+    if (!spare_type(a, t, kind)) return;
     if (!started) {
         started = true;
         spare_a = a;
@@ -227,7 +293,7 @@ static VmaAllocation sub_alloc(VmaAllocator a, uint32_t t, uint32_t kind, VkMemo
         void *mapped = NULL;
         const bool from_spare = kind < 3 && spare[t][kind].mem;   // (made by spare_main: no allocation here)
         if (from_spare) { mem = spare[t][kind].mem; spare[t][kind].mem = VK_NULL_HANDLE; live_count--; spare_used++; }
-        if (from_spare || vkAllocateMemory(a->dev, &mi, NULL, &mem) == VK_SUCCESS) {
+        if (from_spare || alloc_timed(a->dev, &mi, &mem, kind == 2 ? "new 256 MB block, no spare ready" : "new 32 MB block") == VK_SUCCESS) {
             if ((a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
                 vkMapMemory(a->dev, mem, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
                 vkFreeMemory(a->dev, mem, NULL);
@@ -265,9 +331,17 @@ static void sub_free(VmaAllocator a, VmaAllocation al) {
             SubBlock **pp = &a->blocks;
             while (*pp != b) pp = &(*pp)->next;
             *pp = b->next;
-            if (b->mapped) vkUnmapMemory(a->dev, b->mem);
-            vkFreeMemory(a->dev, b->mem, NULL);
-            live_count--;
+            // The class's spare when it has none (stream-hitch): the next block of this class then costs no allocation, and
+            // this free none either (both on the render thread; streaming churns a class's last-but-one block). Not while
+            // short: then it goes back to the driver, as the spares do (vma_shim_drop_spares).
+            if (!b->mapped && spare_type(a, b->type, b->kind) && !spare[b->type][b->kind].mem && !vk_residency_tight()) {
+                spare[b->type][b->kind].mem = b->mem;   // (live_count: a spare counts as live, as the block did)
+                spare_kept++;
+            } else {
+                if (b->mapped) vkUnmapMemory(a->dev, b->mem);
+                vkFreeMemory(a->dev, b->mem, NULL);
+                live_count--;
+            }
             free(b->fr); free(b);
         }
     }
@@ -300,6 +374,20 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
     // next best type of the same request is tried before giving up (`need` flags stay required, so the alias mirror's
     // DEVICE_LOCAL buffer still fails cleanly and exec.c falls back).
     uint32_t bits = req.memoryTypeBits;
+    if (ai->memoryTypeBits && !(bits &= ai->memoryTypeBits)) return VK_ERROR_FEATURE_NOT_PRESENT;   // (VMA's rule; was ignored)
+    // On an integrated GPU a DEVICE_LOCAL requirement (the device window and its copy-back shadow, the mirrors' blocks, the
+    // ASTC scratch) is only where the GPU reads fastest, and every heap there is the same RAM: past the VRAM cap it yields
+    // like a preference, so required allocations do not fill a carve-out beyond the cap either (the Deck v2 stall above:
+    // amdgpu then evicts the compositor's buffers; under Proton the same kernel driver, a 1 GB carve-out). A discrete GPU
+    // keeps the requirement. LARECOMP_UMA_STRICT_LOCAL=1: required on an integrated GPU too.
+    static int strict = -1;
+    if (strict < 0) { const char *e = getenv("LARECOMP_UMA_STRICT_LOCAL"); strict = e && *e == '1'; }
+    if (a->uma && !strict && a->vram_cap && (need & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && heap_bytes[a->vram_heap] + req.size > a->vram_cap) {
+        static int logged;
+        if (!logged++) fprintf(stderr, "[vma] VRAM cap reached on an integrated GPU: allocations that ask for device-local memory "
+                                       "go to the other heap too (the same RAM; LARECOMP_UMA_STRICT_LOCAL=1: they stay required)\n");
+        need &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    }
     if (a->vram_cap && !(need & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && heap_bytes[a->vram_heap] + req.size > a->vram_cap) {
         uint32_t other = 0;
         for (uint32_t i = 0; i < a->mp.memoryTypeCount; i++)
@@ -333,7 +421,10 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
         if (t < 0) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)t};
         al = calloc(1, sizeof *al);
-        r = vkAllocateMemory(a->dev, &mi, NULL, &al->mem);
+        r = alloc_timed(a->dev, &mi, &al->mem, req.size > BIG_MAX ? "own allocation, over 64 MB"
+                                                : kind == 2 && vk_residency_tight() ? "own allocation, VRAM short: no new big block"
+                                                : req.alignment > (1u << 20) ? "own allocation, alignment over 1 MB"
+                                                : "own allocation");
         if (r == VK_SUCCESS) break;
         free(al);
         if (r != VK_ERROR_OUT_OF_DEVICE_MEMORY && r != VK_ERROR_OUT_OF_HOST_MEMORY) return r;

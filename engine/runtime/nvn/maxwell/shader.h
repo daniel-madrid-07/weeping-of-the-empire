@@ -80,6 +80,8 @@ typedef struct {
     uint32_t num_insts;
     uint32_t pc_cases;      // GLSL pc-loop case labels (0: no pc loop); exec.c pa_job: AMD's driver takes minutes and GBs
                             // on a few hundred (issue #9)
+    uint8_t knobs_used;     // live knobs this translation read (1: maxwell_soft_pct, the sun-cascade compares, whatever
+                            // its value): exec.c translates the program again when one of them changes
     char error[256];        // set when translation fails
 } ShaderInfo;
 
@@ -98,6 +100,8 @@ extern uint64_t maxwell_gmem_window;
 extern MAXWELL_TLS uint64_t maxwell_gmem_base, maxwell_gmem_size;
 extern MAXWELL_TLS const uint8_t *maxwell_const_data;  // (BRX jump tables: the program's c1 while it translates; NULL = unknown)
 extern MAXWELL_TLS size_t maxwell_const_size;
+// graphics.soft_shadows' percent for this translation (exec.c translate_program, live); -1: TOTK_SOFT_SHADOWS (tools)
+extern MAXWELL_TLS int maxwell_soft_pct;
 extern const char maxwell_build_stamp[];  // compile date + time of translate.c
 extern bool maxwell_wave_safe;  // subgroups may not be 32 wide (device.c): warp ops address the lane's own 32-lane half
 extern bool maxwell_vs_pointsize;  // no maintenance5 (device.c): every VS writes gl_PointSize (1.0 unless it writes its own)

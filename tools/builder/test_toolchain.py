@@ -21,7 +21,7 @@ def check(name, ok, detail=''):
 
 BLOB = os.urandom(3 * 2**20 + 123)
 SHA = hashlib.sha256(BLOB).hexdigest()
-served = {'ranges': True, 'cut': None, 'hits': []}
+served = {'ranges': True, 'cut': None, 'cut_every': None, 'hits': []}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -29,6 +29,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path.startswith('/missing'):
+            served['hits'].append('404')
+            self.send_response(404)
+            self.end_headers()
+            return
         rng = self.headers.get('Range')
         served['hits'].append(rng)
         start = int(rng.split('=')[1].split('-')[0]) if rng and served['ranges'] else 0
@@ -38,6 +43,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         if served['cut']:   # (the connection drops partway: the client keeps a .part)
             body, served['cut'] = body[:served['cut']], None
+        elif served['cut_every']:   # (a flaky line: every response drops partway)
+            body = body[:served['cut_every']]
         try:
             self.wfile.write(body)
         except OSError:
@@ -88,6 +95,38 @@ with tempfile.TemporaryDirectory() as t:
     served.update(hits=[])
     toolchain.download('blob', url, dest, SHA)
     check('download: done before -> not fetched again', served['hits'] == [])
+    # a flaky line: every response drops after 512 KB; each try gains bytes, so 3 tries in a row is enough
+    dest5 = os.path.join(t, 'dl', 'blob5.bin')
+    served.update(cut_every=512 * 1024, hits=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        toolchain.download('blob', url, dest5, SHA, tries=3)
+    served.update(cut_every=None)
+    check('download: a line that keeps dropping still finishes (failures counted only without progress)',
+          open(dest5, 'rb').read() == BLOB and len(served['hits']) >= 7, str(len(served['hits'])))
+    # a .part left by another file of the same name: its checksum fails, fetched once more from the start
+    dest6 = os.path.join(t, 'dl', 'blob6.bin')
+    with open(dest6 + '.part', 'wb') as f:
+        f.write(os.urandom(4096))
+    served.update(hits=[])
+    with contextlib.redirect_stdout(io.StringIO()) as out6:
+        toolchain.download('blob', url, dest6, SHA)
+    check('download: a foreign .part -> once more from the start, then right', open(dest6, 'rb').read() == BLOB and
+          served['hits'][0] == 'bytes=4096-' and served['hits'][-1] is None and 'from the start' in out6.getvalue(),
+          str(served['hits']))
+    check('rate_text: speed and time left', toolchain.rate_text(0, 0, 0) == '' and
+          toolchain.rate_text(50 * 2**20, 100 * 2**20, 2 * 2**20) == ', 2.0 MB/s, 25 s left' and
+          toolchain.rate_text(0, 600 * 2**20, 2**20) == ', 1.0 MB/s, 10 min left' and
+          toolchain.rate_text(10, 0, 50 * 1024) == ', 50 KB/s', toolchain.rate_text(50 * 2**20, 100 * 2**20, 2 * 2**20))
+    # a 404: no retries, the host and the code said
+    served.update(hits=[])
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            toolchain.download('gone', url.replace('/blob', '/missing'), os.path.join(t, 'gone.bin'))
+        e404 = None
+    except toolchain.ToolchainError as e:
+        e404 = str(e)
+    check('download: a 404 is said at once (one request, no retries)', e404 and 'answered 404' in e404 and
+          served['hits'] == ['404'], f'{e404} {served["hits"]}')
     # unreachable: a clear error after the retries
     try:
         with contextlib.redirect_stdout(io.StringIO()):

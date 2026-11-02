@@ -18,6 +18,7 @@
 #include <random>
 #endif
 #include <vector>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -219,6 +220,10 @@ static std::atomic<u64> g_hw_n[2], g_hw_blk[2], g_hw_lat[2], g_hw_b[2][4];
 // nn::os::YieldThread, "[sleep] ... | YieldThread ..." every ~5 s (os_YieldThread, below)
 static std::atomic<u64> g_y_n, g_y_ns, g_y_max, g_y_long, g_y_frames;
 static const char* yield_mode_name();
+static void evlog(char op, u64 ev, u64 lr);   // (the light-event ring, below: long yields and sleeps go there too)
+// (the X / Z ops only while TOTK_EVRING_DUMP is set, a dump being their only reader: unset, the yield and sleep paths
+// are v0.1.7's)
+static bool evring_gives() { static const bool on = getenv("TOTK_EVRING_DUMP") != nullptr; return on; }
 extern "C" uint64_t nvn_present_count(void);   // (hle_vi / nvn: presents so far)
 static void hw_note(int k, bool blocked, s64 lat) {
     g_hw_n[k]++;
@@ -259,16 +264,56 @@ static const char* yield_mode_name() {
     return nm[yield_mode()];
 }
 // hybrid: this thread's last real SwitchToThread; one is due when it has not switched for TOTK_YIELD_CAP_US (default
-// 1000; 0 = no cap): a ready thread that can only run on this core waits at most that long
+// 1000; 0 = no cap): a ready thread that can only run on this core waits at most that long hybrid-give begin
+// (tools/engine/test_yield_give.py compiles this block)
 static thread_local s64 t_switched;
 static bool switch_due(s64 now) {
     static const s64 cap = getenv("TOTK_YIELD_CAP_US") ? (s64)atoll(getenv("TOTK_YIELD_CAP_US")) * 1000 : 1000000;
     return cap > 0 && now - t_switched > cap;
 }
-// one pass of a spin wait: switch mode SwitchToThread (as before); hybrid a pause, a real switch at least once a ms; pause
-// / sleep0 as named. TOTK_SPIN=<mode> overrides TOTK_YIELD for the spin waits alone (unset: follow TOTK_YIELD), so a gate
-// can tell the two changes apart without a rebuild: YieldThread's hybrid is route-measured, the spin waits' is not, and
-// low-core PCs are where it can cost most.
+// hybrid's real give-way: SwitchToThread, as v0.1.7 (the default again for v0.1.8: the Havok cross-thread ordering crash, 2
+// of 2 B runs of the v0.1.8 gate and 0 of 2 v0.1.7, had 3611b8df / ced1e3af as its first suspect). TOTK_YIELD_LOW_US=<us>
+// (opt-in, 3611b8df's 4000 the measured value): Sleep(0) instead, and one SwitchToThread when this thread has not really
+// switched for that long. SwitchToThread hands the rest of the quantum to ANY ready thread on this CPU, the game's own
+// pipeline compile workers at below-normal / lowest / idle priority included, and a CPU-bound one keeps the core for its
+// whole quantum: a job worker's one YieldThread inside gsys ModelMgr::calcModel's phases took 165-390 ms (cA_route1 [sleep]
+// YieldThread max 390.24 ms, on a host at 100 % CPU). Sleep(0) gives way to equal or higher priority threads only: every
+// guest thread (all at normal priority) still gets this core; the 4 ms switch (whatever the loop's body: a run of yields
+// 20+ us apart never ages) lets a loop waiting on a lower-priority thread on this core with every core busy still let it
+// run within that, not at Windows' starvation boost seconds later. TOTK_YIELD=switch: SwitchToThread at every yield (as
+// v0.1.6).
+enum Give { GIVE_PAUSE, GIVE_SLEEP0, GIVE_SWITCH };
+static thread_local s64 t_give_last, t_give_run, t_low_switch;
+static Give give_way(s64 now) {
+    static const s64 low = getenv("TOTK_YIELD_LOW_US") ? (s64)atoll(getenv("TOTK_YIELD_LOW_US")) * 1000 : 0;
+    t_switched = now;
+    if (low <= 0) return GIVE_SWITCH;
+    if (now - t_low_switch >= low) { t_low_switch = now; return GIVE_SWITCH; }   // (this thread's last real switch)
+    return GIVE_SLEEP0;
+}
+// hybrid's choice for one pass: pause while this thread's run of back-to-back passes (under 20 us apart) is younger than
+// pause_ns (YieldThread: TOTK_YIELD_SPIN_US; spin waits: -1, they pause until a give-way is due) and no give-way is due
+// (TOTK_YIELD_CAP_US since the last one); else give way (above). Only YieldThread's passes make the run (v0.1.7's: a spin
+// pass just before a yield does not age that yield's run; tools/engine/test_yield_give.py checks the default against it)
+static Give hybrid_give(s64 now, s64 pause_ns) {
+    if (pause_ns >= 0) {
+        if (now - t_give_last > 20000) t_give_run = now;   // (a new run)
+        t_give_last = now;
+    }
+    const bool young = pause_ns < 0 || now - t_give_run < pause_ns;
+    if (young && !switch_due(now)) return GIVE_PAUSE;
+    return give_way(now);
+}
+// hybrid-give end
+static void give(Give g) {
+    if (g == GIVE_PAUSE) YieldProcessor();
+    else if (g == GIVE_SLEEP0) Sleep(0);
+    else SwitchToThread();
+}
+// one pass of a spin wait: switch mode SwitchToThread (as before); hybrid a pause, a give-way at least once a ms (above);
+// pause / sleep0 as named. TOTK_SPIN=<mode> overrides TOTK_YIELD for the spin waits alone (unset: follow TOTK_YIELD), so a
+// gate can tell the two changes apart without a rebuild: YieldThread's hybrid is route-measured, the spin waits' is not,
+// and low-core PCs are where it can cost most.
 static int spin_mode() {
     static const int m = [] {
         const char* e = getenv("TOTK_SPIN");
@@ -286,11 +331,7 @@ static void spin_pass() {
     switch (spin_mode()) {
     case YIELD_PAUSE: YieldProcessor(); return;
     case YIELD_SLEEP0: Sleep(0); return;
-    case YIELD_HYBRID: {
-        const s64 now = now_ns();
-        if (switch_due(now)) { SwitchToThread(); t_switched = now; } else YieldProcessor();
-        return;
-    }
+    case YIELD_HYBRID: give(hybrid_give(now_ns(), -1)); return;
     default: SwitchToThread();
     }
 }
@@ -343,6 +384,7 @@ HLE_AS(os_SleepThread, "_ZN2nn2os11SleepThreadENS_8TimeSpanE") {
     s64 t1 = now_ns();
     int b = ns <= 0 ? 0 : ns < 1000000 ? 1 : ns <= 2000000 ? 2 : 3;
     g_sl_n[b]++; g_sl_req[b] += ns > 0 ? (u64)ns : 0; g_sl_act[b] += (u64)(t1 - t0);
+    if (t1 - t0 >= 100000 && evring_gives()) evlog('Z', (u64)(t1 - t0), c->x[30]);   // (the ring: a sleep inside a job on a main wait's chain)
     if (backoff) { g_cb_n++; g_cb_act += (u64)(t1 - t0); }
     u64 last = g_sl_t0.load();
     if (!last) g_sl_t0.compare_exchange_strong(last, (u64)t1);
@@ -381,31 +423,23 @@ HLE_AS(os_SleepThread, "_ZN2nn2os11SleepThreadENS_8TimeSpanE") {
         printf("%s\n", buf);
     }
 }
-// nn::os::YieldThread. On the Switch it lets a same-priority thread on the same core run, which costs little. SwitchToThread
-// hands the rest of the quantum to ANY ready thread on this CPU (our pipeline / translator workers, other processes) and
-// waits for the CPU to come back. TotK's actor jobs (ActorBase PreCalc / PostCalc / SleepCalc / PostSensorCalc) yield once
-// per actor while the main thread waits for the frame's jobs: a worker that loses its slice there stalls the frame.
-// TOTK_YIELD=hybrid (the default since the stutter sprint: route ABBA 89 -> 111 fps median, 1 % low 31.7 -> 36.3) | switch
-// (SwitchToThread, as before) | pause (a CPU pause hint, no OS yield) | sleep0 (Sleep(0): equal or higher priority threads
-// only) | hybrid (a pause while this thread's back-to-back yields have lasted under TOTK_YIELD_SPIN_US, default 50;
-// SwitchToThread after: a guest loop that needs another thread on this core to run still gets it). A loop whose body runs
-// longer than 20 us between yields starts a new run at every yield and would only ever pause, so hybrid also switches when
-// this thread has not really switched for TOTK_YIELD_CAP_US (default 1000; 0 = no cap): a ready thread that can only run on
+// nn::os::YieldThread. On the Switch it lets a same-priority thread on the same core run, which costs little. SwitchToThread hands the rest of the
+// quantum to ANY ready thread on this CPU (our pipeline / translator workers, other processes) and waits for the CPU to come back. TotK's actor jobs
+// (ActorBase PreCalc / PostCalc / SleepCalc / PostSensorCalc) yield once per actor while the main thread waits for the frame's jobs: a worker that
+// loses its slice there stalls the frame. TOTK_YIELD=hybrid (the default since the stutter sprint: route ABBA 89 -> 111 fps median, 1 % low 31.7 ->
+// 36.3) | switch (SwitchToThread, as before) | pause (a CPU pause hint, no OS yield) | sleep0 (Sleep(0): equal or higher priority threads only) |
+// hybrid (a pause while this thread's back-to-back yields have lasted under TOTK_YIELD_SPIN_US, default 50; a give-way after: SwitchToThread, or with
+// the opt-in TOTK_YIELD_LOW_US Sleep(0) and a SwitchToThread once a run has lasted that long, give_way above, so a guest loop that needs another
+// thread on this core to run still gets it). A loop whose body runs longer than 20 us between yields starts a new run at every yield and would only
+// ever pause, so hybrid also gives way when this thread has not for TOTK_YIELD_CAP_US (default 1000; 0 = no cap): a ready thread that can only run on
 // this core waits at most that long.
 HLE_AS(os_YieldThread, "_ZN2nn2os11YieldThreadEv") {
     static const s64 spin = getenv("TOTK_YIELD_SPIN_US") ? (s64)atoll(getenv("TOTK_YIELD_SPIN_US")) * 1000 : 50000;
-    // hybrid: this thread's last yield and the start of its run of back-to-back yields (its last real switch: t_switched)
-    thread_local s64 t_last, t_run;
     const s64 t0 = now_ns();
     switch (yield_mode()) {
     case YIELD_PAUSE: YieldProcessor(); break;
     case YIELD_SLEEP0: Sleep(0); break;
-    case YIELD_HYBRID:
-        if (t0 - t_last > 20000) t_run = t0;   // (more than 20 us since its last yield: a new run)
-        t_last = t0;
-        if (t0 - t_run < spin && !switch_due(t0)) YieldProcessor();
-        else { SwitchToThread(); t_switched = t0; }
-        break;
+    case YIELD_HYBRID: give(hybrid_give(t0, spin)); break;
     default: SwitchToThread();
     }
     // the counter: per thread, flushed every 256 calls (about 70k yields a second from every job thread: no shared line
@@ -413,7 +447,7 @@ HLE_AS(os_YieldThread, "_ZN2nn2os11YieldThreadEv") {
     thread_local struct { u64 n, ns, mx, lng; } y;
     const u64 d = (u64)(now_ns() - t0);
     y.n++; y.ns += d;
-    if (d > 1000000) y.lng++;
+    if (d > 1000000) { y.lng++; if (evring_gives()) evlog('X', d, c->x[30]); }   // (the ring: which guest spin loop lost its core, evchain.py)
     if (d > y.mx) y.mx = d;
     if ((y.n & 255) == 0) {
         g_y_n.fetch_add(y.n, std::memory_order_relaxed); g_y_ns.fetch_add(y.ns, std::memory_order_relaxed);
@@ -597,8 +631,14 @@ HLE_AS(os_SignalEvent, "_ZN2nn2os11SignalEventEPNS0_9EventTypeE") { ev_signal(g_
 HLE_AS(os_ClearEvent, "_ZN2nn2os10ClearEventEPNS0_9EventTypeE") { ev_clear(g_event.get(c->x[0])); }
 // Light-event history ring (job-system hang, then the wait-chain trace of 2026-10-16): op I(nit) S(ignal) C(lear)
 // W(ait enter) w(ait done); T/t timed light-event wait; V/v condition-variable wait, U its signal; R/r light message
-// queue receive, Q send / jam; Y/y nvnSyncWait (objects.c). Dumped by the watchdog; TOTK_EVRING_DUMP=<s> writes the
-// whole ring (1M ops) to evring.txt at that time for scratchpad analysis (who the main thread waits on per frame).
+// queue receive, Q send / jam; Y/y nvnSyncWait (objects.c); X a YieldThread over 1 ms, Z a SleepThread of 0.1 ms or more
+// (their object: the call's length in ns, their time: its end). Dumped by the watchdog; TOTK_EVRING_DUMP=<s>[,<s>...] writes
+// the whole ring (1M ops, ~8 s of play) at each of those times, to evring.txt (one time) or evring_<s>.txt, for scratchpad
+// analysis (who the main thread waits on per frame: tools/engine/cpuprof/evchain.py). A "hitch" entry (TOTK_EVRING_DUMP=hitch,
+// or 30,hitch) also writes it at each logged [hitch] frame whose "other" (game-side) part is TOTK_EVRING_HITCH_MS (default
+// 40) or more, to evring_f<frame>.txt, at most 16 a run and 4 s apart: timed dumps missed every in-play class-A hitch of
+// cA_route2 (the ring covers the 8 s before its dump). The file starts with "# thread <host tid> <guest prio> <name>"
+// lines, so a tid in the ring has a name.
 struct EvOp { s64 t; u64 ev, lr; u32 tid; char op; };
 enum : u64 { EVRING = 1u << 20 };
 static EvOp g_evring[EVRING];
@@ -606,24 +646,82 @@ static std::atomic<u64> g_evpos{0};
 static void evlog(char op, u64 ev, u64 lr) { u64 i = g_evpos++ & (EVRING - 1); g_evring[i] = { now_ns(), ev, lr, (u32)GetCurrentThreadId(), op }; }
 extern "C" void hle_evlog(char op, u64 ev, u64 lr) { evlog(op, ev, lr); }
 static void evring_save(const char* path) {
+    // a copy first (32 MB, a few ms), then the file: the ring moves on at ~125k ops a second while its ~1M lines are
+    // written (a second or more), which tore the oldest part of a dump read from the live ring
+    u64 end = g_evpos.load(), beg = end > EVRING ? end - EVRING : 0;
+    std::vector<EvOp> snap;
+    snap.reserve((size_t)(end - beg));
+    for (u64 i = beg; i < end; i++) snap.push_back(g_evring[i & (EVRING - 1)]);
     FILE* f = fopen(path, "w");
     if (!f) return;
-    u64 end = g_evpos.load(), beg = end > EVRING ? end - EVRING : 0;
-    for (u64 i = beg; i < end; i++) {
-        const EvOp& o = g_evring[i & (EVRING - 1)];
-        fprintf(f, "%lld %c %llx %llx %u\n", (long long)o.t, o.op ? o.op : '?', (unsigned long long)o.ev, (unsigned long long)o.lr, o.tid);
+    {   // the guest threads (registered ones: CreateThread + the main thread) by host id
+        std::shared_lock<std::shared_mutex> l(g_threads.m);
+        for (auto& kv : g_threads.map)
+            if (const HThread* t = kv.second; t && t->tid)
+                fprintf(f, "# thread %lu %d %s\n", (unsigned long)t->tid, t->prio, t->name.c_str());
     }
+    for (const EvOp& o : snap)
+        fprintf(f, "%lld %c %llx %llx %u\n", (long long)o.t, o.op ? o.op : '?', (unsigned long long)o.ev, (unsigned long long)o.lr, o.tid);
     fclose(f);
-    printf("[evring] %llu ops written to %s\n", (unsigned long long)(end - beg), path);
+    printf("[evring] %llu ops written to %s\n", (unsigned long long)snap.size(), path);
     fflush(stdout);
 }
+// evring-hitch begin (tools/engine/test_evring_hitch.py compiles this block)
+static bool g_evring_hitch;   // (TOTK_EVRING_DUMP holds "hitch")
+// TOTK_EVRING_DUMP's times in s, sorted (an unsorted list would sleep a negative time and misname a dump); a "hitch" entry
+// sets g_evring_hitch instead
+static std::vector<int> evring_dump_spec(const char* e) {
+    std::vector<int> secs;
+    for (const char* p = e; *p;) {
+        if (!strncmp(p, "hitch", 5)) g_evring_hitch = true;
+        else secs.push_back(atoi(p));
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+    }
+    std::sort(secs.begin(), secs.end());
+    return secs;
+}
+// a hitch frame's dump is due: "hitch" given, its "other" part TOTK_EVRING_HITCH_MS or more, 4 s since the last one, at
+// most 16 a run (each is ~40 MB of text)
+static bool evring_hitch_due(double other_ms, s64 now) {
+    static const double min_ms = getenv("TOTK_EVRING_HITCH_MS") ? atof(getenv("TOTK_EVRING_HITCH_MS")) : 40.0;
+    static std::atomic<int> n{0};
+    static std::atomic<s64> last{0};
+    if (!g_evring_hitch || other_ms < min_ms) return false;
+    s64 l = last.load();
+    if ((l && now - l < 4000000000ll) || !last.compare_exchange_strong(l, now)) return false;
+    return n.fetch_add(1) < 16;
+}
+// evring-hitch end
 static int s_evring_dump_init = [] {
     if (const char* e = getenv("TOTK_EVRING_DUMP")) {
-        int sec = atoi(e);
-        std::thread([sec] { std::this_thread::sleep_for(std::chrono::seconds(sec)); evring_save("evring.txt"); }).detach();
+        const std::vector<int> secs = evring_dump_spec(e);
+        if (secs.empty()) return 0;
+        std::thread([secs] {
+            int done = 0;
+            for (int s : secs) {
+                std::this_thread::sleep_for(std::chrono::seconds(s - done)); done = s;
+                char path[48];
+                if (secs.size() == 1) snprintf(path, sizeof path, "evring.txt");
+                else snprintf(path, sizeof path, "evring_%d.txt", s);
+                evring_save(path);
+            }
+        }).detach();
     }
     return 0;
 }();
+// (rt_main.cpp rt_hitch_dump, on the thread that logs the [hitch] line: the file is written by a thread of its own)
+extern "C" void hle_evring_hitch(u64 frame, double other_ms) {
+    if (!evring_hitch_due(other_ms, now_ns())) return;
+    std::thread([frame] {
+#ifdef _WIN32  // (background CPU and I/O priority: its ~1M-line write right after a hitch is not the next one)
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+#endif
+        char path[48];
+        snprintf(path, sizeof path, "evring_f%llu.txt", (unsigned long long)frame);
+        evring_save(path);
+    }).detach();
+}
 void hle_evring_dump(u64 focus) {
     u64 end = g_evpos.load(), beg = end > EVRING ? end - EVRING : 0; int shown = 0;
     printf("[evring] %llu ops; last 24 on %llx:\n", end, focus);

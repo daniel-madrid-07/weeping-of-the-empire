@@ -62,8 +62,12 @@ void pc_settings_add_presets(const pc_preset_row *rows, int n);
 
 // Present thread (the overlay), and any thread once start-up is over for reading. NULL: no such key.
 const char *pc_settings_get(const char *key);
+// pc_help.cpp: the player's one line for a row (English; pc_tr gives the game's language), NULL: none (its own help)
+const char *pc_setting_help(const char *key);
 bool pc_settings_copy(const char *key, char *out, size_t n);   // a row's value copied under the lock (false: no row)
 void pc_settings_set(const char *key, const char *value);
+// pc_overlay_vk.c, once, when the device is an integrated GPU: the first start's Frame rate becomes "steady" (pc_settings.cpp)
+void pc_settings_first_start_igpu(void);
 // Any key: NX_SET_<KEY>, else the file's value, registered row or not (pc_input.cpp's per-context bindings)
 bool pc_settings_raw(const char *key, char *out, size_t n);
 // Any thread: writes (value NULL: removes) a key that has no registered row (pc_input.cpp's pc_bind_set:

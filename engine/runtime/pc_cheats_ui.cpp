@@ -14,9 +14,9 @@ bool pc_cheats_tab_available() { return !mods_cheats().empty(); }
 
 void pc_cheats_tab() {
     const std::vector<nxr_cheat> cheats = mods_cheats();
-    ImGui::TextWrapped("%s", pc_tr("Cheats from your mods' cheats folders (Atmosphere format). A cheat that changes values "
-                                   "works at once; one that changes the game's code applies when the game starts again. "
-                                   "Cheats can break a save: keep a copy."));
+    ImGui::TextWrapped("%s", pc_tr("Cheats from your mods' cheats folders (Atmosphere format). They switch at once; one "
+                                   "that changes the game's code once the game is built with it (at the start after its "
+                                   "mod is turned on or changed). Cheats can break a save: keep a copy."));
     ImGui::Spacing();
     std::string mod;
     for (int i = 0; i < (int)cheats.size(); i++) {

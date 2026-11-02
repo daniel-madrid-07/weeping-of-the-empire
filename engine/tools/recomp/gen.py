@@ -354,6 +354,9 @@ class Emitter:
         # --lctx-mem N (--lctx-keep HEX,...): the giant single functions keep their LCtx in memory (Emitter.prologue):
         # clang's time / peak commit on their TUs. 0 = off.
         self.lctx_mem, self.lctx_keep = 0, set()
+        # --split (Emitter.split_text): these functions (or, `min=N`, every one of N+ guest instructions: tests) as
+        # chunks of about split_chunk (--split-chunk) instructions
+        self.split, self.split_min, self.split_chunk = set(), 0, 3000
         # --vlocal all|HEX,...: the V registers of these functions live in locals (vrN_) instead of the real Ctx
         # (rt.h LCtx::v is a reference to it, so every c->v[N] write was a store and every read a load), synced at the
         # X registers' LSO / LSI points (Emitter.lctx_sync). None = off, True = every function, else a set of starts.
@@ -424,6 +427,12 @@ class Emitter:
         last = insns[-1][2] if insns else ''
         if last not in ('ret', 'b', 'br'):
             items.append((end, self.tail(end, end), False))
+        if ((start in self.split or self.split_min and len(insns) >= self.split_min) and start not in self.hooks
+                and start not in self.timed and start not in self.trace and start not in self.alias
+                and not self.vlocal_on(start) and not (self.lctx_mem and len(insns) >= self.lctx_mem)):
+            split = self.split_text(start, items, labels)
+            if split is not None:
+                return split
         codes = self.lctx_sync([it[0] for it in items], [it[1] for it in items], [it[2] for it in items])
         body = [f'rt_trace(cx, IMGBASE + {start:#x}ull, 0);'] if start in self.trace else []
         for (a, _, _), code in zip(items, codes):
@@ -453,6 +462,83 @@ class Emitter:
                     f'rt_time(IMGBASE + {start:#x}ull, __builtin_ia32_rdtsc() - t_); }}\n'
                     f'__attribute__((noinline)) void {FN}{start:x}_t(Ctx* __restrict cx) {{\n' + text + '\n}\n' + fwd)
         return f'void {FN}{start:x}(Ctx* __restrict cx) {{\n' + text + '\n}\n' + fwd
+
+    def vlocal_on(self, start):
+        return self.vlocal is True or bool(self.vlocal) and start in self.vlocal
+
+    # --split: a giant guest function (one C++ function of 18-32k lines) cost clang superlinear time and memory: f_5346a0
+    # at -O1 526 s and 2.3 GB, InstCombine 180 s and the register coalescer 113 s of it, in that one function (setup-fast
+    # 2026-11-02; 16 of them were 30% of a cold key's compile CPU and, 3 at a time on a 16 GB PC, the end of its build).
+    # Split, the function is static chunks of about split_chunk instructions, cut between instructions (where one does
+    # not fall through, when one is near): the same instruction code, labels and LSO / LSI dataflow within a chunk (each
+    # chunk loads its LCtx from the Ctx on entry, as a function does). A branch or a jump-table case to a label of
+    # another chunk becomes an LSO of every register that may have changed (never the --lso-abi drop: the function goes
+    # on), the entry number of that label in the Ctx's unused x[31] (rt.h: xzr reads are emitted as 0, sp lives in.sp),
+    # and a musttail call of that chunk, which switches on it to the label: guest state and stack depth as before, the
+    # caller's return address untouched. f_<off> stays the guest entry (ftab, calls, hooks' names): it sets entry 0 and
+    # tail-calls chunk 0. The whole text stays one block from f_<off>'s line to a bare `}`: the chunks f_<off>_c<k>
+    # follow it, each declared inside the functions that call it and ending on `} // <name>`, so tusplit.py moves the
+    # block whole and a tool that cuts f_<off> out of a TU gets every chunk; build.py's giant_of counts each chunk alone
+    # (a split giant is no giant). Measured on the v0.1.7 image at -O1, chunks of 3000: the 17 of build.py's SPLIT_FUNCS
+    # 6.8-44.8 s and <= 0.45 GB each (f_5346a0: 41.8 s instead of 526 s and 2.3 GB).
+    LABEL_GOTO = re.compile(r'goto L_([0-9a-f]+);')
+    def split_text(self, start, items, labels):
+        n, C = len(items), self.split_chunk
+        cuts = [0]
+        for i in range(1, n):
+            run = i - cuts[-1]
+            if run >= C and (not items[i - 1][2] or run >= C + C // 4) and n - i >= C // 4:
+                cuts.append(i)
+        if len(cuts) == 1:
+            return None
+        chunk_of = {}
+        for k, (b, e) in enumerate(zip(cuts, cuts[1:] + [n])):
+            for i in range(b, e):
+                chunk_of[items[i][0]] = k
+        name = lambda k: f'{FN}{start:x}_c{k}'
+        entries = [{} for _ in cuts]          # per chunk: label address -> entry number (x[31])
+        entries[0][start] = 0
+        def entry(t):
+            e = entries[chunk_of[t]]
+            return e.setdefault(t, len(e))
+        jumps = 0
+        def to(t, k):
+            nonlocal jumps
+            j = chunk_of[t]
+            if j == k:
+                return f'goto L_{t:x};'
+            jumps += 1
+            return f'{{ LSO; (*cx).x[31] = {entry(t)}; [[clang::musttail]] return {name(j)}(cx); }}'
+        chunks = []
+        for k, (b, e) in enumerate(zip(cuts, cuts[1:] + [n])):
+            addrs, codes, falls = [], [], []
+            for a, code, fall in items[b:e]:
+                addrs.append(a)
+                codes.append(self.LABEL_GOTO.sub(lambda m: to(int(m.group(1), 16), k), code))
+                falls.append(fall)
+            if e < n and falls[-1]:           # falls into the next chunk
+                addrs.append(-1)
+                codes.append(to(items[e][0], k))
+                falls.append(False)
+            chunks.append((addrs, codes, falls))
+        decl = ' '.join(f'void {name(k)}(Ctx* __restrict);' for k in range(len(cuts)))
+        out = [f'void {FN}{start:x}(Ctx* __restrict cx) {{\n'
+               f'{decl} (*cx).x[31] = 0; [[clang::musttail]] return {name(0)}(cx);\n'
+               f'}} // {len(cuts)} chunks\n']
+        for k, (addrs, codes, falls) in enumerate(chunks):
+            codes = self.lctx_sync(addrs, codes, falls)
+            sw =' '.join(f'case {i}: goto L_{a:x};' for a, i in sorted(entries[k].items(), key=lambda x: x[1]))
+            body = [decl, f'switch ((*cx).x[31]) {{ {sw} default: __builtin_unreachable(); }}']
+            for a, code in zip(addrs, codes):
+                if a != -1 and (a in labels or a in entries[k]):
+                    body.append(f'L_{a:x}:;')
+                body.append(f'/*{a:x}*/ {code}' if a != -1 else code)
+            out.append(f'void {name(k)}(Ctx* __restrict cx) {{\n' + self.prologue(start) + '\n'.join(body)
+                       + ('\n}\n' if k == len(chunks) - 1 else f'\n}} // {name(k)}\n'))
+        self.stats['split_funcs'] += 1
+        self.stats['split_chunks'] += len(cuts)
+        self.stats['split_jumps'] += jumps
+        return ''.join(out)
 
     # Registers live in an LCtx local (runtime/rt.h): `c` is that local inside generated functions, `cx` the real Ctx.
     # LSO (before a call / return / trap) writes back the registers that may have changed since the last sync on any
@@ -550,6 +636,8 @@ class Emitter:
         callee = m.group(1)
         t = None
         if callee and callee.startswith(FN) and not callee.startswith(IMP):
+            if not re.fullmatch(r'[0-9a-f]+', callee[len(FN):]):
+                return False      # (no function start, e.g. a --split chunk: never called so, kept safe)
             t = int(callee[len(FN):], 16)
         elif m.re is self.ABI_CALL and m.group(2):
             t = int(m.group(2), 16)
@@ -1800,6 +1888,7 @@ def main():
     global IMGBASE, FN, IMP, TAB
     only = None; tu_insns = 60000; plt_all = False; trace = set(); hooks = set(); timed = set(); alias = {}
     lctx_mem = 0; lctx_keep = set(); vlocal = None; lso_abi_file = None
+    split, split_min, split_chunk = set(), 0, 3000
     args = sys.argv[4:]
     for i, x in enumerate(args):
         if x == '--only': only = [int(v, 16) for v in args[i + 1].split(',')]
@@ -1822,6 +1911,12 @@ def main():
         # giant single functions: LCtx kept in memory from N guest instructions up, except --lctx-keep's (hot)
         if x == '--lctx-mem': lctx_mem = int(args[i + 1])
         if x == '--lctx-keep': lctx_keep = {int(v, 16) for v in args[i + 1].split(',')}
+        # giant single functions as chunks (Emitter.split_text): these (hex offsets), or min=N: every function of N+
+        # guest instructions (tests); --split-chunk: about C instructions a chunk
+        if x == '--split':
+            v = args[i + 1]
+            split_min, split = (int(v[4:]), set()) if v.startswith('min=') else (0, {int(h, 16) for h in v.split(',')})
+        if x == '--split-chunk': split_chunk = int(args[i + 1])
         # V registers in locals (Emitter.vlocal): every function, or these
         if x == '--vlocal': vlocal = True if args[i + 1] == 'all' else {int(v, 16) for v in args[i + 1].split(',')}
         # call sites / callees that keep x9-x18 and NZCV at their LSO (abi_scan.py's file; the module's section)
@@ -1876,6 +1971,7 @@ def main():
     em.vdirect = vdirect
     em.fcfuse = fcfuse
     em.lctx_mem, em.lctx_keep = lctx_mem, lctx_keep
+    em.split, em.split_min, em.split_chunk = split, split_min, split_chunk
     em.vlocal = vlocal
     if lso_abi_file: em.lso_abi = load_lso_abi(lso_abi_file, 'sdk' if FN == 's_' else 'main')
     em.fz = fz

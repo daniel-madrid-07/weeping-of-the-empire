@@ -1208,6 +1208,8 @@ static bool in_event() {   // (rt_main's on_crash is vectored: without the guard
     pc_fault_guard(0);
     return r;
 }
+// (totk_hooks.c: graphics.cutscene_aspect = 16:9 frames events in the ultrawide canvas's middle 16:9; present thread)
+extern "C" int pc_in_event(void) { return in_event() ? 1 : 0; }
 
 // The game's own input cuts: the pause manager's reasons, read here with the totk_input_reason, under the fault
 // guard as in_event's. Any -1 (the table unread, a hash not in it) is unknown: the 250 ms fallback, never "clear".

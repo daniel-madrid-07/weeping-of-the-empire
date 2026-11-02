@@ -19,7 +19,7 @@ from games.totk.patches.sites_v100 import (ACTOR_LOD_SITE, ASPECT_SITES, BOUNCE_
                                            DP_SHADOW_FIXED, DP_SHADOW_SCALE, DP_SIM_RADIUS, DP_TERRAIN_LOD, DYNRES_SITE, FOV_SITES, LOD_SITES,
                                            MOUSE_SITE, MOUSE_STALE, PC_CAPTURED, PC_CLAIMED, PC_MOUSE_X, SHADOW_SITE, SIM_SITE,
                                            FOV_MAX, TERRAIN_CTX_SP, TERRAIN_LOD_MORPH_FIRST, TERRAIN_LOD_MORPH_FLAG,
-                                           TERRAIN_LOD_MORPH_PAIR, TERRAIN_LOD_THRESHOLD)
+                                           TERRAIN_LOD_MORPH_PAIR, TERRAIN_LOD_THRESHOLD, DP_TEMP_UNIT, TEMP_UNIT_SITE)
 
 from .common import DATA, STACK, bits, get_s, machine, reg_s
 
@@ -445,9 +445,32 @@ def sim_radius(original, patched):
     return out
 
 
+def tempunit(original, patched):
+    """The map readout's unit: w8 = the language index, the flags handed to the b.eq at site + 4 decide Fahrenheit.
+    Slot 0 and anything above 2: the game's own (eq only for index 1); 1: never; 2: always. x9 is the scratch."""
+    out = []
+    Z = 1 << 30
+    for slot in (0, 1, 2, 3, 0xffffffff):
+        got = []
+        for lang in (0, 1, 2, 5, 15):
+            for name, image in (('patched', patched), ('original', original)):
+                mu = machine(image, _page(unit=(DP_TEMP_UNIT, '<I', slot)))
+                mu.reg_write(UC_ARM64_REG_X8, lang)
+                mu.emu_start(TEMP_UNIT_SITE, TEMP_UNIT_SITE + 4, count=16)
+                assert mu.reg_read(UC_ARM64_REG_PC) == TEMP_UNIT_SITE + 4, f'{name}: did not come back to the b.eq'
+                assert mu.reg_read(UC_ARM64_REG_W8) == lang and mu.reg_read(UC_ARM64_REG_SP) == STACK + 0x4000, name
+                eq = bool(mu.reg_read(UC_ARM64_REG_NZCV) & Z)
+                want = (lang == 1) if name == 'original' or slot not in (1, 2) else (slot == 2)
+                assert eq == want, (name, slot, lang, eq, want)
+                if name == 'patched':
+                    got.append('F' if eq else 'C')
+        out.append(f'slot {slot:#x}: languages 0/1/2/5/15 -> {"".join(got)}')
+    return out
+
+
 def verify(original, patched):
     results = []
-    for fn in (highfps, output_res, render_res, aspect, dynres, fov, shadowres, lod, mouse, actor_lod, terrain_lod, sim_radius):
+    for fn in (highfps, output_res, render_res, aspect, dynres, fov, shadowres, lod, mouse, actor_lod, terrain_lod, sim_radius, tempunit):
         try:
             results.append(dict(name=fn.__name__, status='pass', cases=fn(original, patched)))
         except AssertionError as e:

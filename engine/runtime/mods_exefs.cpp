@@ -11,7 +11,9 @@
 // A file is all or nothing: its data writes wait with its code writes.
 //
 // Cheats: the data cheats run in hle_cheat_vm.inc (nxr_cheat_program), switched in the F10 Cheats tab (saved as
-// cheats.on, ids '|' separated), live. A cheat made only of stores into main's code joins the code patches instead.
+// cheats.on, ids '|' separated), live. A cheat made only of stores into main's code joins the code patches instead, on
+// or off: the build holds a switch site for it (gen_ext.py: its words or the game's, by nxr_code_switch), so once the exe
+// holds it, its switch works at once too (as the rival's rt_patch_switch).
 //
 // Rules after totk-pc-recomp (runtime/mods.c, runtime/cheats.c, tools/exefs_patches.py; MIT License,
 // Copyright (c) 2026 Valiantsin Dzerakh).
@@ -22,6 +24,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -58,7 +61,15 @@ struct CheatRow {
     exefs::Cheat c;
     std::string id;   // FNV-1a 32 of "<mod>/<name>"
     bool on = false;
+    int slot = -1;    // a code cheat's switch (nxr_code_switch), -1 none
 };
+
+// The code cheats' switches: every code cheat of a mod on is built in (on or off) as a switch site (gen_ext.py), its
+// words or the game's by this flag, so the F10 switch works at once once the exe holds it. Slots in scan order: the
+// exe's slots are this scan's only when its set is this scan's (g_live).
+constexpr int MAX_SWITCHES = 4096;
+std::atomic<uint8_t> g_switch[MAX_SWITCHES];
+bool g_live = false;                  // the exe was built with this scan's set: the switches are the cheats'
 
 std::mutex g_mu;
 bool g_image = false;                 // main is in memory (mods_exefs_start); the hook checks nothing before
@@ -66,7 +77,8 @@ exefs::Image g_im;                    // main's layout (img/main.json), at MAIN_
 bool g_early = false;                 // the hook ran before that (a scan from elsewhere first: said in the log)
 std::vector<exefs::Site> g_port;      // the port's own patch sites (TOTK_IMG/patches.json)
 std::vector<Mod> g_mods;              // this scan's mods, in order
-std::vector<exefs::File> g_files;     // their ExeFS files for this build (and the code cheats switched on), in order
+std::vector<exefs::File> g_files;     // their ExeFS files for this build (and their code cheats), in order
+int g_slots = 0;                      // code cheats in g_files (their switch slots 0..)
 std::vector<std::string> g_file_ids;  // per g_files: "file <id> <content>" / "cheat <id> <content>"
 std::vector<CheatRow> g_cheats;
 std::set<std::string> g_cheats_on;    // cheats.on
@@ -231,10 +243,12 @@ void scan_mod(nxr_mod &m) {
                 r.id = fnv32(m.name + "/" + c.name);
                 r.on = g_cheats_on.count(r.id) > 0;
                 if (!c.master) m.cheats_count++;
-                if (md.on && r.on && r.c.kind == exefs::Cheat::CODE) {   // a code cheat joins the code patches
+                // a code cheat joins the code patches, on or off: its switch site is built in, switched live
+                if (md.on && r.c.kind == exefs::Cheat::CODE && g_slots < MAX_SWITCHES) {
                     exefs::File f;
                     f.mod = m.name; f.rel = "cheats/" + fname + " [" + c.name + "]"; f.kind = exefs::File::CODE;
                     f.code = r.c.code;
+                    f.slot = r.slot = g_slots++;
                     g_files.push_back(f);
                     std::string words((const char *)c.words.data(), c.words.size() * 4);
                     g_file_ids.push_back("cheat " + r.id + " " + fnv32(words));
@@ -258,7 +272,8 @@ void note_mod(nxr_mod &m, const Mod &md) {
     for (int i = md.first; i < md.first + md.files; i++) {
         const exefs::File &f = g_files[i];
         if (f.kind == exefs::File::DATA) data_only++;
-        else if (f.kind == exefs::File::CODE) (g_built_ids.count(g_file_ids[i]) ? in_use : waiting)++;
+        else if (f.kind == exefs::File::CODE && !g_built_ids.count(g_file_ids[i])) waiting++;
+        else if (f.kind == exefs::File::CODE && f.slot < 0) in_use++;   // (a code cheat built in: its F10 switch says)
         else if (f.kind != exefs::File::EMPTY && left_out.empty()) left_out = file_note(f);
     }
     if (in_use + data_only) parts.push_back(fmt_n(PC_T("%d ExeFS patches in use"), in_use + data_only));
@@ -271,7 +286,7 @@ void note_mod(nxr_mod &m, const Mod &md) {
     if (!left_out.empty()) parts.push_back(fmt(PC_T("left out: %s"), left_out));
     if (!m.cheats.empty()) {
         if (m.cheats_count) parts.push_back(fmt_n(PC_T("%d cheats (F10 Cheats tab)"), m.cheats_count));
-        else parts.push_back(fmt(PC_T("no cheat file for this game version (%s.txt)"), "082CE09B06E33A12"));
+        else parts.push_back(fmt(PC_T("no cheat file for this game version (%s)"), exefs::cheat_file_of_build()));
     }
     std::string note;
     for (auto &p : parts) note += (note.empty() ? "" : "; ") + p;
@@ -282,11 +297,20 @@ void note_mod(nxr_mod &m, const Mod &md) {
 void hook(std::vector<nxr_mod> &list) {
     std::lock_guard<std::mutex> l(g_mu);
     g_mods.clear(); g_files.clear(); g_file_ids.clear(); g_cheats.clear();
+    g_slots = 0;
     g_early = !g_image;
     std::vector<nxr_mod *> scanned;
     for (auto &m : list)
         if (m.problem != NXR_MOD_DUPLICATE && m.problem != NXR_MOD_BAD_NAME) scan_mod(m), scanned.push_back(&m);
+    for (auto &r : g_cheats) {   // a code cheat left out (it overlaps a file higher in the list): greyed, with why
+        if (r.slot < 0) continue;
+        for (auto &f : g_files)
+            if (f.slot == r.slot && f.kind != exefs::File::CODE) {
+                r.c.kind = exefs::Cheat::BAD; r.c.note = f.note; r.c.arg = f.arg; r.slot = -1;
+            }
+    }
     const std::string set = exefs::set_hash(exefs::code_set(g_files));
+    g_live = g_image && set == g_built && !set.empty();
     std::error_code ec;
     g_failed.clear();
     if (set != g_built && fs::exists(g_exe_dir / "exefs" / (set.empty() ? "none" : set) / "failed.txt", ec))
@@ -426,13 +450,15 @@ void mods_exefs_start(const char *img_dir) {
     size_t b = mj.find("\"build_id\"");
     size_t q = b == std::string::npos ? b : mj.find('"', mj.find(':', b) + 1);
     exefs::Image im;
-    if (q == std::string::npos || !exefs::same_build(mj.substr(q + 1, 40)) || !exefs::image_layout(mj, im)) {
+    const char *bid = q == std::string::npos ? nullptr : exefs::known_build(mj.substr(q + 1, 40));
+    if (!bid || !exefs::image_layout(mj, im)) {
         mods_exefs_hook = nullptr;
         return;
     }
     im.bytes = (const uint8_t *)MAIN_BASE;
     {
         std::lock_guard<std::mutex> l(g_mu);
+        exefs::g_bid = bid;   // (the files and cheats this build takes: its version's, by name)
         g_im = im;
         g_exe_dir = exe_dir();
         load_built();
@@ -458,15 +484,19 @@ void mods_exefs_start(const char *img_dir) {
     int files = 0;
     size_t bytes = 0;
     for (auto &f : g_files) {
+        if (f.slot >= 0) continue;   // (a code cheat: its switch, below; main's bytes stay the game's)
         if (f.kind == exefs::File::DATA || (f.kind == exefs::File::CODE && built)) {
             for (auto *w : {&f.code, &f.data})
                 for (auto &[off, v] : *w) { ((uint8_t *)MAIN_BASE)[off] = v; bytes++; }
             files++;
         }
     }
+    int switches = 0;
+    for (auto &r : g_cheats)
+        if (g_live && r.slot >= 0) g_switch[r.slot].store(r.on, std::memory_order_relaxed), switches++;
     if (any_files)
-        printf("[exefs] %d patch files applied (%zu bytes), code set %s, exe built with %s%s\n", files, bytes,
-               set.empty() ? "none" : set.c_str(), g_built.empty() ? "none" : g_built.c_str(),
+        printf("[exefs] %d patch files applied (%zu bytes), %d code cheats switchable, code set %s, exe built with %s%s\n",
+               files, bytes, switches, set.empty() ? "none" : set.c_str(), g_built.empty() ? "none" : g_built.c_str(),
                built ? "" : g_failed.empty() ? " (code patches not used: no build command)" : " (code patches not used: their build failed)");
     if (!g_cheats.empty()) printf("[exefs] %zu cheats\n", g_cheats.size());
     load_program();
@@ -482,7 +512,8 @@ std::vector<nxr_cheat> mods_cheats() {
         c.usable = r.c.kind != exefs::Cheat::BAD;
         c.code = r.c.kind == exefs::Cheat::CODE;
         if (!c.usable) c.note = fmt(r.c.note.c_str(), r.c.arg);
-        else if (c.code) c.note = pc_tr("It changes the game's code: the game is rebuilt with it at the next start.");
+        else if (c.code && !(g_live && r.slot >= 0))
+            c.note = pc_tr("It changes the game's code: the game is rebuilt with it at the next start.");
         out.push_back(c);
     }
     return out;
@@ -499,8 +530,14 @@ void mods_cheat_set(int i, bool on) {
         std::string v;
         for (auto &id : g_cheats_on) v += (v.empty() ? "" : "|") + id;
         pc_settings_raw_set("cheats.on", v.empty() ? nullptr : v.c_str());
-        if (r.c.kind == exefs::Cheat::CODE) mods_need_restart("a cheat that changes the game's code");
-        else load_program();
+        if (r.c.kind != exefs::Cheat::CODE) load_program();
+        else if (g_live && r.slot >= 0) g_switch[r.slot].store(on, std::memory_order_relaxed);   // (built in: at once)
+        else mods_need_restart("a cheat that changes the game's code");
         return;
     }
+}
+
+// the generated code's read of a switch site's flag (gen_ext.py ExtEmitter.switched; a C++ declaration there)
+int nxr_code_switch(unsigned slot) {
+    return slot < (unsigned)MAX_SWITCHES && g_switch[slot].load(std::memory_order_relaxed);
 }

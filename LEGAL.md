@@ -1,17 +1,24 @@
 # Legal notes
 
-- **No game content.** This repository holds no code, data, assets, text, shaders, keys or firmware from any console
-  or game, and no decompiled game code. What it holds about the game is what a patch needs to find its place:
-  function addresses, offsets, structure offsets, the names of the game's own files, functions and UI panes those
-  patches touch, and the values a layout edit checks before it writes. The game's instructions a patch replaces are
-  checked by a SHA-256 of them, never stored: they are read from your own dump. Where a hook changes what a game
-  function does, our code describes and redoes that behaviour itself. Our own menu labels use the names the game gives
-  its controls and abilities, so players recognise them. `.gitignore` refuses the game's file formats.
+- **No game content.** This repository holds no code, data, assets, text, shaders, keys or firmware from any console or
+  game, and no decompiled game code. What it holds about the game is what a patch needs to find its place: function
+  addresses, offsets, structure offsets, the names of the game's own files, functions and UI panes those patches touch,
+  and the values a layout edit checks before it writes. The game's instructions a patch replaces are checked by a
+  SHA-256 of them, never stored: they are read from your own dump. Where a hook changes what a game function does, our
+  code describes and redoes that behaviour itself. Our own menu labels use the names the game gives its controls and
+  abilities, so players recognise them. It also holds tables for later game versions, `pins_v*.json` and
+  `fields_v*.json` (1.0.0 needs none): offsets, sizes and hashes of the game's code with parts masked, and short notes
+  in our own words, with no instructions, text or names from the game. The builder checks each entry against your own
+  copy and leaves that hook out, with a line in the log, when it does not match. `.gitignore` refuses the game's file
+  formats.
 - **Your own copy only.** The builder needs what you dump from your own console: the game (version 1.0.0), the keys
   file and, optionally, the firmware (only its Korean and Chinese fonts are used; without it a Windows font stands
   in). On your PC it decrypts and extracts the game with your keys,
   recompiles its code and builds the playable folder; everything it makes stays in the work folder next to this
-  repository. The keys file is passed on as a path: it is never printed, copied or uploaded.
+  repository. The keys file is passed on as a path: it is never printed, copied or uploaded. When the game reads its
+  data straight from your dump (since v0.1.8), the install keeps the one key that data needs in
+  `work\extracted\v100\romfs-source.txt`: it is made from your keys on your PC, never printed, kept out of the
+  game's logs and crash reports, and never uploaded. Do not share that file or the install folder.
 - **The optimisation profile (optional).** The builder downloads, from this project's releases, a profile for
   profile-guided optimisation that we made by running the game on our own PC (LLVM's profile format). It holds function
   names, a hash of each function's control flow, how many times each of its branches ran, which function each indirect

@@ -177,6 +177,7 @@ struct Xf {
 };
 Xf screen_xf(u64 scr) {
     Xf x{};
+    if (!ptr_ok(scr)) return x;
     const u64 di = rd<u64>(scr + kScrDrawInfo);
     if (!ptr_ok(di)) return x;
     memcpy(x.p, reinterpret_cast<const void*>(static_cast<uintptr_t>(di + kDiProj)), sizeof x.p);
@@ -245,9 +246,10 @@ Focus focus_now() {
 // pointer (parts panes can be several items wide: mc_tabs1). (t: x, y are device coordinates, tested through the
 // screen's draw transform; lw, lh: the layout's size.)
 template <class F> void for_nodes(u64 scr, int* count, F&& f) {
+    *count = 0;
+    if (!ptr_ok(scr)) return;
     const u64 head = scr + kScrNodes;
     const s32 off = rd<s32>(head + 0x14);
-    *count = 0;
     if (off < 0 || off > 0x40) return;
     for (u64 link = rd<u64>(head + 8); link != head; link = rd<u64>(link + 8)) {
         if (!ptr_ok(link) || ++*count > 512) return;
@@ -354,6 +356,7 @@ TotkBox box_of(u64 pane) {
 // The screen's layout size (the bflyt's; 1920 x 1080 when it cannot be read)
 void layout_size(u64 scr, float* lw, float* lh) {
     *lw = 1920, *lh = 1080;
+    if (!ptr_ok(scr)) return;
     const u64 lyt = rd<u64>(scr + kScrLayout);
     if (!ptr_ok(lyt)) return;
     const float w = rd<float>(lyt + kLytSize), h = rd<float>(lyt + kLytSize + 4);
@@ -459,6 +462,7 @@ int hover_blocked(u64 scr, u64 node, u64 sc, bool stale) {
 // screen, when a pointer finds no item there
 void dump_nodes(u64 scr) {
     static u64 dumped[16];
+    if (!ptr_ok(scr)) return;
     for (u64 d : dumped) if (d == scr) return;
     for (u64& d : dumped) if (!d) { d = scr; break; }
     const Xf t = screen_xf(scr);
@@ -494,6 +498,7 @@ void dump_nodes(u64 scr) {
 // The screen's layout name, for the log
 void layout_name(u64 scr, char* out, size_t n) {
     snprintf(out, n, "?");
+    if (!ptr_ok(scr)) return;
     const u64 lyt = rd<u64>(scr + kScrLayout), name = ptr_ok(lyt) ? rd<u64>(lyt + kLytName) : 0;
     if (name < 0x10000 || name >= (1ull << 47)) return;
     memcpy(out, reinterpret_cast<const void*>(static_cast<uintptr_t>(name)), n - 1);
@@ -509,6 +514,8 @@ void layout_name(u64 scr, char* out, size_t n) {
 constexpr u64 kPouchSlideList = 0x1e0, kSlideElements = 0x58, kElemLayout = 0x20;
 constexpr u64 kPouchMgrGot = totk_main(0x455db58), kPouchActiveTab = 0x18c;
 bool is_pouch(u64 scr) {   // (cached by the screen and its layout: a freed screen's address can come back as another)
+    // (no screen, e.g. focus_now in the frame the pouch closes, with a tab walk still on: v0.1.7 crashed reading 0x28)
+    if (!ptr_ok(scr)) return false;
     static u64 yes, yes_lyt, no, no_lyt;
     const u64 lyt = rd<u64>(scr + kScrLayout);
     if (scr == yes && lyt == yes_lyt) return true;
@@ -521,6 +528,7 @@ bool is_pouch(u64 scr) {   // (cached by the screen and its layout: a freed scre
     return p;
 }
 bool is_options(u64 scr) {   // System > Options (the same cache as is_pouch)
+    if (!ptr_ok(scr)) return false;
     static u64 yes, yes_lyt, no, no_lyt;
     const u64 lyt = rd<u64>(scr + kScrLayout);
     if (scr == yes && lyt == yes_lyt) return true;
@@ -562,6 +570,7 @@ int options_arrow_at(u64 scr, float x, float y, u64* at) {
 // The tab whose icon is under (x, y) (the pouch screen's layout coordinates), -1 if none. The icons' parts panes
 // are 316 wide, 80 apart (mc_tabs1: they overlap), so the nearest centre wins, within half the spacing.
 int tab_at(u64 pouch, float x, float y) {
+    if (!ptr_ok(pouch)) return -1;
     const u64 slide = rd<u64>(pouch + kPouchSlideList);
     if (!ptr_ok(slide)) return -1;
     float cx[9], cy[9], hh[9];
@@ -587,7 +596,7 @@ int tab_at(u64 pouch, float x, float y) {
 // Tests (verbose): the tab icons' boxes, once per pouch screen
 void dump_tabs(u64 pouch) {
     static u64 done;
-    if (done == pouch) return;
+    if (!ptr_ok(pouch) || done == pouch) return;
     done = pouch;
     const u64 slide = rd<u64>(pouch + kPouchSlideList);
     printf("[menu-cursor]   pouch tabs (slide list %#llx):\n", (unsigned long long)slide);
@@ -617,6 +626,7 @@ int active_tab() {
 // The pouch's item popup (the action window) is open: UIPouchScreen +0x1f0 mpPa_ActionWindow_00 -> its layout
 // (+0x20) -> LayoutEx +0x91 mAnimState non-zero, the game's own test
 bool pouch_popup_open(u64 pouch) {
+    if (!ptr_ok(pouch)) return false;
     const u64 win = rd<u64>(pouch + 0x1f0), lyt = ptr_ok(win) ? rd<u64>(win + 0x20) : 0;
     return ptr_ok(lyt) && rd<u8>(lyt + 0x91) != 0;
 }
@@ -1545,6 +1555,7 @@ bool move_focus(const Focus& f, u64 node) {
         if (ptr_ok(bm)) MoveBoxCursor(bm, node);
         return false;
     }
+    if (!ptr_ok(f.control) || !ptr_ok(f.screen)) return false;   // (the menu closed: no focus to move)
     wr<u64>(f.control + kCtlReserved, node);   // = BoxCursorMgr::moveBoxCursor
     wr<u64>(f.screen + kScrReserved, node);
     // (a locked OR keeps a bit eui sets at the same moment; eui's own plain read-modify-write of the byte can still
@@ -1580,7 +1591,8 @@ u64 walk_step(const Focus& f, ULONGLONG now) {
     Walk& w = g_walk;
     if (w.to < 0) return 0;
     const int cur = walk_cur(w.kind);
-    const bool there = w.kind == 0 ? is_pouch(f.screen) : g_pad_open.load();
+    // (the inventory closed mid-walk: no focus screen; v0.1.7 crash 11-02 15:25)
+    const bool there = w.kind == 0 ? f.screen && is_pouch(f.screen) : g_pad_open.load();
     // (the Purah Pad's page reads -1 in a page switch's focus gap: wait, within the time limits)
     const bool unknown = cur < 0 && w.kind == 1;
     bool waiting = w.phase == 0 && w.presses > 0 && (cur == w.last || unknown);

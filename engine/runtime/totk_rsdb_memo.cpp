@@ -44,9 +44,11 @@ namespace {
 
 constexpr size_t kMaxName = 256;   // longer names (none in the table) go to the original
 
-std::atomic<u64> g_gen{1};          // bumped before and after each mutator
-std::atomic<int> g_in_mutator{0};   // mutators running now: no answer is kept meanwhile
-std::atomic<long long> g_hits{0}, g_misses{0}, g_bypass{0}, g_mismatch{0}, g_loads{0};
+// (the generation, read by every getRow on every guest thread, has its cache line to itself: the counters below are
+// written only while TOTK_RSDB_MEMO_STATS=1 or verify mode counts, so a hit writes no shared line)
+alignas(64) std::atomic<u64> g_gen{1};   // bumped before and after each mutator
+std::atomic<int> g_in_mutator{0};       // mutators running now: no answer is kept meanwhile
+alignas(64) std::atomic<long long> g_hits{0}, g_misses{0}, g_bypass{0}, g_mismatch{0}, g_loads{0};
 
 int memo_mode() {
     static const int m = [] {
@@ -64,10 +66,19 @@ int memo_mode() {
 
 struct Hash {
     using is_transparent = void;
-    size_t operator()(std::string_view s) const noexcept {   // FNV-1a
-        u64 h = 0xcbf29ce484222325ull;
-        for (unsigned char ch : s) h = (h ^ ch) * 0x100000001b3ull;
-        return (size_t)h;
+    size_t operator()(std::string_view s) const noexcept {   // 8 bytes a step (byte-wise FNV-1a was ~4 cycles a byte)
+        const char* p = s.data();
+        size_t n = s.size();
+        u64 h = 0x9e3779b97f4a7c15ull ^ n, w;
+        for (; n >= 8; p += 8, n -= 8) {
+            memcpy(&w, p, 8);
+            h = (h ^ w) * 0xbf58476d1ce4e5b9ull;
+            h ^= h >> 31;
+        }
+        w = 0;
+        memcpy(&w, p, n);
+        h = (h ^ w) * 0x94d049bb133111ebull;
+        return (size_t)(h ^ (h >> 29));
     }
 };
 struct Eq {
@@ -82,9 +93,15 @@ struct Cache {
 thread_local Cache t_cache;
 
 // TOTK_RSDB_MEMO_STATS=1: a summary line every 2^20 getRow calls
-void stats_line() {
+bool stats_on() {
     static const bool on = [] { const char* e = getenv("TOTK_RSDB_MEMO_STATS"); return e && e[0] == '1'; }();
-    if (!on) return;
+    return on;
+}
+void count(std::atomic<long long>& n, int mode) {   // (only when something reads it: the stats line, verify mode)
+    if (mode == 2 || stats_on()) n.fetch_add(1, std::memory_order_relaxed);
+}
+void stats_line() {
+    if (!stats_on()) return;
     static std::atomic<long long> calls{0};
     if ((calls.fetch_add(1, std::memory_order_relaxed) & 0xfffff) != 0xfffff) return;
     printf("[rsdb-memo] getRow: %lld hits, %lld misses, %lld bypassed, %lld mismatches; %lld table loads\n",
@@ -150,7 +167,7 @@ void hook_f_b6afc8(Ctx* __restrict c) {
         }
     }
     if (!name || n == kMaxName) {
-        g_bypass.fetch_add(1, std::memory_order_relaxed);
+        count(g_bypass, mode);
         return f_b6afc8_orig(c);
     }
     const std::string_view k(key, 8 + n);
@@ -161,7 +178,7 @@ void hook_f_b6afc8(Ctx* __restrict c) {
         cache.gen = gen;
     }
     if (const auto it = cache.rows.find(k); it != cache.rows.end()) {
-        g_hits.fetch_add(1, std::memory_order_relaxed);
+        count(g_hits, mode);
         if (mode == 2) {
             f_b6afc8_orig(c);
             if (c->x[0] != it->second && g_mismatch.fetch_add(1) < 20)
@@ -173,7 +190,7 @@ void hook_f_b6afc8(Ctx* __restrict c) {
         c->x[0] = it->second;
         return;
     }
-    g_misses.fetch_add(1, std::memory_order_relaxed);
+    count(g_misses, mode);
     f_b6afc8_orig(c);
     if (g_gen.load(std::memory_order_acquire) == gen && g_in_mutator.load(std::memory_order_acquire) == 0)
         cache.rows.emplace(std::string(k), c->x[0]);

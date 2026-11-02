@@ -1,7 +1,9 @@
-// pc_text.cpp: pc_tr (pc_text.h). One table, English -> Spanish (pc_text_es.inc: PC_ES("English", "Español") lines,
-// made and checked by tools/engine/check_texts.py), looked up by the English text itself, so a row's label, help and
-// choice names need no ids; a text the table lacks shows in English. The few texts every player meets in any language
-// (the first start's shader pass, the restart notice) have the game's other languages too (pc_text_langs.inc).
+// pc_text.cpp: pc_tr (pc_text.h). A table per language, English -> its text, looked up by the English text itself, so a
+// row's label, help and choice names need no ids; a text a table lacks shows in English. Spanish (pc_text_es.inc,
+// PC_ES lines: every text has one, tools/engine/check_texts.py), Russian, Brazilian Portuguese and Simplified Chinese
+// (pc_text_ru.inc / _pt / _zh, PC_TR lines, pc-ui 11-02); pc_ui_lang (pc_lang.cpp) picks one. The few texts every
+// player meets in any language (the first start's shader pass, the restart notice) have the game's other languages too
+// (pc_text_langs.inc).
 #include "pc_text.h"
 #include "pc_lang.h"
 
@@ -18,11 +20,35 @@ const Pair kEs[] = {
 #undef PC_ES
     {nullptr, nullptr}};
 
-const std::unordered_map<std::string_view, const char *> &table() {
-    static const auto t = [] {
-        std::unordered_map<std::string_view, const char *> m;
-        for (const Pair *p = kEs; p->en; p++) m.emplace(p->en, p->es);
-        return m;
+const Pair kRu[] = {
+#define PC_TR(en, t) {en, t},
+#include "pc_text_ru.inc"
+    {nullptr, nullptr}};
+const Pair kPt[] = {
+#include "pc_text_pt.inc"
+    {nullptr, nullptr}};
+const Pair kZh[] = {
+#include "pc_text_zh.inc"
+#undef PC_TR
+    {nullptr, nullptr}};
+
+using Table = std::unordered_map<std::string_view, const char *>;
+Table make(const Pair *p) {
+    Table m;
+    for (; p->en; p++) m.emplace(p->en, p->es);
+    return m;
+}
+// the table of the port's texts' language (pc_ui_lang), null: English
+const Table *table() {
+    static const Table *t = [] {
+        const char *ui = pc_ui_lang();
+        static Table m;
+        if (!strcmp(ui, "es")) m = make(kEs);
+        else if (!strcmp(ui, "ru")) m = make(kRu);
+        else if (!strcmp(ui, "pt")) m = make(kPt);
+        else if (!strcmp(ui, "zh-Hans")) m = make(kZh);
+        else return (const Table *)nullptr;
+        return (const Table *)&m;
     }();
     return t;
 }
@@ -66,12 +92,16 @@ const char *tr_langs(int li, const char *en) {
 
 }  // namespace
 
+extern "C" void pc_tr_each(void (*fn)(const char *text, void *ctx), void *ctx) {
+    if (const Table *t = table())
+        for (const auto &e : *t) fn(e.second, ctx);
+}
+
 extern "C" const char *pc_tr(const char *en) {
     if (!en) return en;
-    if (pc_lang_es()) {
-        const auto &t = table();
-        auto it = t.find(en);
-        return it == t.end() ? en : it->second;
+    if (const Table *t = table()) {
+        auto it = t->find(en);
+        if (it != t->end()) return it->second;
     }
     return tr_langs(lang_index(), en);
 }

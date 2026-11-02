@@ -51,6 +51,9 @@ void tegra_deswizzle(const uint8_t *src, uint8_t *dst, uint32_t wb, uint32_t hb,
                      uint32_t block_height_log2, uint32_t block_depth_log2);
 void tegra_swizzle(const uint8_t *src, uint8_t *dst, uint32_t wb, uint32_t hb, uint32_t d, uint32_t bpb,
                    uint32_t block_height_log2, uint32_t block_depth_log2);
+// Byte offset of byte xb of block row y in a depth-1 block-linear surface wb blocks of bpb bytes wide (the 16 bytes from
+// a multiple of 16 are contiguous): textures.c's CPU-read targets copy each such run to its address.
+uint64_t tegra_block_linear_offset(uint32_t xb, uint32_t y, uint32_t wb, uint32_t bpb, uint32_t block_height_log2);
 // Bytes [x0, x0 + nx) of block rows [y0, y0 + ny) of slices [z0, z0 + nz) of a block-linear surface (wb x hb x d blocks
 // of bpb bytes) to (to_surface) or from linear data whose row y of slice z is at lin + z * is + y * rs: the region
 // alone, at its swizzled addresses (texels_rw used to deswizzle and reswizzle the whole level around each write).

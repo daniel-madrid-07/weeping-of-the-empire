@@ -818,7 +818,9 @@ static void profile_threads(int samples, int ms) {
 static std::atomic<uint64_t> g_hitch_req;   // (frame ms x 10) << 32 | (other ms x 10); 0 = none pending
 static std::atomic<uint64_t> g_hitch_frame;
 static bool g_hitch_on;
+extern "C" void hle_evring_hitch(u64 frame, double other_ms);   // (hle_os_thread.cpp: TOTK_EVRING_DUMP=hitch)
 extern "C" void rt_hitch_dump(uint64_t frame, double ms, double other_ms) {
+    hle_evring_hitch(frame, other_ms);
     if (!g_hitch_on) return;
     uint64_t v = (uint64_t)(ms * 10) << 32 | (uint32_t)(other_ms > 0 ? other_ms * 10 : 0), z = 0;
     if (!v) v = 1;
@@ -1015,7 +1017,8 @@ static void hitch_thread() {
     }
 }
 #else
-extern "C" void rt_hitch_dump(uint64_t, double, double) {}
+extern "C" void hle_evring_hitch(u64 frame, double other_ms);   // (hle_os_thread.cpp: TOTK_EVRING_DUMP=hitch)
+extern "C" void rt_hitch_dump(uint64_t frame, double, double other_ms) { hle_evring_hitch(frame, other_ms); }
 // Linux: TOTK_PROF / TOTK_WATCHDOG sampling needs SuspendThread + GetThreadContext (and a PE module list): not available. The
 // watchdog still lists every guest thread's HLE position and guest backtrace below; for host profiles use `perf record -g`.
 static void profile_threads(int samples, int ms) {
@@ -1131,10 +1134,123 @@ static void print_stats() {
     for (auto& [n, i] : top) printf("  %10llu %s%s\n", n, g_hle[i] ? "" : "UNIMPL ", g_imp_names[i]);
 }
 
+#ifdef _WIN32
+// The log's size (a player on a Pentium G4600 + RX 550: several MB in minutes). When stdout is a file (the launcher's
+// totk-*.log, a boot's totk.log) and no diagnostic asks for everything (LARECOMP_VK_PROF, LARECOMP_HITCH_MS,
+// TOTK_HITCH_STACKS, uncapped as before), it is held under TOTK_LOG_CAP_MB (default 32; 0 = no cap): once over, its newest
+// quarter of the cap moves down behind the first half and a marker line, so the file keeps its start (PC, settings,
+// loading) and the latest play. Checked every 2 s on its own thread, with stdout and stderr locked and flushed while the
+// file changes (both write through the same handle: launcher.c hStdOutput = hStdError).
+static void log_cap_start() {
+    const char* pe = getenv("LARECOMP_VK_PROF");
+    if ((pe && strcmp(pe, "0")) || getenv("LARECOMP_HITCH_MS") || getenv("TOTK_HITCH_STACKS")) return;
+    const char* e = getenv("TOTK_LOG_CAP_MB");
+    const long long cap = (e ? atoll(e) : 32) << 20;
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (cap <= 0 || !h || h == INVALID_HANDLE_VALUE || GetFileType(h) != FILE_TYPE_DISK) return;
+    wchar_t path[MAX_PATH * 2];
+    if (!GetFinalPathNameByHandleW(h, path, MAX_PATH * 2, 0)) return;
+    // (the launcher's handle is write-only: the newest part is read through a second handle; both share read and write)
+    HANDLE r = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (r == INVALID_HANDLE_VALUE) { printf("[log] no size cap: the log cannot be read back (error %lu)\n", GetLastError()); return; }
+    std::thread([h, r, cap] {
+        const long long head = cap / 2, tail = cap / 4;
+        std::vector<char> buf;
+        long long dropped = 0;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            LARGE_INTEGER sz;
+            if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= cap) continue;
+            // The newest `tail` bytes are read first, unlocked (a cold HDD: tens of ms): the file only grows meanwhile, and
+            // the read handle has its own file pointer. Under the lock only what was appended since is read, then the
+            // writes (positioned writes on stdout's synchronous handle move its file pointer: printf must not run then) and
+            // the truncation.
+            const long long from = sz.QuadPart - tail;
+            buf.resize((size_t)tail);
+            OVERLAPPED ro = {}; ro.Offset = (DWORD)from; ro.OffsetHigh = (DWORD)(from >> 32);
+            DWORD got = 0;
+            bool ok = ReadFile(r, buf.data(), (DWORD)tail, &got, &ro) && got;
+            _lock_file(stdout); _lock_file(stderr);
+            fflush(stdout); fflush(stderr);
+            LARGE_INTEGER sz1;
+            if (ok && GetFileSizeEx(h, &sz1) && sz1.QuadPart > from + (long long)got) {   // (appended while reading)
+                const long long more = sz1.QuadPart - (from + (long long)got);
+                buf.resize((size_t)got + (size_t)more);
+                OVERLAPPED ro2 = {}; ro2.Offset = (DWORD)(from + got); ro2.OffsetHigh = (DWORD)((from + (long long)got) >> 32);
+                DWORD got2 = 0;
+                ok = ReadFile(r, buf.data() + got, (DWORD)more, &got2, &ro2) && got2 == (DWORD)more;
+                got += got2;
+            }
+            if (ok) {
+                size_t start = 0;   // (from the next line start)
+                while (start < got && buf[start] != '\n') start++;
+                if (start < got) start++;
+                dropped += from + (long long)start - head;
+                char mark[256];
+                // (CRLF as the CRT's text-mode stdout writes around it)
+                const int mn = snprintf(mark, sizeof mark, "\r\n[log] -------- the log reached its %lld MB cap (TOTK_LOG_CAP_MB): %.1f MB "
+                                        "of it dropped here so far; the newest part follows --------\r\n", cap >> 20, dropped / 1048576.0);
+                DWORD put = 0;
+                OVERLAPPED wo = {}; wo.Offset = (DWORD)head; wo.OffsetHigh = (DWORD)(head >> 32);
+                ok = WriteFile(h, mark, (DWORD)mn, &put, &wo) && put == (DWORD)mn;
+                const long long at = head + mn;
+                OVERLAPPED wo2 = {}; wo2.Offset = (DWORD)at; wo2.OffsetHigh = (DWORD)(at >> 32);
+                ok = ok && WriteFile(h, buf.data() + start, (DWORD)(got - start), &put, &wo2) && put == got - start;
+                LARGE_INTEGER end; end.QuadPart = at + (long long)(got - start);
+                ok = ok && SetFilePointerEx(h, end, nullptr, FILE_BEGIN) && SetEndOfFile(h);
+                fseek(stdout, 0, SEEK_END); fseek(stderr, 0, SEEK_END);   // (the CRT's positions: the new end)
+            }
+            _unlock_file(stderr); _unlock_file(stdout);
+            if (!ok) { printf("[log] size cap stopped: the log could not be rewritten (error %lu)\n", GetLastError()); return; }
+        }
+    }).detach();
+}
+#endif
+
+// Fleet test mode (TOTK_FLEET=1, ram-diet 2026-11-02; never a player default): a movie plays, no crash, menus, mods) at
+// the smallest RAM / VRAM such a check needs, so more of them fit on one PC. Every knob below is only a default: a
+// variable the caller set wins. Timed boots and perf measurements never set it (they keep the real settings). Elsewhere:
+// no DLSS / frame generation (ngx.c, the NGX DLL is not loaded), 2 precompile workers at most (exec.c pc_start_workers).
+extern "C" int rt_fleet(void) {
+    static int f = -1;
+    if (f < 0) { const char* e = getenv("TOTK_FLEET"); f = e && *e && strcmp(e, "0") != 0; }
+    return f;
+}
+static void fleet_apply() {
+    if (!rt_fleet()) return;
+    static const char* const kv[][2] = {
+        {"TOTK_RES_SCALE", "0.5"},               // 800 x 450 scene targets (a graphics.render_scale row beats it: boot.py drops the row)
+        {"NX_SET_GRAPHICS_SHADOW_SCALE", "1"},   // the renderer's shadow targets at the game's own size (default 2: 4x the bytes),
+        {"TOTK_SHADOW_SCALE", "1"},              // over a settings row, and without the rows (no overlay)
+        {"LARECOMP_VRAM_BUDGET_MB", "3072"},     // residency parks / evicts idle textures past it (textures.c vk_residency_tick)
+        {"LARECOMP_VK_RECYCLE_MB", "128"},       // the freed-image pool (else 512 MB to 3 GB of VRAM room)
+        {"LARECOMP_VMA_SPARE", "0"},             // no emptied 256 MB image blocks kept as spares (shim_vma.c)
+        {"LARECOMP_VK_RING_IDLE_MS", "5000"},    // the transient ring's extra chunks given back after 5 s, not 60
+        {"LARECOMP_MIRROR_IDLE_S", "10"},        // VRAM mirror blocks unbound for 10 s freed, not 30
+        {"TOTK_PRECOMPILE_ARCHIVE", "spirv"},    // the archive's shaders translated, not warmed into pipelines at the title:
+                                                 // each pipeline is made when first drawn (quick from the shared pipeline cache)
+    };
+    char set[512] = "";
+    for (const auto& e : kv) {
+        const bool had = getenv(e[0]) != nullptr;
+#ifdef _WIN32
+        if (!had) _putenv_s(e[0], e[1]);
+#else
+        if (!had) setenv(e[0], e[1], 0);
+#endif
+        snprintf(set + strlen(set), sizeof set - strlen(set), " %s=%s%s", e[0], had ? getenv(e[0]) : e[1], had ? " (caller's)" : "");
+    }
+    printf("[fleet] test mode (TOTK_FLEET=1): no DLSS / frame generation, at most 2 precompile workers (the first-start pass aside),%s\n", set);
+}
 int main(int argc, char** argv) {
     rt_uptime_s();
     setvbuf(stdout, nullptr, _IOFBF, 1 << 16);
+#ifdef _WIN32
+    log_cap_start();
+#endif
     pc_crash_install();   // nxrecomp: TOTK_PC_CRASH=1 crash reports + minidumps, from here on (on_crash comes later)
+    fleet_apply();        // (before anything reads the variables it sets)
     // Idle priority class by default: test runs shared the PC with the user's video playback and made its audio crackle
     // (user 2026-10-14). TOTK_PRIORITY=normal opts out (e.g. for clean perf measurements) and sets the normal class
     // outright: a child inherits BELOW_NORMAL / IDLE from its parent, so "not lowered" still meant a game at the builds'

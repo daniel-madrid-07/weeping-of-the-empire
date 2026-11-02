@@ -123,37 +123,5 @@ HLE_AS(oe_PopNotificationMessage, "_ZN2nn2oe22PopNotificationMessageEv") {   // 
     g_messages.pop_front();
 }
 
-// ---- nn::nfp (amiibo): a Switch with no NFC reader found (integration's gap audit, row 5; the frozen runtime's
-// hle_oe.c:198-273 is the reference, all 14 symbols main.elf imports). Without them GetState stayed 0 (NonInitialized)
-// after Initialize, and Attach left the game's SystemEventType unset: a WaitSystemEvent on it (the amiibo menu) read an
-// event never made; and with GetState 1 alone ListDevices / Mount / StartDetection would fall to x0 = 0 ("success") with
-// their outputs unwritten. Now Initialize -> Initialized (1), the availability event is a real one never signalled,
-// ListDevices finds no device and every device call answers "device not found".
-void hle_sysevent_init(u64 ev, bool autoclear);   // hle_os_thread.cpp
-static constexpr u32 kNfpDeviceNotFound = 0x8073;   // nfp module 115, description 64
-static std::atomic<u32> g_nfp_state{0};
-HLE_AS(nfp_Initialize, "_ZN2nn3nfp10InitializeEv") { g_nfp_state = 1; c->x[0] = 0; }
-HLE_AS(nfp_Finalize, "_ZN2nn3nfp8FinalizeEv") { g_nfp_state = 0; c->x[0] = 0; }
-HLE_AS(nfp_GetState, "_ZN2nn3nfp8GetStateEv") { c->x[0] = g_nfp_state.load(); }   // 0 NonInitialized, 1 Initialized
-HLE_AS(nfp_ListDevices, "_ZN2nn3nfp11ListDevicesEPNS0_12DeviceHandleEPii") {   // (DeviceHandle* out, int* count, int max)
-    if (c->x[1]) *(s32*)c->x[1] = 0;
-    c->x[0] = kNfpDeviceNotFound;
-}
-HLE_AS(nfp_AttachAvailabilityChangeEvent, "_ZN2nn3nfp29AttachAvailabilityChangeEventEPNS_2os15SystemEventTypeE") {
-    if (c->x[0]) hle_sysevent_init(c->x[0], false);
-    printf("[nfp] availability event %llx: no NFC reader, never signalled\n", (unsigned long long)c->x[0]);
-}
-HLE_AS(nfp_GetDeviceState, "_ZN2nn3nfp14GetDeviceStateERKNS0_12DeviceHandleE") { c->x[0] = 0; }   // DeviceState_Init
-// (no device is ever listed, so a handle reaching these is none of ours)
-HLE_AS(nfp_Mount, "_ZN2nn3nfp5MountERKNS0_12DeviceHandleENS0_9ModelTypeENS0_11MountTargetE") { c->x[0] = kNfpDeviceNotFound; }
-HLE_AS(nfp_GetNpadId, "_ZN2nn3nfp9GetNpadIdEPjRKNS0_12DeviceHandleE") { c->x[0] = kNfpDeviceNotFound; }
-HLE_AS(nfp_AttachActivateEvent, "_ZN2nn3nfp19AttachActivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE") {
-    c->x[0] = kNfpDeviceNotFound;
-}
-HLE_AS(nfp_AttachDeactivateEvent, "_ZN2nn3nfp21AttachDeactivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE") {
-    c->x[0] = kNfpDeviceNotFound;
-}
-HLE_AS(nfp_StartDetection, "_ZN2nn3nfp14StartDetectionERKNS0_12DeviceHandleE") { c->x[0] = kNfpDeviceNotFound; }
-HLE_AS(nfp_StopDetection, "_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE") { c->x[0] = kNfpDeviceNotFound; }
-HLE_AS(nfp_GetTagInfo, "_ZN2nn3nfp10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE") { c->x[0] = kNfpDeviceNotFound; }
-HLE_AS(nfp_GetModelInfo, "_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE") { c->x[0] = kNfpDeviceNotFound; }
+// ---- nn::nfp (amiibo): pc_amiibo.cpp (one virtual reader, the player's dumps from F10 > Amiibo; was a Switch with
+// no NFC reader here until rival-parity, 2026-11-02)

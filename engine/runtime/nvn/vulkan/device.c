@@ -1,5 +1,6 @@
 // Vulkan device, window, swapchain and presentation (counterpart of the window/present half of metal.m).
 #include <SDL3/SDL.h>
+#include <ctype.h>
 #include <SDL3/SDL_vulkan.h>
 #include <math.h>
 #include <pthread.h>
@@ -16,6 +17,7 @@
 #include "../shim/las.h"  // TotK: was ../../ui/menu.h
 #include "vk.h"
 #include "../../pc_overlay.h"
+#include "../../pc_settings.h"   // (graphics.shader_wait: the held-frame limit, vi_present below)
 #include "../output_scale.h"
 #include "../../pc.h"     // nxrecomp: F12 screenshots
 #include "../../cpu_place.h"   // nxrecomp: the cache saver on the helper cores
@@ -124,6 +126,8 @@ static void vk_pipeline_cache_prefetch(void) {   // (ui_window_init, once: creat
 }
 #ifdef _WIN32
 extern int shim_file_replace(const char *src, const char *dst);         // (shim_win.c: MoveFileEx, replace existing)
+extern void *shim_file_map_new(const char *path, size_t size, void **handle);
+extern int shim_file_map_done(void *view, void *handle, size_t keep);
 extern void shim_remove_old_files(const char *pattern, int min_age_s);
 #else
 #include <glob.h>
@@ -142,6 +146,10 @@ size_t g_vk_pcache_loaded;   // bytes of cache/vk_pipelines.bin the driver accep
 extern uint32_t vk_archive_warm_snapshot(void);
 extern void vk_archive_warm_commit(uint32_t n);
 #include "../shim/las.h"  // TotK: was ../renderer.h
+
+// pc_window.cpp's graphics.shader_wait row changed (its apply, any thread): the present re-reads it
+static volatile bool g_shader_wait_dirty = true;
+void vk_shader_wait_changed(void) { g_shader_wait_dirty = true; }
 
 VkG g_vk;
 static SDL_Window *window;
@@ -197,6 +205,109 @@ _Noreturn static void gpu_unsupported(const char *gpu, const char *what) {
     _exit((int)0x47505530u);   // "GPU0"
 }
 
+// The driver's CPU memory (amd-compat, public #25 RX 6600 / #23 Vega 7: our commit climbed from 6 to 26 GB on 16 GB
+// PCs while our device memory stayed flat, and no line said whose it was): counting allocation callbacks at
+// vkCreateInstance / vkCreateDevice. Objects made with no allocator use their parent's where the driver does so (AMD's
+// does); a driver that ignores them counts 0. Per allocation scope, plus the allocations the driver only reports
+// (internal: executable code), in the [hostmem] line (vk_driver_mem_line). LARECOMP_VK_ALLOC_COUNT=0: none, as before.
+typedef struct { void *base; size_t size; uint32_t scope; } VkaHdr;
+static _Atomic long long vka_scope[5], vka_total, vka_peak, vka_blocks, vka_internal;
+static void vka_add(uint32_t scope, long long d) {
+    atomic_fetch_add(&vka_scope[scope], d);
+    long long t = atomic_fetch_add(&vka_total, d) + d, p = atomic_load(&vka_peak);
+    while (t > p && !atomic_compare_exchange_weak(&vka_peak, &p, t)) {}
+}
+static void *VKAPI_PTR vka_alloc(void *ud, size_t size, size_t align, VkSystemAllocationScope scope) {
+    (void)ud;
+    if (align < 16) align = 16;
+    unsigned char *base = malloc(size + sizeof(VkaHdr) + align - 1);
+    if (!base) return NULL;
+    uintptr_t p = ((uintptr_t)base + sizeof(VkaHdr) + align - 1) & ~(uintptr_t)(align - 1);
+    VkaHdr *h = (VkaHdr *)p - 1;
+    h->base = base, h->size = size, h->scope = (uint32_t)scope <= 4 ? (uint32_t)scope : 1;
+    vka_add(h->scope, (long long)size);
+    atomic_fetch_add(&vka_blocks, 1);
+    return (void *)p;
+}
+static void VKAPI_PTR vka_free(void *ud, void *mem) {
+    (void)ud;
+    if (!mem) return;
+    VkaHdr *h = (VkaHdr *)mem - 1;
+    vka_add(h->scope, -(long long)h->size);
+    atomic_fetch_sub(&vka_blocks, 1);
+    free(h->base);
+}
+static void *VKAPI_PTR vka_realloc(void *ud, void *orig, size_t size, size_t align, VkSystemAllocationScope scope) {
+    if (!orig) return vka_alloc(ud, size, align, scope);
+    if (!size) { vka_free(ud, orig); return NULL; }
+    void *n = vka_alloc(ud, size, align, scope);
+    if (!n) return NULL;   // (the original stays valid)
+    size_t old = ((VkaHdr *)orig - 1)->size;
+    memcpy(n, orig, old < size ? old : size);
+    vka_free(ud, orig);
+    return n;
+}
+static void VKAPI_PTR vka_inote(void *ud, size_t size, VkInternalAllocationType t, VkSystemAllocationScope s) {
+    (void)ud, (void)t, (void)s;
+    atomic_fetch_add(&vka_internal, (long long)size);
+}
+static void VKAPI_PTR vka_ifree(void *ud, size_t size, VkInternalAllocationType t, VkSystemAllocationScope s) {
+    (void)ud, (void)t, (void)s;
+    atomic_fetch_sub(&vka_internal, (long long)size);
+}
+static const VkAllocationCallbacks vka_cb = {.pfnAllocation = vka_alloc, .pfnReallocation = vka_realloc, .pfnFree = vka_free,
+                                             .pfnInternalAllocation = vka_inote, .pfnInternalFree = vka_ifree};
+static const VkAllocationCallbacks *vka(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_VK_ALLOC_COUNT"); on = !e || strcmp(e, "0") != 0; }
+    return on ? &vka_cb : NULL;
+}
+// "driver CPU allocations: X MB live (command, object, cache, device, instance), peak, blocks; internal" (the
+// [hostmem] line; "off" when LARECOMP_VK_ALLOC_COUNT=0)
+void vk_driver_mem_line(char *out, size_t n) {
+    if (!vka()) { snprintf(out, n, "driver CPU allocations: not counted (LARECOMP_VK_ALLOC_COUNT=0)"); return; }
+    const double mb = 1024.0 * 1024;
+    snprintf(out, n, "driver CPU allocations: %.0f MB live (command %.0f, object %.0f, cache %.0f, device %.0f, instance %.0f), "
+             "peak %.0f MB, %lld blocks; driver internal %.0f MB", atomic_load(&vka_total) / mb, atomic_load(&vka_scope[0]) / mb,
+             atomic_load(&vka_scope[1]) / mb, atomic_load(&vka_scope[2]) / mb, atomic_load(&vka_scope[3]) / mb,
+             atomic_load(&vka_scope[4]) / mb, atomic_load(&vka_peak) / mb, atomic_load(&vka_blocks), atomic_load(&vka_internal) / mb);
+}
+
+// The device's memory heaps and types, once (AMD reports: whether resizable BAR is on decides where host-visible
+// buffers can go; without it the device-local host-visible heap is 256 MB, #25). Flags: DL device-local, HV host-visible,
+// HC host-coherent, CA host-cached, LZ lazily allocated, P protected, AC / AU AMD device-coherent / uncached.
+static void log_memory_layout(void) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    char b[1024];
+    int o = 0;
+    uint64_t big_dl = 0;
+    for (uint32_t h = 0; h < mp.memoryHeapCount && o < (int)sizeof b - 64; h++) {
+        const bool dl = mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+        if (dl && mp.memoryHeaps[h].size > big_dl) big_dl = mp.memoryHeaps[h].size;
+        o += snprintf(b + o, sizeof b - o, "%s%u: %llu MB%s", h ? "; " : "", h, (unsigned long long)(mp.memoryHeaps[h].size >> 20),
+                      dl ? " device-local" : "");
+    }
+    LOG("[vk] memory heaps %s\n", b);
+    o = 0;
+    uint64_t bar = 0;
+    for (uint32_t t = 0; t < mp.memoryTypeCount && o < (int)sizeof b - 64; t++) {
+        const VkMemoryPropertyFlags f = mp.memoryTypes[t].propertyFlags;
+        const uint32_t h = mp.memoryTypes[t].heapIndex;
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && mp.memoryHeaps[h].size > bar)
+            bar = mp.memoryHeaps[h].size;
+        o += snprintf(b + o, sizeof b - o, "%s%u heap %u%s%s%s%s%s%s%s%s", t ? ", " : "", t, h,
+                      f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? " DL" : "", f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? " HV" : "",
+                      f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? " HC" : "", f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? " CA" : "",
+                      f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT ? " LZ" : "", f & VK_MEMORY_PROPERTY_PROTECTED_BIT ? " P" : "",
+                      f & VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD ? " AC" : "", f & VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD ? " AU" : "");
+    }
+    LOG("[vk] memory types %s\n", b);
+    LOG("[vk] host-visible VRAM: %s\n", g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated GPU (shared memory)"
+        : !bar ? "none" : bar * 10 >= big_dl * 9 ? "all of it (resizable BAR on)"
+        : bar <= (256ull << 20) ? "a 256 MB window (resizable BAR off)" : "part of it (a larger BAR window)");
+}
+
 // LARECOMP_VK_VALIDATION=1: Khronos validation layer (MSYS2 package vulkan-validation-layers)
 static void create_instance(void) {
     Uint32 n_sdl = 0;
@@ -215,13 +326,13 @@ static void create_instance(void) {
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
-    VkResult r = vkCreateInstance(&ci, NULL, &g_vk.inst);
+    VkResult r = vkCreateInstance(&ci, vka(), &g_vk.inst);
     if (r != VK_SUCCESS && validate) {
         LOG("[vk] validation layer unavailable (%d); continuing without\n", r);
         ci.enabledLayerCount = 0;
         ci.enabledExtensionCount--;
         validate = false;
-        r = vkCreateInstance(&ci, NULL, &g_vk.inst);
+        r = vkCreateInstance(&ci, vka(), &g_vk.inst);
     }
     if (r != VK_SUCCESS) {
         char why[96];
@@ -302,13 +413,54 @@ static const char *device_unfit(VkPhysicalDevice pd, const VkPhysicalDevicePrope
 
 // The best device that can run the game: discrete first, then integrated, then anything else (a software driver last);
 // LARECOMP_GPU=<index> picks one (if it can run the game). None can: the message box, naming the best one and why.
+// The GPUs that can run the game, by name, in the order the driver lists them (pc-ui's graphics GPU row: its choices,
+// written back to LARECOMP_GPU by name): filled by pick_device; vk_gpu_names returns how many (0 before the device).
+#define GPU_NAMES_MAX 8
+static char g_gpu_names[GPU_NAMES_MAX][VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+static int g_gpu_nnames;
+int vk_gpu_names(const char **out, int max) {
+    int n = g_gpu_nnames < max ? g_gpu_nnames : max;
+    for (int i = 0; i < n; i++) out[i] = g_gpu_names[i];
+    return n;
+}
+static bool gpu_name_match(const char *name, const char *want, bool part) {   // (case-insensitive: whole, or contained)
+    size_t nl = strlen(name), wl = strlen(want);
+    for (size_t at = 0; at + wl <= nl; at++) {
+        size_t k = 0;
+        while (k < wl && tolower((unsigned char)name[at + k]) == tolower((unsigned char)want[k])) k++;
+        if (k == wl && (part || (at == 0 && wl == nl))) return true;
+        if (!part) break;
+    }
+    return false;
+}
 static void pick_device(void) {
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(g_vk.inst, &n, NULL);
     if (!n) gpu_unsupported(NULL, "the Vulkan driver lists no GPU");
     VkPhysicalDevice *pd = calloc(n, sizeof *pd);
     vkEnumeratePhysicalDevices(g_vk.inst, &n, pd);
-    int want = getenv("LARECOMP_GPU") ? atoi(getenv("LARECOMP_GPU")) : -1, best = -1, best_score = -1, rej_score = -1;
+    // LARECOMP_GPU: an index in the driver's list (as before), or a GPU's name (whole, case-insensitive; else the first
+    // whose name contains it): the index of a GPU moves when a driver or another GPU changes, its name does not
+    const char *wg = getenv("LARECOMP_GPU");
+    int want = -1, best = -1, best_score = -1, rej_score = -1;
+    if (wg && *wg) {
+        char *end = NULL;
+        long v = strtol(wg, &end, 10);
+        if (end && *end == 0) want = (int)v;
+        else {
+            int part = -1;
+            for (uint32_t i = 0; i < n && want < 0; i++) {
+                VkPhysicalDeviceProperties p;
+                vkGetPhysicalDeviceProperties(pd[i], &p);
+                if (gpu_name_match(p.deviceName, wg, false)) want = (int)i;
+                // (either way round: pc-ui's row stores Windows' (DXGI) adapter name, which a driver could report longer or
+                // shorter than its Vulkan deviceName)
+                else if (part < 0 && (gpu_name_match(p.deviceName, wg, true) || (p.deviceName[0] && gpu_name_match(wg, p.deviceName, true)))) part = (int)i;
+            }
+            if (want < 0) want = part;
+            if (want < 0) LOG("[vk] LARECOMP_GPU=%s: no GPU of that name: automatic\n", wg);
+        }
+    }
     uint32_t best_q = UINT32_MAX;
     char rej_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = "", rej_why[128] = "";
     for (uint32_t i = 0; i < n; i++) {
@@ -327,6 +479,7 @@ static void pick_device(void) {
             continue;
         }
         if (score > best_score) { best_score = score; best = (int)i; best_q = q; }
+        if (g_gpu_nnames < GPU_NAMES_MAX) snprintf(g_gpu_names[g_gpu_nnames++], sizeof g_gpu_names[0], "%s", p.deviceName);
     }
     if (best < 0) gpu_unsupported(rej_name, rej_why);
     if (want >= 0 && best != want) LOG("[vk] LARECOMP_GPU=%d cannot run the game: using gpu %d\n", want, best);
@@ -554,6 +707,13 @@ static void create_device(void) {
     // depth-format colour targets: one copy instead of image -> buffer -> image). LARECOMP_NO_MAINT8=1: off.
     g_vk.maint8 = has_ext(ep, ne, VK_KHR_MAINTENANCE_8_EXTENSION_NAME) && !getenv("LARECOMP_NO_MAINT8");
     if (g_vk.maint8) ext[n_ext++] = VK_KHR_MAINTENANCE_8_EXTENSION_NAME;
+    // VK_EXT_image_2d_view_of_3d (public #16 teleport): a shader's 2D lookup on a 3D texture reads its slice 0, as Maxwell's
+    // 2D instruction on a 3D texture header does (textures.c vk_view); without it such a slot got the dummy view. Link's
+    // warp dissolve discards against an 8x8x8 pattern sampled that way, so he vanished at once. LARECOMP_NO_2D_OF_3D=1: off.
+    // LARECOMP_2D_OF_3D=copy: the fallback without the extension (textures.c slice_twin_view), to check it on a GPU that has it
+    const char *v23 = getenv("LARECOMP_2D_OF_3D");
+    g_vk.view2d_of_3d = has_ext(ep, ne, VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME) && !getenv("LARECOMP_NO_2D_OF_3D") && !(v23 && !strcmp(v23, "copy"));
+    if (g_vk.view2d_of_3d) ext[n_ext++] = VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME;
     vk_present_device_exts(ep, ne, ext, &n_ext);   // present.c: present id / wait, HDR metadata (when used)
     vk_ngx_device_exts(ep, ne, ext, &n_ext, 40);   // ngx.c: what DLSS asks for on this GPU (TOTK_DLSS only)
     free(ep);
@@ -578,7 +738,15 @@ static void create_device(void) {
     if (g_vk.maint5) { have_m5.pNext = have13.pNext; have13.pNext = &have_m5; }
     VkPhysicalDeviceMaintenance8FeaturesKHR have_m8 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     if (g_vk.maint8) { have_m8.pNext = have13.pNext; have13.pNext = &have_m8; }
+    VkPhysicalDeviceImage2DViewOf3DFeaturesEXT have_v23 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT};
+    if (g_vk.view2d_of_3d) { have_v23.pNext = have13.pNext; have13.pNext = &have_v23; }
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    if (g_vk.view2d_of_3d && !(have_v23.image2DViewOf3D && have_v23.sampler2DViewOf3D)) {
+        g_vk.view2d_of_3d = false;
+        drop_ext(ext, &n_ext, VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME);
+    }
+    LOG("[vk] 2D views of 3D textures (a 2D lookup on a 3D texture reads slice 0): %s\n", g_vk.view2d_of_3d ? "on (2D views)"
+          : getenv("LARECOMP_NO_2D_OF_3D") ? "off (LARECOMP_NO_2D_OF_3D: dummy view)" : "no extension: a 2D copy of the slice (textures.c)");
     if (g_vk.maint5 && !have_m5.maintenance5) { g_vk.maint5 = false; drop_ext(ext, &n_ext, VK_KHR_MAINTENANCE_5_EXTENSION_NAME); }
     if (g_vk.maint8 && !have_m8.maintenance8) { g_vk.maint8 = false; drop_ext(ext, &n_ext, VK_KHR_MAINTENANCE_8_EXTENSION_NAME); }
     extern bool maxwell_vs_pointsize;
@@ -623,8 +791,12 @@ static void create_device(void) {
         VkShaderStageFlags narrow = p13.minSubgroupSize < 32 ? sg_used & ~g_vk.sg32_stages : 0;
         LOG("[vk] subgroups %u..%u wide: warp ops required 32 wide in stages 0x%x, wave-safe forms elsewhere%s\n", p13.minSubgroupSize,
             p13.maxSubgroupSize, g_vk.sg32_stages, narrow ? "" : " (every stage covered)");
-        if (narrow) LOG("[vk] warning: stages 0x%x may run subgroups narrower than 32: shaders with warp ops (vote / ballot / shuffle / "
-                        "lane masks) are wrong there\n", narrow);
+        // (Intel: VS / FS run 8 or 16 wide, only compute pins. hdr's census of the 2026-11-02 seed: the 63 VS / FS programs
+        // with warp ops use quad xor 1 / 2, ballot leader election, votes and the min-pc loop, all correct at any width >= 4;
+        // the one 32-lane reduction (xor 1..16) is compute, pinned)
+        if (narrow) LOG("[vk] note: stages 0x%x may run subgroups narrower than 32 (not pinnable there): their warp ops run in the "
+                        "wave-safe forms; a shuffle across lanes 16-31 or a 32-lane reduction there would be wrong (none in TotK's "
+                        "shader seed)\n", narrow);
     }
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
@@ -664,6 +836,9 @@ static void create_device(void) {
     if (g_vk.maint5) { m5f.pNext = f13.pNext; f13.pNext = &m5f; }
     VkPhysicalDeviceMaintenance8FeaturesKHR m8f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR, .maintenance8 = VK_TRUE};
     if (g_vk.maint8) { m8f.pNext = f13.pNext; f13.pNext = &m8f; }
+    VkPhysicalDeviceImage2DViewOf3DFeaturesEXT v23f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT,
+                                                       .image2DViewOf3D = VK_TRUE, .sampler2DViewOf3D = VK_TRUE};
+    if (g_vk.view2d_of_3d) { v23f.pNext = f13.pNext; f13.pNext = &v23f; }
     f13.pNext = vk_present_features(f13.pNext);
     // vendor binary = the driver's own GPU crash dump (NVIDIA 617: supported), saved by vk_device_fault_report
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
@@ -687,6 +862,11 @@ static void create_device(void) {
     b->depthBiasClamp = h->depthBiasClamp;
     b->depthClamp = h->depthClamp;
     b->largePoints = h->largePoints;
+    // Occlusion queries with exact sample counts (public #16, the camera recognised nothing): without
+    // VK_QUERY_CONTROL_PRECISE_BIT a driver may answer any non-zero value for "some samples passed" (a binary
+    // occlusion query: 1 NVIDIA counts anyway). LARECOMP_OQ_PRECISE=0: off (the old non-precise queries).
+    g_vk.oq_precise = h->occlusionQueryPrecise && !(getenv("LARECOMP_OQ_PRECISE") && *getenv("LARECOMP_OQ_PRECISE") == '0');
+    b->occlusionQueryPrecise = g_vk.oq_precise;
     b->wideLines = h->wideLines;
     b->imageCubeArray = h->imageCubeArray;
     b->sampleRateShading = h->sampleRateShading;
@@ -694,8 +874,10 @@ static void create_device(void) {
     b->vertexPipelineStoresAndAtomics = h->vertexPipelineStoresAndAtomics;
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
-    extern int contact_strength(void);   // (contact.c: asked for only with TOTK_CONTACT_SHADOWS on; the default device as before)
-    g_vk.storage_ext = h->shaderStorageImageExtendedFormats && contact_strength() > 0;
+    // (contact.c: the B10G11R11 scene colour as a storage image. Asked for wherever the GPU has it, since the row is
+    // live and a device's features are fixed at its creation; the feature alone changes nothing: STORAGE usage is given
+    // only while contact shadows are on, textures.c)
+    g_vk.storage_ext = h->shaderStorageImageExtendedFormats;
     b->shaderStorageImageExtendedFormats = g_vk.storage_ext;
     g_vk.fill_nonsolid = h->fillModeNonSolid;   // (exec.c: wireframe draws fill without it)
     g_vk.dual_src_blend = h->dualSrcBlend;      // (exec.c: SRC1 blend factors fall back to SRC0's)
@@ -729,7 +911,7 @@ static void create_device(void) {
                                   .queueCount = nqueue, .pQueuePriorities = prio};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
-    VkResult dr = vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev);
+    VkResult dr = vkCreateDevice(g_vk.phys, &di, vka(), &g_vk.dev);
     if (dr != VK_SUCCESS) {   // (which request: every feature bit above is a queried one, so this names the culprit kind)
         char el[2048] = "";
         for (uint32_t i = 0, o = 0; i < n_ext && o < sizeof el - 80; i++) o += (uint32_t)snprintf(el + o, sizeof el - o, " %s", ext[i]);
@@ -740,6 +922,7 @@ static void create_device(void) {
         snprintf(why, sizeof why, "its driver refused the device the game needs (vkCreateDevice %d)", dr);
         gpu_unsupported(g_vk.props.deviceName, why);
     }
+    log_memory_layout();
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
     VkQueue pq = VK_NULL_HANDLE;
     if (nqueue == 2) vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 1, &pq);
@@ -838,11 +1021,34 @@ void vk_pipeline_cache_save(void) {
         pthread_mutex_unlock(&pcache_save_lock);
         return;
     }
+    mkdir("cache", 0755);
+    char tmp[96];
+    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", pcache_file(), (unsigned long)getpid());
+#ifdef _WIN32
+    // (ram-diet) The driver's data straight into the tmp file's mapping: no heap block the cache's size and no second
+    // copy through fwrite. No mapping (no file, a full disk): through the heap below, as before.
+    void *mh;
+    uint8_t *view = shim_file_map_new(tmp, sz + sizeof(PcacheTrailer), &mh);
+    if (view) {
+        size_t got = sz;
+        bool ok = vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &got, view) == VK_SUCCESS && got;   // (VK_INCOMPLETE: it grew since)
+        if (ok) {
+            PcacheTrailer tr = {.size = got, .hash = pcache_hash(view, got)};
+            memcpy(tr.magic, PCACHE_MAGIC, sizeof tr.magic);
+            memcpy(view + got, &tr, sizeof tr);
+        }
+        ok = shim_file_map_done(view, mh, ok ? got + sizeof(PcacheTrailer) : 0) == 0 && ok;
+        if (ok) ok = shim_file_replace(tmp, pcache_file()) == 0;
+        if (!ok) remove(tmp);
+        if (ok) { pcache_saved = got; vk_archive_warm_commit(warm_n); }
+        static int nlog;
+        if (nlog++ < 8) LOG("[vk] pipeline cache saved: %zu KB%s\n", got >> 10, ok ? " (mapped)" : " (FAILED)");
+        pthread_mutex_unlock(&pcache_save_lock);
+        return;
+    }
+#endif
     void *data = malloc(sz);
-    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
-        mkdir("cache", 0755);
-        char tmp[96];
-        snprintf(tmp, sizeof tmp, "%s.%lu.tmp", pcache_file(), (unsigned long)getpid());
+    if (data && vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
         FILE *f = fopen(tmp, "wb");
         if (f) {
             PcacheTrailer tr = {.size = sz, .hash = pcache_hash(data, sz)};
@@ -1024,12 +1230,27 @@ static void create_swapchain(void) {
 static atomic_int g_sc_recreate;
 void vk_request_swapchain_recreate(void) { atomic_store(&g_sc_recreate, 1); }
 
+// Where a game present's time goes (stream-hitch, 2026-11-02): the hitch line's "present" was all of backend_present,
+// GPU-bound frames (the frame slot's fence), the pacer's own waits and a swapchain re-creation alike. exec.c prints the
+// split under a hitch line and counts the pacer's wait apart (a frame the cap or the game's interval held is no hitch).
+uint64_t g_pr_ns[PR_N];
+bool g_pr_paused;   // (the pacer held this frame for a pause on focus loss)
+static void pace_point(void) {   // vi_pace_present_point, timed
+    extern bool vi_pace_was_held(void);
+    const uint64_t t = SDL_GetTicksNS();
+    vi_pace_present_point();
+    g_pr_ns[PR_PACE] += SDL_GetTicksNS() - t;
+    if (vi_pace_was_held()) g_pr_paused = true;
+}
+
 extern void vkq_drain(void);   // (LARECOMP_VKQ_SUBMIT: the record thread may hold queued submits; VkQueue is externally synchronised)
 static void recreate_swapchain(void) {
+    const uint64_t t = SDL_GetTicksNS();
     vk_present_queue_drain();   // (vkDeviceWaitIdle: every queue to itself)
     vkq_drain();
     vkDeviceWaitIdle(g_vk.dev);
     create_swapchain();
+    g_pr_ns[PR_RECREATE] += SDL_GetTicksNS() - t;
 }
 
 // ================================================================== frames (start screen and game)
@@ -1076,8 +1297,13 @@ bool vk_frame_begin(const float clear[4]) {
     if (trace) LOG("[vk] frame begin %dx%d (swapchain %ux%u)\n", w, h, g_vk.sc_extent.width, g_vk.sc_extent.height);
     slot = (slot + 1) % FRAMES;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
-    vk_wait_seq(slot_seq[slot]);
+    {
+        const uint64_t t = SDL_GetTicksNS();
+        vk_wait_seq(slot_seq[slot]);
+        g_pr_ns[PR_SLOT] += SDL_GetTicksNS() - t;
+    }
     VkResult r;
+    const uint64_t t_acq = SDL_GetTicksNS();
     for (uint64_t a0 = SDL_GetTicksNS();;) {   // (UINT64_MAX before: a compositor that stops releasing images = a silent hang)
         // (present.c: polled under the swapchain lock, which the FG present thread's presents take too)
         g_rt_op = "vkAcquireNextImageKHR", g_rt_op_ns = SDL_GetTicksNS();
@@ -1092,6 +1318,7 @@ bool vk_frame_begin(const float clear[4]) {
         recreate_swapchain();
         r = vk_present_acquire(acquire_sem[slot], UINT64_MAX, &cur_frame.image);
     }
+    g_pr_ns[PR_ACQ] += SDL_GetTicksNS() - t_acq;   // (a re-creation inside is counted twice: there and here)
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
     cur_frame.acquired = acquire_sem[slot];
     slot_seq[slot] = vk_pending_seq();
@@ -1324,9 +1551,10 @@ void vk_frame_end(const char *shot_path) {
     uint64_t seq = vk_pending_seq();
     uint64_t t_submit = SDL_GetTicksNS();
     vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE);
+    g_pr_ns[PR_SUBMIT] += SDL_GetTicksNS() - t_submit;
     extern void vk_present_latency_present(int stage);   // (present.c: low latency markers of a game frame)
     if (g_game_present) vk_present_latency_present(0);
-    if (g_game_present) vi_pace_present_point();   // pacing at the present (TOTK_PACE_AT): the cap's wait between the GPU submit and the present
+    if (g_game_present) pace_point();   // pacing at the present (TOTK_PACE_AT): the cap's wait between the GPU submit and the present
     uint64_t t_paced = SDL_GetTicksNS();
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
@@ -1349,6 +1577,7 @@ void vk_frame_end(const char *shot_path) {
         g_rt_op = NULL;
         vk_present_done(total_frames, pid, seq, r, t_submit, t_paced);   // timing; queued-frame and frames-in-flight limits
     }
+    g_pr_ns[PR_PRESENT] += SDL_GetTicksNS() - t_paced;
     if (r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) vk_present_lost();
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) recreate_swapchain();
     cur_frame.ok = false;
@@ -1515,6 +1744,7 @@ void backend_present(NvnTexture *t) {
     // ngx.c DLSS-G: TOTK_DLSS=fgtest replaces b's contents with the generated frame; TOTK_DLSS=fg presents the ngen
     // generated frames first, generated frame k at k / (ngen + 1) of a real-frame interval after the last real present,
     // then this frame as usual
+    vk_ngx_prepare(vk_cmd(), b);   // (once, on the start's black screens: SR / FG features at the scene's sizes)
     int ngen = vk_ngx_fg_frame(vk_cmd(), b);
     bool gen = ngen > 0;
     static const float black[4] = {0, 0, 0, 1};
@@ -1554,7 +1784,39 @@ void backend_present(NvnTexture *t) {
     static uint64_t force_t0;   // (the present that armed the forced frame: its wall time runs from there to here)
     bool forced = g_hold_force;
     g_hold_force = false;
-    bool held = hold_on && shown_any && must && !forced && (held_run < 30 || hold_force);
+    // Shader wait (the row graphics.shader_wait, Options > Graphics and F10: "Limit to 0.1 s" the default, "Always wait"
+    // for zero visual loss TOTK_HOLD_MAX_MS=<ms> overrides, 0 = always wait): once a run of held frames has lasted 100 ms,
+    // frames whose skips are only ordinary draws (no compute dispatch, no fullscreen / tile pass: those can blank the
+    // frame) are shown without those draws until every skip of a frame is gone, instead of holding up to 30 frames and
+    // then forcing one that waits for the builds (the v0.1.7 gate: one 110 KB fragment shader the seed lacked held 1 s and
+    // its forced frame waited 1.4 s more, 2.4 s frozen). The held builds keep the front of the queue (exec.c prog_hurry /
+    // job_hurry). The row is read live (vk_shader_wait_changed, and once a second).
+    static int64_t hold_max_ns = -1;
+    static uint64_t sw_read_t;
+    {
+        static int env = -1;
+        static int64_t env_ns;
+        if (env < 0) { const char *e = getenv("TOTK_HOLD_MAX_MS"); env = e != NULL; env_ns = e ? (int64_t)(atof(e) * 1e6) : 0; }
+        if (env) hold_max_ns = env_ns;
+        else if (hold_max_ns < 0 || g_shader_wait_dirty || t0 - sw_read_t >= 1000000000ull) {
+            sw_read_t = t0;
+            g_shader_wait_dirty = false;
+            const char *v = pc_settings_get("graphics.shader_wait");
+            hold_max_ns = v && !strcmp(v, "always") ? 0 : 100000000;
+        }
+    }
+    static uint64_t held_t0;   // (wall time of the run's first held frame)
+    static bool cap_on;        // (a capped run: ordinary skips shown until a frame has none)
+    const bool partial_only = !g_skip_comp_frame && !g_skip_full_frame && !g_skip_prog_full;
+    if (!g_skip_prog_frame && !g_skip_pipe_frame && !g_skip_comp_frame) cap_on = false;
+    if (hold_max_ns > 0 && must && partial_only && !cap_on && held_run && t0 - held_t0 >= (uint64_t)hold_max_ns) {
+        cap_on = true;
+        static int ncap;
+        if (ncap++ < 100)
+            LOG("[hold] frame %llu shown after %.0f ms of held frames (%llu): its ordinary draws still building are left out "
+                "until built (TOTK_HOLD_MAX_MS)\n", (unsigned long long)total_frames, (t0 - held_t0) / 1e6, (unsigned long long)held_run);
+    }
+    bool held = hold_on && shown_any && must && !forced && (held_run < 30 || hold_force) && !(cap_on && partial_only);
     if (!held && (g_skip_pipe_frame || g_skip_prog_frame || g_skip_comp_frame)) g_shown_with_skips++;
     static uint64_t forced_n;
     if (forced && forced_n++ < 200)  // (the freeze the zero-visual rule trades for: the §10 reads it from here)
@@ -1570,7 +1832,7 @@ void backend_present(NvnTexture *t) {
     static char run_kinds[8];  // before this decision, and its own skips held nothing)
     static int run_nkeys;
     if (held) {
-        if (!held_run++) { held_from = total_frames; held_sk[0] = held_sk[1] = held_sk[2] = 0; }
+        if (!held_run++) { held_from = total_frames; held_t0 = t0; held_sk[0] = held_sk[1] = held_sk[2] = 0; }
         if (hold_force && held_run >= 30) { g_hold_force = true; force_t0 = t0; }   // (the next frame builds what it needs)
         held_sk[0] += g_skip_prog_frame; held_sk[1] += g_skip_pipe_frame; held_sk[2] += g_skip_comp_frame;
         g_held_window++;
@@ -1599,7 +1861,11 @@ void backend_present(NvnTexture *t) {
     // and the generated -> real gap, which should be about half the real interval)
     static uint64_t fg_n_gen, fg_n_real, fg_n_late, fg_wait_ns, fg_gap_ns, fg_gen_t, fg_log_t;
     int npass = gen && !held ? ngen : 0;   // (generated presents before the real one)
-    if (npass) renderer_submit();   // (the frame and the generation run on the GPU while we wait to present)
+    if (npass) {   // (the frame and the generation run on the GPU while we wait to present)
+        const uint64_t ts = SDL_GetTicksNS();
+        renderer_submit();
+        g_pr_ns[PR_SUBMIT] += SDL_GetTicksNS() - ts;
+    }
     // FG present thread (present.c, TOTK_FG_PRESENT_THREAD=1): it places each present itself; nothing waits here
     const bool pq = vk_present_queue_on();
     bool have = false;
@@ -1613,6 +1879,7 @@ void backend_present(NvnTexture *t) {
             while (SDL_GetTicksNS() + 2000000ull < due) SDL_Delay(1);
             while (SDL_GetTicksNS() < due) {}
             fg_wait_ns += SDL_GetTicksNS() - now;
+            g_pr_ns[PR_FG] += SDL_GetTicksNS() - now;
         } else fg_n_late++;
     }
     have = !held && vk_frame_begin(black);
@@ -1724,8 +1991,10 @@ void backend_present(NvnTexture *t) {
         }
         if (shot && getenv("LARECOMP_EXIT_AFTER_SHOT")) { fflush(stdout); fflush(stderr); _exit(0); }
     } else if (real) {
+        const uint64_t ts = SDL_GetTicksNS();
         renderer_submit();
-        vi_pace_present_point();   // (pacing at the present: a held frame is paced too)
+        g_pr_ns[PR_SUBMIT] += SDL_GetTicksNS() - ts;
+        pace_point();   // (pacing at the present: a held frame is paced too)
         vk_present_skipped(total_frames);
     }
     }
@@ -2144,6 +2413,7 @@ void backend_present(NvnTexture *t) {
 #ifndef _WIN32
         if (last_fps_time > 0) {
             char sysb[640]; rt_sys_line(sysb, sizeof sysb); LOG("[sys] %s\n", sysb);
+            char db[320]; vk_driver_mem_line(db, sizeof db); LOG("[hostmem] %s\n", db);
             extern uint64_t vma_shim_tag_bytes(int tag, uint32_t *count);
             uint32_t c1, c2, c3, c0;
             uint64_t b1 = vma_shim_tag_bytes(1, &c1), b2 = vma_shim_tag_bytes(2, &c2), b3 = vma_shim_tag_bytes(3, &c3), b0 = vma_shim_tag_bytes(0, &c0);
@@ -2156,6 +2426,16 @@ void backend_present(NvnTexture *t) {
         if (last_fps_time > 0) {   // "[host]" (shim_win.c): host RAM and paging, as [sys] on Linux
             extern void shim_host_line(char *out, size_t n);
             char hb[256]; shim_host_line(hb, sizeof hb); LOG("[host] %s\n", hb);
+            extern void shim_heap_line(char *out, size_t n);
+            char db[320], ph[96];
+            vk_driver_mem_line(db, sizeof db);
+            shim_heap_line(ph, sizeof ph);
+            // (ram-diet: the guest's own parts, both imported = pinned; with the [host] commit / working set they show what
+            // is the game's and what is ours or the driver's)
+            extern uint64_t kernel_heap_size(void), g_alias_import_size, g_alias_import_committed;
+            LOG("[hostmem] %s; %s; guest heap %llu MB, alias import window %llu of %llu MB committed\n", db, ph,
+                (unsigned long long)(kernel_heap_size() >> 20), (unsigned long long)(g_alias_import_committed >> 20),
+                (unsigned long long)(g_alias_import_size >> 20));
         }
 #endif
         if (last_fps_time > 0) {  // "[vram]": the OS
@@ -2192,10 +2472,40 @@ void backend_present(NvnTexture *t) {
                 uint32_t nb;
                 uint64_t bb, bl, sb, sd;
                 vma_shim_big(g_vk.vma, &nb, &bb, &bl, &sb, &sd);
+                extern uint64_t vma_shim_spares_kept(void);
                 if (nb || sb || sd)
-                    LOG("[vram] big image blocks: %u of 256 MB, %llu of %llu MB live (%.0f %%), spares held %llu MB, given back %llu\n", nb,
+                    LOG("[vram] big image blocks: %u of 256 MB, %llu of %llu MB live (%.0f %%), spares held %llu MB, given back %llu, "
+                        "emptied blocks kept as spares %llu\n", nb,
                         (unsigned long long)(bl >> 20), (unsigned long long)(bb >> 20), bb ? 100.0 * bl / bb : 0.0, (unsigned long long)(sb >> 20),
-                        (unsigned long long)sd);
+                        (unsigned long long)sd, (unsigned long long)vma_shim_spares_kept());
+            }
+            {   // (vram-fit 2026-11-02, the 4K 10 GB report: where the heap's usage goes beyond the lines above) the small
+                // blocks' free ranges (still the driver's count of ours), the transient ring (shrinks: exec.c ring_retire),
+                // rendered images idle for LARECOMP_VRAM_IDLE_MS (residency never evicts those), and usage outside our
+                // allocations (the driver's own: pipelines, NGX / DLSS, the swapchain)
+                extern void vma_shim_blocks(VmaAllocator a, int kind, bool vram, uint32_t *n, uint64_t *bytes, uint64_t *live);
+                extern uint64_t vk_ring_bytes(int *n, uint64_t *peak, uint64_t *made, uint64_t *trim_n, uint64_t *trim_bytes);
+                extern uint64_t vk_tex_rendered_idle(uint64_t idle_frames, uint32_t *count);
+                extern uint64_t vk_residency_idle_frames(void);
+                extern uint64_t vk_park_bytes(uint32_t *n, uint64_t *parked, uint64_t *returned, uint32_t *used_n, uint64_t *used_bytes);
+                uint32_t n0, n1, ns, ni, npk, npu;
+                uint64_t s0, l0, s1, l1, ss, ls, rpk, rmd, rtn, rtb, pkn, pkr, pku, pkb = vk_park_bytes(&npk, &pkn, &pkr, &npu, &pku);
+                int rn;
+                vma_shim_blocks(g_vk.vma, 0, true, &n0, &s0, &l0);
+                vma_shim_blocks(g_vk.vma, 1, true, &n1, &s1, &l1);
+                vma_shim_blocks(g_vk.vma, -1, false, &ns, &ss, &ls);   // (system memory: the ring without resizable BAR, parked images)
+                uint64_t rb = vk_ring_bytes(&rn, &rpk, &rmd, &rtn, &rtb), ri = vk_tex_rendered_idle(vk_residency_idle_frames(), &ni);
+                uint64_t use = 0, mine = 0;
+                for (uint32_t h = 0; h < mp.memoryProperties.memoryHeapCount && h < nh; h++)
+                    if ((mp.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && hb[h] > mine) use = bud.heapUsage[h], mine = hb[h];
+                LOG("[vram] slack: small blocks %u buffer (%llu of %llu MB live) + %u image (%llu of %llu MB live); transient ring %d "
+                    "chunks %llu MB (peak %llu MB, %llu made, %llu given back = %llu MB); rendered idle %llu MB (%u); usage outside ours %lld MB; "
+                    "parked in system memory %llu MB (%u, of which used since %llu MB (%u); since start parked %llu, returned %llu); system-memory blocks %u (%llu of %llu MB live)\n",
+                    n0, (unsigned long long)(l0 >> 20), (unsigned long long)(s0 >> 20), n1, (unsigned long long)(l1 >> 20),
+                    (unsigned long long)(s1 >> 20), rn, (unsigned long long)(rb >> 20), (unsigned long long)(rpk >> 20),
+                    (unsigned long long)rmd, (unsigned long long)rtn, (unsigned long long)(rtb >> 20), (unsigned long long)(ri >> 20), ni,
+                    g_vk.mem_budget ? (long long)(use >> 20) - (long long)(mine >> 20) : 0ll, (unsigned long long)(pkb >> 20), npk, (unsigned long long)(pku >> 20), npu,
+                    (unsigned long long)pkn, (unsigned long long)pkr, ns, (unsigned long long)(ls >> 20), (unsigned long long)(ss >> 20));
             }
             {   // (textures.c: live game textures by kind; idle = unused for LARECOMP_VRAM_IDLE_MS, what residency may evict)
                 extern void vk_tex_vram_split(uint64_t idle_frames, uint64_t bytes[3], uint32_t count[4]);

@@ -9,7 +9,7 @@ The replaced words come from the 1.0.0 image (the work folder's, games.totk.patc
 import unittest
 
 from games.totk.patches import PatchError, default_image, layout_v100, load_main_image, sites_v100
-from games.totk.patches.port import PortError, needed_addresses, pcrel_target, relocate, retarget
+from games.totk.patches.port import PortError, layout_of, needed_addresses, pcrel_target, relocate, retarget
 from games.totk.patches.sites_v100 import Layout, Orig
 
 
@@ -64,7 +64,8 @@ class RelocateTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.old = layout_v100()
-        cls.new = Layout(text_end=cls.old.text_end + SHIFT + 0x10, data_off=cls.old.data_off + 0x20000)
+        cls.new = Layout(text_end=cls.old.text_end + SHIFT + 0x10, data_off=cls.old.data_off + 0x20000,
+                         span=cls.old.span + 0x20000)
         cls.patches = v100_set()
         cls.moved = relocate(cls.patches, cls.old, cls.new, lambda t: t + SHIFT)
 
@@ -73,6 +74,8 @@ class RelocateTest(unittest.TestCase):
             return t - self.old.pad + self.new.pad
         if self.old.data_off <= t < self.old.data_off + sites_v100.DATA_PAGE_SIZE:
             return t - self.old.data_off + self.new.data_off
+        if self.old.extra[0] <= t < self.old.extra[1]:
+            return t - self.old.extra[0] + self.new.extra[0]
         return t + SHIFT
 
     def test_identity(self):
@@ -107,10 +110,27 @@ class RelocateTest(unittest.TestCase):
         self.assertIn(f'{site:#x}', str(e.exception))
 
     def test_short_padding_refuses(self):
-        tight = Layout(text_end=self.new.pad_end - 0x100, data_off=self.new.data_off)
+        tight = Layout(text_end=self.new.pad_end - 0x100, data_off=self.new.data_off, span=self.new.span)
         with self.assertRaises(PortError) as e:
             relocate(self.patches, self.old, tight, lambda t: t + SHIFT)
         self.assertIn('padding', str(e.exception))
+
+    def test_no_extra_area_refuses(self):
+        bare = Layout(text_end=self.new.text_end, data_off=self.new.data_off)   # (no span: no extra veneer area)
+        with self.assertRaises(PortError) as e:
+            relocate(self.patches, self.old, bare, lambda t: t + SHIFT)
+        self.assertIn('extra veneer area', str(e.exception))
+
+    def test_port_table_layout(self):
+        """port_table's Layout of a new main (layout_of) has the extra veneer area: the whole 1.0.0 set, tempunit's
+        veneer past the span included, relocates onto it."""
+        from types import SimpleNamespace
+        m = SimpleNamespace(text=SimpleNamespace(end=self.old.text_end + SHIFT + 0x10), size=self.old.span + 0x20000)
+        lay = layout_of(m)
+        self.assertEqual(lay.extra, (self.old.span + 0x20000, lay.data_off))
+        moved = relocate(self.patches, self.old, lay, lambda t: t + SHIFT)
+        temp = next(q for q in moved if q.feature == 'tempunit')
+        self.assertTrue(all(lay.extra[0] <= a < b <= lay.extra[1] for a, b in temp.veneers))
 
     def test_needed(self):
         need = needed_addresses(self.patches, self.old)

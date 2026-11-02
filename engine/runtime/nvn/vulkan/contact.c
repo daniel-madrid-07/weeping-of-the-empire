@@ -14,6 +14,9 @@
 // newest pass: the projection scales c4[7].x and c4[8].y, the far plane c4[14].y and the first sun cascade's depth row
 // c4[44].xyz, whose negation points from a view-space position toward the sun. The scene colour images get STORAGE usage
 // while the setting is on (textures.c, contact_wants_storage). TOTK_CONTACT_DEBUG=1: the frame shows the factor in grey.
+// Live (graphics.contact_shadows, contact_set_strength): the strength is read at each pass; the pipeline is made the
+// first time it is on, and turning it on or off has textures.c remake the scene colour images with or without STORAGE
+// between two frames (renderer_tex_remake), as a start with that value would have made them.
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -47,14 +50,26 @@ static struct {
     uint64_t passes;
 } C;
 
+static int g_strength = -1;   // (settings thread writes, the render thread reads; -1: TOTK_CONTACT_SHADOWS not read yet)
+static int parse_strength(const char *e) {
+    const int s = e && *e ? atoi(e) : 0;
+    return s < 0 || s > 100 ? 0 : s;
+}
 int contact_strength(void) {
-    static int s = -1;
+    int s = __atomic_load_n(&g_strength, __ATOMIC_ACQUIRE);
     if (s < 0) {
-        const char *e = getenv("TOTK_CONTACT_SHADOWS");
-        s = e && *e ? atoi(e) : 0;
-        if (s < 0 || s > 100) s = 0;
+        int expect = -1;
+        __atomic_compare_exchange_n(&g_strength, &expect, parse_strength(getenv("TOTK_CONTACT_SHADOWS")), false, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE);
+        s = __atomic_load_n(&g_strength, __ATOMIC_ACQUIRE);
     }
     return s;
+}
+void contact_set_strength(const char *v) {
+    const int was = contact_strength(), s = parse_strength(v);
+    __atomic_store_n(&g_strength, s, __ATOMIC_RELEASE);
+    extern void renderer_tex_remake(void);   // (textures.c: the scene colours' STORAGE follows at the next present)
+    if (!was != !s) renderer_tex_remake();
 }
 
 // (an r11f_g11f_b10f storage image needs shaderStorageImageExtendedFormats: without it the setting does nothing)
@@ -202,8 +217,11 @@ bool contact_flush(VkCommandBuffer cb) {
 }
 
 bool contact_pass_begin(const ContactPass *p) {
+    const int s = contact_strength();
+    if (!s) { C.scene = C.depth = NULL, C.pending = false; return false; }   // (turned off live: nothing remembered)
     if (!C.tried && !init()) return false;
     if (!C.ok) return false;
+    C.strength = s;
     C.passes++;
     if (p->c4_addr && p->c4_size == 0x940) C.c4 = p->c4_addr;   // (the newest camera block seen at a pass start)
     TexBackend *scene, *depth;

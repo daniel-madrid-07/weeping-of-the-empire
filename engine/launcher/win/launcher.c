@@ -41,6 +41,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shobjidl.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -53,6 +54,8 @@
 
 #include "saves.h"
 #include "autoupdate.h"
+#include "../../runtime/mods_install.h"
+#include <bcrypt.h>
 
 enum { EARLY_MS = 20000, LOG_MAX = 256 * 1024, KEEP_AUTO_BACKUPS = 10, KEEP_GAME_LOGS = 8, MAX_CANDIDATES = 16 };
 static DWORD g_early_ms = EARLY_MS;   /* (test_launcher.c shortens it) */
@@ -1110,6 +1113,7 @@ enum { RUNNING, QUIT, FAILED, MISSING, RESTART };
  * (engine/runtime/nvn/vulkan/device.c gpu_unsupported): no second dialog, and no older package tried (it would fail
  * the same way). */
 #define GPU_UNSUPPORTED_CODE 0x47505530u   /* "GPU0" */
+#define DUMP_LOST_CODE 0x444D5030u         /* "DMP0": the game dump went away during play (hle_fs.cpp dump_lost; it said so) */
 static wchar_t g_restart_file[MAX_PATH];
 static wchar_t g_restart_set[8][64];
 static int g_restart_n;
@@ -1138,12 +1142,18 @@ static void restart_env_apply(void) {
  * tab's (settings.ini mods.order / mods.off), the top mod wins a file two of them change, the port's own files win
  * over a mod's, the resource size table is merged and computed for the mods' files (hle_fs.cpp rstb_merged). A name
  * starting with '_' or '.' is left out; a name in both folders is used from the game folder's.
+ * Another game version's package (player.txt version=, e.g. 1.4.3: `ver` "1.4.3", `tag` "143") reads mods-v<tag> in
+ * both places instead, as its saves live in userdata-v<tag>: a mod is made for one version, and a 1.4.3 mod's files
+ * are wrong in 1.0.0 and the other way round.
  * Sets TOTK_MODS_DIR (the game folder's first: F10's "Open mods folder" opens it); returns how many folders exist. */
-static void mods_readme(const wchar_t *dir) {   /* (rewritten each start: an older one described the replace-only folder) */
+static void mods_readme(const wchar_t *dir, const wchar_t *ver) {   /* (rewritten each start) */
     wchar_t p[MAX_PATH];
     swprintf(p, MAX_PATH, L"%ls\\LEEME-README.txt", dir);
     FILE *f = _wfopen(p, L"w, ccs=UTF-8");
     if (!f) return;
+    if (ver && *ver)
+        fwprintf(f, L"Mods para la versión %ls del juego (los de 1.0.0 van en la carpeta mods).\n"
+                    L"Mods for game version %ls (1.0.0's go in the mods folder).\n\n", ver, ver);
     fputws(L"Mods: una carpeta por mod, como en los emuladores (<nombre>\\romfs, <nombre>\\exefs, <nombre>\\cheats, o\n"
            L"atmosphere\\contents\\0100F2C0115B6000\\romfs de la tarjeta SD; la salida de TKMM también vale).\n"
            L"Orden y activación en el juego: F10 > Mods (gana el de arriba); se aplican al volver a empezar.\n"
@@ -1156,11 +1166,101 @@ static void mods_readme(const wchar_t *dir) {   /* (rewritten each start: an old
            L"This folder (beside the game) and %APPDATA%\\nxrecomp\\TotK-engine\\mods both work.\n", f);
     fclose(f);
 }
-static int mods_env(void) {
+/* A mod dropped on the launcher (or its shortcut): each path on the command line that exists (an archive or a folder;
+ * options start with "--") is installed into the game folder's mods / mods-v143 by mods_install.h, the version in use
+ * being this folder's game's (its player.txt version=; none = 1.0.0), and said in one box; then the game starts as
+ * usual. Nothing but the two mods folders is written. */
+static void mi_version_text(int v, wchar_t *out, size_t n) {   /* 143 -> "1.4.3" */
+    wchar_t d[16];
+    swprintf(d, 16, L"%d", v);
+    out[0] = 0;
+    for (size_t i = 0; d[i] && wcslen(out) + 2 < n; i++) {
+        size_t l = wcslen(out);
+        if (i) out[l++] = L'.';
+        out[l++] = d[i];
+        out[l] = 0;
+    }
+}
+static int install_paths(wchar_t **argv, int argc) {   /* argv[1..argc-1] (test_launcher.c calls it directly) */
+    int done = 0;
+    wchar_t cur[MAX_PATH] = L"", pkg[MAX_PATH], ver[32] = L"";
+    read_name(L"current.txt", cur, MAX_PATH);
+    if (cur[0]) swprintf(pkg, MAX_PATH, L"%ls\\packages\\%ls", g_dir, cur);
+    else swprintf(pkg, MAX_PATH, L"%ls", g_dir);
+    package_value(pkg, L"version", 0, ver, 32);
+    int in_use = 100;
+    if (ver[0] && wcscmp(ver, L"1.0.0")) {
+        in_use = 0;
+        for (const wchar_t *c = ver; *c; c++) if (*c >= L'0' && *c <= L'9') in_use = in_use * 10 + (*c - L'0');
+    }
+    wchar_t d100[MAX_PATH], d143[MAX_PATH];
+    swprintf(d100, MAX_PATH, L"%ls\\mods", g_dir);
+    swprintf(d143, MAX_PATH, L"%ls\\mods-v143", g_dir);
+    for (int i = 1; i < argc; i++) {
+        /* (a folder, or an archive by its extension: any other file on the command line is not a dropped mod) */
+        const DWORD at = GetFileAttributesW(argv[i]);
+        const wchar_t *ext = wcsrchr(argv[i], L'.');
+        if (!wcsncmp(argv[i], L"--", 2) || at == INVALID_FILE_ATTRIBUTES ||
+            (!(at & FILE_ATTRIBUTE_DIRECTORY) && !(ext && (!_wcsicmp(ext, L".zip") || !_wcsicmp(ext, L".7z") || !_wcsicmp(ext, L".rar")))))
+            continue;
+        ModInstall m;
+        const int rc = mods_install(argv[i], d100, d143, in_use, &m);
+        done++;
+        say(L"mod install %ls: rc %d, kinds %d, version %d (%ls), %ls", argv[i], rc, m.kinds, m.version,
+            m.named ? L"named by its files" : L"the one in use", rc == MI_OK ? m.dest : L"-");
+        if (rc != MI_OK) {
+            const wchar_t *why =
+                rc == MI_UNPACK ? ES_EN(L"no se ha podido abrir. Descomprímelo tú y arrastra su carpeta al lanzador",
+                                        L"it could not be opened. Unpack it yourself and drop its folder on the launcher")
+                : rc == MI_NOT_A_MOD ? ES_EN(L"no tiene carpeta romfs, exefs ni cheats. Si el mod va comprimido dentro, "
+                                             L"descomprímelo y arrastra esa carpeta",
+                                             L"it has no romfs, exefs or cheats folder. If the mod is packed inside it, unpack "
+                                             L"it and drop that folder instead")
+                : rc == MI_OTHER_GAME ? ES_EN(L"es un mod de otro juego", L"it is a mod for another game")
+                : rc == MI_CODE_MODULES ? ES_EN(L"carga código propio (subsdk / main), que un juego recompilado no puede cargar",
+                                                L"it loads code of its own (subsdk / main), which a recompiled game cannot load")
+                : ES_EN(L"no se ha podido copiar. Comprueba que se puede escribir en la carpeta mods junto al juego",
+                        L"it could not be copied. Check that the mods folder beside the game can be written");
+            message(MB_ICONWARNING, ES_EN(L"No he instalado el mod:\n%ls\n\nMotivo: %ls.", L"The mod was not installed:\n%ls\n\nWhy: %ls."),
+                    argv[i], why);
+            continue;
+        }
+        wchar_t what[96] = L"", vtext[16], use[16];
+        if (m.kinds & MI_ROMFS) wcscat(what, L"RomFS");
+        if (m.kinds & MI_EXEFS) wcscat(what, what[0] ? ES_EN(L" + parches de código", L" + code patches") : ES_EN(L"parches de código", L"code patches"));
+        if (m.kinds & MI_CHEATS) wcscat(what, what[0] ? ES_EN(L" + trucos", L" + cheats") : ES_EN(L"trucos", L"cheats"));
+        mi_version_text(m.version, vtext, 16);
+        mi_version_text(in_use, use, 16);
+        wchar_t note[512] = L"";
+        if (!m.named)
+            swprintf(note, 512, ES_EN(L"\nSus archivos no dicen la versión del juego: lo pongo para la que juegas (%ls).",
+                                      L"\nIts files don't name a game version: it was put with the one you play (%ls)."), use);
+        else if (m.version != 100 && m.version != 143)
+            swprintf(note, 512, ES_EN(L"\nEstá hecho para la versión %ls del juego, que el port no crea: lo pongo con los mods de 1.4.3, "
+                                      L"puede no funcionar.",
+                                      L"\nIt is made for game version %ls, which the port does not build: it was put with the 1.4.3 "
+                                      L"mods and may not work."), vtext);
+        message(MB_ICONINFORMATION, ES_EN(L"Mod instalado: %ls (%ls, para %ls)\nen %ls%ls\n\nOrden y activación: F10 > Mods.",
+                                          L"Mod installed: %ls (%ls, for %ls)\nin %ls%ls\n\nOrder and switches: F10 > Mods."),
+                m.name, what, vtext, m.dest, note);
+    }
+    return done;
+}
+static int install_dropped(void) {
+    int argc = 0;
+    wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return 0;
+    const int done = install_paths(argv, argc);
+    LocalFree(argv);
+    return done;
+}
+
+static int mods_env(const wchar_t *ver, const wchar_t *tag) {
     static wchar_t value[2 * MAX_PATH + 2];
-    wchar_t local[MAX_PATH], user[MAX_PATH];
-    swprintf(local, MAX_PATH, L"%ls\\mods", g_dir);
-    swprintf(user, MAX_PATH, L"%ls\\mods", g_base);
+    wchar_t local[MAX_PATH], user[MAX_PATH], name[48] = L"mods";
+    if (tag && *tag) swprintf(name, 48, L"mods-v%ls", tag);
+    swprintf(local, MAX_PATH, L"%ls\\%ls", g_dir, name);
+    swprintf(user, MAX_PATH, L"%ls\\%ls", g_base, name);
     mkdirs(local);
     mkdirs(user);
     value[0] = 0;
@@ -1168,7 +1268,7 @@ static int mods_env(void) {
     const wchar_t *dirs[2] = {local, user};
     for (int i = 0; i < 2; i++) {
         if (!exists(dirs[i]) || (i && !_wcsicmp(local, user))) continue;
-        mods_readme(dirs[i]);
+        mods_readme(dirs[i], tag && *tag ? ver : NULL);
         size_t len = wcslen(value);
         swprintf(value + len, sizeof value / sizeof *value - len, L"%ls%ls", len ? L";" : L"", dirs[i]);
         n++;
@@ -1177,6 +1277,191 @@ static int mods_env(void) {
     SetEnvironmentVariableW(L"TOTK_USER_MODS", NULL);
     say(L"mods: TOTK_MODS_DIR=%ls", value);
     return n;
+}
+/* The player's amiibo dumps (engine/runtime/pc_amiibo.cpp, F10 > Amiibo): an amiibo folder beside the game, made here
+ * as mods is, and %APPDATA%\nxrecomp\TotK-engine\amiibo when it exists; the first is the one F10 opens. */
+static void amiibo_env(void) {
+    static wchar_t value[2 * MAX_PATH + 2];
+    wchar_t local[MAX_PATH], user[MAX_PATH];
+    swprintf(local, MAX_PATH, L"%ls\\amiibo", g_dir);
+    swprintf(user, MAX_PATH, L"%ls\\amiibo", g_base);
+    mkdirs(local);
+    value[0] = 0;
+    const wchar_t *dirs[2] = {local, user};
+    for (int i = 0; i < 2; i++) {
+        if (!exists(dirs[i]) || (i && !_wcsicmp(local, user))) continue;
+        size_t len = wcslen(value);
+        swprintf(value + len, sizeof value / sizeof *value - len, L"%ls%ls", len ? L";" : L"", dirs[i]);
+    }
+    SetEnvironmentVariableW(L"TOTK_AMIIBO_DIR", value[0] ? value : NULL);
+    say(L"amiibo: TOTK_AMIIBO_DIR=%ls", value);
+}
+
+/* ---------------------------------------------------------------- the game's data in the player's dump */
+/* Since v0.1.8 Setup leaves the game's data in the player's own dump (romfs-source.txt, pipeline/nx/romsource.py; the
+ * game reads and decrypts it in place, engine/runtime/rom_source.h): no 17 GB romfs.bin. The dump has to stay where
+ * Setup read it. Moved or deleted: one sentence and the choice to pick it again; a picked file is taken only when it is
+ * the same size and the first 64 KiB of the game's data in it are the same bytes (sha256 of the raw bytes: no keys
+ * needed here). Then the file's dump= line, Setup's Dump value and the file's record (<file>.verified.json, which the
+ * next Setup run makes again) follow. */
+typedef struct {
+    wchar_t dump[MAX_PATH];
+    unsigned long long dump_size, image_offset, image_size;
+    char check[65];
+} DumpSource;
+
+static int is_dump_source(const wchar_t *p) {
+    size_t n = wcslen(p);
+    return n >= 16 && !_wcsicmp(p + n - 16, L"romfs-source.txt");
+}
+static char *read_small_text(const wchar_t *p) {   /* the whole file, NUL-terminated; NULL: none or over 1 MB */
+    FILE *f = _wfopen(p, L"rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *b = n >= 0 && n <= (1 << 20) ? malloc((size_t)n + 1) : NULL;
+    if (b) b[fread(b, 1, (size_t)n, f)] = 0;
+    fclose(f);
+    return b;
+}
+static int source_value(const char *text, const char *key, char *out, size_t n) {
+    size_t kl = strlen(key);
+    for (const char *l = text; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL)
+        if (!strncmp(l, key, kl) && l[kl] == '=') {
+            size_t m = strcspn(l + kl + 1, "\r\n");
+            if (m >= n) return 0;
+            memcpy(out, l + kl + 1, m);
+            out[m] = 0;
+            return 1;
+        }
+    return 0;
+}
+static int read_dump_source(const wchar_t *p, DumpSource *s) {
+    char *t = read_small_text(p), v[4 * MAX_PATH];
+    int ok = t && source_value(t, "dump", v, sizeof v) && MultiByteToWideChar(CP_UTF8, 0, v, -1, s->dump, MAX_PATH) > 0;
+    ok = ok && source_value(t, "dump_size", v, sizeof v) && (s->dump_size = _strtoui64(v, NULL, 10)) > 0;
+    ok = ok && source_value(t, "image_offset", v, sizeof v) && ((s->image_offset = _strtoui64(v, NULL, 10)), 1);
+    ok = ok && source_value(t, "image_size", v, sizeof v) && (s->image_size = _strtoui64(v, NULL, 10)) > 0;
+    ok = ok && source_value(t, "check", s->check, sizeof s->check) && strlen(s->check) == 64;
+    free(t);
+    return ok;
+}
+/* the file at `path` is the dump `s` names: the same size, the same raw bytes where the game's data starts */
+static int dump_matches(const wchar_t *path, const DumpSource *s) {
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER sz, at;
+    at.QuadPart = (LONGLONG)s->image_offset;
+    int ok = GetFileSizeEx(h, &sz) && (unsigned long long)sz.QuadPart == s->dump_size && SetFilePointerEx(h, at, NULL, FILE_BEGIN);
+    if (ok) {
+        DWORD want = (DWORD)(s->image_size < 65536 ? s->image_size : 65536), got = 0;
+        unsigned char *buf = malloc(want), d[32];
+        BCRYPT_ALG_HANDLE alg = NULL;
+        char hex[65];
+        ok = buf && ReadFile(h, buf, want, &got, NULL) && got == want &&
+             BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) == 0 && BCryptHash(alg, NULL, 0, buf, want, d, 32) == 0;
+        if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+        free(buf);
+        if (ok) {
+            for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", d[i]);
+            ok = !_stricmp(hex, s->check);
+        }
+    }
+    CloseHandle(h);
+    return ok;
+}
+/* romfs-source.txt `p` with its dump= line naming `path` (replaced whole); its record goes */
+static int rewrite_dump_source(const wchar_t *p, const wchar_t *path) {
+    char *t = read_small_text(p), u8[4 * MAX_PATH];
+    wchar_t tmp[MAX_PATH], rec[MAX_PATH];
+    if (!t || !WideCharToMultiByte(CP_UTF8, 0, path, -1, u8, sizeof u8, NULL, NULL)) { free(t); return 0; }
+    swprintf(tmp, MAX_PATH, L"%ls.partial", p);
+    FILE *f = _wfopen(tmp, L"wb");
+    int ok = f != NULL;
+    for (const char *l = t; ok && *l;) {
+        const char *e = strchr(l, '\n');
+        size_t m = e ? (size_t)(e - l + 1) : strlen(l);
+        if (!strncmp(l, "dump=", 5)) fprintf(f, "dump=%s\n", u8);
+        else fwrite(l, 1, m, f);
+        l += m;
+    }
+    if (f) ok = !fclose(f) && ok;
+    free(t);
+    ok = ok && MoveFileExW(tmp, p, MOVEFILE_REPLACE_EXISTING);
+    swprintf(rec, MAX_PATH, L"%ls.verified.json", p);
+    if (ok) DeleteFileW(rec);
+    return ok;
+}
+enum { DUMP_PICK = 1101, DUMP_CLOSE };
+static int pick_dump(const wchar_t *was, wchar_t *out, size_t n) {
+    wchar_t content[1024];
+    swprintf(content, 1024, ES_EN(L"El juego lee sus datos de tu copia del juego (el dump), que ya no está en:\n%ls\n\nSi la has "
+                                  L"movido, elígela otra vez. Si la vas a borrar, vuelve a instalar con Setup marcando \"Copiar los "
+                                  L"archivos del juego\".",
+                                  L"The game reads its data from your game dump, which is no longer at:\n%ls\n\nIf you moved it, pick "
+                                  L"it again. If you'll delete it, install again with Setup and tick \"Copy the game files\"."), was);
+    const TASKDIALOG_BUTTON b[] = {{DUMP_PICK, ES_EN(L"Elegir el dump", L"Pick the dump")}, {DUMP_CLOSE, ES_EN(L"Cerrar", L"Close")}};
+    if (task(ES_EN(L"No encuentro tu copia del juego", L"Can't find your game dump"), content, b, 2, NULL, 0, NULL, 0,
+             TD_WARNING_ICON) != DUMP_PICK)
+        return 0;
+    IFileOpenDialog *d = NULL;
+    int ok = 0;
+    if (FAILED(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileOpenDialog, (void **)&d))) return 0;
+    const COMDLG_FILTERSPEC spec[] = {{ES_EN(L"Juego de Switch (NSP, XCI)", L"Switch game (NSP, XCI)"), L"*.nsp;*.xci"}};
+    IFileOpenDialog_SetFileTypes(d, 1, spec);
+    FILEOPENDIALOGOPTIONS o;
+    if (SUCCEEDED(IFileOpenDialog_GetOptions(d, &o))) IFileOpenDialog_SetOptions(d, o | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
+    IFileOpenDialog_SetTitle(d, ES_EN(L"Tu copia del juego (la misma que leyó Setup)", L"Your game dump (the one Setup read)"));
+    if (SUCCEEDED(IFileOpenDialog_Show(d, NULL))) {
+        IShellItem *it = NULL;
+        if (SUCCEEDED(IFileOpenDialog_GetResult(d, &it))) {
+            PWSTR p = NULL;
+            if (SUCCEEDED(IShellItem_GetDisplayName(it, SIGDN_FILESYSPATH, &p))) { swprintf(out, n, L"%ls", p); CoTaskMemFree(p); ok = 1; }
+            IShellItem_Release(it);
+        }
+    }
+    IFileOpenDialog_Release(d);
+    return ok;
+}
+static int (*g_pick_dump)(const wchar_t *was, wchar_t *out, size_t n) = pick_dump;   /* (test_launcher.c answers instead) */
+static const wchar_t *g_setup_key = UPD_SETUP_KEY;   /* (test_launcher.c: a key that is not there) */
+
+/* 1: the dump romfs-source.txt `src` names is there at its size, or the player picked it again; 0: not (said) */
+static int dump_source_ready(const wchar_t *src) {
+    DumpSource s;
+    if (!read_dump_source(src, &s)) {
+        message(MB_ICONWARNING, ES_EN(L"El archivo que dice dónde están los datos del juego está dañado:\n%ls\n\nVuelve a instalar con Setup.",
+                                      L"The file that says where the game data is, is damaged:\n%ls\n\nInstall again with Setup."), src);
+        return 0;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExW(s.dump, GetFileExInfoStandard, &fa) &&
+        ((unsigned long long)fa.nFileSizeHigh << 32 | fa.nFileSizeLow) == s.dump_size)
+        return 1;
+    say(L"game dump %ls: not there at its size", s.dump);
+    for (int tries = 0; tries < 5; tries++) {
+        wchar_t picked[MAX_PATH] = L"";
+        if (!g_pick_dump(s.dump, picked, MAX_PATH)) break;
+        if (!dump_matches(picked, &s)) {
+            message(MB_ICONWARNING, ES_EN(L"Ese archivo no es la copia del juego que leyó Setup:\n%ls",
+                                          L"That file is not the game dump Setup read:\n%ls"), picked);
+            continue;
+        }
+        if (!rewrite_dump_source(src, picked)) {
+            message(MB_ICONWARNING, ES_EN(L"No pude guardar la nueva ubicación en:\n%ls", L"Couldn't save the new location in:\n%ls"), src);
+            return 0;
+        }
+        HKEY k;   /* (Setup's own Dump value: its next run finds the dump there too) */
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, g_setup_key, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+            RegSetValueExW(k, L"Dump", 0, REG_SZ, (const BYTE *)picked, (DWORD)((wcslen(picked) + 1) * sizeof(wchar_t)));
+            RegCloseKey(k);
+        }
+        say(L"game dump picked again: %ls", picked);
+        return 1;
+    }
+    say(L"game dump: not picked again");
+    return 0;
 }
 
 static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, size_t whyn, HANDLE *game, FILETIME *started) {
@@ -1211,11 +1496,12 @@ static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, si
     }
 
     wchar_t userdata[MAX_PATH], run[MAX_PATH], crashes[MAX_PATH], logs[MAX_PATH], logp[MAX_PATH];
+    wchar_t ver[32], tag[32] = L"";   /* (another game version: its saves and mods folders, -v<tag>) */
     swprintf(userdata, MAX_PATH, L"%ls\\userdata", g_base);
     {   /* another game version (package.py's version=, e.g. 1.4.3; none = 1.0.0, the folder as before) keeps its own
            saves in userdata-v<digits>: a save that version writes does not load in 1.0.0. On its first start it gets a
            copy of the 1.0.0 saves (the game upgrades them as it loads them); the 1.0.0 folder is never touched. */
-        wchar_t ver[32], tag[32], src[MAX_PATH], dst[MAX_PATH];
+        wchar_t src[MAX_PATH], dst[MAX_PATH];
         package_value(pkg, L"version", 0, ver, 32);
         if (ver[0] && wcscmp(ver, L"1.0.0")) {
             int n = 0;
@@ -1270,7 +1556,8 @@ static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, si
     SetEnvironmentVariableW(L"TOTK_OVERLAY", overlay[0] ? overlay : NULL);
     SetEnvironmentVariableW(L"TOTK_PRIORITY", L"normal");
     SetEnvironmentVariableW(L"TOTK_CRASH_DIR", crashes);
-    mods_env();
+    mods_env(ver, tag);
+    amiibo_env();
     swprintf(g_restart_file, MAX_PATH, L"%ls\\restart.env", g_local);   /* (the game's restart request: RESTART_CODE) */
     DeleteFileW(g_restart_file);
     SetEnvironmentVariableW(L"NXR_LAUNCHER_RESTART", g_restart_file);
@@ -1332,6 +1619,7 @@ static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, si
     if (code == RESTART_CODE) { say(L"%ls asked for a restart within %.1f s", name, g_early_ms / 1000.0); return RESTART; }
     if (code == 0) { say(L"%ls quit normally within %.1f s", name, g_early_ms / 1000.0); return QUIT; }
     if (code == GPU_UNSUPPORTED_CODE) { say(L"%ls: this GPU cannot run the game (the game showed why)", name); return QUIT; }
+    if (code == DUMP_LOST_CODE) { say(L"%ls: the game dump could not be read (the game showed why)", name); return QUIT; }
     wchar_t rep[MAX_PATH];   /* a crash this early still writes its report (pc_crash.cpp): point at it, as after a late crash */
     crash_report_since(*started, rep, MAX_PATH);
     if (code == 0xC000001Du)   /* STATUS_ILLEGAL_INSTRUCTION: an instruction this CPU lacks that cpu_missing does not check */
@@ -1364,7 +1652,7 @@ static int play_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, s
             CloseHandle(game);
             say(L"%ls exited (code 0x%08lx)", name, code);
             if (code != RESTART_CODE) {
-                if (code && code != GPU_UNSUPPORTED_CODE) {
+                if (code && code != GPU_UNSUPPORTED_CODE && code != DUMP_LOST_CODE) {
                     wchar_t rep[MAX_PATH], logs[MAX_PATH];
                     crash_report_since(started, rep, MAX_PATH);
                     swprintf(logs, MAX_PATH, L"%ls\\logs", g_local);
@@ -1440,6 +1728,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show) {
         FreeLibrary(vk);
         say(L"vulkan: loader found");
     }
+    install_dropped();   /* (a mod dropped on the launcher: installed, said, then the game starts) */
     int menu = (args && wcsstr(args, L"--saves")) || (GetAsyncKeyState(VK_SHIFT) & 0x8000);
     if (menu) say(L"update check: skipped (saves menu)");   /* the player asked for this folder's menu */
     else if (auto_update()) return 0;                        /* the updated build's launcher does the rest */
@@ -1491,10 +1780,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show) {
         wchar_t pack[MAX_PATH];
         package_value(pkgs[i], L"env.TOTK_ROMFS_PACK", 1, pack, MAX_PATH);
         if (pack[0] && !exists(pack) && !dir_has_files(romfs)) {
-            message(MB_ICONWARNING, ES_EN(L"No encuentro los datos del juego (romfs.bin) en:\n%ls\n\nVuelve a instalar con Setup.",
-                                          L"Can't find the game data (romfs.bin) in:\n%ls\n\nInstall again with Setup."), pack);
+            message(MB_ICONWARNING, ES_EN(L"No encuentro los datos del juego en:\n%ls\n\nVuelve a instalar con Setup.",
+                                          L"Can't find the game data in:\n%ls\n\nInstall again with Setup."), pack);
             return 1;
         }
+        /* since v0.1.8 the data stays in the player's dump (romfs-source.txt): it has to be where Setup read it */
+        if (pack[0] && is_dump_source(pack) && exists(pack) && !dump_source_ready(pack)) return 1;
         int r = play_package(pkgs[i], names[i], why[i], 768);
         if (r == RUNNING || r == QUIT) { maybe_update(pkgs[0]); return 0; }
         if (i + 1 < count) say(L"falling back to %ls", names[i + 1]);

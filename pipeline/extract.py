@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from .nx import romfs as romfs_mod
+from .nx import romsource
 from .nx.common import below_normal_priority, require, wait_for_ram, write_json
 from .nx.bktr import CRYPT_CTR_EX, BktrSection
 from .nx.container import (CRYPT_CTR, CRYPT_NONE, CRYPT_NAMES, FS_PFS0, FS_ROMFS, NcaSection, load_keys, partition_entries,
@@ -90,15 +91,18 @@ def extract_exefs(nsp, keys_path, out_dir, log=print, update=None):
     return report
 
 
-def extract_romfs(nsp, keys_path, out_dir, expected=None, unpack=True, log=print, update=None):
+def extract_romfs(nsp, keys_path, out_dir, expected=None, unpack=True, log=print, update=None, in_dump=False):
     """Verify every IVFC level and write out_dir/romfs.bin, out_dir/romfs-index.json and (unpack) out_dir/romfs/.
     With `update` (the player's dump of the update NSP) the image is the update's RomFS merged over the base game's.
+    With `in_dump` the image stays in the dump: out_dir/romfs-source.txt (nx/romsource.py) replaces romfs.bin (the
+    same full pass and pinned hash; no 17 GB copy; a base game only, no unpacked tree).
 
     `expected` = {'size', 'sha256'} of the image; a mismatch raises and leaves no image behind.
     """
+    require(not (in_dump and (update or unpack)), 'the RomFS can stay in the dump only for a base game without a tree')
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    image = out_dir / 'romfs.bin'
+    image = out_dir / (romsource.SOURCE if in_dump else 'romfs.bin')
     keys = load_keys(keys_path)
     t0 = time.monotonic()
     with open(nsp, 'rb') as f, (open(update, 'rb') if update else io.BytesIO()) as fu:
@@ -110,16 +114,31 @@ def extract_romfs(nsp, keys_path, out_dir, expected=None, unpack=True, log=print
         del keys
         if section.size > 1024 ** 3:   # heavy job on a shared machine (memory itself stays ~100 MB)
             wait_for_ram(log=log)
-        log(f'romfs: section {section.index}, {section.size / 2**30:.2f} GiB, verifying IVFC levels 0-5')
-        result = romfs_mod.extract_image(section, image, log=log)
+        log(f'romfs: section {section.index}, {section.size / 2**30:.2f} GiB, verifying IVFC levels 0-5' +
+            (' (the image stays in the dump)' if in_dump else ''))
+        result = romfs_mod.extract_image(section, None if in_dump else image, log=log)
+        source = romsource.describe(section, nsp, result['image_offset'], result['romfs_size'],
+                                    result['romfs_sha256']) if in_dump else None
     t_image = time.monotonic() - t0
     if expected:
         if result['romfs_size'] != expected['size'] or result['romfs_sha256'] != expected['sha256']:
-            image.rename(image.with_name('romfs.bin.mismatch'))
+            if not in_dump:
+                image.rename(image.with_name('romfs.bin.mismatch'))
             raise ValueError(f"RomFS hash/size mismatch: got {result['romfs_size']} {result['romfs_sha256']}, "
                              f"expected {expected['size']} {expected['sha256']}")
+    if in_dump:
+        romsource.write_source(image, source)
+    # the other form of the same image goes (romfs.bin when the dump serves it now, romfs-source.txt when copied out),
+    # with its verified record: step 2 records the new one
+    olds = ('romfs.bin.verified.json', 'romfs.bin') if in_dump else () if update else \
+        (romsource.SOURCE + '.verified.json', romsource.SOURCE)
+    for old in olds:
+        try:
+            (out_dir / old).unlink(missing_ok=True)
+        except OSError as e:   # (open in a running game: left, the next run removes it)
+            log(f'romfs: {old} left in place ({e.strerror})')
     files = romfs_mod.index_romfs(image)
-    write_json(out_dir / 'romfs-index.json', dict(image='romfs.bin', files=files))
+    write_json(out_dir / 'romfs-index.json', dict(image=image.name, files=files))
     unpacked = None
     t_unpack = 0.0
     if unpack:
@@ -132,7 +151,7 @@ def extract_romfs(nsp, keys_path, out_dir, expected=None, unpack=True, log=print
                   ivfc_blocks=result['ivfc_blocks'], romfs_size=result['romfs_size'],
                   romfs_sha256=result['romfs_sha256'], expected_match=bool(expected),
                   file_count=len(files), total_file_bytes=sum(e['size'] for e in files),
-                  image='romfs.bin', index='romfs-index.json', tree='romfs' if unpack else None,
+                  image=image.name, index='romfs-index.json', tree='romfs' if unpack else None,
                   seconds=dict(image=round(t_image, 1), unpack=round(t_unpack, 1)),
                   integrity='FS header and all six IVFC levels verified; RSA signature not checked')
     write_json(out_dir / 'romfs-report.json', report)
@@ -172,6 +191,8 @@ def main(argv=None):
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--expected', type=Path, help='expected-v1.0.0.json')
     p.add_argument('--no-unpack', action='store_true')
+    p.add_argument('--in-dump', action='store_true',
+                   help='romfs: leave the image in the dump (romfs-source.txt instead of romfs.bin; implies --no-unpack)')
     a = p.parse_args(argv)
     below_normal_priority()
     log = lambda m: print(m, flush=True)  # noqa: E731
@@ -183,8 +204,8 @@ def main(argv=None):
     elif a.step == 'exefs':
         extract_exefs(a.nsp, a.keys, a.out, log=log, update=a.update)
     else:
-        extract_romfs(a.nsp, a.keys, a.out, expected=expected.get('romfs'), unpack=not a.no_unpack, log=log,
-                      update=a.update)
+        extract_romfs(a.nsp, a.keys, a.out, expected=expected.get('romfs'), unpack=not (a.no_unpack or a.in_dump),
+                      log=log, update=a.update, in_dump=a.in_dump)
 
 
 if __name__ == '__main__':

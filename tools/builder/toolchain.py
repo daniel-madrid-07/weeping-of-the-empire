@@ -22,7 +22,9 @@ import subprocess
 import sys
 import tarfile
 import time
+import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -56,54 +58,98 @@ def _mb(n):
     return f'{n / 2**20:.0f}'
 
 
+def rate_text(done, total, rate):
+    """', 2.1 MB/s, 3 min left' (the speed over the last seconds, smoothed); '' before there is one"""
+    if rate <= 0:
+        return ''
+    s = f', {rate / 2**20:.1f} MB/s' if rate >= 2**20 / 10 else f', {rate / 1024:.0f} KB/s'
+    if total and done < total:
+        left = (total - done) / rate
+        s += f', {left / 60:.0f} min left' if left >= 90 else f', {left:.0f} s left'
+    return s
+
+
+def unreachable(name, url, err):
+    """the sentence for a download that will not come: offline / blocked said plainly, and that a rerun continues"""
+    host = urllib.parse.urlsplit(url).hostname or url
+    reason = getattr(err, 'reason', err)
+    offline = isinstance(reason, (socket.gaierror, ConnectionRefusedError, TimeoutError, socket.timeout))
+    return (f'{name}: {host} could not be reached ({err}). ' +
+            ('Check that this PC is connected to the internet; a firewall, proxy or school / work network can block '
+             f'{host}. ' if offline else 'Check the internet connection. ') +
+            'Then start again: the download continues where it stopped.')
+
+
 def download(name, url, dest, sha256=None, size=None, tries=6):
-    """url -> dest with progress lines ('download <name>: 45% (400/901 MB)': the window moves its bar by them).
-    Resumes dest.part after a cut; retries with a growing pause; checks the sha256 when one is pinned."""
+    """url -> dest with progress lines ('download <name>: 45% (400/901 MB, 2.1 MB/s, 4 min left)': the window moves its
+    bar by them). Resumes dest.part after a cut, with a growing pause (2, 4, 8 ... 60 s) between tries; gives up after
+    `tries` failures in a row that gained no byte, so a slow line that keeps dropping still finishes. Never hands back
+    a partial file: dest exists only once complete (and its sha256 checked when pinned); a resumed .part whose checksum
+    fails (left by another version's file of the same name) is fetched once more from the start."""
     if os.path.isfile(dest) and (not sha256 or file_sha256(dest) == sha256):
         return dest
     part = dest + '.part'
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    for attempt in range(1, tries + 1):
-        have = os.path.getsize(part) if os.path.exists(part) else 0
+    fails, refetched, err = 0, False, None
+    while True:
+        have = start = os.path.getsize(part) if os.path.exists(part) else 0
         req = urllib.request.Request(url, headers=dict(UA, **({'Range': f'bytes={have}-'} if have else {})))
+        complete = False
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 if have and r.status != 206:
-                    have = 0   # (no range support: from the start)
+                    have = start = 0   # (no range support: from the start)
                 total = (int(r.headers['Content-Length']) + have) if r.headers.get('Content-Length') else size
-                done, last, t0 = have, 0.0, time.monotonic()
+                done, last, rate, mark = have, time.monotonic(), 0.0, (time.monotonic(), have)
                 with open(part, 'ab' if have else 'wb') as f:
                     while True:
-                        chunk = r.read(1 << 20)
+                        chunk = r.read(1 << 18)
                         if not chunk:
                             break
                         f.write(chunk)
                         done += len(chunk)
-                        if time.monotonic() - last >= 2:
-                            last = time.monotonic()
-                            say(f'download {name}: {done * 100 // total}% ({_mb(done)}/{_mb(total)} MB)' if total
-                                else f'download {name}: {_mb(done)} MB')
+                        now = time.monotonic()
+                        if now - last >= 2:
+                            inst = (done - mark[1]) / max(now - mark[0], 1e-3)
+                            rate = inst if not rate else 0.7 * rate + 0.3 * inst
+                            last, mark = now, (now, done)
+                            say(f'download {name}: {done * 100 // total}% ({_mb(done)}/{_mb(total)} MB{rate_text(done, total, rate)})'
+                                if total else f'download {name}: {_mb(done)} MB{rate_text(done, 0, rate)}')
             if total and os.path.getsize(part) < total:
                 raise OSError('connection closed early')
-            break
+            complete = True
         except urllib.error.HTTPError as e:
             if e.code == 416:   # (a stale .part at least as long as the file: check it as it is)
-                break
-            err = e
+                complete = True
+            elif 400 <= e.code < 500 and e.code not in (408, 429):   # (no retry helps: said at once)
+                raise ToolchainError(f'{name}: {urllib.parse.urlsplit(url).hostname} answered {e.code} for {url}. '
+                                     'Start again later; if it stays like this, report it.')
+            else:
+                err = e
         except (OSError, http.client.HTTPException) as e:   # (IncompleteRead: a body cut short)
+            if isinstance(e, OSError) and (e.errno == 28 or getattr(e, 'winerror', None) in (39, 112)):   # (disk full)
+                raise ToolchainError(f'{name}: the disk is full ({os.path.dirname(dest)}). Free some space, then start '
+                                     'again: the download continues where it stopped.')
             err = e
-        if attempt == tries:
-            raise ToolchainError(f'{name}: download failed ({err}). Check the internet connection and start again: '
-                                 'it continues where it stopped.')
-        say(f'download {name}: {err}; retrying')
-        time.sleep(3 * attempt)
-    if sha256:
-        got = file_sha256(part)
-        if got != sha256:
-            os.remove(part)
-            raise ToolchainError(f'{name}: the download does not match its checksum ({got}); start again')
-    os.replace(part, dest)
-    return dest
+        if complete:
+            if sha256:
+                got = file_sha256(part)
+                if got != sha256:
+                    os.remove(part)
+                    if start and not refetched:
+                        refetched = True
+                        say(f'download {name}: the resumed file does not match its checksum: from the start')
+                        continue
+                    raise ToolchainError(f'{name}: the download does not match its checksum ({got}); start again')
+            os.replace(part, dest)
+            return dest
+        gained = os.path.exists(part) and os.path.getsize(part) > start
+        fails = 1 if gained else fails + 1
+        if fails >= tries:
+            raise ToolchainError(unreachable(name, url, err))
+        pause = min(60, 2 ** fails)
+        say(f'download {name}: {err}; retrying in {pause} s')
+        time.sleep(pause)
 
 
 def file_sha256(path):

@@ -10,10 +10,12 @@ link input of totk.exe: TOTK_APP_ICON_RES, engine/tools/recomp/mkninja_win.py); 
 (512 px). Prints one JSON line: the source ("romfs" or "neutral") and the sizes.
 
 The ring: timg/__Combined.bntx of the Common layout archive holds it as two BC4 masks, the ring itself
-(Logo_Element_L^s, 427 px) and its shadow / glow (Logo_ElementSh_GameTitle_00^s, 547 px, the same centre). The title
-layout colours them; here the ring is mint on the shadow in teal, turned 44 degrees clockwise as on the title
-screen. Without the archive, a texture of another size or format (a different game version, a damaged dump), the
-neutral icon is made instead and the line says so."""
+(Logo_Element_L^s, 427 px) and its shadow / glow (Logo_ElementSh_GameTitle_00^s, 547 px, the same centre; read only to
+check the archive is the expected one), turned 44 degrees clockwise as on the title screen. The icon is a flat 2-colour
+emblem: the ring's mask cut at half coverage in mint, its inner detail and a halo of HALO of its width around it in
+teal, nothing soft, transparent outside. 16 to 32 px take a simplified ring (the detail closed up), which stays a clean
+ring at that size. Without the archive, a texture of another size or format (a different game version, a damaged dump),
+the neutral icon is made instead and the line says so."""
 import argparse
 import io
 import json
@@ -30,8 +32,10 @@ RING = 'Logo_Element_L^s'
 SHADOW = 'Logo_ElementSh_GameTitle_00^s'
 BC4_UNORM = 0x1d01
 TURN = -44                       # degrees (PIL: counter-clockwise), the title screen's angle
-MINT = (74, 213, 159)  # the ring
-TEAL = (34, 117, 129)            # the shadow under it
+MINT = (0x4a, 0xd5, 0x9f)  # the ring
+TEAL = (0x23, 0x75, 0x81)        # its inner detail and the halo
+HALO = 0.06                      # the halo's width, of the emblem's
+SMALL = 32                       # sizes up to this take the simplified ring
 SIZES = (16, 20, 24, 32, 40, 48, 64, 96, 128, 256)
 
 
@@ -99,16 +103,29 @@ def common_archive(romfs, v100_name):
     return other[-1]
 
 
-def compose(ring, shadow, size=1024):
-    """The icon at size x size RGBA, cropped tight to what is visible (the shadow's glow included)."""
-    n = shadow.width
-    r = Image.new('L', (n, n))
-    r.paste(ring, ((n - ring.width) // 2, (n - ring.height) // 2))
-    r = np.asarray(r.rotate(TURN, resample=Image.BICUBIC)).astype(np.float32) / 255
-    s = np.asarray(shadow.rotate(TURN, resample=Image.BICUBIC)).astype(np.float32) / 255
-    rgb = np.array(TEAL, np.float32) * (1 - r[..., None]) + np.array(MINT, np.float32) * r[..., None]
-    alpha = np.maximum(s, r)
-    img = Image.fromarray(np.dstack([rgb, alpha * 255]).round().astype(np.uint8), 'RGBA')
+def blur_over(mask, sigma, t):
+    """A bool mask blurred (sigma px) and cut at t: t 0.5 smooths it and closes holes and gaps under ~sigma, a low t
+    grows it by ~2 sigma with a rounded outline."""
+    im = Image.fromarray(mask.astype(np.uint8) * 255).filter(ImageFilter.GaussianBlur(float(sigma)))
+    return np.asarray(im).astype(np.float32) / 255 > t
+
+
+def compose(ring, size=1024, simple=False, k=4):
+    """The emblem at size x size RGBA, cropped tight: the ring's mask (k times up, turned, cut at half coverage) in mint,
+    a teal halo of HALO of its width under it (its holes teal too), transparent outside; drawn at k times and scaled
+    down, so its edges are smooth. simple: the ring's detail closed up (the small sizes)."""
+    n = int(ring.width * 1.35)   # (room for the halo)
+    c = Image.new('L', (n, n))
+    c.paste(ring, ((n - ring.width) // 2, (n - ring.height) // 2))
+    big = c.resize((n * k, n * k), Image.BICUBIC).rotate(TURN, resample=Image.BICUBIC)
+    r = np.asarray(big).astype(np.float32) / 255 > 0.5
+    ys, xs = np.nonzero(r)
+    w = float(max(xs.max() - xs.min(), ys.max() - ys.min()))
+    if simple:
+        r = blur_over(r, w * 0.02, 0.5)
+    halo = blur_over(r, w * HALO / 2.05, 0.02) | r   # (a straight edge's blur crosses 0.02 at ~2.05 sigma)
+    rgb = np.where(r[..., None], np.array(MINT, np.uint8), np.array(TEAL, np.uint8))
+    img = Image.fromarray(np.dstack([rgb, halo.astype(np.uint8) * 255]), 'RGBA')
     return square_crop(img, size)
 
 
@@ -122,7 +139,6 @@ def neutral(size=1024):
     c, ro, ri = big / 2, big * 0.46, big * 0.27
     d.ellipse([c - ro, c - ro, c + ro, c + ro], fill=255)
     d.ellipse([c - ri, c - ri, c + ri, c + ri], fill=0)
-    halo = halo.filter(ImageFilter.GaussianBlur(big * 0.012))
     img.paste(Image.new('RGBA', (big, big), TEAL + (255,)), mask=halo)
     ring = Image.new('L', (big, big), 0)
     d = ImageDraw.Draw(ring)
@@ -152,13 +168,7 @@ def square_crop(img, size):
 # --------------------------------------------------------------------------------------------------------------- .ico
 
 def scaled(img, px):
-    """img at px x px; small sizes lose the outer glow's faint edge, which only blurs them."""
-    out = img.resize((px, px), Image.LANCZOS)
-    if px <= 32:
-        a = np.asarray(out).copy()
-        a[..., 3] = np.clip((a[..., 3].astype(np.int32) - 24) * 255 // 231, 0, 255)
-        out = Image.fromarray(a, 'RGBA')
-    return out
+    return img.resize((px, px), Image.LANCZOS)
 
 
 def bmp_entry(img):
@@ -176,11 +186,12 @@ def bmp_entry(img):
     return head + bgra + bytes(mask)
 
 
-def ico_entries(img, sizes=SIZES):
-    """[(px, image bytes)]: 32-bit BMP entries, PNG from 256 px up (as Windows' own icons)."""
+def ico_entries(img, sizes=SIZES, small=None):
+    """[(px, image bytes)]: 32-bit BMP entries, PNG from 256 px up (as Windows' own icons); small (if given) for the
+    sizes up to SMALL."""
     entries = []
     for px in sizes:
-        im = scaled(img, px)
+        im = scaled(small if small is not None and px <= SMALL else img, px)
         if px >= 256:
             buf = io.BytesIO()
             im.save(buf, 'PNG', optimize=True)
@@ -237,17 +248,18 @@ def main(argv=None):
     if not a.neutral and not a.romfs:
         p.error('--romfs or --neutral')
     source, why = 'neutral', 'asked' if a.neutral else ''
-    img = None
+    img = small = None
     if not a.neutral:
         try:
-            img = compose(*ring_masks(a.romfs))
+            ring, _ = ring_masks(a.romfs)
+            img, small = compose(ring), compose(ring, simple=True)
             source = 'romfs'
         except Exception as e:  # (whatever the dump holds: the Setup never fails over an icon)
             why = f'{type(e).__name__}: {e}'
     if img is None:
         img = neutral()
     a.out.mkdir(parents=True, exist_ok=True)
-    entries = ico_entries(img)
+    entries = ico_entries(img, small=small)
     write_ico(entries, a.out / 'totk.ico')
     write_res(entries, a.out / 'totk.res')
     if a.preview:

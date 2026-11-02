@@ -47,6 +47,8 @@ enum {
     TOTK_DP_LATCH_QPC = 168,       /* runtime i64: QueryPerformanceCounter when those totals were read */
     TOTK_DP_SHADOW_FIXED = 208,    /* runtime f32: non-zero = the depth shadow map at the largest size the game picks, not
                                       the view-derived one (shadowres); 0 = the game's own */
+    TOTK_DP_TEMP_UNIT = 212,       /* runtime u32: the Purah Pad map's temperature unit, 0 = the game's (English (US): °F,
+                                      the rest °C), 1 = °C, 2 = °F (the tempunit patch and sign hook, v0.1.8)*/
     /* platform's PlatPcPage (platform/include/platform/pc.h, 0x80 bytes): mouse totals, glyph style, overlay state.
        app binds it after totk_patches_init: plat_pc_page_bind(page + TOTK_DP_PC_OFFSET, sizeof(PlatPcPage)). */
     TOTK_DP_PC_OFFSET = 0x100,

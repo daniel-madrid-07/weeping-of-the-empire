@@ -37,9 +37,10 @@ def get_s(mu, n):
 
 
 def machine(image, page=b''):
-    """The whole image (span, .bss zero) plus the data page holding `page`, a stack and a frame area."""
+    """The whole image (span, .bss zero, then the extra veneer area up to the data page) plus the data page holding
+    `page`, a stack and a frame area."""
     mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
-    mu.mem_map(0, MAIN_SPAN)
+    mu.mem_map(0, max(MAIN_SPAN, DATA))
     mu.mem_write(0, bytes(image))
     mu.mem_map(DATA, 0x4000)
     if page:

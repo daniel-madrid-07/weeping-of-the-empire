@@ -51,3 +51,4 @@ obj/
 
 # Tracked on purpose
 !/engine/third_party/opus/lib/opus.lib
+romfs-source.txt

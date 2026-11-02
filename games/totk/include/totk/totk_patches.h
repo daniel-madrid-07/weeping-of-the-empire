@@ -43,8 +43,10 @@ typedef struct TotkSettings {
     float mouse_scale;                  /* mouse camera multiplier (default 1); 0 = off: platform's stick emulation */
     float mouse_rate;                   /* stick deflection per mouse count at the 30 Hz ratio (calibration, default
                                            TOTK_MOUSE_RATE_DEFAULT) */
+    unsigned temp_unit;                 /* the map's temperature unit: 0 the game's (default), 1 °C, 2 °F */
     double min_frame_ms, max_frame_ms;  /* clamp of the measured frame step (default 1000/240 .. 1000/15: sustained above
-                                           240 FPS the game runs faster than real time, below 15 FPS slower) */
+                                           240 FPS the game runs faster than real time, below 15 FPS slower;
+                                           TOTK_STEP_360=1: 1000/360) */
 } TotkSettings;
 
 /* Full right-stick deflection turns the camera by an unmeasured angle per 30 Hz frame; 0.02 assumes about 0.11 rad
@@ -54,13 +56,14 @@ typedef struct TotkSettings {
 void totk_settings_default(TotkSettings *s);
 
 /* TOTK_REALTIME=0|1, TOTK_RENDER_RES=<w>x<h>, TOTK_OUTPUT_RES=<w>x<h>, TOTK_OUTPUT_MAX=<w>x<h>, TOTK_ASPECT=<w>:<h> |
- * <ratio> | 0, TOTK_MAX_FPS=<hz 30..240> (lower clamp of the frame step), TOTK_DYNAMIC_RES=off | on | <floor 0.25..1> (off: fixed
+ * <ratio> | 0, TOTK_MAX_FPS=<hz 30..totk_max_fps_highest()> (lower clamp of the frame step), TOTK_DYNAMIC_RES=off | on | <floor 0.25..1> (off: fixed
  * scene size, the default; on: the game's dynamic resolution), TOTK_FOV=<multiplier 0.5..2> | 0 (the game's own),
  * TOTK_SHADOW_RES=<multiplier 0.5..2> | 0 (the game's own), TOTK_LOD=<multiplier 0.5..8> | 0 (the game's own), TOTK_ACTOR_LOD=<multiplier 0.5..4> | 0 (the game's own),
  * TOTK_TERRAIN_LOD=<multiplier 0.5..2> | 0 (the game's own), TOTK_SIM_DISTANCE=<multiplier 0.5..4> (1 = the game's own),
  * TOTK_TEXTURE_CACHE=<multiplier 1..3 | percentage 100..300> (texture cache size, needs its HeapDef set),
  * TOTK_MOUSE_CAMERA=<multiplier 0..4> (0: platform's stick
- * emulation instead of the camera hook), TOTK_MOUSE_RATE=<stick per count, 0.001..1> (calibration). Returns NULL, or what was wrong (the settings keep the
+ * emulation instead of the camera hook), TOTK_MOUSE_RATE=<stick per count, 0.001..1> (calibration),
+ * TOTK_TEMP_UNIT=c | f | <empty> (the map's temperature unit; empty = the game's). Returns NULL, or what was wrong (the settings keep the
  * values read before it). */
 const char *totk_settings_from_env(TotkSettings *s);
 
@@ -84,6 +87,14 @@ void totk_frame_step_pin(double ms);
  * fast motion on 240 <-> 30). Any thread; call it when the new cap takes effect. */
 #define TOTK_RETARGET_PRESENTS 60
 void totk_frame_step_retarget(void);
+/* Hold the realtime step at or above 1/TOTK_HOLD_FPS (on = 1) or let it follow the frame time again down to
+ * 1/TOTK_MAX_FPS (on = 0; the step ramps there as after a retarget). Held from the start until the first call. Any
+ * thread.*/
+#define TOTK_HOLD_FPS 240
+void totk_frame_step_hold(int on);
+/* The highest TOTK_MAX_FPS and frame-rate cap: TOTK_HOLD_FPS (v0.1.8: gameplay steps under 1/240 s crash Havok's solver
+ * too, totk_patches.c), 360 with TOTK_STEP_360=1 (the 1/360 path, held at 1/240 through loads only). */
+int totk_max_fps_highest(void);
 
 /* Switch the game's output size while running (<= the swapchain size in both dimensions); the game lays out its crop,
  * canvas and UI again at its next display update. Returns 1 when requested. */
@@ -113,6 +124,8 @@ float totk_shadow_res_current(void);
 /* Model LOD distance multiplier while running (0 or 1 = the game's own; clamped to 0.5..8): each LOD level is kept k
  * times further away. Takes effect next frame. */
 void totk_lod_set(float scale);
+/* The map's temperature unit now (0 the game's, 1 °C, 2 °F): TOTK_DP_TEMP_UNIT, read by the game at each readout update */
+void totk_temp_unit_set(unsigned unit);
 float totk_lod_current(void);
 
 /* The run-time settings of the graphics patches, for platform's settings registry. app registers each row with
@@ -151,6 +164,10 @@ uint64_t totk_output_extra_bytes(const TotkSettings *s);
  * aspect-<w>x<h>, then output-<w>x<h>[-scene-<w>x<h>][-tex<percent>] when the output is bigger than 1920x1080, the
  * scene bigger than 1600x900 or the texture cache grown). Returns how many were written. */
 int totk_overlay_sets(const TotkSettings *s, char names[2][64]);
+
+/* The UI layout set of a <w>x<h> canvas, aspect-<w>x<h>, where a layout set depends only on the canvas's shape: a canvas
+ * of the shape of a set built by default is given that set (1920x1200 -> aspect-2560x1600). 0 (name untouched) at 16:9. */
+int totk_layout_set(unsigned w, unsigned h, char name[64]);
 
 #ifdef __cplusplus
 }

@@ -16,6 +16,8 @@ code from the TotK data page, a page right after main's image that the runtime c
 
 Veneers (code that does more than the one replaced instruction) live in main's text padding: the zero bytes between the
 end of .text (text_end) and the next page. `b <veneer>` replaces the site and the veneer ends with `b <site + 4>`.
+The padding is full (1520 of 1520 bytes); newer veneers live in the extra veneer area (Layout.extra): main's own memory
+from its span to the data page, zero in the image and never used by the game, which main.bin is extended to hold.
 """
 from dataclasses import dataclass, field
 
@@ -31,6 +33,7 @@ DP_ASPECT = 56                                  # f32: aspect ratio for the came
 DP_RES_FLOOR = 64                               # f32: lowest dynamic-resolution scale, 1.0 = fixed, 0 = the game's own
 DP_FOV_SCALE = 68                               # f32: camera field-of-view multiplier, 0 = the game's own
 DP_SHADOW_SCALE = 72                            # f32: depth shadow map size multiplier, 0 = the game's own
+DP_TEMP_UNIT = 212                              # u32: the map readout's temperature unit, 0 / >2 = the game's, 1 = C, 2 = F
 DP_SHADOW_FIXED = 208                           # f32 / u32: non-zero = the shadow map at its largest size, not the view's
 DP_LOD_SCALE = 76                               # f32: model LOD distance multiplier, 0 = the game's own
 DP_MOUSE_SCALE = 80                             # f32: mouse camera multiplier (setting), 0 = off (platform's stick)
@@ -90,9 +93,17 @@ class Patch:
 
 @dataclass
 class Layout:
-    """What the patches need to know about the image: the end of .text, and the data page's offset from main's base."""
+    """What the patches need to know about the image: the end of .text, and the data page's offset from main's base.
+    span: main's loaded size (.bss included); with it, the extra veneer area: from span (page-aligned) to the data page,
+    main's own memory that nothing uses (the runtime maps it with the image, rt_main.cpp load_module). The text padding
+    is full in 1.0.0 (1520 of 1520 bytes), so new veneers go there; main.bin is zero-extended to hold them."""
     text_end: int
     data_off: int
+    span: int = None
+
+    @property
+    def extra(self):          # (start, end) of the extra veneer area, or None
+        return None if self.span is None else ((self.span + 0xfff) & ~0xfff, self.data_off)
 
     @property
     def pad(self):            # first 16-byte boundary in the text padding
@@ -731,6 +742,56 @@ def ui_cb():
     return p
 
 
+# The Purah Pad map's temperature readout converts to Fahrenheit only for one language: main+0x1036ae8 cmp w8, #1 (w8 =
+# the game's language index, from its language singleton or, before that exists, from the system language through the
+# fallback at main+0x1037c48, which joins at main+0x1036ae4), then b.eq to the conversion at main+0x1037550 (x 1.8 + 32).
+# The only such conversion in main. (The unit sign beside it is a picture picked by a layout animation: not this patch.)
+TEMP_UNIT_SITE = 0x1036ae8
+EXTRA_TEMPUNIT = 0        # offset in the extra veneer area: 40 bytes
+
+
+def tempunit(lay):
+    """Temperature unit of the map readout from the data page (+212, u32): 1 = Celsius, 2 = Fahrenheit, 0 or anything
+    else = the game's own choice (a stale page value across a version mismatch stays harmless). The veneer leaves the
+    flags for the b.eq after the site: forced, `cmp w9, #2` gives ne for 1 and eq for 2. w9 is free: nothing reads it
+    before the adrp at main+0x1036b3c writes it (on the Fahrenheit path either), and both paths join at the site."""
+    p = Patch('tempunit')
+    if lay.extra is None:
+        raise ValueError('tempunit needs the extra veneer area (Layout.span)')
+    at = lay.extra[0] + EXTRA_TEMPUNIT
+    s = TEMP_UNIT_SITE
+    p.put(s, a.b(s, at), 'tempunit: cmp w8, #1 (language index: English (US)) -> b <veneer>')
+    veneer = [a.adrp(9, at, lay.data_off),
+              a.ldr_w(9, 9, DP_TEMP_UNIT),            # ldr w9, [x9, #212]
+              a.cmp_w_imm(9, 1),
+              a.b_cond('eq', at + 12, at + 32),       # 1: forced
+              a.cmp_w_imm(9, 2),
+              a.b_cond('eq', at + 20, at + 32),       # 2: forced
+              Orig(s),                                # anything else: the game's cmp w8, #1
+              a.b(at + 28, s + 4),
+              a.cmp_w_imm(9, 2),                      # forced: ne for 1 (Celsius), eq for 2 (Fahrenheit)
+              a.b(at + 36, s + 4)]
+    p.code(at, veneer, 'temperature unit veneer')
+    return p
+
+
+CAMBLEND_SITES = (0xaa8108, 0xaa815c, 0xaa81a4, 0xaa81ec, 0xaa8218)
+FMOV_S1_ONE = 0x1e2e1001   # fmov s1, #1.0
+
+
+def camblend():
+    """Camera mode-switch blend at any frame rate. FUN_aa80c8 eases the old mode's offsets (position +0x5f0..+0x5f8, angles
+    +0x608 / +0x60c, +0x614, +0x610) to 0: ab12f0 steps the progress by dt (the VFR step, 1 at 30 fps) and eases it (e),
+    r = (1 - e_new) / (1 - e_old) is the part of the rest left, and each offset takes x * powf(r, dt). The product of the
+    r's telescopes to 1 - e, so the extra ^dt makes the offset x0 (1 - e)^dt: the designed curve at 30, sqrt-shaped at
+    60, ^0.25 at 120 (it hangs, then drops at the end). The exponent at the 5 powf calls becomes 1 (mov v1.16b, v8.16b ->
+    fmov s1, #1.0): the 30 fps curve at every rate, and bit-identical at 30. dt still drives the progress."""
+    p = Patch('camblend')
+    for s in CAMBLEND_SITES:
+        p.put(s, FMOV_S1_ONE, 'camera blend: mov v1.16b, v8.16b (powf exponent dt) -> fmov s1, #1.0')
+    return p
+
+
 FEATURES = {
     # name: (builder, default on, needs)
     'fps60': (lambda lay: fps60(), True, ()),
@@ -753,6 +814,8 @@ FEATURES = {
     # does not.
     'vk_guard': (lambda lay: vk_guard(), False, ()),
     'ui_cb': (lambda lay: ui_cb(), False, ()),  # off: as is it CRASHES at start; the heap growth is on gp-uicb
+    'tempunit': (tempunit, True, ()),   # 0 on the page = the game's own unit: on by default for the Display row
+    'camblend': (lambda lay: camblend(), True, ()),   # 2026-11-02 (bow aim zoom at high fps); `--features default,-camblend` off
 }
 
 

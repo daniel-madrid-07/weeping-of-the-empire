@@ -15,7 +15,10 @@ struct nxr_cheat {
     std::string note;   // why it cannot be used, or that it needs the next start ("" none); in the player's language
     bool on = false;    // the player's switch (saved: cheats.on)
     bool usable = true;
-    bool code = false;  // it changes the game's code: built in at the next start
+    bool code = false;  // it changes the game's code: built in (on or off) at the start after it appears
 };
 std::vector<nxr_cheat> mods_cheats();
-void mods_cheat_set(int i, bool on);   // saved at once; a data cheat runs (or stops) right away
+void mods_cheat_set(int i, bool on);   // saved at once; a data cheat, or a code cheat the exe holds, switches right away
+
+// A switch site's flag (the code cheat in that slot is on), read by the generated code (gen_ext.py).
+int nxr_code_switch(unsigned slot);

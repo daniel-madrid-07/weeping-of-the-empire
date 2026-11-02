@@ -34,6 +34,7 @@ extern "C" uint64_t hid_game_buttons(void);   // hle_hid.cpp: the Npad buttons t
 extern "C" bool shim_window_fullscreen(void);   // shim_win.c (borderless or exclusive)
 extern "C" bool pc_overlay_open(void);          // pc_overlay.cpp: the settings window (or the Welcome one) is open
 extern "C" void* totk_data_page_current(void);  // games/totk/runtime/totk_patches.c: the data page, or NULL
+extern "C" float totk_camera_stick_applied(void);   // totk_camera_speed.cpp: the right stick's camera speed row
 extern "C" void pc_mouse_inject(double dx, double dy);   // (below: TOTK_CTL "mouse", and TOTK_MOUSE_FLOOD's events)
 #define WM_APP_CAPTURE (WM_APP + 50)            // wParam 1 / 0, lParam the reason (const char*); shim_win.c: WM_APP + 1 .. 3
 #define WM_APP_RECLIP (WM_APP + 51)
@@ -160,6 +161,53 @@ bool page_claimed() {
     return p && __atomic_load_n((uint32_t*)(p + kPcPage + kClaimed), __ATOMIC_ACQUIRE) != 0;
 }
 
+// Ultrahand holding an object (public issue #29: the mouse neither turned the camera nor moved the object; the R
+// rotation and the wheel, d-pad presses, worked). The veneer adds the mouse to the camera stick step's processed pair
+// only, and keeps its claim (so no right-stick emulation) while that step runs; the step also copies the pad's raw
+// pair, and what moves the camera and the held object during a grab gets no mouse. So while Ultrahand holds (the
+// ability context, TPS_HOLDING) the multiplier at +80 goes to 0: the veneer releases its claim and the mouse drives the
+// right stick (pc_mouse_stick_counts' emulation, through the game's stick curve, not 1:1), back to the row's multiplier
+// when it lets go (the veneer primes again: no catch-up turn). TOTK_MOUSE_GRAB_STICK=0 keeps the veneer during a grab.
+std::atomic<float> g_mult{1.0f};   // the row's multiplier (reload)
+std::atomic<bool> g_grab{false};   // grab_switch: the stick has the mouse while Ultrahand holds
+// The right stick's camera speed row (controls.stick_camera_speed) multiplies the game's speeds, which the veneer's turn
+// goes through too: the multiplier is divided by the factor the served camera pack carries, so the mouse keeps its own
+// speed (speed_follow, from the input thread once the pack is built)
+std::atomic<float> g_speed{1.0f};
+SRWLOCK g_publish = SRWLOCK_INIT;   // reload (the overlay's thread) and grab_switch (the input thread) publish in turn
+void scale_publish() {   // any thread
+    uint8_t* p = page();
+    if (!p) return;
+    AcquireSRWLockExclusive(&g_publish);
+    const float f = g_grab.load() ? 0.0f : g_mult.load() / g_speed.load();
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    __atomic_store_n((uint32_t*)(p + kMouseScale), bits, __ATOMIC_RELEASE);
+    ReleaseSRWLockExclusive(&g_publish);
+}
+void speed_follow() {   // the input thread, each read
+    const float a = totk_camera_stick_applied();
+    if (a > 0 && a != g_speed.load(std::memory_order_relaxed)) {
+        g_speed.store(a);
+        scale_publish();
+        printf("[mouse] camera: the right stick's speed x%.2f, the mouse's multiplier divided by it\n", a);
+    }
+}
+void grab_switch() {   // the input thread, each read
+    static const bool on = [] {
+        const char* e = getenv("TOTK_MOUSE_GRAB_STICK");
+        return !e || strcmp(e, "0") != 0;
+    }();
+    const bool hold = on && pc_ctx() == PCX_ABILITY && (totk_player_state() & TPS_HOLDING) != 0;
+    if (hold == g_grab.load(std::memory_order_relaxed)) return;
+    g_grab.store(hold);
+    scale_publish();
+    static int logs;
+    if (logs++ < 100)
+        printf("[mouse] Ultrahand %s: the mouse %s\n", hold ? "holds an object" : "let go",
+               hold ? "drives the right stick" : "turns the camera directly again");
+}
+
 // TOTK_MOUSE_CAMERA is a multiplier (the controls.mouse_camera_scale row writes it 0..4): unset = 1 (on by default since
 // the 2026-10-23 all-on pass), 0 = off, above 0 scales the turn (the veneer's multiplier; the stick's full speed / it).
 // TOTK_MOUSE_SENS 0.1.. 20 (the controls.mouse_sensitivity row).
@@ -175,12 +223,8 @@ void reload() {
     AcquireSRWLockExclusive(&g_lock);
     g_sens = sens; g_full = full; g_inv = inv; g_scale = scale > 0 ? scale : 1; g_aim_scale = aim;
     ReleaseSRWLockExclusive(&g_lock);
-    if (uint8_t* p = page()) {   // (totk_patches.c wrote it at boot; the row changes it live)
-        float f = scale > 0 ? (float)fmin(scale, 4.0) : 0.0f;
-        uint32_t bits;
-        memcpy(&bits, &f, 4);
-        __atomic_store_n((uint32_t*)(p + kMouseScale), bits, __ATOMIC_RELEASE);
-    }
+    g_mult.store(scale > 0 ? (float)fmin(scale, 4.0) : 0.0f);   // (totk_patches.c wrote it at boot; the row changes it live)
+    scale_publish();
     bool was = g_on.exchange(scale > 0);
     if (scale > 0)
         printf("[mouse] camera%s: the pointer is captured while the window is active and the overlay closed; x%.2f, "
@@ -1058,6 +1102,8 @@ extern "C" void pc_mouse_stick_counts(int32_t* rx, int32_t* ry, double* cdx, dou
     if (!enabled()) return;
     attach();
     policy();
+    grab_switch();
+    speed_follow();
     if (pc_mouse_injected()) page_captured(true);
     else if (!g_captured.load()) page_captured(false);
     LARGE_INTEGER now, f; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
@@ -1074,6 +1120,7 @@ extern "C" void pc_mouse_stick_counts(int32_t* rx, int32_t* ry, double* cdx, dou
         g_vx += (dx / dt - g_vx) * a; g_vy += (dy / dt - g_vy) * a;
     } else g_vx = g_vy = 0;
     double full = g_full / (g_sens * g_scale * (g_menu.load() ? 1 : aim_gain()));   // (the bow drawn: controls.mouse_aim_scale)
+    if (!g_menu.load()) full *= g_speed.load(std::memory_order_relaxed);   // (the camera's speeds times the stick row)
     double sx = g_vx / full, sy = -g_vy / full * (g_menu.load() ? 1 : g_inv);   // stick +y = up (a menu's cursor: not inverted)
     double m = sqrt(sx * sx + sy * sy);
     if (m < 0.01) return;   // still: the pad's or the keys' stick stays

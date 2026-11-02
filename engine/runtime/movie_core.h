@@ -54,6 +54,7 @@ struct WebM {
     const uint8_t* view = nullptr;         // the mapped view: d itself, or below it for a slice (open_slice)
 #endif
     const uint8_t* d = nullptr; uint64_t n = 0;
+    std::vector<uint8_t> owned;            // open_bytes: the movie's bytes held in memory (d points into them)
     uint64_t timescale = 1000000;          // ns per timecode unit
     double duration = 0;                   // in timecode units
     std::vector<Track> tracks;
@@ -198,6 +199,13 @@ struct WebM {
         return index(err, errn);
     }
 #endif
+    // A movie whose bytes the caller read whole (the RomFS image in the encrypted game dump: no mapping shows it
+    // decrypted): kept until close.
+    bool open_bytes(std::vector<uint8_t>&& bytes, char* err, size_t errn) {
+        owned = std::move(bytes);
+        d = owned.data(); n = owned.size();
+        return index(err, errn);
+    }
     bool index(char* err, size_t errn) {
         int64_t tc = 0;
         walk(0, n, 0, nullptr, &tc);
@@ -211,9 +219,10 @@ struct WebM {
         if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
         d = view = nullptr; map = nullptr; file = INVALID_HANDLE_VALUE; n = 0;
 #else
-        if (d) munmap((void*)d, (size_t)n);
+        if (d && owned.empty()) munmap((void*)d, (size_t)n);
         d = nullptr; n = 0;
 #endif
+        owned.clear(); owned.shrink_to_fit();
     }
     ~WebM() { close(); }
 };

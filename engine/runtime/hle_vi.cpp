@@ -302,11 +302,13 @@ extern "C" void vi_set_pace_at(const char *v) {
 }
 static std::atomic<int> g_pace_interval{2};
 
-// ---------------------------------------------------------------- unlocked frame rate (TOTK_UNLOCK_FPS=1) Never
-// unpaced. "Unlocked" is:
-// - gameplay: the clock at a ceiling, TOTK_UNLOCK_CEIL=<fps> (60..480), by default the game window's monitor refresh
-//   (60..240; 120 when it cannot be read; looked up every 2 s);
-// - loading screens, the title and other light screens: the game's own interval (Switch timing). Gameplay is told
+// ---------------------------------------------------------------- unlocked frame rate (TOTK_UNLOCK_FPS=1) Never unpaced.
+// "Unlocked" is:
+// - gameplay: the clock at a ceiling, TOTK_UNLOCK_CEIL=<fps> (60..240), by default the game window's monitor refresh
+//   (60..240; 120 when it cannot be read; looked up every 2 s; 240 is the realtime step's floor, TOTK_MAX_FPS; 360 for
+//   both with TOTK_STEP_360=1, totk_max_fps_highest);
+// - the title and world-pausing menus that draw little: the game's own interval (Switch timing); a load on screen: the
+//   loading pace (below); other light screens (a fade, the fast-travel warp): the ceiling (g_light_cap). Gameplay is told
 //   from them by the render passes a frame (exec.c vk_exec_passes_total, a 4-present mean; boot.py's world anchor reads
 //   the same): the loading screen draws 2, the fade into it 20-120, the title ~155 and the world 175-500 (boots
 //   paceunl2_2247 / pace120_2237): gameplay after 1 s at >= 60, loading again below 30 (menus that light may pace too).
@@ -425,11 +427,15 @@ template <class F> static int rate_get(std::atomic<int> &a, F from_env) {
     if (v < 0) { int want = -1; a.compare_exchange_strong(want, from_env()); v = a.load(); }
     return v;
 }
+// The highest cap: 240, the game step's floor (step_hold_track); 360 with TOTK_STEP_360=1 (totk_patches.h)
+extern "C" int totk_max_fps_highest(void);
+static int step_highest(void) { static const int h = totk_max_fps_highest(); return h; }   // (getenv once: rate_get)
 static int fps_setting() {
 #ifdef TOTK_CAP30
     return 0;   // (above)
 #endif
-    return rate_get(g_fps_set, [] { const char *e = getenv("TOTK_FPS"); return e ? std::max(atoi(e), 0) : 0; });
+    // (an old player.txt's TOTK_FPS=300 / 360 is the highest: above the step's floor the game would run fast)
+    return rate_get(g_fps_set, [] { const char *e = getenv("TOTK_FPS"); return e ? std::min(std::max(atoi(e), 0), step_highest()) : 0; });
 }
 static int unlock_mode() {   // 0 paced as set, 1 unlocked, 2 raw (unpaced)
 #ifdef TOTK_CAP30
@@ -449,13 +455,14 @@ static int steady_setting() {
 extern "C" int vi_fps_setting(void) { return fps_setting(); }   // hle_hid.cpp (quick menus), device.c (window title)
 extern "C" int vi_unlock_setting(void) { return unlock_mode(); }
 extern "C" void totk_frame_step_retarget(void);   // games/totk (totk_patches.h): the realtime step after a rate change
-// display.fps_cap's values (pc_settings.cpp V_FPS): "30" the game's own, "60" / "90" / "120", "unlocked", "steady"
+// display.fps_cap's values (pc_settings.cpp V_FPS): "30" the game's own, "40" / "45" (a PC that cannot hold 60),
+// "60" .. "240" (the usual monitor rates), "unlocked", "steady"
 // (unlocked at a rate the frames hold; a start's TOTK_UNLOCK_STEADY=vrr keeps its 10 % steps)
 extern "C" void vi_set_frame_rate(const char *v) {
     if (!v) return;
     const bool steady = !strcmp(v, "steady"), unlocked = steady || !strcmp(v, "unlocked");
     const int was_steady = steady_setting();
-    g_fps_set.store(unlocked || !strcmp(v, "30") ? 0 : std::max(atoi(v), 0));
+    g_fps_set.store(unlocked || !strcmp(v, "30") ? 0 : std::min(std::max(atoi(v), 0), step_highest()));
     g_steady.store(!steady ? 0 : was_steady >= 2 ? was_steady : 1);
     g_unlock.store(unlocked ? 1 : 0);
     // (the pacer takes the new values at its next frame; the realtime step ramps to the new rate at once instead of its
@@ -599,23 +606,66 @@ static bool world_paused_menu(void) {
     default: return was = false;
     }
 }
+// Held at 1/240 while the world may be loading: no gameplay state (the loading screen, a fade, the title, light screens),
+// a load on screen or a banc change, the title phase, and for TOTK_STEP_HOLD_S (2 s) after the last of them, while the
+// world's new bodies are first solved; meanwhile vi_pace_wait paces at 240 at most, so the game keeps real time (a held
+// step at 360 fps would be 1.5x). Gameplay then steps down to 1/360 s (TOTK_MAX_FPS), so 300 / 360 fps run at 1.0x.
+// TOTK_STEP_HOLD=always: held for good (the 1/240 floor everywhere, as before); =0: never. Unlocked with TOTK_LOAD_PACE=0
+// (no loading rule, loads not told from gameplay): held throughout. v0.1.8 release blocker: gameplay steps under 1/240 s
+// crashed the same solver (3 of 4 exclusive runs, v0.1.7 none), so that 1/360 path is opt-in, TOTK_STEP_360=1
+// (totk_max_fps_highest); without it the step is held for good (always).
+extern "C" void totk_frame_step_hold(int on);   // games/totk (totk_patches.h)
+static std::atomic<bool> g_step_hold{true};
+static void step_hold_track(bool loading) {
+    using clk = std::chrono::steady_clock;
+    static const int mode = [] {   // 0 never, 1 loads, 2 always
+        if (step_highest() <= 240) return 2;
+        const char *e = getenv("TOTK_STEP_HOLD");
+        return !e || !*e ? 1 : !strcmp(e, "0") ? 0 : !strcmp(e, "always") ? 2 : 1;
+    }();
+    static const double settle = [] {
+        const char *e = getenv("TOTK_STEP_HOLD_S");
+        return e && *e ? std::min(std::max(atof(e), 0.0), 30.0) : 2.0;
+    }();
+    static clk::time_point last_load;
+    const auto now = clk::now();
+    if (loading || last_load.time_since_epoch().count() == 0) last_load = now;
+    const bool hold = mode == 2 || (mode == 1 && std::chrono::duration<double>(now - last_load).count() < settle);
+    static bool told;
+    if (hold == g_step_hold.load(std::memory_order_relaxed) && told) return;
+    told = true;
+    g_step_hold.store(hold, std::memory_order_relaxed);
+    totk_frame_step_hold(hold ? 1 : 0);
+    static int logs;
+    if (logs++ < 200) printf("[pace] game step %s\n", !hold ? "free down to 1/360 s" : mode == 1 ? "held at 1/240 s or more (a load)"
+                                                       : "held at 1/240 s or more (for good)");
+}
+static double step_floor(void) { return g_step_hold.load(std::memory_order_relaxed) ? 1.0 / 240 : 1.0 / 360; }
+
+// A light screen that is neither the title nor a world-pausing menu (a fade, the fast-travel warp, a cutscene that draws
+// little) keeps the player's rate (unlocked: the ceiling; above 120: the cap) instead of the game's own interval: the
+// warp drew 13-24 render passes, dropped from the cap to 30 fps mid-play and back. Not above 240 while the game step is
+// held (vi_pace_wait: 480 fps with the 1/240 floor had no crash, 240 none), and a load on screen still takes the loading
+// pace. TOTK_LIGHT_PACE=interval: the game's interval there (as before).
+static std::atomic<bool> g_light_cap{false};
 // Per game present (game thread): the gameplay / loading state and the ceiling, for vi_pace_wait (any thread).
 static void load_track(void) {
     display_note();
     display_notice();
-    vk_warm_present(g_gameplay.load(), world_paused_menu());   // (the state as of the last present: one frame behind)
+    const bool menu = world_paused_menu();
+    vk_warm_present(g_gameplay.load(), menu);   // (the state as of the last present: one frame behind)
     static const bool rule = !getenv("TOTK_LOAD_PACE") || strcmp(getenv("TOTK_LOAD_PACE"), "0") != 0;
     // (the gameplay / loading state is followed whatever the setting, so a change to unlocked or above 120 in game
     // starts from the right state instead of a second of loading pace)
     using clk = std::chrono::steady_clock;
     auto now = clk::now();
     if (unlock_mode() == 1) {
-        static const int fixed = getenv("TOTK_UNLOCK_CEIL") ? std::min(std::max(atoi(getenv("TOTK_UNLOCK_CEIL")), 60), 480) : 0;
+        static const int fixed = getenv("TOTK_UNLOCK_CEIL") ? std::min(std::max(atoi(getenv("TOTK_UNLOCK_CEIL")), 60), step_highest()) : 0;
         static clk::time_point checked;
         if (checked.time_since_epoch().count() == 0 || now - checked >= std::chrono::seconds(2)) {
             const bool first = checked.time_since_epoch().count() == 0;
             checked = now;
-            int hz = window_monitor_hz(), c = fixed ? fixed : hz ? std::min(std::max(hz, 60), 240) : 120;
+            int hz = window_monitor_hz(), c = fixed ? fixed : hz ? std::min(std::max(hz, 60), step_highest()) : 120;
             // (the ceiling stays the monitor's: DLSS-G halves it and VRR steady starts from its margin; vi_pace_wait holds
             // the game frames under audio_fps_max after those)
             if (first || c != g_unlock_ceil.load()) {
@@ -625,7 +675,8 @@ static void load_track(void) {
             }
             g_unlock_ceil.store(c);
         }
-        if (!rule) { g_gameplay.store(true); return; }
+        // (no loading rule: loads are not told from gameplay here, so the step is held throughout)
+        if (!rule) { g_gameplay.store(true); step_hold_track(true); return; }
     }
     static u64 last, ring[4];
     static unsigned n;
@@ -680,12 +731,16 @@ static void load_track(void) {
             if (fast) printf("[pace] loading screen: %d fps (TOTK_LOAD_FPS=0: the cap)\n", load_fps());
         }
     }
+    step_hold_track(!to || g_load_fast.load() || totk_banc_change() || g_title_phase);
+    static const bool light_keep = !getenv("TOTK_LIGHT_PACE") || strcmp(getenv("TOTK_LIGHT_PACE"), "interval") != 0;
+    g_light_cap.store(light_keep && !to && !g_title_phase && !menu, std::memory_order_relaxed);
     if (to != on) {
         g_gameplay.store(to);
         static int logs;
         if (logs++ < 100)
             printf("[pace] %s: %.0f render passes a frame -> %s\n", to ? "gameplay" : "loading / light screen", ppf,
-                   to ? (unlock_mode() == 1 ? "unlocked" : "TOTK_FPS") : "the game's interval");
+                   to ? (unlock_mode() == 1 ? "unlocked" : "TOTK_FPS")
+                      : g_light_cap.load(std::memory_order_relaxed) ? "the player's rate (TOTK_LIGHT_PACE)" : "the game's interval");
     }
 }
 
@@ -703,10 +758,11 @@ extern "C" void vi_present_pace(int interval) {
     vk_present_latency_sleep();   // (low latency on: Reflex's sleep before the next frame samples input)
 }
 extern "C" void vk_present_jit_wait(uint64_t ns);   // nvn/vulkan/present.c: a wait after input (low latency, any GPU)
+extern "C" bool vi_pace_was_held(void) { return t_pace_held; }   // (device.c: the last vi_pace_present_point was a focus pause)
 extern "C" void vi_pace_present_point(void) {
+    t_pace_held = false;   // (before the return: vi_pace_was_held answers for this call)
     if (!vi_pace_at_present()) return;
     const auto t0 = std::chrono::steady_clock::now();
-    t_pace_held = false;
     vi_pace_wait(g_pace_interval.load());
     if (t_pace_held) return;  // (a pause is no pacing wait: jit_sleep would sleep 3/4 of a period after it)
     vk_present_jit_wait((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
@@ -794,6 +850,8 @@ static int64_t steady_period(int ceil, bool late, std::chrono::steady_clock::tim
 
 #ifdef _WIN32
 extern "C" bool vk_ngx_fg_on(void);   // nvn/vulkan/ngx.c: DLSS-G set up (TOTK_DLSS=fg / fgtest and NGX ready)
+extern "C" int vk_ngx_fg_frames(void);         // ngx.c: generated frames per real one asked (x2 = 1 .. x4 = 3)
+extern "C" void vk_ngx_fg_set_active(int n);   // ngx.c: how many it generates now
 extern "C" int vk_present_mode_active(void);   // nvn/vulkan/present.c: the current swapchain's mode (2: FIFO; -1 none)
 // VRR: the display.vrr row on and the swapchain FIFO (pc_window.cpp present_of_rows; the swapchain's own mode, so the
 // pacing follows it across a row change and its re-create). A hand-set LARECOMP_VK_PRESENT=fifo without the row is plain
@@ -841,9 +899,10 @@ static void vi_pace_wait(int interval) {
     // TOTK_FPS=60: pace at every vsync (interval 1) instead of the game's 2 (needs the speed fix above for 100 % speed)
     const int fps_set = fps_setting();   // (live: the display.fps_cap row)
     static const bool rule = !getenv("TOTK_LOAD_PACE") || strcmp(getenv("TOTK_LOAD_PACE"), "0") != 0;
-    // unlocked: the ceiling in gameplay; unlocked or above 120 (loading rule): the game's interval on light screens
-    int fps = unlock_mode() == 1 ? (g_gameplay.load() ? g_unlock_ceil.load() : 0)
-            : fps_set > 120 && rule && !g_gameplay.load() ? 0 : fps_set;
+    // unlocked: the ceiling in gameplay; unlocked or above 120 (loading rule): the game's interval on the title and in
+    // world-pausing menus; other light screens keep the player's rate (g_light_cap)
+    const bool own = !g_gameplay.load() && !g_light_cap.load(std::memory_order_relaxed);
+    int fps = unlock_mode() == 1 ? (own ? 0 : g_unlock_ceil.load()) : fps_set > 120 && rule && own ? 0 : fps_set;
     const int load_pace = g_load_fast.load() ? load_fps() : 0;   // (the loading screen's own pace, g_load_fast)
     if (load_pace) fps = load_pace;
     // (a movie: its own pace, above. 30 does not take the clock path below, which starts above 30: it is two of the 60 Hz
@@ -851,14 +910,21 @@ static void vi_pace_wait(int interval) {
     // logged and no effect. A rate that is not a whole number of ticks (24, 25) goes on the clock)
     const bool video_pace = g_video_on.load(std::memory_order_relaxed) && video_fps();
     if (video_pace) fps = video_fps();
-    // DLSS-G (the presenter: one generated frame between real ones): the cap is the frames on screen, so the real frames
-    // pace at half of it (120 on a 120 Hz monitor: 60 real + 60 generated; at the cap itself they would put 240 on a 120
-    // Hz screen, dropped by mailbox or queued by FIFO). Never under 30 real. TOTK_FG_CAP=real: the cap paces the real
-    // frames (the output twice it), for A/Bs. The game's own 30 is left alone.... and the real frames pace by steady
-    // unlocked's rungs below that (2 refresh periods a step): when the game cannot hold half the cap, its generated
-    // frames came late, out 3-4 ms before the real one and replaced on screen. With a rung the real frames hold, each
-    // generated frame keeps its half interval, and no wait is added on the render thread beyond the present's own cap.
+    // (the game step held at 1/240 s or more, step_hold_track: no faster frames, so the game keeps real time meanwhile)
+    if (fps > 240 && g_step_hold.load(std::memory_order_relaxed)) fps = 240;
+    // DLSS-G (the presenter: n generated frames between real ones, the Options row's x2 / x3 / x4 = n 1 / 2 / 3): the cap is
+    // the frames on screen, so the real frames pace at 1 / (n + 1) of it (120 on a 120 Hz monitor at x2: 60 real + 60
+    // generated; at x4: 30 real + 90 generated; at the cap itself they would put 240 on a 120 Hz screen, dropped by mailbox
+    // or queued by FIFO). Never under 30 real: where cap / (n + 1) would be, fewer frames are generated (x4 at a 60 cap
+    // generates 1: 30 + 30; vk_ngx_fg_set_active), so the frames shown never pass the cap. TOTK_FG_CAP=real: the cap paces
+    // the real frames (the output n + 1 times it), for A/Bs. The game's own 30 is left alone (real frames at 30), and under a
+    // 60 cap one frame is generated whatever the multiplier (30 + 30: no count keeps both real frames at 30 and the frames
+    // shown at the cap; x4 at 30 showed 120).... and the real frames pace by steady unlocked's rungs below that (n + 1
+    // refresh periods a step): when the game cannot hold half the cap, its generated frames came late, out 3-4 ms before the
+    // real one and replaced on screen. With a rung the real frames hold, each generated frame keeps its half interval, and no
+    // wait is added on the render thread beyond the present's own cap.
     bool fg_steady = false, fg_vrr = false, vrr_top = false, vrr_unlocked = false;
+    int fg_unit = 2;   // (refresh periods a rung step: a real frame and its generated ones each on a whole refresh)
 #ifdef _WIN32
     {
         static const bool cap_real = getenv("TOTK_FG_CAP") && !strcmp(getenv("TOTK_FG_CAP"), "real");
@@ -874,7 +940,9 @@ static void vi_pace_wait(int interval) {
             const int hz = rns ? (int)(1e9 / rns + 0.5) : 0;
             if (hz >= 60 && hz - hz * hz / 3600 < fps) fps = hz - hz * hz / 3600, vrr_top = true;
         }
-        if (!fgtest && !cap_real && fps >= 60 && vk_ngx_fg_on()) {
+        const int fg_n = vk_ngx_fg_frames();   // (0: FG off)
+        int fg_k = fg_n;
+        if (!fgtest && !cap_real && fps >= 60 && fg_n) {
             // With VRR (the display.vrr row: FIFO) the panel shows each frame as it comes, so the whole-refresh rungs only
             // cost rate (a game holding 100 real fps fell to the 60 rung: 120 on screen against 130 without FG); there the
             // frames on screen stay under the panel's maximum by Reflex's margin, hz - hz^2 / 3600 (116 at 120 Hz, 138 at
@@ -885,9 +953,12 @@ static void vi_pace_wait(int interval) {
             const int hz = rns ? (int)(1e9 / rns + 0.5) : 0;
             fg_vrr = present_vrr();
             if (fg_vrr && hz >= 60) fps = std::min(fps, hz - hz * hz / 3600);
-            fps = std::max(fps / 2, 30);
+            fg_k = std::max(1, std::min(fg_n, fps / 30 - 1));
+            fps = std::max(fps / (fg_k + 1), 30);
+            fg_unit = fg_k + 1;
             fg_steady = !fg_vrr;
-        }
+        } else if (!fgtest && !cap_real && fps > 0 && fg_n) fg_k = 1;
+        if (fg_n) vk_ngx_fg_set_active(fg_k);
     }
 #endif
     g_pace_period_ns.store(0);   // (set again below while the clock pacer paces FG's real frames)
@@ -967,7 +1038,7 @@ static void vi_pace_wait(int interval) {
             // (late: this frame came a quarter period or more after its slot, the deadline the last one set; smaller
             // misses are routine at a rate the game holds: a 120 cap held 117 fps with 28 % of frames a little late)
             const auto slack = std::chrono::nanoseconds((steady_ns ? steady_ns : 1000000000ll / fps) / 4);
-            steady_ns = steady_period(fps, now > next + slack, now, fg_steady ? 2 : 1, vrr_top && !fg_steady);
+            steady_ns = steady_period(fps, now > next + slack, now, fg_steady ? fg_unit : 1, vrr_top && !fg_steady);
         } else steady_ns = 0;
         const auto period = std::chrono::nanoseconds(steady_ns ? steady_ns : 1000000000ll / fps);
         paced_period((int64_t)period.count(), adapt);
@@ -1000,9 +1071,10 @@ static void vi_pace_wait(int interval) {
 // present interval 2). It stores ratio = interval / 2 and frameTime = interval / 60 at this+8, then deltaFrame = ratio
 // * speed multiplier, deltaTime = deltaFrame / 30 at this+0 and per core at this+16, +56, +96. With the fixed interval
 // every frame advanced 1/30 s of game time: 2.06x speed at 62 fps. The hook scales those outputs by k = measured frame
-// time / (interval / 60). Astro Bot lessons: the raw frame time is clamped to [1/240, 1/20] s (a load stall must not
-// inject a huge step, physics dislikes > 1/20 s) and smoothed with an EMA of 0.08 (instant jumps crashed Astro).
-// TOTK_SPEED_FIX=0: old behaviour (fixed step); [speedfix] logs k every 300 calls.
+// time / (interval / 60). Astro Bot lessons: the raw frame time is clamped to [1/360, 1/20] s, [1/240, 1/20] while the
+// step is held (step_hold_track; a load stall must not inject a huge step, physics dislikes > 1/20 s) and smoothed with
+// an EMA of 0.08 (instant jumps crashed Astro). TOTK_SPEED_FIX=0: old behaviour (fixed step); [speedfix] logs k every
+// 300 calls.
 void f_7a83e4_orig(Ctx* __restrict c);
 void hook_f_7a83e4(Ctx* __restrict c) {
     static const bool on = !getenv("TOTK_SPEED_FIX") || strcmp(getenv("TOTK_SPEED_FIX"), "0");
@@ -1043,7 +1115,7 @@ void hook_f_7a83e4(Ctx* __restrict c) {
         }
         return;
     }
-    dt = std::min(std::max(dt, 1.0 / 240), 1.0 / 20);
+    dt = std::min(std::max(dt, step_floor()), 1.0 / 20);
     // (the loading pace started or ended: the mean starts again from the NEW pace's period, the first one the pacer set
     // after the change, else the world's first frames after a load at 120 would step a quarter of 1/30 s at a 30 cap until
     // the mean caught up: slow motion into the fade. The boundary frame's own dt is still the old pace)
@@ -1055,7 +1127,7 @@ void hook_f_7a83e4(Ctx* __restrict c) {
     if (st[i].reseed && g_paced_seq.load(std::memory_order_acquire) != st[i].seq) {
         const double p = g_paced_ns.load(std::memory_order_relaxed) / 1e9;
         st[i].reseed = false;
-        if (p > 0) { st[i].ema = std::min(std::max(p, 1.0 / 240), 1.0 / 20); dt = st[i].ema; }
+        if (p > 0) { st[i].ema = std::min(std::max(p, step_floor()), 1.0 / 20); dt = st[i].ema; }
     }
     st[i].ema += 0.08 * (dt - st[i].ema);
     float k = (float)(st[i].ema / nominal);

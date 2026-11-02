@@ -11,6 +11,7 @@
 #include "pc_settings.h"
 #include "pc_device_switch.h"   // the device the prompts follow: what counts as a use, the anti-flicker guards
 #include "pc_key_hold.h"        // the move keys' minimum hold (keyboard_read)
+#include "pc_text.h"            // pc_tr (the dead-zone rows' readout)
 #include "totk_menu_cursor.h"
 #include "totk_player_state.h"
 #include "totk_ability.h"
@@ -117,7 +118,8 @@ static u64 scripted_buttons() {
 // ------------------------------------------------------------------ host input
 // Pad: XInput (Xbox controllers; a DualSense / Pro Controller shows up through Steam Input or DS4Windows). Face buttons
 // map by POSITION like Eden's SDL default (pad B = right = Switch A, pad A = bottom = Switch B, Y = top = X, X = left
-// = Y), so on-screen prompts match where the button sits; TOTK_PAD_LABELS=1 maps by label instead (pad A -> Switch A).
+// = Y), so on-screen prompts match where the button sits; TOTK_PAD_LABELS=1 maps by label instead (pad A -> Switch A;
+// a PlayStation pad over raw HID: Cross -> A; a Nintendo pad is the same either way).
 // Keyboard (only while the game window is in front): WASD move (Ctrl = walk), arrows / IJKL camera, Space X (jump),
 // Shift B (sprint / back), E or Enter A (action / confirm), F Y (attack), Q L (abilities), R R (throw / use),
 // Z ZL (target / shield), C ZR (bow), V LS (crouch), G RS (look), Esc PLUS (menu), M MINUS (map), 1-4 D-pad L U R D,
@@ -126,6 +128,31 @@ enum : u64 { BtnA = 1u << 0, BtnB = 1u << 1, BtnX = 1u << 2, BtnY = 1u << 3, Btn
              BtnL = 1u << 6, BtnR = 1u << 7, BtnZL = 1u << 8, BtnZR = 1u << 9, BtnPlus = 1u << 10, BtnMinus = 1u << 11,
              BtnLeft = 1u << 12, BtnUp = 1u << 13, BtnRight = 1u << 14, BtnDown = 1u << 15 };
 struct HostInput { u64 buttons; s32 lx, ly, rx, ry; };
+// Back paddles (rival-parity 11-02; the Switch has none): P1 right top, P2 right bottom, P3 left top, P4 left bottom (the
+// Xbox Elite's names Windows.Gaming.Input below), sony_decode). controls.paddle_1.. _4 (TOTK_PADDLE_1.. 4, live) give
+// each the Switch button it presses; none by default. Bits 0..3 = P1..P4.
+static std::atomic<u64> g_paddle_btn[4];   // the Switch button each paddle presses (0: none)
+static u64 paddle_buttons(unsigned held) {
+    u64 b = 0;
+    for (int i = 0; i < 4; i++) if (held >> i & 1) b |= g_paddle_btn[i].load(std::memory_order_relaxed);
+    return b;
+}
+static u64 paddle_button_of(const char* v) {
+    static const struct { const char* n; u64 b; } names[] = {
+        {"a", BtnA}, {"b", BtnB}, {"x", BtnX}, {"y", BtnY}, {"l", BtnL}, {"r", BtnR}, {"zl", BtnZL}, {"zr", BtnZR},
+        {"plus", BtnPlus}, {"minus", BtnMinus}, {"ls", BtnLS}, {"rs", BtnRS}, {"up", BtnUp}, {"down", BtnDown},
+        {"left", BtnLeft}, {"right", BtnRight}};
+    for (auto& n : names) if (v && !strcmp(v, n.n)) return n.b;
+    return 0;
+}
+static void paddles_load() {   // the start's environment, once (the rows' applies set them after)
+    static const bool once = [] {
+        const char* vars[4] = {"TOTK_PADDLE_1", "TOTK_PADDLE_2", "TOTK_PADDLE_3", "TOTK_PADDLE_4"};
+        for (int i = 0; i < 4; i++) g_paddle_btn[i] = paddle_button_of(getenv(vars[i]));
+        return true;
+    }();
+    (void)once;
+}
 static std::atomic<int> g_padmap_gen{1};   // the pad bindings changed (overlay rows): pad_remap rebuilds
 
 #ifdef _WIN32
@@ -148,6 +175,17 @@ static XInputGetState_t xinput_load() {
 // unset = the pad's own. Raised for a stick that drifts at rest, lowered for finer small movements (the other public
 // port's players asked for it: drift, their #12 #99 #111 #115).
 static std::atomic<int> g_dead_zone[2] = {{-1}, {-1}};   // Npad units (0..32767), 0 = the pad's own, -1 = not read yet
+// TOTK_WALK_SPEED (controls.walk_speed, live): the keys' stick with the walk key held, 0.2 .. 0.9 of its travel (0.45)
+static float walk_units(const char* v) {
+    const float w = v && *v ? (float)atof(v) : 0.45f;
+    return w >= 0.2f && w <= 0.9f ? w : 0.45f;
+}
+static std::atomic<float> g_walk_scale{-1};   // -1: not read yet (the start's environment, once)
+static float walk_scale() {
+    float w = g_walk_scale.load(std::memory_order_relaxed);
+    if (w < 0) g_walk_scale = w = walk_units(getenv("TOTK_WALK_SPEED"));
+    return w;
+}
 static int dead_zone_units(const char* v) { double p = v && *v ? atof(v) : 0; return p > 0 ? (int)lrint(fmin(p, 90.0) * 327.67) : 0; }
 static int dead_zone(int right, int own) {
     int d = g_dead_zone[right].load(std::memory_order_relaxed);
@@ -156,8 +194,13 @@ static int dead_zone(int right, int own) {
 }
 
 // radial dead zone, rescaled so the edge of the dead zone is 0 and full deflection stays 32767 (Npad stick range)
-static void stick(SHORT x, SHORT y, int dz, s32* ox, s32* oy) {
+// The last raw deflection each stick read (left 0, right 1; any pad: the last one read), in percent of its travel, before
+// the dead zone: the dead-zone rows show it next to their value (dead_zone_format), so a player sees how far a resting
+// stick drifts and what a push reaches
+static std::atomic<float> g_stick_raw[2];
+static void stick(SHORT x, SHORT y, int dz, s32* ox, s32* oy, int which) {
     float fx = x, fy = y, m = sqrtf(fx * fx + fy * fy);
+    g_stick_raw[which & 1].store(fminf(m / 327.67f, 100.0f), std::memory_order_relaxed);
     if (m <= dz) { *ox = *oy = 0; return; }
     float k = fminf((m - dz) / (32767.0f - dz), 1.0f) * 32767.0f / m;
     *ox = (s32)lrintf(fx * k); *oy = (s32)lrintf(fy * k);
@@ -230,7 +273,126 @@ static void xinput_scan_thread(XInputGetState_t get) {
         WaitForSingleObject(xscan_event(), 750);
     }
 }
+// An Xbox Elite's paddles: XInput has no bits for them, Windows.Gaming.Input does (GamepadButtons Paddle1.. 4). Its COM
+// interfaces are called here by vtable slot (no WinRT headers in the build) through combase.dll, loaded once a paddle
+// row or the trigger rumble row is set; a thread of its own (MTA) reads the first Gamepad every 4 ms while an XInput pad
+// is in use and a paddle is bound, and lists the Gamepads again each second. Paddles the Xbox Accessories app maps to
+// buttons arrive as those buttons through XInput instead. With several Xbox pads, the first Gamepad's paddles count. The
+// same thread gives that Gamepad the rumble thread's levels with its impulse triggers, on a change and once a second
+// while any runs, and only while it is the one Gamepad (with two, the first may not be the pad in use); put_Vibration
+// sets all four motors, so while it drives them the rumble thread leaves XInputSetState alone (the driver may set the
+// triggers to rest on an XInput write). The row turned off, or a second pad: all four to rest once, and XInput takes the
+// big motors back.
+static std::atomic<unsigned> g_wgi_paddles{0};
+static std::atomic<bool> g_wgi_driving{false};         // the thread sends the four motors (rumble thread: no XInput)
+static std::atomic<unsigned long long> g_wgi_vib{0};   // motors left | right << 16 | trigger left << 32 | right << 48
+static std::atomic<bool> g_wgi_vib_on{false};          // (controls.rumble_triggers on)
+static void wgi_thread() {
+    HMODULE cb = LoadLibraryW(L"combase.dll");
+    typedef HRESULT(WINAPI * RoInitialize_t)(int);
+    typedef HRESULT(WINAPI * RoGetActivationFactory_t)(void*, REFIID, void**);
+    typedef HRESULT(WINAPI * WindowsCreateString_t)(const wchar_t*, UINT32, void**);
+    typedef HRESULT(WINAPI * WindowsDeleteString_t)(void*);
+    auto ro_init = cb ? (RoInitialize_t)GetProcAddress(cb, "RoInitialize") : nullptr;
+    auto ro_factory = cb ? (RoGetActivationFactory_t)GetProcAddress(cb, "RoGetActivationFactory") : nullptr;
+    auto str_new = cb ? (WindowsCreateString_t)GetProcAddress(cb, "WindowsCreateString") : nullptr;
+    auto str_del = cb ? (WindowsDeleteString_t)GetProcAddress(cb, "WindowsDeleteString") : nullptr;
+    void* statics = nullptr;
+    if (ro_init && ro_factory && str_new && str_del && SUCCEEDED(ro_init(1 /* RO_INIT_MULTITHREADED */))) {
+        static const wchar_t kClass[] = L"Windows.Gaming.Input.Gamepad";
+        static const GUID kIGamepadStatics = {0x8bbce529, 0xd49c, 0x39e9, {0x95, 0x60, 0xe4, 0x7d, 0xde, 0x96, 0xb7, 0xc8}};
+        void* name = nullptr;
+        if (SUCCEEDED(str_new(kClass, (UINT32)(sizeof kClass / sizeof kClass[0] - 1), &name))) {
+            if (FAILED(ro_factory(name, kIGamepadStatics, &statics))) statics = nullptr;
+            str_del(name);
+        }
+    }
+    printf("[hid] Windows.Gaming.Input %s\n", statics ? "ready (an Xbox Elite's paddles, impulse triggers)" : "unavailable");
+    if (!statics) return;
+    // vtable slots: IUnknown 0-2, IInspectable 3-5; IGamepadStatics get_Gamepads 10; IVectorView GetAt 6, get_Size 7;
+    // IGamepad put_Vibration 7 (GamepadVibration: four doubles 0..1, by value), GetCurrentReading 8 (GamepadReading:
+    // u64 Timestamp, u32 Buttons, then six doubles)
+    struct Reading { UINT64 ts; UINT32 buttons, pad_; double lt, rt, lx, ly, rx, ry; };
+    struct Vibration { double left, right, left_trigger, right_trigger; };
+    auto slot = [](void* o, int i) { return (*(void***)o)[i]; };
+    auto release = [&](void* o) { if (o) ((ULONG(STDMETHODCALLTYPE*)(void*))slot(o, 2))(o); };
+    void* pad = nullptr;
+    ULONGLONG listed = 0, vib_t = 0;
+    unsigned long long vib_sent = 0;
+    UINT32 pads = 0;
+    bool told_several = false;
+    for (;;) {
+        const bool vib_on = g_wgi_vib_on.load(std::memory_order_relaxed);
+        bool paddles = false;
+        for (auto& b : g_paddle_btn) paddles = paddles || b.load(std::memory_order_relaxed);
+        if (g_xslot.load() < 0 || (!paddles && !vib_on && !vib_sent)) {
+            g_wgi_paddles = 0;
+            g_wgi_driving = false;
+            if (g_xslot.load() < 0) vib_sent = 0;   // (the pad is gone: nothing to set to rest)
+            Sleep(250);
+            continue;
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (!pad || now - listed >= 1000) {   // (the list fills a moment after the first look, and pads come and go)
+            listed = now;
+            void* view = nullptr;
+            void* first = nullptr;
+            UINT32 n = 0;
+            if (SUCCEEDED(((HRESULT(STDMETHODCALLTYPE*)(void*, void**))slot(statics, 10))(statics, &view)) && view) {
+                if (SUCCEEDED(((HRESULT(STDMETHODCALLTYPE*)(void*, UINT32*))slot(view, 7))(view, &n)) && n &&
+                    FAILED(((HRESULT(STDMETHODCALLTYPE*)(void*, UINT32, void**))slot(view, 6))(view, 0, &first)))
+                    first = nullptr;
+                release(view);
+            }
+            release(pad);
+            pad = first;
+            pads = n;
+        }
+        Reading r = {};
+        unsigned held = 0;
+        if (paddles && pad && SUCCEEDED(((HRESULT(STDMETHODCALLTYPE*)(void*, Reading*))slot(pad, 8))(pad, &r)))
+            held = (r.buttons >> 14) & 15;   // Paddle1 0x4000 .. Paddle4 0x20000
+        g_wgi_paddles = held;
+        // off (or not the one pad): all four to rest once; XInput sends the big motors again from its next tick
+        const bool drive = vib_on && pad && pads == 1;
+        if (vib_on && pads > 1 && !told_several) {
+            told_several = true;
+            printf("[hid] trigger rumble: %u Xbox pads, off while more than one is connected\n", pads);
+        }
+        g_wgi_driving = drive;
+        const unsigned long long want = drive ? g_wgi_vib.load(std::memory_order_relaxed) : 0;
+        if (pad && ((want != vib_sent && now - vib_t >= 10) || (want && now - vib_t >= 1000))) {
+            auto lvl = [&](int i) { return (double)(want >> (16 * i) & 0xFFFF) / 65535.0; };
+            const Vibration v = {lvl(0), lvl(1), lvl(2), lvl(3)};
+            ((HRESULT(STDMETHODCALLTYPE*)(void*, Vibration))slot(pad, 7))(pad, v);
+            vib_sent = want;
+            vib_t = now;
+        }
+        Sleep(4);
+    }
+}
+static std::atomic<bool> g_wgi_started{false};
+static void wgi_start() {
+    if (!g_wgi_started.load(std::memory_order_relaxed) && !g_wgi_started.exchange(true)) std::thread(wgi_thread).detach();
+}
+static unsigned wgi_paddles() {
+    if (!g_wgi_started.load(std::memory_order_relaxed)) {
+        bool any = false;
+        for (auto& b : g_paddle_btn) any = any || b.load(std::memory_order_relaxed);
+        if (!any) return 0;   // (no paddle bound: no thread, no WinRT)
+        wgi_start();
+    }
+    return g_wgi_paddles.load(std::memory_order_relaxed);
+}
+// the rumble thread's levels (0..1) for the Gamepad's four motors; on = the trigger rumble row is on
+static void wgi_vibrate(float left, float right, float left_trigger, float right_trigger, bool on) {
+    auto q = [](float a) { return (unsigned long long)lrintf(fminf(1.0f, fmaxf(0.0f, a)) * 65535.0f); };
+    g_wgi_vib.store(q(left) | q(right) << 16 | q(left_trigger) << 32 | q(right_trigger) << 48, std::memory_order_relaxed);
+    g_wgi_vib_on.store(on, std::memory_order_relaxed);
+    if (on) wgi_start();
+}
 static void pad_read(HostInput* in) {
+    paddles_load();
     static XInputGetState_t get = xinput_load();
     static const bool labels = getenv("TOTK_PAD_LABELS") != nullptr;
     static int slot = -1;
@@ -261,8 +423,9 @@ static void pad_read(HostInput* in) {
     for (auto& m : map) if (p.buttons & m.x) in->buttons |= labels ? m.lab : m.pos;
     if (p.lt > 30) in->buttons |= BtnZL;      // XINPUT_GAMEPAD_TRIGGER_THRESHOLD
     if (p.rt > 30) in->buttons |= BtnZR;
-    stick(p.lx, p.ly, dead_zone(0, 7849), &in->lx, &in->ly);   // XINPUT_GAMEPAD_LEFT / RIGHT_THUMB_DEADZONE
-    stick(p.rx, p.ry, dead_zone(1, 8689), &in->rx, &in->ry);
+    stick(p.lx, p.ly, dead_zone(0, 7849), &in->lx, &in->ly, 0);   // XINPUT_GAMEPAD_LEFT / RIGHT_THUMB_DEADZONE
+    stick(p.rx, p.ry, dead_zone(1, 8689), &in->rx, &in->ry, 1);
+    in->buttons |= paddle_buttons(wgi_paddles());
 }
 #else
 static void pad_read(HostInput* in);   // SDL gamepad, below the pad state
@@ -290,6 +453,7 @@ struct HidPad {
     std::mutex mmu; Motion m; std::atomic<bool> has_imu{false};
     // rumble output: a second handle (synchronous ReadFile on the read handle would hold WriteFile until a report lands)
     std::atomic<HANDLE> wr{INVALID_HANDLE_VALUE}; std::atomic<int> kind{PadNone}; bool bt = false; int outlen = 64; u8 seq = 0;
+    std::atomic<unsigned> paddles{0};   // a DualSense Edge's back buttons, as P1 (right) / P3 (left)
 };
 static HidPad g_hidpad[4];
 static HidPad g_mousepad;   // the mouse as the gyro (keyboard_read, TOTK_MOUSE_GYRO): motion only, never in g_hidpad loops
@@ -406,11 +570,14 @@ static void sony_decode(const u8* r, PadKind kind, bool bt, HidPad* pad) {
     else return;
     u8 b0 = ds4_order ? p[4] : p[7], b1 = ds4_order ? p[5] : p[8], b2 = ds4_order ? p[6] : p[9];
     u8 l2 = ds4_order ? p[7] : p[4], r2 = ds4_order ? p[8] : p[5];
+    // by position (Circle = A) or, TOTK_PAD_LABELS, by label as pad_read and the PlayStation prompts have it (Cross = A,
+    // Circle = B, Square = X, Triangle = Y)
+    static const bool labels = getenv("TOTK_PAD_LABELS") != nullptr;
     u64 b = 0;
-    if (b0 & 0x40) b |= BtnA;   // Circle (right)
-    if (b0 & 0x20) b |= BtnB;   // Cross (bottom)
-    if (b0 & 0x80) b |= BtnX;   // Triangle (top)
-    if (b0 & 0x10) b |= BtnY;   // Square (left)
+    if (b0 & 0x40) b |= labels ? BtnB : BtnA;   // Circle (right)
+    if (b0 & 0x20) b |= labels ? BtnA : BtnB;   // Cross (bottom)
+    if (b0 & 0x80) b |= labels ? BtnY : BtnX;   // Triangle (top)
+    if (b0 & 0x10) b |= labels ? BtnX : BtnY;   // Square (left)
     static const u64 hat[8] = {BtnUp, BtnUp | BtnRight, BtnRight, BtnRight | BtnDown, BtnDown, BtnDown | BtnLeft, BtnLeft, BtnLeft | BtnUp};
     if ((b0 & 15) < 8) b |= hat[b0 & 15];
     if (b1 & 0x01) b |= BtnL;
@@ -422,10 +589,13 @@ static void sony_decode(const u8* r, PadKind kind, bool bt, HidPad* pad) {
     if (b1 & 0x40) b |= BtnLS;
     if (b1 & 0x80) b |= BtnRS;
     if (b2 & 0x02) b |= BtnMinus;   // touchpad click = map too
+    // a DualSense Edge's back buttons (SDL's hidapi PS5 driver: byte 2 of the buttons, 0x40 left, 0x80 right; the full
+    // report only): P1 right, P3 left
+    pad->paddles = ds4_order ? 0u : (b2 & 0x80 ? 1u : 0u) | (b2 & 0x40 ? 4u : 0u);
     auto ax = [](u8 v) { int d = (int)v - 128; return d < 0 ? d * 32767 / 128 : d * 32767 / 127; };   // +-32767
     s32 x, y;
-    stick((SHORT)ax(p[0]), (SHORT)-ax(p[1]), dead_zone(0, 5000), &x, &y); pad->lx = x; pad->ly = y;   // y down on the pad
-    stick((SHORT)ax(p[2]), (SHORT)-ax(p[3]), dead_zone(1, 5000), &x, &y); pad->rx = x; pad->ry = y;
+    stick((SHORT)ax(p[0]), (SHORT)-ax(p[1]), dead_zone(0, 5000), &x, &y, 0); pad->lx = x; pad->ly = y;   // y down on the pad
+    stick((SHORT)ax(p[2]), (SHORT)-ax(p[3]), dead_zone(1, 5000), &x, &y, 1); pad->rx = x; pad->ry = y;
     pad->buttons = b;
 }
 
@@ -463,8 +633,8 @@ static void nin_decode(const u8* r, PadKind kind, NinCal* k, HidPad* pad) {
     if (b5 & 0x40) b |= BtnL;
     if (b5 & 0x80) b |= BtnZL;
     s32 x, y;
-    if (kind != PadJoyR) { stick((SHORT)v[0], (SHORT)v[1], dead_zone(0, 4000), &x, &y); pad->lx = x; pad->ly = y; }   // y up already
-    if (kind != PadJoyL) { stick((SHORT)v[2], (SHORT)v[3], dead_zone(1, 4000), &x, &y); pad->rx = x; pad->ry = y; }
+    if (kind != PadJoyR) { stick((SHORT)v[0], (SHORT)v[1], dead_zone(0, 4000), &x, &y, 0); pad->lx = x; pad->ly = y; }   // y up already
+    if (kind != PadJoyL) { stick((SHORT)v[2], (SHORT)v[3], dead_zone(1, 4000), &x, &y, 1); pad->rx = x; pad->ry = y; }
     pad->buttons = b;
 }
 
@@ -1172,8 +1342,8 @@ static void pad_read(HostInput* in) {
     if (SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 3855) in->buttons |= BtnZL;    // 30 / 255 of the 0..32767 range (XInput threshold)
     if (SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 3855) in->buttons |= BtnZR;
     auto ax = [&](SDL_GamepadAxis a, bool flip) { int v = SDL_GetGamepadAxis(g, a); if (flip) v = -v; return (SHORT)(v > 32767 ? 32767 : v < -32767 ? -32767 : v); };
-    stick(ax(SDL_GAMEPAD_AXIS_LEFTX, false), ax(SDL_GAMEPAD_AXIS_LEFTY, true), dead_zone(0, 7849), &in->lx, &in->ly);      // SDL y is down, Npad y up
-    stick(ax(SDL_GAMEPAD_AXIS_RIGHTX, false), ax(SDL_GAMEPAD_AXIS_RIGHTY, true), dead_zone(1, 8689), &in->rx, &in->ry);   // (XInput dead zones)
+    stick(ax(SDL_GAMEPAD_AXIS_LEFTX, false), ax(SDL_GAMEPAD_AXIS_LEFTY, true), dead_zone(0, 7849), &in->lx, &in->ly, 0);      // SDL y is down, Npad y up
+    stick(ax(SDL_GAMEPAD_AXIS_RIGHTX, false), ax(SDL_GAMEPAD_AXIS_RIGHTY, true), dead_zone(1, 8689), &in->rx, &in->ry, 1);   // (XInput dead zones)
 }
 // Sensor events from the UI thread (shim_sdl3.c): accelerometer samples are kept, each gyroscope sample is fused with the latest one
 // using the sensor's own timestamps. SDL frame (x right, y up, z toward the player; accel m/s^2, gyro rad/s) -> Switch frame as
@@ -1318,7 +1488,7 @@ static void hidpad_read(HostInput* in) {
     bool lset = in->lx || in->ly, rset = in->rx || in->ry;
     for (auto& p : g_hidpad) {
         if (!p.live) continue;
-        in->buttons |= p.buttons.load();
+        in->buttons |= p.buttons.load() | paddle_buttons(p.paddles.load(std::memory_order_relaxed));
         s32 lx = p.lx, ly = p.ly, rx = p.rx, ry = p.ry;
         if (!lset && (lx || ly)) { in->lx = lx; in->ly = ly; lset = true; }
         if (!rset && (rx || ry)) { in->rx = rx; in->ry = ry; rset = true; }
@@ -2024,7 +2194,7 @@ static void keyboard_read(HostInput* in) {
     auto axis = [&](int neg, int pos) { return (int)(held >> pos & 1) - (int)(held >> neg & 1); };
     int mx = axis(16, 18), my = axis(19, 17);
     int cx = axis(20, 22), cy = axis(23, 21);
-    float walk = held >> kWalk & 1 ? 0.45f : 1.0f;
+    float walk = held >> kWalk & 1 ? walk_scale() : 1.0f;
     {   // a quick tap's direction held for key_min_hold_ms (pc_key_hold.h); not into a menu, the map, the overlay or the
         // title (their keys are not the walk's: the hold ends at once there) (the console layout's map too by
         // map_screen: g_screen is a button-edge guess)
@@ -2074,10 +2244,39 @@ CTL_APPLY(ap_glyphs, "TOTK_GLYPHS", g_glyph_forced = v && *v && strcmp(v, "auto"
 CTL_APPLY(ap_map, "TOTK_MOUSE_MAP", (void)0)
 CTL_APPLY(ap_menus, "TOTK_MENU_KEYS", (void)0)
 CTL_APPLY(ap_rumble, "TOTK_RUMBLE", rumble_reload())
+CTL_APPLY(ap_rumble_curve, "TOTK_RUMBLE_CURVE", rumble_reload())
+CTL_APPLY(ap_rumble_triggers, "TOTK_RUMBLE_TRIGGERS", rumble_reload())
 CTL_APPLY(ap_pad_motion, "TOTK_GYRO", gyro_set(v))
 CTL_APPLY(ap_gyro_scale, "TOTK_GYRO_SCALE", gyro_scale_set(v))
 CTL_APPLY(ap_dead_zone_l, "TOTK_STICK_DEADZONE_L", g_dead_zone[0] = dead_zone_units(v))
 CTL_APPLY(ap_dead_zone_r, "TOTK_STICK_DEADZONE_R", g_dead_zone[1] = dead_zone_units(v))
+CTL_APPLY(ap_walk_speed, "TOTK_WALK_SPEED", g_walk_scale = walk_units(v))
+CTL_APPLY(ap_paddle_1, "TOTK_PADDLE_1", g_paddle_btn[0] = paddle_button_of(v))
+CTL_APPLY(ap_paddle_2, "TOTK_PADDLE_2", g_paddle_btn[1] = paddle_button_of(v))
+CTL_APPLY(ap_paddle_3, "TOTK_PADDLE_3", g_paddle_btn[2] = paddle_button_of(v))
+CTL_APPLY(ap_paddle_4, "TOTK_PADDLE_4", g_paddle_btn[3] = paddle_button_of(v))
+static const char* const kTriggerV[] = {"", "0.5", "1", nullptr};
+static const char* const kTriggerN[] = {"Off", "Light", "Full strength", nullptr};
+static const char* const kPaddleV[] = {"", "a", "b", "x", "y", "l", "r", "zl", "zr", "plus", "minus", "ls", "rs", "up",
+                                       "down", "left", "right", nullptr};
+static const char* const kPaddleN[] = {"None", "A", "B", "X", "Y", "L", "R", "ZL", "ZR", "+", "-", "Left stick click",
+                                       "Right stick click", "D-pad up", "D-pad down", "D-pad left", "D-pad right",
+                                       nullptr};
+// The dead-zone rows' value with the stick's deflection now (the settings overlay's thread draws it each frame)
+static const char* dead_zone_format(int which) {
+    static char buf[2][96];
+    char now[48], *o = now;   // (the text goes into a format: its own '%' doubled)
+    for (const char* t = pc_tr("the stick now"); *t && o + 2 < now + sizeof now; t++) {
+        if (*t == '%') *o++ = '%';
+        *o++ = *t;
+    }
+    *o = 0;
+    snprintf(buf[which], sizeof buf[which], "%%.0f %%%%   (%s: %.0f %%%%)", now,
+             g_stick_raw[which].load(std::memory_order_relaxed));
+    return buf[which];
+}
+static const char* dead_zone_format_l(float) { return dead_zone_format(0); }
+static const char* dead_zone_format_r(float) { return dead_zone_format(1); }
 CTL_APPLY(ap_key_hold, "TOTK_KEY_MIN_HOLD_MS", (void)0)
 CTL_APPLY(ap_sprint_toggle, "TOTK_SPRINT_TOGGLE", pc_input_toggle_set(0, v))
 CTL_APPLY(ap_lock_toggle, "TOTK_LOCK_TOGGLE", pc_input_toggle_set(1, v))
@@ -2166,6 +2365,12 @@ static const pc_setting k_ctl_rows[] = {
      "(right).", "", kCtlOffV, kCtlOffN, 0, 0, 0, 0, "TOTK_MENU_KEYS", nullptr, ap_menus, nullptr},
     {"controls.rumble", "Controls", "Pad", "Rumble strength", "The pad's motors (Xbox, PlayStation and Switch pads): 0 "
      "= off, 1 = the game's own.", "1", nullptr, nullptr, 0.0f, 2.0f, 0.1f, 0, "TOTK_RUMBLE", nullptr, ap_rumble, nullptr},
+    {"controls.rumble_curve", "Controls", "Pad", "Rumble curve", "How light rumbles feel next to strong ones: below 1 "
+     "light rumbles come through stronger, above 1 only strong ones; 1 = the game's own.", "1", nullptr, nullptr, 0.3f,
+     2.0f, 0.1f, 0, "TOTK_RUMBLE_CURVE", nullptr, ap_rumble_curve, nullptr},
+    {"controls.rumble_triggers", "Controls", "Pad", "Trigger rumble (Xbox)", "An Xbox One or Series pad's trigger "
+     "motors buzz with the game's rumble, each trigger with its side's. Off by default: the Switch pad has no trigger "
+     "motors.", "", kTriggerV, kTriggerN, 0, 0, 0, 0, "TOTK_RUMBLE_TRIGGERS", nullptr, ap_rumble_triggers, nullptr},
     {"controls.gyro", "Controls", "Pad", "Motion (gyro)", "The motion sensors of a DualSense, DualShock 4, Pro "
      "Controller or Joy-Con, for the game's motion aiming (the game's own Motion Controls option turns it on there). Off: the pad "
      "lies still for the game.", "", kCtlOnV, kCtlOnN, 0, 0, 0, 0, "TOTK_GYRO", nullptr, ap_pad_motion, nullptr},
@@ -2175,11 +2380,27 @@ static const pc_setting k_ctl_rows[] = {
     {"controls.deadzone_left", "Controls", "Pad", "Left stick dead zone", "How far the left stick must move before it "
      "counts, in percent of its travel. Raise it if Link moves with the stick at rest (a worn stick); lower it for finer "
      "small steps. 0 = the pad's own (Xbox 24, PlayStation 15, Switch 12).", "0", nullptr, nullptr, 0.0f, 50.0f, 1.0f,
-     0, "TOTK_STICK_DEADZONE_L", nullptr, ap_dead_zone_l, nullptr},
+     0, "TOTK_STICK_DEADZONE_L", nullptr, ap_dead_zone_l, nullptr, dead_zone_format_l},
     {"controls.deadzone_right", "Controls", "Pad", "Right stick dead zone", "How far the right stick must move before it "
      "counts, in percent of its travel. Raise it if the camera turns with the stick at rest; lower it for finer aiming. "
      "0 = the pad's own (Xbox 27, PlayStation 15, Switch 12).", "0", nullptr, nullptr, 0.0f, 50.0f, 1.0f, 0,
-     "TOTK_STICK_DEADZONE_R", nullptr, ap_dead_zone_r, nullptr},
+     "TOTK_STICK_DEADZONE_R", nullptr, ap_dead_zone_r, nullptr, dead_zone_format_r},
+    {"controls.stick_camera_speed", "Controls", "Pad", "Camera speed (right stick)", "The camera's turn with the right "
+     "stick (and the camera keys) times this, at each of the game's own camera speeds, top speed included; the mouse "
+     "keeps its own sensitivity. At the next start.", "1", nullptr, nullptr, 0.25f, 3.0f, 0.05f, PC_SET_RESTART,
+     "TOTK_STICK_SENS", nullptr, nullptr, nullptr},
+    {"controls.walk_speed", "Controls", KM, "Walk speed", "With the walk key held (Alt in the PC layout): how far the "
+     "movement keys push the stick, in its travel (1 = a full push, as without the key).", "0.45", nullptr, nullptr, 0.2f,
+     0.9f, 0.05f, 0, "TOTK_WALK_SPEED", nullptr, ap_walk_speed, nullptr},
+#define PADDLE_ROW(n, label, where)                                                                                    \
+    {"controls.paddle_" #n, "Controls", "Pad", label, "The Switch button this back paddle presses: an Xbox Elite's " \
+     "paddles (unless the Xbox Accessories app maps them to buttons), a DualSense Edge's back buttons (" where ").",   \
+     "", kPaddleV, kPaddleN, 0, 0, 0, 0, "TOTK_PADDLE_" #n, nullptr, ap_paddle_##n, nullptr}
+    PADDLE_ROW(1, "Back paddle P1 (right, top)", "the right one"),
+    PADDLE_ROW(2, "Back paddle P2 (right, bottom)", "none: P1 and P3 only"),
+    PADDLE_ROW(3, "Back paddle P3 (left, top)", "the left one"),
+    PADDLE_ROW(4, "Back paddle P4 (left, bottom)", "none: P1 and P3 only"),
+#undef PADDLE_ROW
     {"game.pause_unfocused", "Game", "Window", "Pause when the window loses focus", "TOTK_PAUSE_UNFOCUSED: while the "
      "game window is not in front the game stops, picture, sound and its clock, and goes on where it was "
      "(hle_oe.cpp oe_host_paused).", "", kCtlOffV, kCtlOffN, 0, 0, 0,
@@ -2609,13 +2830,12 @@ static void ctl_read(HostInput* in) {
 #ifndef _WIN32
 extern "C" void oe_focus_update(bool focused);   // hle_oe.cpp: TOTK_PAUSE_UNFOCUSED
 #endif
-// Pad button bindings: the readers above give each pad button as the Switch button it is unbound (by position: A = the
-// right face button, B = bottom, X = top, Y = left, on Xbox, PlayStation and Nintendo pads alike; TOTK_PAD_LABELS as
-// each reader has it); the game gets the actions bound to the buttons held. TOTK_PADBIND_<ACTION> (A B X Y LSTICK RSTICK
-// L R ZL ZR PLUS MINUS DPAD_LEFT DPAD_UP DPAD_RIGHT DPAD_DOWN; the overlay's controls.pad.* rows) = up to 4 buttons by
-// TOTK_PRESS's names ("B,ZR"), "none" = unbound, unset = its own button; a button may serve several actions. The overlay
-// and its L3 + R3 chord read the buttons as the readers give them, so no binding locks it out. per action: the buttons
-// that give it (quiet: no log of unknown names); returns how many actions are rebound
+// Pad button bindings: the readers above give each pad button as the Switch button it is unbound (by position: A = the right face button, B =
+// bottom, X = top, Y = left, on Xbox, PlayStation and Nintendo pads alike; TOTK_PAD_LABELS: by label on Xbox and PlayStation pads); the game
+// gets the actions bound to the buttons held. TOTK_PADBIND_<ACTION> (A B X Y LSTICK RSTICK L R ZL ZR PLUS MINUS DPAD_LEFT DPAD_UP DPAD_RIGHT
+// DPAD_DOWN; the overlay's controls.pad.* rows) = up to 4 buttons by TOTK_PRESS's names ("B,ZR"), "none" = unbound, unset = its own button; a
+// button may serve several actions. The overlay and its L3 + R3 chord read the buttons as the readers give them, so no binding locks it out.
+// per action: the buttons that give it (quiet: no log of unknown names); returns how many actions are rebound
 static int padbind_sources(u64 src[16], bool quiet) {
     static const char* const acts[16] = {"A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R", "ZL", "ZR", "PLUS", "MINUS",
                                          "DPAD_LEFT", "DPAD_UP", "DPAD_RIGHT", "DPAD_DOWN"};
@@ -3501,15 +3721,34 @@ static XInputSetState_t xinput_set_load() {
 #endif
 // TOTK_RUMBLE: strength, 0 = off, 1 = the game's own (default), up to 4. The settings overlay's controls.rumble row
 // (k_ctl_rows) sets it live: rumble_reload re-reads it and the rumble thread picks it up at its next 5-ms tick.
-static std::atomic<float> g_rumble_gain{-1.0f};
+// TOTK_RUMBLE_CURVE (controls.rumble_curve, rival-parity 11-02): the game's amplitudes raised to this power before
+// the gain, on every pad: below 1 light rumbles come through stronger, above 1 only strong ones; 1 = the game's own.
+// TOTK_RUMBLE_TRIGGERS (controls.rumble_triggers): an Xbox pad's impulse triggers, each the high band of its side of
+// the Switch pad's rumble times this (0 = off, the default: the Switch has no trigger motors).
+static std::atomic<float> g_rumble_gain{-1.0f}, g_rumble_curve{1.0f}, g_rumble_triggers{0.0f};
 static void rumble_reload() {
+    const char* c = getenv("TOTK_RUMBLE_CURVE");
+    float k = c && *c ? (float)atof(c) : 1.0f;
+    g_rumble_curve = k > 0.2f ? (k < 3 ? k : 3.0f) : (k > 0 ? 0.2f : 1.0f);
+    const char* t = getenv("TOTK_RUMBLE_TRIGGERS");
+    float tv = t && *t ? (float)atof(t) : 0.0f;
+    g_rumble_triggers = tv > 0 ? (tv < 1 ? tv : 1.0f) : 0.0f;
     const char* e = getenv("TOTK_RUMBLE");
     float v = e && *e ? (float)atof(e) : 1.0f;
-    g_rumble_gain = v < 0 ? 0.0f : v > 4 ? 4.0f : v;
+    g_rumble_gain = v < 0 ? 0.0f : v > 4 ? 4.0f : v;   // (last: rumble_gain's first read waits for it)
 }
 static float rumble_gain() {
     if (g_rumble_gain.load() < 0) rumble_reload();
     return g_rumble_gain.load();
+}
+// the gathered amplitudes through the curve row
+static void rumble_shape(vib::Val v[2]) {
+    const float k = g_rumble_curve.load(std::memory_order_relaxed);
+    if (k == 1.0f) return;
+    for (int s = 0; s < 2; s++) {
+        v[s].alo = v[s].alo > 0 ? powf(v[s].alo, k) : 0.0f;
+        v[s].ahi = v[s].ahi > 0 ? powf(v[s].ahi, k) : 0.0f;
+    }
 }
 // Eden/yuzu SDL rumble for 2-motor pads: frequency attenuation, then (a + a^0.35) / 2 (w31)
 static float motor_amp(float a, float f, bool high) {
@@ -3595,6 +3834,7 @@ static void rumble_thread() {
         vib::Val v[2];
         gain = rumble_gain();
         if (gain > 0) vib::gather(v, now);
+        rumble_shape(v);
         float lo = fminf(1.0f, fmaxf(motor_amp(v[0].alo, v[0].flo, false), motor_amp(v[1].alo, v[1].flo, false)) * gain);
         float hi = fminf(1.0f, fmaxf(motor_amp(v[0].ahi, v[0].fhi, true), motor_amp(v[1].ahi, v[1].fhi, true)) * gain);
         bool any = lo > 0.004f || hi > 0.004f;
@@ -3605,13 +3845,20 @@ static void rumble_thread() {
         }
         // Xbox: on change (at most 100/s) and a 1-s refresh while on
         int xs = g_xslot;
-        if (xset && xs >= 0) {
+        if (xset && xs >= 0 && g_wgi_driving.load(std::memory_order_relaxed)) {
+            memset(xs_sent.b, 0xFF, 4);   // (Windows.Gaming.Input drives all four motors: resend once it stops)
+        } else if (xset && xs >= 0) {
             XVib xv = {(WORD)lrintf(lo * 65535), (WORD)lrintf(hi * 65535)};
             bool ch = memcmp(xs_sent.b, &xv, 4) != 0;
             if ((ch && now - xs_sent.t >= 10000) || (any && now - xs_sent.t >= 1000000)) {
                 xset_any(xset, (DWORD)xs, &xv); memcpy(xs_sent.b, &xv, 4); xs_sent.t = now; out_n++;
             }
         }
+        // its impulse triggers (Windows.Gaming.Input's thread sends; the tick after the row is turned off says so once)
+        const float trig = g_rumble_triggers.load(std::memory_order_relaxed);
+        if (xs >= 0 && (trig > 0 || g_wgi_vib_on.load(std::memory_order_relaxed)))
+            wgi_vibrate(lo, hi, fminf(1.0f, motor_amp(v[0].ahi, v[0].fhi, true) * gain * trig),
+                        fminf(1.0f, motor_amp(v[1].ahi, v[1].fhi, true) * gain * trig), trig > 0);
         for (int i = 0; i < 4; i++) {
             HidPad* p = &g_hidpad[i];
             HANDLE w = p->wr;
@@ -3653,7 +3900,7 @@ static void rumble_thread() {
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     float gain = rumble_gain();   // (re-read every tick below: the overlay's controls.rumble row)
     printf("[hid] rumble: gain %.2f, SDL_RumbleGamepad\n", gain);
-    u64 sent_t = 0; Uint16 sent_l = 0, sent_h = 0;
+    u64 sent_t = 0; Uint16 sent_l = 0, sent_h = 0, sent_tl = 0, sent_tr = 0;
     int first = 0;
     for (;;) {
         LARGE_INTEGER due; due.QuadPart = -50000;          // 5 ms
@@ -3663,6 +3910,7 @@ static void rumble_thread() {
         vib::Val v[2];
         gain = rumble_gain();
         if (gain > 0) vib::gather(v, now);
+        rumble_shape(v);
         float lo = fminf(1.0f, fmaxf(motor_amp(v[0].alo, v[0].flo, false), motor_amp(v[1].alo, v[1].flo, false)) * gain);
         float hi = fminf(1.0f, fmaxf(motor_amp(v[0].ahi, v[0].fhi, true), motor_amp(v[1].ahi, v[1].fhi, true)) * gain);
         bool any = lo > 0.004f || hi > 0.004f;
@@ -3671,13 +3919,18 @@ static void rumble_thread() {
             printf("[hid] rumble: L %.2f@%.0f/%.2f@%.0f R %.2f@%.0f/%.2f@%.0f -> motors %.2f %.2f\n", v[0].alo, v[0].flo, v[0].ahi, v[0].fhi,
                    v[1].alo, v[1].flo, v[1].ahi, v[1].fhi, lo, hi);
         }
+        // the trigger rumble row: an Xbox pad's impulse triggers, each the high band of its side
+        const float trig = g_rumble_triggers.load(std::memory_order_relaxed);
+        Uint16 tl = (Uint16)lrintf(fminf(1.0f, motor_amp(v[0].ahi, v[0].fhi, true) * gain * trig) * 65535);
+        Uint16 tr = (Uint16)lrintf(fminf(1.0f, motor_amp(v[1].ahi, v[1].fhi, true) * gain * trig) * 65535);
         // on change (at most 100/s) and a 0.5-s refresh while on (each call runs the motors for 1 s)
         Uint16 l = (Uint16)lrintf(lo * 65535), h = (Uint16)lrintf(hi * 65535);
-        bool ch = l != sent_l || h != sent_h;
-        if ((ch && now - sent_t >= 10000) || (any && now - sent_t >= 500000)) {
+        bool ch = l != sent_l || h != sent_h || tl != sent_tl || tr != sent_tr;
+        if ((ch && now - sent_t >= 10000) || ((any || tl || tr) && now - sent_t >= 500000)) {
             std::lock_guard<std::mutex> lk(g_gp_mu);
             if (g_gp && g_gp_rumble) SDL_RumbleGamepad(g_gp, l, h, 1000);
-            sent_l = l; sent_h = h; sent_t = now;
+            if (g_gp && (tl || tr || sent_tl || sent_tr)) SDL_RumbleGamepadTriggers(g_gp, tl, tr, 1000);
+            sent_l = l; sent_h = h; sent_tl = tl; sent_tr = tr; sent_t = now;
         }
     }
 }

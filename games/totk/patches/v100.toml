@@ -14,6 +14,7 @@ text_end = 0x2aa6a10
 span = 0x4666000
 data_page = 0x4668000
 data_page_size = 0x4000
+extra_area = [0x4666000, 0x4668000]
 
 [[feature]]
 name = "fps60"
@@ -116,6 +117,18 @@ name = "ui_cb"
 default = false
 needs = []
 original_sha256 = "f38a8a149fba2f3f54eacf85ef6a93381324133cdd2f79119e8e092533f3e721"
+
+[[feature]]
+name = "tempunit"
+default = true
+needs = []
+original_sha256 = "7aec595abda9cabeee47d207f41755cf4675c0e21441bcddb385295d70d6573c"
+
+[[feature]]
+name = "camblend"
+default = true
+needs = []
+original_sha256 = "335004b6fa2761d2fa219eb60112d1cadd6a6a27971c997018a493b6538b04cc"
 
 [[patch]]
 feature = "fps60"
@@ -3610,4 +3623,138 @@ offset = 0x129c5a0
 new = "0806a052"
 new_asm = "mov w8, #0x300000"
 reason = "ui_cb: the ui2d constant buffer half 0x1a0000 -> 0x300000"
+
+[[veneer]]
+feature = "tempunit"
+module = "main"
+start = 0x4666000
+end = 0x4666028
+
+[[patch]]
+feature = "tempunit"
+module = "main"
+offset = 0x1036ae8
+new = "46bdd814"
+new_asm = "b #0x4666000"
+reason = "tempunit: cmp w8, #1 (language index: English (US)) -> b <veneer>"
+
+[[patch]]
+feature = "tempunit"
+module = "main"
+offset = 0x4666000
+new = "090000d0"
+new_asm = "adrp x9, #0x4668000"
+reason = "temperature unit veneer [0]"
+
+[[patch]]
+feature = "tempunit"
+module = "main"
+offset = 0x4666004
+new = "29d540b9"
+new_asm = "ldr w9, [x9, #0xd4]"
+reason = "temperature unit veneer [1]"
+
+[[patch]]
+feature = "tempunit"
+module = "main"
+offset = 0x4666008
+new = "3f050071"
+new_asm = "cmp w9, #1"
+reason = "temperature unit veneer [2]"
+
+[[patch]]
+feature = "tempunit"
+module = "main"
+offset = 0x466600c
+new = "a0000054"
+new_asm = "b.eq #0x4666020"
+reason = "temperature unit veneer [3]"
+
+[[patch]]
+feature = "tempunit"
+module = "main"
+offset = 0x4666010
+new = "3f090071"
+new_asm = "cmp w9, #2"
+reason = "temperature unit veneer [4]"
+
+[[patch]]
+feature = "tempunit"
+module = "main"
+offset = 0x4666014
+new = "60000054"
+new_asm = "b.eq #0x4666020"
+reason = "temperature unit veneer [5]"
+
+[[patch]]
+feature = "tempunit"
+module = "main"
+offset = 0x4666018
+copy_of = 0x1036ae8
+new_asm = "(the word at main+0x1036ae8)"
+reason = "temperature unit veneer [6]"
+
+[[patch]]
+feature = "tempunit"
+module = "main"
+offset = 0x466601c
+new = "b4422717"
+new_asm = "b #0x1036aec"
+reason = "temperature unit veneer [7]"
+
+[[patch]]
+feature = "tempunit"
+module = "main"
+offset = 0x4666020
+new = "3f090071"
+new_asm = "cmp w9, #2"
+reason = "temperature unit veneer [8]"
+
+[[patch]]
+feature = "tempunit"
+module = "main"
+offset = 0x4666024
+new = "b2422717"
+new_asm = "b #0x1036aec"
+reason = "temperature unit veneer [9]"
+
+[[patch]]
+feature = "camblend"
+module = "main"
+offset = 0xaa8108
+new = "01102e1e"
+new_asm = "fmov s1, #1.00000000"
+reason = "camera blend: mov v1.16b, v8.16b (powf exponent dt) -> fmov s1, #1.0"
+
+[[patch]]
+feature = "camblend"
+module = "main"
+offset = 0xaa815c
+new = "01102e1e"
+new_asm = "fmov s1, #1.00000000"
+reason = "camera blend: mov v1.16b, v8.16b (powf exponent dt) -> fmov s1, #1.0"
+
+[[patch]]
+feature = "camblend"
+module = "main"
+offset = 0xaa81a4
+new = "01102e1e"
+new_asm = "fmov s1, #1.00000000"
+reason = "camera blend: mov v1.16b, v8.16b (powf exponent dt) -> fmov s1, #1.0"
+
+[[patch]]
+feature = "camblend"
+module = "main"
+offset = 0xaa81ec
+new = "01102e1e"
+new_asm = "fmov s1, #1.00000000"
+reason = "camera blend: mov v1.16b, v8.16b (powf exponent dt) -> fmov s1, #1.0"
+
+[[patch]]
+feature = "camblend"
+module = "main"
+offset = 0xaa8218
+new = "01102e1e"
+new_asm = "fmov s1, #1.00000000"
+reason = "camera blend: mov v1.16b, v8.16b (powf exponent dt) -> fmov s1, #1.0"
 

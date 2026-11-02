@@ -21,6 +21,7 @@
 
 bool hle_fs_host_path(const char* p, std::string* out);   // hle_fs.cpp
 bool hle_fs_pack_slice(const std::string& hp, void** h, u64* off, u64* size);   // hle_fs.cpp
+bool hle_fs_pack_bytes(const std::string& hp, std::vector<u8>* out);            // hle_fs.cpp
 void hle_sysevent_signal(u64 ev);                          // hle_os_thread.cpp (any nn::os event)
 extern "C" void renderer_note_video_frame(void);          // nvn/vulkan/textures.c (hle_vi.cpp's video pace)
 
@@ -93,10 +94,6 @@ static void x_dtor(Ctx* c) {
     *(Ext**)(c->x[0] + 8) = nullptr;
     g_ext_grave.bury(e);
 }
-// (main has this helper from ultrawide d9a7ad93, not in v0.1.7; the movie-test hook's frame times use it)
-static int64_t now_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
 // The movie playing now (one at a time): its path and length, for the "[movie] played" line at its end of stream
 static std::mutex g_cur_m;
 static std::string g_cur_path;
@@ -115,6 +112,72 @@ static const char* test_movie(const char* p, std::string* buf) {
     return buf->c_str();
 }
 
+#ifdef _WIN32
+// A ready VP9 decoder. A movie's decoder thread opened its MFT when the movie started, and the game held a frame for the
+// first picture: the Microsoft VP9 Video Extensions decoder is a Store-packaged MFT, found and activated in open(). Now
+// one is opened in the background when the game sets up its movie library, when a movie's source is set (at its size)
+// and after each movie, and parked; a decoder thread takes it when the size matches, waiting for one still opening
+// instead of opening a second. Its COM objects live in the MTA (CoIncrementMTAUsage keeps the apartment); the decode
+// threads are MTA too. TOTK_MOVIE_PARK=0: off (each movie opens its own, as before).
+static std::mutex g_park_m;
+static std::condition_variable g_park_cv;
+static movie_host::Vp9Dec* g_parked;
+static int g_park_w, g_park_h, g_want_w, g_want_h;   // (the parked decoder's size; the size asked for last)
+static bool g_park_busy, g_park_failed;
+static bool park_on() {
+    static const bool on = !(getenv("TOTK_MOVIE_PARK") && !strcmp(getenv("TOTK_MOVIE_PARK"), "0"));
+    return on;
+}
+static void park_decoder(int w, int h) {
+    if (!park_on() || w <= 0 || h <= 0) return;
+    movie_host::Vp9Dec* old = nullptr;
+    {
+        std::lock_guard<std::mutex> l(g_park_m);
+        if (g_park_failed) return;
+        g_want_w = w; g_want_h = h;  // (an opener running for another size sees this and opens again)
+        if (g_park_busy || (g_parked && g_park_w == w && g_park_h == h)) return;
+        old = g_parked; g_parked = nullptr;   // (another size: deleted by the opener, not on the game thread)
+        g_park_busy = true;
+    }
+    std::thread([old] {
+        static CO_MTA_USAGE_COOKIE cookie;
+        static const bool mta = SUCCEEDED(CoIncrementMTAUsage(&cookie));   // (once: the MTA outlives this thread)
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        delete old;
+        for (;;) {
+            int w, h;
+            { std::lock_guard<std::mutex> l(g_park_m); w = g_want_w; h = g_want_h; }
+            auto* v = new movie_host::Vp9Dec;
+            char err[200] = "";
+            const bool ok = mta && v->open(w, h, err, sizeof err);
+            if (!ok) {
+                MLOG("[movie] parked decoder %dx%d: %s (each movie opens its own)\n", w, h, mta ? err : "no MTA");
+                delete v;
+                v = nullptr;
+            }
+            movie_host::Vp9Dec* stale = nullptr;
+            {
+                std::lock_guard<std::mutex> l(g_park_m);
+                if (ok && (g_want_w != w || g_want_h != h)) stale = v;   // (asked for another size meanwhile: again)
+                else { g_parked = v; g_park_w = w; g_park_h = h; g_park_busy = false; if (!ok) g_park_failed = true; }
+            }
+            if (!stale) break;
+            delete stale;
+        }
+        g_park_cv.notify_all();
+        CoUninitialize();
+    }).detach();
+}
+static movie_host::Vp9Dec* take_parked(int w, int h) {
+    if (!park_on()) return nullptr;
+    std::unique_lock<std::mutex> l(g_park_m);
+    g_park_cv.wait_for(l, std::chrono::seconds(5), [] { return !g_park_busy; });   // (one still opening: wait for it)
+    if (!g_parked || g_park_w != w || g_park_h != h) return nullptr;
+    movie_host::Vp9Dec* v = g_parked;
+    g_parked = nullptr;
+    return v;
+}
+#endif
 static void x_set_source(Ctx* c) {      // SetDataSource(const char* path)
     Ext* e = ext(c); std::string tbuf; const char* p = test_movie((const char*)c->x[1], &tbuf);
     std::string hp; char err[200] = "";
@@ -124,7 +187,9 @@ static void x_set_source(Ctx* c) {      // SetDataSource(const char* path)
     bool ok;
 #ifdef _WIN32
     void* ph = nullptr; u64 poff = 0, psize = 0;
+    std::vector<u8> bytes;   // (the RomFS image in the encrypted game dump: the movie read whole and decrypted)
     if (hle_fs_pack_slice(hp, &ph, &poff, &psize)) ok = e->wm.open_slice((HANDLE)ph, poff, psize, err, sizeof err);
+    else if (hle_fs_pack_bytes(hp, &bytes)) ok = e->wm.open_bytes(std::move(bytes), err, sizeof err);
     else
 #endif
         ok = e->wm.open(hp.c_str(), err, sizeof err);
@@ -138,6 +203,10 @@ static void x_set_source(Ctx* c) {      // SetDataSource(const char* path)
     }
     MLOG("[movie] SetDataSource %s: %zu tracks, %zu samples, %.1f s\n", p, e->wm.tracks.size(), e->wm.samples.size(),
          e->wm.duration * e->wm.timescale / 1e9);
+#ifdef _WIN32
+    for (const auto& t : e->wm.tracks)   // (a decoder at the video's size, opening while the game sets up the player)
+        if (t.width > 0 && t.height > 0) { park_decoder(t.width, t.height); break; }
+#endif
     c->x[0] = kOk;
 }
 static void x_set_source_mem(Ctx* c) { MLOG("[movie] SetDataSource(memory %llx, %d) unsupported\n", (unsigned long long)c->x[1], (int)c->x[2]); c->x[0] = kErr; }
@@ -209,6 +278,17 @@ static void x_buffered(Ctx* c) {
 static void x_unused(Ctx* c) { MLOG("[movie] Extractor: unexpected slot\n"); c->x[0] = kErr; }
 
 // ------------------------------------------------------------------ Decoder
+// A pre-rendered movie is on screen (totk_hooks.c pillarboxes it on a wider canvas): a decoder started and not stopped,
+// and the game took a decoded frame in the last half second (a decoder the game keeps after its movie, or a paused
+// one, is not a movie on screen)
+static std::atomic<int> g_playing{0};
+static std::atomic<int64_t> g_shown_ms{0};
+static int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+extern "C" int movie_playing(void) {
+    return g_playing.load(std::memory_order_relaxed) > 0 && now_ms() - g_shown_ms.load(std::memory_order_relaxed) < 500;
+}
 constexpr int kIn = 4, kOut = 6;
 constexpr u32 kInCap = 4 << 20;
 struct Dec {
@@ -236,9 +316,20 @@ struct Dec {
 #ifdef _WIN32
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 #endif
-        movie_host::Vp9Dec vd; char err[200] = "";
+        char err[200] = "";
+#ifdef _WIN32
+        std::unique_ptr<movie_host::Vp9Dec> vdp(take_parked(w, h));   // (a parked decoder: no open on the movie's start)
+        const bool parked = vdp != nullptr;
+        if (!vdp) vdp.reset(new movie_host::Vp9Dec);
+        movie_host::Vp9Dec& vd = *vdp;
+        bool ok = parked || vd.open(w, h, err, sizeof err);
+#else
+        const bool parked = false;
+        movie_host::Vp9Dec vd;
         bool ok = vd.open(w, h, err, sizeof err);
-        MLOG("[movie] decoder thread: %s %dx%d%s%s\n", ok ? vd.name : "VP9 decoder FAILED", w, h, ok ? "" : ": ", ok ? "" : err);
+#endif
+        MLOG("[movie] decoder thread: %s %dx%d%s%s%s\n", ok ? vd.name : "VP9 decoder FAILED", w, h, ok ? "" : ": ", ok ? "" : err,
+             parked ? " (parked)" : "");
         // No decoder at all: the movie ends at once, as a one-frame black movie (format event, one frame, end of stream on
         // the first input). Issues #22 / #25 (v0.1.7, no VP9 MFT): the error event and an end of stream with no frame
         // before it left the game on the Ganon cutscene's loading screen for good.
@@ -303,10 +394,12 @@ struct Dec {
         vd.close();
 #ifdef _WIN32
         CoUninitialize();
+        park_decoder(w, h);   // (the next movie's)
 #endif
     }
     void start() {
         { std::lock_guard<std::mutex> l(m); if (started) return; started = true; quit = false; }
+        g_playing++;
         th = std::thread([this] { run(); });
         if (ev_in) hle_sysevent_signal(ev_in);
     }
@@ -316,6 +409,7 @@ struct Dec {
         if (th.joinable()) th.join();
         std::lock_guard<std::mutex> l(m);
         started = false;
+        g_playing--;
     }
     void clear() {                         // flush: drop queued input and decoded output
         std::lock_guard<std::mutex> l(m);
@@ -450,6 +544,7 @@ static void get_out(Ctx* c, bool with_md) {   // GetOutputBuffer(int, Buffer*) [
     if (!b->base || f.size() > b->capacity) { MLOG("[movie] GetOutputBuffer: frame %zu bytes does not fit (capacity %llu)\n", f.size(), (unsigned long long)b->capacity); c->x[0] = kErr; return; }
     memcpy((void*)b->base, f.data(), f.size());
     b->offset = 0; b->size = (s32)f.size();
+    if (!f.empty()) g_shown_ms.store(now_ms(), std::memory_order_relaxed);   // (movie_playing)
     // the 2-argument form leaves garbage in x3 (play.log 09:21: x3 = 1 -> md_of(1) read address 1 and crashed)
     if (with_md && c->x[3]) { MD* m = md_of(c->x[3]); if (m) fill_format(d, m); }
     c->x[0] = kOk;
@@ -521,7 +616,12 @@ static void init_vtables() {
 
 }  // namespace mv
 
-HLE_AS(movie_SetAllocator, "_ZN5movie12SetAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_") { c->x[0] = 0; }
+HLE_AS(movie_SetAllocator, "_ZN5movie12SetAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_") {
+#ifdef _WIN32
+    mv::park_decoder(1920, 1080);   // (the game sets up its movie library at start-up: the first movie's decoder, 1080p)
+#endif
+    c->x[0] = 0;
+}
 HLE_AS(nv_SetGraphicsAllocator, "_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_") { c->x[0] = 0; }
 HLE_AS(nv_SetGraphicsDevtoolsAllocator, "_ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_") { c->x[0] = 0; }
 HLE_AS(nv_InitializeGraphics, "_ZN2nv18InitializeGraphicsEPvm") { c->x[0] = 0; }

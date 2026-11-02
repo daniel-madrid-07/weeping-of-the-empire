@@ -115,6 +115,11 @@ constexpr u64 kRootPlayerLink = totk_field(PlayerRoot, 0x20);   // (logged only:
 // compile; a diagnostic one leaves an unplaced field at TOTK_FIELD_UNKNOWN, and then the walks read nothing (no
 // player). 1.0.0: always true.
 constexpr bool kFieldsKnown = [] {
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    // (the verb numbers this file compares, kVerbWalk, kVerbInvalid and the sprint / climb / ride sets, are 1.0.0's:
+    // totk_version.h TOTK_VERBS_KNOWN)
+    if (!TOTK_VERBS_KNOWN) return false;
+#endif
     for (const u64 f : {kEmMainEvent, kActorComponents, kCompAttention, kCompAS, kCompPlayer, kCompSpecialPower,
                         kASSlots, kSlotVerb, kSlotVerbAlt, kPlStateBytes, kPlMoveRate, kPlMoveFlags, kAttState,
                         kSpRequested, kSpCurrent, kSpUltraHand, kUhState, kCompEquipmentUser, kCompDynamicEquipment,

@@ -7,11 +7,16 @@
 #include "pc_overlay.h"
 #include "pc_bind_ui.h"
 #include "pc_display_caps.h"
+#include "mods.h"
 #include "pc_mods_ui.h"
 #include "pc_cheats_ui.h"
+#include "pc_amiibo.h"
+#include "pc_lang.h"
 #include "pc_settings.h"
+#include "pc_sysinfo.h"
 #include "pc_restart.h"
 #include "pc_text.h"
+#include "font_check.h"   // (the menu font: a damaged system font is skipped)
 #include "../third_party/imgui/imgui.h"
 #include <windows.h>
 #include <algorithm>
@@ -84,6 +89,76 @@ void hardware_lines(char *cpu, size_t cn, char *gpu, size_t gn, char *disp, size
     }
 }
 
+// "Copy system info" (rival-parity 11-02): what a bug report needs, for the clipboard. Players paste it into public
+// issues, so the user name never shows (pc_sysinfo.cpp: the profile folder as %USERPROFILE%, the name itself as <user>),
+// and no path is listed: not the settings file's, nor a setting's whose value is a path ("(a path)"), so no dump, keys
+// or redirected profile folder either.
+// player.txt of the package (next to totk.exe): release=, commit=, version=, dirty=; "" when absent
+std::string package_field(const char *name) {
+    wchar_t exe[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (!n || n >= MAX_PATH) return "";
+    wchar_t *slash = wcsrchr(exe, L'\\');
+    if (!slash) return "";
+    wcscpy(slash + 1, L"player.txt");
+    FILE *f = _wfopen(exe, L"r");
+    if (!f) return "";
+    char line[1024];
+    std::string out;
+    const size_t k = strlen(name);
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, name, k) && line[k] == '=') {
+            out = line + k + 1;
+            while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+            break;
+        }
+    fclose(f);
+    return out;
+}
+std::string system_info() {
+    std::string t = "Tears of the Kingdom (nxrecomp)";
+    const std::string rel = package_field("release"), commit = package_field("commit"), ver = package_field("version");
+    t += rel.empty() ? std::string(commit.empty() ? ", development build" : "") : ", " + rel;
+    if (!commit.empty()) t += ", commit " + commit.substr(0, 9) + (package_field("dirty") == "1" ? " (dirty)" : "");
+    t += ", game " + (ver.empty() ? std::string("1.0.0") : ver) + "\n";
+    typedef LONG(WINAPI * RtlGetVersionFn)(OSVERSIONINFOW *);
+    OSVERSIONINFOW os = {sizeof os};
+    if (auto f = (RtlGetVersionFn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"); f && !f(&os)) {
+        char b[96];
+        snprintf(b, sizeof b, "Windows %s, build %lu\n", os.dwBuildNumber >= 22000 ? "11" : "10", os.dwBuildNumber);
+        t += b;
+    }
+    char cpu[256], gpu[320], disp[384];
+    hardware_lines(cpu, sizeof cpu, gpu, sizeof gpu, disp, sizeof disp);
+    t += std::string(cpu) + "\n" + gpu + "\n" + (disp[0] ? std::string(disp) + "\n" : "");
+    std::string changed;
+    for (int i = 0, n = pc_settings_count(); i < n; i++) {
+        const pc_setting_view s = pc_settings_at(i);
+        if (!*s.def->page || !strcmp(s.value, s.def->def ? s.def->def : "")) continue;   // (hidden rows, defaults)
+        const bool path = strchr(s.value, '\\') || strchr(s.value, '/') || strchr(s.value, ':');
+        changed += std::string(changed.empty() ? "" : ", ") + s.def->key + "=" + (path ? "(a path)" : s.value);
+    }
+    t += "Settings changed: " + (changed.empty() ? std::string("none") : changed) + "\n";
+    int on = 0;
+    for (const nxr_mod &m : mods_list()) on += m.on && m.problem == NXR_MOD_OK;
+    t += "Mods on: " + std::to_string(on) + "\n";
+    t += std::string("Settings saved: ") + (pc_settings_file() ? "yes" : "no (TOTK_SETTINGS=0)") + "\n";
+    return pc_mask_user(t);
+}
+bool copy_text(const std::string &utf8) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+    HGLOBAL h = n > 0 ? GlobalAlloc(GMEM_MOVEABLE, n * sizeof(wchar_t)) : nullptr;
+    if (!h) return false;
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, (wchar_t *)GlobalLock(h), n);
+    GlobalUnlock(h);
+    if (!OpenClipboard(g_hwnd.load())) return GlobalFree(h), false;
+    EmptyClipboard();
+    const bool ok = SetClipboardData(CF_UNICODETEXT, h) != nullptr;
+    CloseClipboard();
+    if (!ok) GlobalFree(h);
+    return ok;
+}
+
 // Restart the game. The window closes as with its X (shim_win.c saves a pending settings change, device.c's exit path
 // waits for the GPU and saves the pipeline cache: progress since the last save is lost, as at any close), and that
 // path's last step starts the game again: pc_restart.cpp (under the launcher, the launcher does it; the settings file's
@@ -105,6 +180,7 @@ void restart_now() {
 
 void set_open(bool open) {
     if (g_open.exchange(open) != open) printf("[pc-overlay] settings %s\n", open ? "opened" : "closed");
+    if (open) pc_settings_set("pc.f10_hint", "3");   // the player knows the key: the pause screens' hint stops (hle_osd.cpp)
 }
 
 uint8_t mods_now() {   // UI thread: GetKeyState follows this thread's message queue
@@ -188,6 +264,92 @@ std::vector<pc_cmd> g_cmd;
 std::vector<pc_tex_req> g_tex;
 pc_draw g_draw;
 
+// The port's texts in Russian or Chinese (pc_ui_lang) need glyphs the menu's font (Bahnschrift) and the game's Rodin
+// NTLG lack: a Windows font of the player's is merged into each font for them (the first font's glyphs stay first),
+// checked like the menu font (font_check.h); never a font of ours. Russian: Segoe UI (then Arial); Simplified Chinese:
+// Microsoft YaHei (then DengXian, SimHei). None there: those texts show as boxes, the rest as before.
+const pl_fonts::bytes &lang_font() {
+    static const pl_fonts::bytes f = [] {
+        const char *ui = pc_ui_lang();
+        std::vector<const char *> c;
+        if (!strcmp(ui, "zh-Hans"))
+            c = {"C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\Deng.ttf", "C:\\Windows\\Fonts\\simhei.ttf"};
+        else if (!strcmp(ui, "ru"))
+            c = {"C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\arial.ttf"};
+        for (const char *path : c) {
+            pl_fonts::bytes b = font_check_file(path);
+            if (!b.empty()) {
+                printf("[pc-overlay] %s texts: glyphs from %s\n", ui, path);
+                return b;
+            }
+        }
+        if (!c.empty()) printf("[pc-overlay] %s texts: no Windows font with their glyphs\n", ui);
+        return pl_fonts::bytes{};
+    }();
+    return f;
+}
+void merge_lang_font(float size) {   // (into the font added last)
+    const pl_fonts::bytes &f = lang_font();
+    if (f.empty()) return;
+    ImFontConfig c;
+    c.MergeMode = true;
+    c.FontDataOwnedByAtlas = false;
+    ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void *)f.data(), (int)f.size(), size, &c);
+}
+
+// The menu font (font_check.h: a damaged or unusual system font is skipped instead of aborting the atlas build; the
+// bytes stay alive for the atlas, which rebuilds from them). Read once, from the warm-up thread or the first open.
+const pl_fonts::bytes &menu_font() {
+    static const pl_fonts::bytes f = [] {
+        for (const char *path : {"C:\\Windows\\Fonts\\bahnschrift.ttf", "C:\\Windows\\Fonts\\segoeui.ttf"}) {
+            pl_fonts::bytes b = font_check_file(path);
+            if (!b.empty()) return b;
+            if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+                printf("[pc-overlay] %s does not read as a font: skipped\n", path);
+        }
+        return pl_fonts::bytes{};
+    }();
+    return f;
+}
+
+// F10 in Russian or Chinese, opened without a stall: at start a thread of low priority reads the fonts (Microsoft
+// YaHei is ~20 MB) and lists the characters the language's table uses; then, while nothing is shown, the present
+// thread draws kWarmPerFrame of those glyphs a frame into the atlas at the size F10 uses (an empty ImGui frame, no
+// draw), and uploads the atlas once, at the end. The first open finds them all ready. English / Spanish: nothing
+// (their glyphs are few and the font small).
+std::atomic<int> g_warm{0};   // 0 not started, 1 the thread reads, 2 glyphs to draw, 3 done (or nothing to do)
+std::vector<ImWchar> g_warm_chars;   // (written by the thread before g_warm = 2)
+constexpr size_t kWarmPerFrame = 48;
+void warm_start() {
+    const char *ui = pc_ui_lang();
+    if (strcmp(ui, "ru") && strcmp(ui, "zh-Hans")) return (void)(g_warm = 3);
+    g_warm = 1;
+    std::thread([] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        menu_font();
+        const bool have = !lang_font().empty();
+        std::vector<ImWchar> cps;
+        if (have)
+            pc_tr_each([](const char *t, void *ctx) {
+                auto *v = (std::vector<ImWchar> *)ctx;
+                for (const unsigned char *p = (const unsigned char *)t; *p;) {   // UTF-8 -> code points past ASCII
+                    uint32_t cp = *p, n = cp < 0x80 ? 1 : (cp >> 5) == 6 ? 2 : (cp >> 4) == 14 ? 3 : (cp >> 3) == 30 ? 4 : 1;
+                    cp = n == 1 ? cp : cp & (0x7f >> n);
+                    for (uint32_t k = 1; k < n && p[k]; k++) cp = cp << 6 | (p[k] & 0x3f);
+                    p += n;
+                    if (cp >= 0x80 && cp <= 0xffff) v->push_back((ImWchar)cp);
+                }
+            }, &cps);
+        std::sort(cps.begin(), cps.end());
+        cps.erase(std::unique(cps.begin(), cps.end()), cps.end());
+        g_warm_chars = std::move(cps);
+        printf("[pc-overlay] %s: %zu glyphs to draw ahead of the first F10\n", pc_ui_lang(), g_warm_chars.size());
+        g_warm = g_warm_chars.empty() ? 3 : 2;
+    }).detach();
+}
+// One warm-up step while nothing is shown: the texture uploads to make (the last step), or null
+const pc_draw *warm_step(uint32_t w, uint32_t h);
+
 void init_imgui() {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -198,11 +360,12 @@ void init_imgui() {
     io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures | ImGuiBackendFlags_HasGamepad;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     io.ConfigNavSwapGamepadButtons = true;   // the game's own convention: A (right face) confirms, B (bottom) goes back
-    const char *fonts[] = {"C:\\Windows\\Fonts\\bahnschrift.ttf", "C:\\Windows\\Fonts\\segoeui.ttf"};
-    bool font = false;
-    for (const char *f : fonts)
-        if (GetFileAttributesA(f) != INVALID_FILE_ATTRIBUTES && io.Fonts->AddFontFromFileTTF(f, 18.0f)) { font = true; break; }
-    if (!font) io.Fonts->AddFontDefault();
+    const pl_fonts::bytes &ui_font = menu_font();
+    ImFontConfig fc;
+    fc.FontDataOwnedByAtlas = false;
+    if (ui_font.empty() || !io.Fonts->AddFontFromMemoryTTF((void *)ui_font.data(), (int)ui_font.size(), 18.0f, &fc))
+        io.Fonts->AddFontDefault();
+    merge_lang_font(18.0f);
     ImGui::StyleColorsDark();
     ImGuiStyle& st = ImGui::GetStyle();
     st.WindowRounding = 6.0f;
@@ -359,8 +522,10 @@ void fps_fonts() {   // before NewFrame: read the first time the readout shows, 
         c.FontDataOwnedByAtlas = false;
         snprintf(c.Name, sizeof c.Name, "Rodin NTLG B");
         g_fps_bold = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(g_font_b.data(), (int)g_font_b.size(), 0.0f, &c);
+        if (g_fps_bold) merge_lang_font(0.0f);   // (the labels in Russian or Chinese)
         snprintf(c.Name, sizeof c.Name, "Rodin NTLG M");
         g_fps_medium = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(g_font_m.data(), (int)g_font_m.size(), 0.0f, &c);
+        if (g_fps_medium) merge_lang_font(0.0f);
         if (!g_fps_bold || !g_fps_medium) {
             g_fps_bold = g_fps_medium = nullptr;
             g_font_state.store(3);
@@ -394,7 +559,7 @@ void fps_readout(uint32_t w, uint32_t h) {
     if (nrows) {
         snprintf(rows[0][0], 32, "%s", pc_tr("frame"));
         snprintf(rows[0][1], 32, "%.1f ms", st[1]);
-        snprintf(rows[1][0], 32, pc_tr("1%% low"));
+        snprintf(rows[1][0], 32, "%s", pc_tr("1% low"));
         if (st[2] > 0) snprintf(rows[1][1], 32, "%.0f %s", st[2], unit);
         else snprintf(rows[1][1], 32, "--");   // (collecting: under 100 frames since it was turned on)
         snprintf(rows[2][0], 32, "%s", pc_tr("worst"));
@@ -556,6 +721,14 @@ void pad_widget(const pc_setting *d, const char *value) {
     }
 }
 
+// The row whose help the page shows at its bottom (settings_page): the one under the mouse this frame, else the one in
+// focus (keyboard / pad), else the last one shown, so the line stays put between rows and while a combo is open
+const pc_setting *g_help_hover, *g_help_focus, *g_help_shown;
+void note_help(const pc_setting *d) {
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) g_help_hover = d;
+    if (ImGui::IsItemFocused() || ImGui::IsItemActive()) g_help_focus = d;
+}
+
 // One registry row (pc_settings.h): label, then a combo (choice rows) or a slider, then its state
 void setting_row(const pc_setting_view &s) {
     const pc_setting *d = s.def;
@@ -563,7 +736,7 @@ void setting_row(const pc_setting_view &s) {
     ImGui::TableNextColumn();
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(pc_tr(d->label));
-    if (d->help && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", pc_tr(d->help));
+    note_help(d);
     ImGui::TableNextColumn();
     ImGui::PushID(d->key);
     ImGui::SetNextItemWidth(-FLT_MIN);
@@ -584,7 +757,9 @@ void setting_row(const pc_setting_view &s) {
     } else {
         const bool pct = d->min >= 0 && d->max <= 1;   // 0..1 rows read as percentages (volume)
         float v = (float)atof(s.value), shown = pct ? v * 100 : v;
-        const char *fmt = d->format ? d->format(shown) : pct ? "%.0f %%" : "%.2f";
+        // (a row's own format in the player's language when it is a text: shadow_fixed_format's; a number's is
+        // left as it is, pc_tr giving back what it does not know)
+        const char *fmt = d->format ? pc_tr(d->format(shown)) : pct ? "%.0f %%" : "%.2f";
         if (ImGui::SliderFloat("##v", &shown, pct ? d->min * 100 : d->min, pct ? d->max * 100 : d->max, fmt)) {
             float x = pct ? shown / 100 : shown;
             if (d->step > 0) x = d->min + d->step * (float)(int)((x - d->min) / d->step + 0.5f);
@@ -595,7 +770,7 @@ void setting_row(const pc_setting_view &s) {
             pc_settings_set(d->key, b);
         }
     }
-    if (d->help && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_DelayNormal)) ImGui::SetTooltip("%s", pc_tr(d->help));
+    note_help(d);
     ImGui::TableNextColumn();
     if (s.overridden) {   // (short: the column fits "at next start"; "this run (NX_SET_)" was cut off at 1080p)
         ImGui::TextDisabled("%s", pc_tr("this run"));
@@ -603,6 +778,26 @@ void setting_row(const pc_setting_view &s) {
     } else if (s.restart_pending) ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.3f, 1.0f), "%s", pc_tr("at next start"));
     else if (d->flags & PC_SET_RESTART) ImGui::TextDisabled("%s", pc_tr("restart"));
     ImGui::PopID();
+}
+
+float g_footer_h = 0;   // settings_window's lines under the tabs, as measured last frame
+
+// The help line of the row in focus (note_help), under the page's rows: what the row does, better looking or faster,
+// its cost (pc_help.cpp, else the row's own help), and whether it waits for the next start (its PC_SET_RESTART flag, so
+// it follows a row made live)
+void help_box() {
+    const pc_setting *d = g_help_hover ? g_help_hover : g_help_focus ? g_help_focus : g_help_shown;
+    g_help_hover = g_help_focus = nullptr;
+    g_help_shown = d;
+    ImGui::Separator();
+    const char *text = d ? pc_setting_help(d->key) : nullptr;
+    if (d && !text) text = d->help;
+    if (!d || !text) {
+        ImGui::TextDisabled("%s", pc_tr("Point at a setting, or move to it, to see what it does."));
+        return;
+    }
+    ImGui::TextWrapped("%s", pc_tr(text));
+    if (d->flags & PC_SET_RESTART) ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.3f, 1.0f), "%s", pc_tr("Applies when the game starts again."));
 }
 
 void settings_page(const char *page) {
@@ -615,6 +810,9 @@ void settings_page(const char *page) {
         for (const char *q : sections) seen |= !strcmp(q, s.def->section);
         if (!seen) sections.push_back(s.def->section);
     }
+    // the rows scroll above the help line (three lines of text) and the window's own lines under the tabs
+    const float help_h = ImGui::GetTextLineHeightWithSpacing() * 3 + ImGui::GetStyle().ItemSpacing.y * 2;
+    ImGui::BeginChild("##rows", ImVec2(0, -(help_h + g_footer_h)));
     for (const char *section : sections) {
         ImGui::SeparatorText(pc_tr(section));
         if (!ImGui::BeginTable(section, 3, ImGuiTableFlags_SizingStretchProp)) continue;
@@ -627,13 +825,18 @@ void settings_page(const char *page) {
         }
         ImGui::EndTable();
     }
-    if (sections.empty()) { ImGui::TextDisabled("%s", pc_tr("No settings on this page yet.")); return; }
-    ImGui::Spacing();
-    if (ImGui::Button(pc_tr("Reset this page to defaults")))
-        for (int i = 0; i < n; i++) {
-            pc_setting_view s = pc_settings_at(i);
-            if (!strcmp(s.def->page, page) && s.def->def) pc_settings_set(s.def->key, s.def->def);
-        }
+    if (sections.empty()) {
+        ImGui::TextDisabled("%s", pc_tr("No settings on this page yet."));
+    } else {
+        ImGui::Spacing();
+        if (ImGui::Button(pc_tr("Reset this page to defaults")))
+            for (int i = 0; i < n; i++) {
+                pc_setting_view s = pc_settings_at(i);
+                if (!strcmp(s.def->page, page) && s.def->def) pc_settings_set(s.def->key, s.def->def);
+            }
+    }
+    ImGui::EndChild();
+    help_box();
 }
 
 void settings_window(uint32_t w, uint32_t h) {
@@ -654,7 +857,8 @@ void settings_window(uint32_t w, uint32_t h) {
             // steps
             static int want = -1;
             if (g_open_keys.exchange(false))   // pc_overlay_open_keys: the Keys tab
-                want = (int)pages.size() + (pc_mods_tab_available() ? 1 : 0) + (pc_cheats_tab_available() ? 1 : 0);
+                want = (int)pages.size() + (pc_mods_tab_available() ? 1 : 0) + (pc_cheats_tab_available() ? 1 : 0) +
+                       (pc_amiibo_tab_available() ? 1 : 0);
             int cur = 0;
             for (int i = 0; i < (int)pages.size(); i++)
                 if (ImGui::BeginTabItem((std::string(pc_tr(pages[i])) + "###" + pages[i]).c_str(), nullptr,
@@ -681,9 +885,18 @@ void settings_window(uint32_t w, uint32_t h) {
                 pc_cheats_tab();
                 ImGui::EndTabItem();
             }
+            // the player's amiibo dumps (pc_amiibo.cpp), when a launcher set an amiibo folder
+            const bool with_amiibo = pc_amiibo_tab_available();
+            const int amiibo = cheats + (with_cheats ? 1 : 0);
+            if (with_amiibo && ImGui::BeginTabItem((std::string(pc_tr("Amiibo")) + "###Amiibo").c_str(), nullptr,
+                                                   want == amiibo ? ImGuiTabItemFlags_SetSelected : 0)) {
+                cur = amiibo;
+                pc_amiibo_tab();
+                ImGui::EndTabItem();
+            }
             // the rebinding pages: the last tab, once the rebinding API answers
             const bool with_keys = pc_bind_keys_available();
-            const int keys = cheats + (with_cheats ? 1 : 0), tabs = keys + (with_keys ? 1 : 0);
+            const int keys = amiibo + (with_amiibo ? 1 : 0), tabs = keys + (with_keys ? 1 : 0);
             if (with_keys && ImGui::BeginTabItem((std::string(pc_tr("Keys")) + "###Keys").c_str(), nullptr, want == keys ? ImGuiTabItemFlags_SetSelected : 0)) {
                 cur = keys;
                 pc_bind_keys_tab();
@@ -697,6 +910,7 @@ void settings_window(uint32_t w, uint32_t h) {
             if (step && !ImGui::IsAnyItemActive() && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
                 want = (cur + step + tabs) % tabs;
         }
+        const float footer_y = ImGui::GetCursorPosY();
         ImGui::Separator();
         bool pending = false;
         for (int i = 0, n = pc_settings_count(); i < n; i++) pending |= pc_settings_at(i).restart_pending;
@@ -723,7 +937,17 @@ void settings_window(uint32_t w, uint32_t h) {
         if (disp[0]) ImGui::TextDisabled("%s", disp);
         if (const char *f = pc_settings_file()) ImGui::TextDisabled(pc_tr("Saved to %s"), f);
         else ImGui::TextDisabled("%s", pc_tr("Not saved (TOTK_SETTINGS=0)"));
+        {   // for a bug report: the version, this PC and the changed settings, the user name masked (system_info)
+            static double copied_at = -10;
+            static bool copied_ok;
+            if (ImGui::SmallButton(pc_tr("Copy system info"))) copied_ok = copy_text(system_info()), copied_at = ImGui::GetTime();
+            if (ImGui::GetTime() - copied_at < 2.0) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", copied_ok ? pc_tr("Copied: paste it into your bug report.") : pc_tr("Could not copy."));
+            }
+        }
         ImGui::TextDisabled("%s", pc_tr("F10, Esc, B or L3 + R3 closes. A: select. L / R: pages. F9: perf overlay."));
+        g_footer_h = ImGui::GetCursorPosY() - footer_y;
     }
     ImGui::End();
     // Esc closes when no widget holds the keyboard; the pad's B (ImGui's cancel, swapped: feed_pad) when nothing is active
@@ -943,6 +1167,28 @@ extern "C" bool pc_overlay_pad(uint64_t buttons) {
     return g_open.load() || g_welcome.load();
 }
 
+namespace {   // (the one declared with the warm-up, above)
+const pc_draw *warm_step(uint32_t w, uint32_t h) {
+    static size_t next;
+    if (!g_init) init_imgui();
+    ImGuiIO &io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)w, (float)h);
+    io.DeltaTime = 1.0f / 60;
+    apply_scale(h);   // (F10's size at this window height: the glyphs drawn are the ones it will ask for)
+    ImGui::NewFrame();
+    ImFontBaked *b = ImGui::GetFontBaked();
+    for (size_t k = 0; k < kWarmPerFrame && next < g_warm_chars.size(); k++) b->FindGlyph(g_warm_chars[next++]);
+    ImGui::Render();   // (no window: nothing drawn)
+    if (next < g_warm_chars.size()) return nullptr;   // (the atlas uploads once, below)
+    g_warm = 3;
+    printf("[pc-overlay] %zu glyphs drawn ahead of the first F10\n", g_warm_chars.size());
+    handle_textures(ImGui::GetDrawData());
+    g_vtx.clear(), g_idx.clear(), g_cmd.clear();
+    g_draw = {g_vtx.data(), 0, g_idx.data(), 0, g_cmd.data(), 0, g_tex.data(), (uint32_t)g_tex.size()};
+    return g_tex.empty() ? nullptr : &g_draw;   // (pc_overlay_vk.c: uploads, no pass with nothing to draw)
+}
+}  // namespace
+
 extern "C" const pc_draw *pc_overlay_build(uint32_t w, uint32_t h) {
     note_frame();
     static bool was_visible, was_open;
@@ -963,6 +1209,7 @@ extern "C" const pc_draw *pc_overlay_build(uint32_t w, uint32_t h) {
     }
     const bool readout = shim_fps_overlay_mode() != 0;   // (the fps readout: F3, display.fps_readout)
     const bool visible = open_now || g_perf.load() || g_welcome.load() || readout;
+    if (g_warm.load() == 0) warm_start();
     if (!visible) {
         if (was_visible) {   // drop what was queued while closing, so nothing replays at the next open
             std::lock_guard<std::mutex> lk(g_q_mu);
@@ -970,7 +1217,7 @@ extern "C" const pc_draw *pc_overlay_build(uint32_t w, uint32_t h) {
         }
         was_visible = false;
         pc_settings_tick_save();   // (a binding changed from the game's Options rows: saved without the overlay)
-        return nullptr;
+        return g_warm.load() == 2 ? warm_step(w, h) : nullptr;
     }
     if (!g_init) init_imgui();
     ImGuiIO& io = ImGui::GetIO();

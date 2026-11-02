@@ -106,6 +106,10 @@ def relocate(patches, old: Layout, new: Layout, port, data_page_size=sites_v100.
             return t - old.pad + new.pad
         if old.data_off <= t < old.data_off + data_page_size:
             return t - old.data_off + new.data_off
+        if old.extra and old.extra[0] <= t < old.extra[1]:      # the extra veneer area moves with the image's span
+            if not new.extra or t - old.extra[0] + new.extra[0] >= new.extra[1]:
+                raise PortError(f'{what}: target {t:#x} is in the extra veneer area and the new build has no room there')
+            return t - old.extra[0] + new.extra[0]
         if 0 <= t < old.text_end:
             m = port(t)
             if m is None:
@@ -138,7 +142,7 @@ def relocate(patches, old: Layout, new: Layout, port, data_page_size=sites_v100.
                 new_w = word_at(w.new, w.offset, at, what)
             if at is not None and orig is not None and new_w is not None:
                 q.words.append(PortedWord(at, new_w, w.reason, pad=w.pad, original=orig, v100_offset=w.offset))
-        if new.pad_end < max([b for _, b in q.veneers] + [0]):
+        if new.pad_end < max([b for a_, b in q.veneers if a_ < new.pad_end] + [0]):
             raise PortError(f'{p.feature}: veneers end past the new text padding ({new.pad_end:#x}); the new build '
                             f'has {new.pad_end - new.text_end} bytes of padding, 1.0.0 had {old.pad_end - old.text_end}')
         out.append(q)
@@ -156,6 +160,12 @@ def placeable(r):
     return r.get('how') in ('exact', 'aligned') and bool(r.get('confirmed'))
 
 
+def layout_of(m, data_off=None):
+    """The Layout of a loaded main (recomp.nso image: text.end, size = the span): its text padding, its data page and
+    its extra veneer area (span to data page), so the 1.0.0 set's veneers in that area move too (tempunit)."""
+    return Layout(text_end=m.text.end, data_off=data_off or (m.size + 0x3fff) & ~0x3fff, span=m.size)
+
+
 def port_table(old_nso, new_nso, version, new_data_off=None):
     """Run the porter on two main NSOs and relocate every feature. Returns (game, patches, report, image); patches is None
     (and report['error'] says why) when the set cannot be placed."""
@@ -169,7 +179,7 @@ def port_table(old_nso, new_nso, version, new_data_off=None):
     from . import layout_v100, load_main_image
 
     m = load_nso(str(new_nso), 'main')
-    new = Layout(text_end=m.text.end, data_off=new_data_off or (m.size + 0x3fff) & ~0x3fff)
+    new = layout_of(m, new_data_off)
     old = layout_v100()
     patches = sites_v100.with_image(sites_v100.build(old, list(sites_v100.FEATURES)), load_main_image(old_nso))
     porter = vp.Porter(vp.load_image(str(old_nso)), vp.load_image(str(new_nso))).run()

@@ -20,8 +20,8 @@ uint32_t le32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
 uint16_t le16(const uint8_t* p) { uint16_t v; memcpy(&v, p, 2); return v; }
 uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 
-// The bytes of SARC member `name` (little-endian SARC only, as the game's), or false
-bool sarc_member(const std::vector<uint8_t>& a, const char* name, std::vector<uint8_t>* out) {
+// Where SARC member `name` is in `a`: its bytes [*at, *at + *n) (little-endian SARC only, as the game's), or false
+bool sarc_span(const std::vector<uint8_t>& a, const char* name, size_t* at_out, size_t* n_out) {
     if (a.size() < 0x14 || memcmp(a.data(), "SARC", 4) || le16(&a[6]) != 0xfeff) return false;
     const size_t head = le16(&a[4]), data = le32(&a[0x0c]);
     if (head + 12 > a.size() || memcmp(&a[head], "SFAT", 4)) return false;
@@ -35,10 +35,19 @@ bool sarc_member(const std::vector<uint8_t>& a, const char* name, std::vector<ui
         const size_t at = names + (size_t)(attr & 0xffffff) * 4;
         if (at + want >= a.size() || memcmp(&a[at], name, want) || a[at + want]) continue;
         if (lo > hi || data + hi > a.size()) return false;
-        out->assign(a.begin() + data + lo, a.begin() + data + hi);
+        *at_out = data + lo;
+        *n_out = hi - lo;
         return true;
     }
     return false;
+}
+
+// The bytes of SARC member `name`, or false
+bool sarc_member(const std::vector<uint8_t>& a, const char* name, std::vector<uint8_t>* out) {
+    size_t at, n;
+    if (!sarc_span(a, name, &at, &n)) return false;
+    out->assign(a.begin() + (std::ptrdiff_t)at, a.begin() + (std::ptrdiff_t)(at + n));
+    return true;
 }
 
 // One zstd frame of the RomFS, with dictionary `dict` (empty: none)
@@ -55,6 +64,12 @@ bool unzstd(const std::vector<uint8_t>& in, const std::vector<uint8_t>& dict, st
 }
 
 }  // namespace
+
+// (pc_camera_speed.cpp reads its pack with the same two)
+bool pc_romfs_sarc_span(const std::vector<uint8_t>& a, const char* name, size_t* at, size_t* n) { return sarc_span(a, name, at, n); }
+bool pc_romfs_unzstd(const std::vector<uint8_t>& in, const std::vector<uint8_t>& dict, std::vector<uint8_t>* out) {
+    return unzstd(in, dict, out);
+}
 
 // The decoded OpenType bytes of the game's font `name` (e.g. "ninP_RodinNTLG-B_DH_003_subset"), or false
 bool pc_ui_font(const char* name, std::vector<uint8_t>* otf) {

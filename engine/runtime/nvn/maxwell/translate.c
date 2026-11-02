@@ -114,7 +114,10 @@ typedef struct {
     uint8_t imap[32]; // SPH ps.imap_generic_vector: 2 bits per component, 1 constant, 2 perspective, 3 screen-linear
     uint32_t cur_pc;
     bool flat;            // forward-only branches: blocks in address order as flag-guarded ifs, no pc loop (flat_plan)
-    uint32_t *flat_sync;  // flat: the static target (pc) of the SYNC in each slot (0: unreachable)
+    uint32_t *flat_sync;  // flat: the static target (pc) of the SYNC / BRK in each slot (0: unreachable)
+    bool flat_npc;        // flat with BRX / loops: the pending block's pc in npc instead of a flag per block (flat_npc_on)
+    int flat_nr;          // flat_npc: loop regions [flat_rs[k], flat_re[k]] (slots), nested or apart
+    uint32_t *flat_rs, *flat_re;
     uint32_t dag_guard;   // pc loop without backward branches: its iteration cap (2 x labels + 16); 0 = guard_limit()
     uint32_t dag_why;     // (no DAG guard) the pc of the first backward branch / loop / call op + 1 (GLSL comment)
     bool gmem_coherent;   // LARECOMP_GMEM_COHERENT=1 and a cache-bypassing LDG / STG or a MEMBAR.GL / .SYS: gmem_ / gdev_ coherent volatile
@@ -330,11 +333,15 @@ static int d16_ref_on(void) {
 // TOTK_SOFT_SHADOWS=<percent> (graphics.soft_shadows, restart; 0 = the game's look): fragment-shader compares of a
 // 2D-array shadow map at an explicit LOD (the sun's cascades) become a contact-hardening filter (PCSS): 8 depth reads
 // around the point find the average blocker in front of it, the penumbra is that distance x 0.5 x percent / 100 (clamped
-// to 0.35 .. 5 texels of a 960 map, as in the rival's v0.3.1 patch 0010, MIT), then 8 compares on a disc of that radius
-// are averaged; no blocker = the original single compare. Shaders with more than TOTK_SOFT_SHADOWS_MAX (default 8) such
+// to 0.35.. 5 texels of a 960 map, as in the rival's v0.3.1 patch 0010, MIT), then 8 compares on a disc of that radius are
+// averaged; no blocker = the original single compare. Shaders with more than TOTK_SOFT_SHADOWS_MAX (default 8) such
 // compares are the game's own wide kernels already: left as they are. The changed sources are new shaders (compiled once).
+// Live since 2026-11-02: exec.c gives each translation the row's current percent (maxwell_soft_pct), and a shader that has
+// such compares says so (ShaderInfo.knobs_used, also at 0 %), so a change translates exactly those again.
+MAXWELL_TLS int maxwell_soft_pct = -1;
 static int soft_shadow_pct(void) {
     static int v = -1;
+    if (maxwell_soft_pct >= 0) return maxwell_soft_pct > 200 ? 0 : maxwell_soft_pct;
     if (v < 0) { const char *e = getenv("TOTK_SOFT_SHADOWS"); v = e ? atoi(e) : 0; if (v < 0 || v > 200) v = 0; }
     return v;
 }
@@ -981,6 +988,8 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
         snprintf(P, sizeof P, "vec%d(%s, %s)", n + 1, xs, dref);
     }
     char e[2000], ex[300] = "";
+    if (t->shadow && type == TEXTYPE_2D_ARRAY && layer && lod_kind == 1 && c->stage == STAGE_FRAGMENT && !t->bindless)
+        c->info->knobs_used |= 1;   // (the soft-shadow form depends on the live percent, off included)
     if (t->shadow && type == TEXTYPE_2D_ARRAY && layer && lod_kind == 1 && c->stage == STAGE_FRAGMENT && slot < 32 &&
         (c->soft_twin[slot] || c->info->ntex < 30) &&
         !t->bindless && soft_shadow_pct() > 0) {   // (soft_shadow_pct: the sun's cascades through nxsoft<slot>)
@@ -1408,7 +1417,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
 
 #define OPM(val, mask) ((w & (uint64_t)(mask)) == (uint64_t)(val))
     if (OPM(0xe300000000000000ull, 0xfff0000000000000ull)) {  // EXIT
-        sp(&c->body, c->flat ? "    tk_ = true;\n" : c->branchy ? "    exit_now = true; break;\n" : "    break;\n");
+        sp(&c->body, c->flat_npc ? "    npc = 0u;\n" : c->flat ? "    tk_ = true;\n" : c->branchy ? "    exit_now = true; break;\n" : "    break;\n");
     } else if (OPM(0xe330000000000000ull, 0xfff0000000000000ull)) {  // KIL
         c->info->uses_discard = true;
         if (c->nodiscard) {
@@ -1428,23 +1437,26 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0xe240000000000000ull, 0xfff0000000000020ull)) {  // BRA
         uint32_t target = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
         c->uses_branches = true;
-        if (c->flat) sp(&c->body, "    tk_ = true; f_%u = true;\n", target);
+        if (c->flat_npc) sp(&c->body, "    npc = %uu;\n", target);
+        else if (c->flat) sp(&c->body, "    tk_ = true; f_%u = true;\n", target);
         else sp(&c->body, "    pc = %uu; continue;\n", target);
     } else if (OPM(0xe290000000000000ull, 0xfff0000000000020ull)) {  // SSY
         c->uses_branches = true;
         if (!c->flat) sp(&c->body, "    ssy[ssy_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xe2a0000000000000ull, 0xfff0000000000020ull)) {  // PBK
         c->uses_branches = true;
-        sp(&c->body, "    pbk[pbk_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        if (!c->flat) sp(&c->body, "    pbk[pbk_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xe2b0000000000000ull, 0xfff0000000000020ull)) {  // PCNT
         c->uses_branches = true;
         sp(&c->body, "    pcnt[pcnt_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xf0f8000000000000ull, 0xfff8000000000000ull)) {  // SYNC
         if (!c->flat) sp(&c->body, "    pc = ssy[--ssy_n]; continue;\n");
+        else if (c->flat_npc) sp(&c->body, "    npc = %uu;\n", c->flat_sync[pc / 8]);   // (0: unreachable block)
         else if (c->flat_sync[pc / 8]) sp(&c->body, "    tk_ = true; f_%u = true;\n", c->flat_sync[pc / 8]);
         else sp(&c->body, "    tk_ = true;\n");   // (unreachable block)
     } else if (OPM(0xe340000000000000ull, 0xfff0000000000000ull)) {  // BRK
-        sp(&c->body, "    pc = pbk[--pbk_n]; continue;\n");
+        if (!c->flat) sp(&c->body, "    pc = pbk[--pbk_n]; continue;\n");
+        else sp(&c->body, "    npc = %uu;\n", c->flat_sync[pc / 8]);   // (flat_plan: the npc form only; 0: unreachable block)
     } else if (OPM(0xe350000000000000ull, 0xfff0000000000000ull)) {  // CONT
         sp(&c->body, "    pc = pcnt[pcnt_n - 1]; continue;\n");
     } else if (OPM(0xef98000000000000ull, 0xfff8000000000000ull)) {
@@ -2270,8 +2282,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     p2r_done:;
     } else if (OPM(0xe250000000000000ull, 0xfff0000000000020ull)) {  // BRX reg + imm (relative)
         // computed targets can name a scheduling word; execution continues at the next slot (as for BRA)
-        sp(&c->body, "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; continue; }\n", pc + 8, R(a),
-           (uint32_t)sbits(w, 20, 24));
+        sp(&c->body, "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; %s }\n", pc + 8, R(a),
+           (uint32_t)sbits(w, 20, 24), c->flat_npc ? "npc = t;" : "pc = t; continue;");
     } else if (OPM(0x50a0000000000000ull, 0xfff8000000000000ull)) {  // CSETP (zero/sign flags only)
         int test = (int)bits(w, 8, 5);
         const char *cond;
@@ -3105,49 +3117,91 @@ static bool nv_pcloop(const uint8_t *blob, size_t max_size, int stage) {
 static MAXWELL_TLS const char *maxwell_flat_why;
 static MAXWELL_TLS uint32_t maxwell_flat_why_pc;
 #define FLAT_NO(WHY, PC) do { if (ok) { maxwell_flat_why = (WHY); maxwell_flat_why_pc = (uint32_t)(PC); } ok = false; } while (0)
-static bool flat_plan(const uint64_t *code, size_t end, const uint8_t *label, uint8_t *bstart, uint32_t *sync_t) {
+// Flat npc form (2026-11-02, issues #9 / #23 / #25, AMD): BRX switches and (vertex shaders) backward-BRA loops no longer force the pc loop.
+// TotK's three VS 8761/8762/8764 (27 BRX switches with forward tables + 3 do-while loops of a conditional backward BRA each) were 422-case pc
+// loops, 352 KB of GLSL, that AMD's compiler builds for minutes. A plan with either uses one pending block address instead of a flag per block
+// (Ctx.flat_npc): "if (npc == <pc>) { npc = <next block>;... }"; a BRA / SYNC sets npc to its target, a BRX to its computed one (a target that is
+// no block start runs nothing more, as the pc loop's default case), EXIT to 0. A backward BRA from slot e to slot s makes the blocks of [s, e] a
+// loop region "do {... } while (npc == <s's pc> && ++lg_ < guard)": an iteration runs the region's blocks in address order, the back edge sets
+// npc to s, anything else leaves. Regions that overlap without nesting are widened to the outer one's end (blocks past the back edge run only
+// when npc names them, so the widened iteration does what the narrow one did); regions with one start are one. lg_ counts every iteration of
+// every region (the pc loop's guard_limit cap). The SSY stack simulated along the edges must match at a loop's start too, which must be reached
+// from ahead. Loops: vertex shaders only and none with SHFL / VOTE (the do-while groups lanes otherwise than the pc loop's min-pc reconvergence:
+// fragment derivatives, the lanes a warp op sees; compute: barriers); a BRX without loops keeps the flat form's address order in any stage. Not
+// on NVIDIA (its compiler's form-dependent faults, above: its pc loops stay as they were). LARECOMP_FLAT_NPC=0: off (the pc loop, as before). PBK
+// / BRK (same day; 1,340 of the pack's 2,157 pc-loop stages off NVIDIA, 1,315 of them VS): the npc form too. The PBK stack (the pc loop's pbk[],
+// apart from ssy[]) is simulated along the edges with the SSY one and must match at joins and at loop starts alike; a BRK sets npc to the static
+// top of it (flat_sync, as a SYNC's), PBK emits nothing.
+static bool flat_npc_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_FLAT_NPC"); on = !(e && *e == '0'); }
+    return on && !maxwell_nvidia;
+}
+static bool flat_plan(const uint64_t *code, size_t end, const uint8_t *label, uint8_t *bstart, uint32_t *sync_t, bool loops,
+                      bool *npc, uint32_t **rs, uint32_t **re, int *nr) {
     enum { MAXD = 8 };
     maxwell_flat_why = NULL;
-    typedef struct { int8_t n; uint32_t t[MAXD]; } Stk;   // n < 0: no edge into this block yet
+    *npc = false;
+    *rs = *re = NULL;
+    *nr = 0;
+    typedef struct { int8_t n, bn; uint32_t t[MAXD], b[MAXD]; } Stk;   // SSY stack t, PBK stack b; n < 0: no edge into this block yet
     Stk *in = malloc(sizeof(Stk) * (end + 1));
     if (!in) return false;
+    uint8_t *cand = NULL;   // (one BRX's targets, brx_targets)
     bool ok = true;
+    int64_t warp_pc = -1, back_pc = -1;
     for (size_t i = 0; i <= end; i++) in[i].n = -1;
     for (size_t i = 0; i < end && ok; i++) {
         if (i % 4 == 0) continue;
         uint64_t w = code[i];
         uint32_t pc = (uint32_t)(i * 8);
         uint32_t top = (uint32_t)(w >> 52);
+        if ((w & 0xfff8000000000000ull) == 0xef10000000000000ull || (w & 0xfff8000000000000ull) == 0x50d8000000000000ull)
+            warp_pc = pc;   // (SHFL / VOTE)
         bool is_bra = (w & 0xfff0000000000020ull) == 0xe240000000000000ull;
         bool is_sync = (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull;
         bool is_ssy = (w & 0xfff0000000000020ull) == 0xe290000000000000ull;
+        bool is_brx = (w & 0xfff0000000000020ull) == 0xe250000000000000ull;
+        bool is_pbk = (w & 0xfff0000000000020ull) == 0xe2a0000000000000ull;
         if (label[i]) bstart[i] = 1;
         if (is_bra) {
             int64_t t = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
-            if (t <= pc || (size_t)(t / 8) >= end) FLAT_NO(t <= pc ? "backward BRA" : "BRA out of range", pc);   // (backward: a loop)
+            if ((t <= pc && !loops) || (size_t)(t / 8) >= end) FLAT_NO(t <= pc ? "backward BRA" : "BRA out of range", pc);   // (backward: a loop)
+            if (t <= pc) { *npc = true; back_pc = pc; }
         } else if (is_ssy) {
             int64_t t = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
             if (t <= pc || (size_t)(t / 8) >= end) FLAT_NO("backward SSY", pc);
+        } else if (is_brx || is_pbk || top == 0xe34) {   // (BRX, PBK, BRK: the npc form only)
+            if (!flat_npc_on()) FLAT_NO(is_brx ? "BRX" : is_pbk ? "PBK" : "BRK", pc);
+            if (is_pbk) {
+                int64_t t = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
+                if (t <= pc || (size_t)(t / 8) >= end) FLAT_NO("backward PBK", pc);
+            }
+            *npc = true;
         } else if (top >= 0xe20 && top <= 0xe3f && top != 0xe30 && top != 0xe33) {
             static const char *const flow_names[32] = {"JMX", "JMP", "JCAL", "PEXIT", "BRA.CC", "BRX", "CAL", "PRET", "", "SSY.C", "PBK",
                 "PCNT", "", "", "", "", "EXIT", "LONGJMP", "RET", "KIL", "BRK", "CONT", "RTT", "SAM", "RAM", "IDE", "BPT"};
             const char *nm = flow_names[top - 0xe20];
             FLAT_NO(nm && *nm ? nm : "other flow op", pc);   // (any other flow op: BRX, JMP/JMX, CAL/JCAL, PRET/RET, PBK/BRK, PCNT/CONT, PEXIT, ... or BRA.CC)
         }
-        if (is_bra || is_sync || top == 0xe30) {   // (EXIT) ends its block: the next slot starts one
+        if (is_bra || is_brx || is_sync || top == 0xe30 || top == 0xe34) {   // (EXIT, BRK) ends its block: the next slot starts one
             size_t n = i + 1;
             if (n % 4 == 0) n++;
             if (n < end) bstart[n] = 1;
         }
     }
+    if (ok && back_pc >= 0 && warp_pc >= 0) FLAT_NO("loop with SHFL / VOTE", warp_pc);   // (the lanes they see: min-pc's)
     bstart[1] = 1;
-    // SSY stack along the edges, blocks in address order (every edge goes forward)
+    // SSY and PBK stacks along the edges, blocks in address order (every edge but a loop's back edge goes forward)
     Stk cur = {0};
     bool live = false;
+    uint32_t *ls = NULL, *le = NULL;   // loop regions (slots), one per live back edge
+    int nl = 0;
     #define FLAT_EDGE(T, ST) do { size_t ti_ = (T) / 8; if (ti_ >= end) { ok = false; break; } \
         if (in[ti_].n < 0) in[ti_] = (ST); \
-        else if (in[ti_].n != (ST).n || memcmp(in[ti_].t, (ST).t, sizeof(uint32_t) * (size_t)(ST).n)) FLAT_NO("join with two SSY stacks", ti_ * 8); } while (0)
-    in[1].n = 0;
+        else if (in[ti_].n != (ST).n || memcmp(in[ti_].t, (ST).t, sizeof(uint32_t) * (size_t)(ST).n)) FLAT_NO("join with two SSY stacks", ti_ * 8); \
+        else if (in[ti_].bn != (ST).bn || memcmp(in[ti_].b, (ST).b, sizeof(uint32_t) * (size_t)(ST).bn)) FLAT_NO("join with two PBK stacks", ti_ * 8); } while (0)
+    in[1].n = in[1].bn = 0;
     for (size_t i = 1; i < end && ok; i++) {
         if (i % 4 == 0) continue;
         uint64_t w = code[i];
@@ -3162,9 +3216,41 @@ static bool flat_plan(const uint64_t *code, size_t end, const uint8_t *label, ui
         if ((w & 0xfff0000000000020ull) == 0xe290000000000000ull) {   // SSY
             if (cur.n >= MAXD) { FLAT_NO("SSY stack too deep", pc); break; }
             cur.t[cur.n++] = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
+        } else if ((w & 0xfff0000000000020ull) == 0xe2a0000000000000ull) {   // PBK
+            if (cur.bn >= MAXD) { FLAT_NO("PBK stack too deep", pc); break; }
+            cur.b[cur.bn++] = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
+        } else if ((uint32_t)(w >> 52) == 0xe34) {   // BRK (the pc loop's pc = pbk[--pbk_n])
+            if (bits(w, 16, 4) == (PT | 8)) continue;
+            if (cur.bn <= 0) { FLAT_NO("BRK on empty stack", pc); break; }
+            Stk popped = cur;
+            popped.bn--;
+            uint32_t t = cur.b[cur.bn - 1];
+            if (t <= pc) { FLAT_NO("backward BRK", pc); break; }
+            sync_t[i] = t;
+            FLAT_EDGE(t, popped);
+            if (pt) live = false;
         } else if ((w & 0xfff0000000000020ull) == 0xe240000000000000ull) {   // BRA
             if (bits(w, 16, 4) == (PT | 8)) continue;   // (@!PT: never)
-            FLAT_EDGE(norm_target((int64_t)pc + 8 + sbits(w, 20, 24)), cur);
+            uint32_t t = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
+            if (t <= pc) {   // (a loop's back edge: its start was reached from ahead, with this stack)
+                if (in[t / 8].n < 0) { FLAT_NO("loop entered from behind", pc); break; }
+                if (!ls) { ls = malloc(sizeof(uint32_t) * end); le = malloc(sizeof(uint32_t) * end); }
+                if (!ls || !le) { ok = false; break; }
+                ls[nl] = t / 8;
+                le[nl++] = (uint32_t)i;
+            }
+            FLAT_EDGE(t, cur);
+            if (pt) live = false;
+        } else if ((w & 0xfff0000000000020ull) == 0xe250000000000000ull) {   // BRX: an edge to each table target
+            if (bits(w, 16, 4) == (PT | 8)) continue;
+            if (!cand && !(cand = malloc(end + 4))) { ok = false; break; }
+            memset(cand, 0, end + 4);
+            if (!brx_targets(code, i, end, cand)) { FLAT_NO("BRX without a table", pc); break; }
+            for (size_t t = 1; t < end && ok; t++) {
+                if (!cand[t]) continue;
+                if (t <= i) { FLAT_NO("backward BRX", pc); break; }
+                FLAT_EDGE(t * 8, cur);
+            }
             if (pt) live = false;
         } else if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull) {   // SYNC
             if (bits(w, 16, 4) == (PT | 8)) continue;
@@ -3182,6 +3268,28 @@ static bool flat_plan(const uint64_t *code, size_t end, const uint8_t *label, ui
     }
     #undef FLAT_EDGE
     free(in);
+    free(cand);
+    // loop regions: one per start (the farthest back edge), then widened until any two nest or are apart
+    for (bool again = ok; again;) {
+        again = false;
+        for (int a = 0; a < nl && !again; a++)
+            for (int b = 0; b < nl && !again; b++) {
+                if (a == b) continue;
+                if (ls[a] == ls[b]) {   // (one start: one region)
+                    if (le[b] > le[a]) le[a] = le[b];
+                    ls[b] = ls[nl - 1];
+                    le[b] = le[nl - 1];
+                    nl--;
+                    again = true;
+                } else if (ls[a] < ls[b] && ls[b] <= le[a] && le[a] < le[b]) {   // (b starts inside a and ends past it)
+                    le[a] = le[b];
+                    again = true;
+                }
+            }
+    }
+    if (ok && nl > 64) FLAT_NO("over 64 loops", 0);   // (maxwell_translate's lopen)
+    if (ok) { *rs = ls; *re = le; *nr = nl; }
+    else { free(ls); free(le); }
     if (!ok && !maxwell_flat_why) maxwell_flat_why = "?";
     return ok;
 }
@@ -3317,19 +3425,36 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     if (any_branch && c->glsl && !brx_any && !no_flat && !dbg && !c->trace && !nv_pcloop(blob, max_size, stage)) {
         bstart = calloc(end + 4, 1);
         c->flat_sync = calloc(end + 4, sizeof(uint32_t));
-        if (bstart && c->flat_sync && flat_plan((const uint64_t *)code, end, label, bstart, c->flat_sync)) {
+        if (bstart && c->flat_sync && flat_plan((const uint64_t *)code, end, label, bstart, c->flat_sync,
+                                                       stage == STAGE_VERTEX && flat_npc_on(), &c->flat_npc, &c->flat_rs, &c->flat_re, &c->flat_nr)) {
             c->flat = true;
             c->minpc = false;
             c->branchy = false;
-            for (size_t i = 2; i < end; i++)   // (the block flags, declared ahead of the first block)
-                if (bstart[i] && i % 4) sp(&c->body, "  bool f_%u = false;\n", (uint32_t)(i * 8));
-        }
+            if (c->flat_npc) sp(&c->body, c->flat_nr ? "  uint npc = 8u; uint lg_ = 0u;\n" : "  uint npc = 8u;\n");
+            else
+                for (size_t i = 2; i < end; i++)   // (the block flags, declared ahead of the first block)
+                    if (bstart[i] && i % 4) sp(&c->body, "  bool f_%u = false;\n", (uint32_t)(i * 8));
+        } else c->flat_npc = false;
     }
     bool any_label = false;
+    int lopen[64], nopen = 0;   // (flat_npc: the open loop regions, innermost last)
     for (size_t i = 0; i < end && !c->fail; i++) {
         if (i % 4 == 0) continue;
         uint32_t pc = (uint32_t)(i * 8);
-        if (c->flat && bstart[i]) {
+        if (c->flat_npc && bstart[i]) {   // (fall-through by default: a branch at the block's end overwrites npc)
+            size_t nx = i + 1;
+            while (nx < end && (nx % 4 == 0 || !bstart[nx])) nx++;
+            if (any_label) sp(&c->body, "  }\n");
+            for (; nopen && c->flat_re[lopen[nopen - 1]] < i; nopen--)
+                sp(&c->body, "  } while (npc == %uu && ++lg_ < %luu);\n", c->flat_rs[lopen[nopen - 1]] * 8, guard_limit());
+            for (int k = 0; k < c->flat_nr; k++)
+                if (c->flat_rs[k] == i) {   // (flat_plan: at most 64 regions)
+                    lopen[nopen++] = k;
+                    sp(&c->body, "  do {\n");
+                }
+            sp(&c->body, "  if (npc == %uu) { npc = %uu;\n", pc, (uint32_t)(nx * 8));
+            any_label = true;
+        } else if (c->flat && bstart[i]) {
             if (any_label) sp(&c->body, "    if (!tk_) f_%u = true;\n  }\n", pc);   // (falls through unless a branch was taken)
             if (i == 1) sp(&c->body, "  { bool tk_ = false;\n");
             else sp(&c->body, "  if (f_%u) { bool tk_ = false;\n", pc);
@@ -3351,10 +3476,14 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         info->num_insts++;
     }
     if (c->flat && any_label) sp(&c->body, "  }\n");
+    for (; nopen; nopen--) sp(&c->body, "  } while (npc == %uu && ++lg_ < %luu);\n", c->flat_rs[lopen[nopen - 1]] * 8, guard_limit());
     free(label);
     free(bstart);
     free(c->flat_sync);
     c->flat_sync = NULL;
+    free(c->flat_rs);
+    free(c->flat_re);
+    c->flat_rs = c->flat_re = NULL;
     if (c->fail) { free(c->body.buf); free(c); return info; }
     if (c->glsl) return glsl_finish(c, any_branch && !c->flat, dbg);
 

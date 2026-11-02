@@ -34,6 +34,7 @@ extern "C" int vk_precompile_warmup_progress(int* done, int* total);     // exec
 extern "C" uint64_t vk_scene_idle_frames(void);                           // exec.c (pause screens)
 extern "C" int osd_menu_is_open(void);                                    // below (Graphics menu)
 #include "pc_overlay.h"                                                   // the PC overlay replaces that menu
+#include "pc_settings.h"                                                  // pc.f10_hint
 
 // one rendered text block (banner, fps readout)
 struct OsdBlock { std::vector<uint32_t> px; int w = 0, h = 0, font_h = 0; std::string text; };
@@ -172,6 +173,7 @@ static bool osd_menu_enabled() {
     return on;
 }
 static bool g_hint_held;                                   // osd_banner (render thread): a held picture's hint timer
+static bool g_hint_this;                                   // ... and whether this one gets the hint (pc.f10_hint)
 static std::chrono::steady_clock::time_point g_hint_since;
 // A short notice over the banner (pc_shot.cpp's "Screenshot saved"), from any thread; osd_banner shows it for `ms`.
 static std::mutex g_toast_mu;
@@ -204,12 +206,23 @@ extern "C" const uint32_t* osd_banner(int target_h, int* w, int* h) {
     } else if (g_title_phase) {
         t = g_skip_opening ? pc_tr("Skip opening: ON   (F2 / Minus to change)") : pc_tr("Skip opening: OFF   (F2 / Minus to change)");
     } else if (osd_menu_enabled() && !osd_menu_is_open() && vk_scene_idle_frames() > 45) {   // a pause / System menu holds the picture
-        // With the PC overlay: the first 4 s of each such screen only (it sat on every map and inventory screen), and
-        // not while the overlay is open
+        // With the PC overlay: the first 4 s of such a screen only (it sat on every map and inventory screen), not while
+        // the overlay is open, and on the first 3 such screens only, never again once F10 has been opened
+        // (pc.f10_hint, kept in the settings: Reddit 11-02, "keeps popping up from time to time")
         const auto now = std::chrono::steady_clock::now();
-        if (!g_hint_held) g_hint_since = now;
+        if (!g_hint_held) {
+            g_hint_since = now;
+            char seen[8];   // (copied under the settings lock: set_open writes it from the UI thread)
+            const int n = pc_settings_copy("pc.f10_hint", seen, sizeof seen) ? atoi(seen) : 0;
+            g_hint_this = n < 3;
+            if (g_hint_this && pc_overlay_enabled()) {
+                char v[4];
+                snprintf(v, sizeof v, "%d", n + 1);
+                pc_settings_set("pc.f10_hint", v);
+            }
+        }
         g_hint_held = true;
-        if (!pc_overlay_enabled() || (!pc_overlay_open() && now - g_hint_since < std::chrono::seconds(4)))
+        if (!pc_overlay_enabled() || (g_hint_this && !pc_overlay_open() && now - g_hint_since < std::chrono::seconds(4)))
             t = pc_tr("Graphics settings: F10  (pad: L3 + R3)");
     }
     if (!(vk_scene_idle_frames() > 45)) g_hint_held = false;

@@ -37,9 +37,9 @@ The game's own Options screen (System > Options) shows the main PC settings too,
 resolution, fullscreen resolution, frame rate, the FPS counter; Graphics: render resolution...). To show only the
 game's own options, add the line env.TOTK_OPTIONS_MENU=0 at the end of player.txt.
 
-The frame rate starts at 120 (the original runs at 30). In F10 > Graphics you can choose 30, 60, 90, 120 or
-"Unlocked": no limit, up to your monitor's refresh rate, 240 fps at most, with the game running at its right
-speed.
+The frame rate starts at 120 (the original runs at 30). In F10 > Graphics (or Options > Display) you can choose
+30, 40, 45, 60, 75, 90, 120, 144, 165, 180, 200, 240 or "Unlocked": no limit, up to your
+monitor's refresh rate, 240 fps at most, with the game running at its right speed.
 
 DLSS frame generation (NVIDIA RTX 40 series or newer, off by default, experimental) does not make the game itself
 faster: use it only when the game runs under 60 fps without it, on a monitor of 120 Hz or more, with the frame limit

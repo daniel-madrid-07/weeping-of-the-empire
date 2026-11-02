@@ -7,6 +7,7 @@
 #include "pc_lang.h"   // pc_lang_code: the CJK glyph guard (glyph_patches)
 #include "cpu_place.h"
 #include "romfs_image.h"
+#include "rom_source.h"
 #include <windows.h>
 #include <cstdio>
 #include <string>
@@ -27,6 +28,7 @@
 #include "rstb_merge.h"
 #include "mods.h"
 #include "mods_scan.h"
+#include "save_tree.h"   // (save_tree_same: a Commit that changed nothing is not published)
 #ifndef _WIN32
 #include <unistd.h>   // (getpid: the merged resource size table's name)
 #endif
@@ -441,6 +443,9 @@ static std::shared_ptr<const FilePatch> glyph_patches(const std::string& hp) {
 // built).
 struct GlyphLive {
     std::mutex m;
+    unsigned gen = 0;                           // bumped by each serving that resets the state (glyph_live_search)
+    std::chrono::steady_clock::time_point pane_search_at, rescan_at;   // the last search for pane objects; for a change
+    std::atomic<long long> rescan_due{0};   // a rescan a change was too soon for: when the live loop runs it (live_ms; 0 none)
     bool served = false, located = false;
     std::chrono::steady_clock::time_point served_at;
     unsigned epoch = 0;                         // what the game's copies show now
@@ -460,6 +465,9 @@ struct GlyphLive {
     bool msg_looked = false;
 };
 static GlyphLive g_live;
+static long long live_ms() {   // (steady milliseconds, for rescan_due)
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 extern "C" unsigned hid_glyph_epoch(void);   // hle_hid.cpp
 extern "C" u64 g_rt_heap_base;                // hle_os_mem.cpp
 extern "C" u64 kernel_heap_size(void);        // hle_os_mem.cpp: committed bytes from g_rt_heap_base
@@ -577,11 +585,13 @@ static void glyph_live_font(const std::vector<u16>& ids) {
     std::lock_guard<std::mutex> l(g_live.m);
     if (!g_bank.cmap_sig.empty()) g_live.cmap_now = cmap_with(ids);
     g_live.cmap_at.clear();
+    g_live.gen++;
 }
 // glyph_patches: the Common archive was served; keep its masks as the game got them
 static void glyph_live_served(const std::string& hp, bool common, int style) {
     std::lock_guard<std::mutex> l(g_live.m);
     if (!common) return;
+    g_live.gen++;
     const GlyphBank& b = g_bank;
     g_live.mask_orig.assign(b.masks.size(), {});
     g_live.mask_now.assign(b.masks.size(), {});
@@ -633,8 +643,23 @@ static int scan_range(u8* p, u8* end, const MemFind* f, int nf, const u8* bloom,
     pc_fault_guard(0);
     return n;
 }
+// The scan (seconds: 4.5 GB of heap and alias region) at below-normal CPU priority, so on a 4-core PC it takes no core
+// from the game's and the render thread's work; it holds no lock others wait on (glyph_live_search). The thread's own
+// priority again afterwards. TOTK_GLYPH_SCAN_PRIO=0: the thread's priority.
+struct ScanPrio {
+    int old = THREAD_PRIORITY_ERROR_RETURN;
+    ScanPrio() {
+        static const bool off = getenv("TOTK_GLYPH_SCAN_PRIO") && !strcmp(getenv("TOTK_GLYPH_SCAN_PRIO"), "0");
+        old = GetThreadPriority(GetCurrentThread());
+        if (off || old == THREAD_PRIORITY_ERROR_RETURN || old <= THREAD_PRIORITY_BELOW_NORMAL ||
+            !SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL))
+            old = THREAD_PRIORITY_ERROR_RETURN;
+    }
+    ~ScanPrio() { if (old != THREAD_PRIORITY_ERROR_RETURN) SetThreadPriority(GetCurrentThread(), old); }
+};
 static void mem_find(std::vector<MemFind>& f, const std::vector<std::pair<const u8*, size_t>>& mine) {
     if (f.empty()) return;
+    ScanPrio prio;
     std::vector<u8> bloom(8192);
     for (auto& e : f) {
         int best = -1;
@@ -863,22 +888,52 @@ static void msg_literals(const u8* gki) {
     printf("[fs] glyph bank live: %zu button characters written out in %d message files (Mals at %p, %u bytes)\n",
            g_live.msg.size(), files, (const void*)s, n);
 }
-// The copies found again: those still holding what they were last given; a search for the rest (search).
-static void glyph_live_locate(bool search = true) {
-    std::vector<MemFind> f;
-    auto keep = [&](std::vector<u8*>& at, const std::vector<u8>& now) {
+// The copies found again: those still holding what they were last given; a search for the rest. The search runs without
+// g_live.m, which the file serving's glyph_live_served / font / rearm take: its patterns are copied out under the lock
+// (glyph_live_take), looked for unlocked (glyph_live_scan), and the hits put back under it (glyph_live_put), dropped if
+// the serving reset the state meanwhile (g_live.gen).
+struct LiveSearch {
+    unsigned gen = 0;                           // g_live.gen when taken
+    std::vector<std::vector<u8>> pats;          // the patterns (copies)
+    std::vector<int> target;                    // per pattern: a mask's index, kTargetGki, kTargetCmap, or kTargetPane - i
+    std::vector<bool> wide;
+    std::vector<std::vector<u8*>> hits;
+    size_t copies = 0;                          // the patterns before the panes' names
+    std::vector<size_t> pane_search;
+    std::vector<std::pair<const u8*, size_t>> mine;   // this file's own copies (hits there are not the game's)
+    double ms = 0;
+};
+constexpr int kTargetGki = -1, kTargetCmap = -2, kTargetPane = -100;
+constexpr std::chrono::seconds kPaneSearchGap{600}, kRescanGap{60};
+static std::vector<u8*>* live_target(int t) {   // (g_live.m held)
+    if (t == kTargetGki) return &g_live.gki_at;
+    if (t == kTargetCmap) return &g_live.cmap_at;
+    if (t >= 0) return (size_t)t < g_live.mask_at.size() ? &g_live.mask_at[t] : nullptr;
+    const size_t i = (size_t)(kTargetPane - t);
+    return i < g_live.pane_hits.size() ? &g_live.pane_hits[i] : nullptr;
+}
+// g_live.m held: the copies known checked (those changed are forgotten); false when nothing is left to look for.
+// search false: the check alone (the pane objects' search window is not used)
+static bool glyph_live_take(LiveSearch& s, bool search = true) {
+    s = LiveSearch();
+    s.gen = g_live.gen;
+    auto keep = [&](std::vector<u8*>& at, const std::vector<u8>& now, int target) {
         std::vector<u8*> ok;
         for (u8* a : at) if (!memcmp(a, now.data(), now.size())) ok.push_back(a);
         at = ok;
-        if (at.empty() && now.size() >= 16) f.push_back({now.data(), now.size(), 0, 0, &at});
+        if (at.empty() && now.size() >= 16) s.pats.push_back(now), s.target.push_back(target), s.wide.push_back(true);
     };
-    for (size_t i = 0; i < g_live.mask_now.size(); i++) if (!g_live.mask_now[i].empty()) keep(g_live.mask_at[i], g_live.mask_now[i]);
-    keep(g_live.gki_at, g_live.gki_now);
-    keep(g_live.cmap_at, g_live.cmap_now);
-    const size_t copies = f.size();
+    for (size_t i = 0; i < g_live.mask_now.size(); i++) if (!g_live.mask_now[i].empty()) keep(g_live.mask_at[i], g_live.mask_now[i], (int)i);
+    keep(g_live.gki_at, g_live.gki_now, kTargetGki);
+    keep(g_live.cmap_at, g_live.cmap_now, kTargetCmap);
+    s.copies = s.pats.size();
     // DoCommand's pane copies: the objects and the resource copy still there; a search by name while either is missing
-    // (the objects exist once the HUD is built, and are built again with it)
-    std::vector<size_t> pane_search;
+    // (the objects exist once the HUD is built, and are built again with it), at most every kPaneSearchGap, and each
+    // search is a full heap + alias scan
+    const auto now = std::chrono::steady_clock::now();
+    const bool panes_due = search && (g_live.pane_search_at == std::chrono::steady_clock::time_point() ||
+                                      now - g_live.pane_search_at >= kPaneSearchGap);
+    if (panes_due) g_live.pane_search_at = now;
     for (size_t i = 0; i < g_bank.panes.size() && i < g_live.pane_obj.size(); i++) {
         const auto& p = g_bank.panes[i];
         auto& obj = g_live.pane_obj[i];
@@ -886,25 +941,46 @@ static void glyph_live_locate(bool search = true) {
         obj.erase(std::remove_if(obj.begin(), obj.end(), [&](u8* a) { return !pane_object_ok(a, p); }), obj.end());
         res.erase(std::remove_if(res.begin(), res.end(), [&](u8* a) { return !pane_resource(a, p); }), res.end());
         if (!obj.empty() && !res.empty()) continue;
+        if (!panes_due) continue;
         g_live.pane_hits[i].clear();
-        MemFind e{(const u8*)p.name.c_str(), p.name.size() + 1, 0, 0, &g_live.pane_hits[i]};
-        e.wide = false;   // (guest memory only)
-        f.push_back(e);
-        pane_search.push_back(i);
+        s.pats.emplace_back((const u8*)p.name.c_str(), (const u8*)p.name.c_str() + p.name.size() + 1);
+        s.target.push_back(kTargetPane - (int)i);
+        s.wide.push_back(false);   // (guest memory only)
+        s.pane_search.push_back(i);
     }
-    if (f.empty() || !search) return;
-    std::vector<std::pair<const u8*, size_t>> mine = {{g_bank.gki_sig.data(), g_bank.gki_sig.size()},
-                                                      {g_live.gki_now.data(), g_live.gki_now.size()},
-                                                      {g_bank.cmap_sig.data(), g_bank.cmap_sig.size()},
-                                                      {g_live.cmap_now.data(), g_live.cmap_now.size()}};
-    for (auto* v : {&g_live.mask_orig, &g_live.mask_now}) for (auto& t : *v) mine.push_back({t.data(), t.size()});
-    for (auto& p : g_bank.panes) mine.push_back({(const u8*)p.name.c_str(), p.name.size() + 1});
+    if (s.pats.empty()) return false;
+    s.mine = {{g_bank.gki_sig.data(), g_bank.gki_sig.size()}, {g_live.gki_now.data(), g_live.gki_now.size()},
+              {g_bank.cmap_sig.data(), g_bank.cmap_sig.size()}, {g_live.cmap_now.data(), g_live.cmap_now.size()}};
+    for (auto* v : {&g_live.mask_orig, &g_live.mask_now}) for (auto& t : *v) s.mine.push_back({t.data(), t.size()});
+    for (auto& p : g_bank.panes) s.mine.push_back({(const u8*)p.name.c_str(), p.name.size() + 1});
+    for (auto& p : s.pats) s.mine.push_back({p.data(), p.size()});
+    return true;
+}
+// without the lock: the search itself
+static void glyph_live_scan(LiveSearch& s) {
+    s.hits.assign(s.pats.size(), {});
+    std::vector<MemFind> f;
+    for (size_t k = 0; k < s.pats.size(); k++) {
+        MemFind e{s.pats[k].data(), s.pats[k].size(), 0, 0, &s.hits[k]};
+        e.wide = s.wide[k];
+        f.push_back(e);
+    }
     const auto t0 = std::chrono::steady_clock::now();
-    mem_find(f, mine);
-    if (!pane_search.empty()) {
+    mem_find(f, s.mine);
+    s.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+// g_live.m held: the hits where they belong, if the state is still the one searched
+static void glyph_live_put(LiveSearch& s) {
+    if (s.gen != g_live.gen) {
+        printf("[fs] glyph bank live: the files were served again during the search (%.0f ms); its hits dropped\n", s.ms);
+        return;
+    }
+    for (size_t k = 0; k < s.pats.size(); k++)
+        if (std::vector<u8*>* at = live_target(s.target[k]); at && at->empty()) *at = s.hits[k];
+    if (!s.pane_search.empty()) {
         int objs = 0, res = 0;
         const u8* stray = nullptr;
-        for (size_t i : pane_search) {
+        for (size_t i : s.pane_search) {
             const auto& p = g_bank.panes[i];
             auto add = [](std::vector<u8*>& v, u8* a) { if (std::find(v.begin(), v.end(), a) == v.end()) v.push_back(a); };
             const u8* other = nullptr;
@@ -924,28 +1000,37 @@ static void glyph_live_locate(bool search = true) {
             if (g_live.pane_obj[i].empty() && missing.size() < 300) missing += " " + g_bank.panes[i].name;
         }
         printf("[fs] glyph bank live: DoCommand pane copies: %d of %zu in pane objects, %d in the layout resource (%zu looked for)%s%s\n",
-               objs, g_bank.panes.size(), res, pane_search.size(), missing.empty() ? "" : "; no object:", missing.c_str());
+               objs, g_bank.panes.size(), res, s.pane_search.size(), missing.empty() ? "" : "; no object:", missing.c_str());
         if (stray && !g_live.pane_dumped) { pane_dump(stray); g_live.pane_dumped = true; }
-        f.resize(copies);
-        if (f.empty()) return;
+        if (!s.copies) return;
     }
     u8* const heap = (u8*)g_rt_heap_base;
     int found = 0;
     std::string where;
-    for (auto& e : f) {
-        found += !e.at->empty();
-        for (u8* a : *e.at) {
-            char s[64];
+    for (size_t k = 0; k < s.copies; k++) {
+        found += !s.hits[k].empty();
+        for (u8* a : s.hits[k]) {
+            char t[64];
             u64 ab = 0, an = 0;
             rt_alias_carved(&ab, &an);
-            snprintf(s, sizeof s, " %p%s", (void*)a, a >= heap && a < heap + kernel_heap_size() ? "(heap)"
+            snprintf(t, sizeof t, " %p%s", (void*)a, a >= heap && a < heap + kernel_heap_size() ? "(heap)"
                                                    : (u64)a >= ab && (u64)a < ab + an ? "(alias)" : "(host)");
-            if (where.size() < 600) where += s;
+            if (where.size() < 600) where += t;
         }
     }
     g_live.located = true;
-    printf("[fs] glyph bank live: %d of %zu copies found in %.0f ms:%s\n", found, f.size(),
-           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), where.c_str());
+    printf("[fs] glyph bank live: %d of %zu copies found in %.0f ms:%s\n", found, s.copies, s.ms, where.c_str());
+}
+// The search, its lock held only around the take and the put (any thread but the file serving's)
+static void glyph_live_search() {
+    LiveSearch s;
+    {
+        std::lock_guard<std::mutex> l(g_live.m);
+        if (!glyph_live_take(s)) return;
+    }
+    glyph_live_scan(s);
+    std::lock_guard<std::mutex> l(g_live.m);
+    glyph_live_put(s);
 }
 // The game's copies (those located) made to show the style and bindings in force now; true when some are not located.
 static bool glyph_live_write(int style, bool log) {
@@ -1039,19 +1124,39 @@ static bool glyph_live_write(int style, bool log) {
                style, masks, mask_places, gki_done ? "rewritten" : "unchanged", g_live.gki_at.size(),
                cmap_done ? "rewritten" : "unchanged", g_live.cmap_at.size(), panes, b.panes.size(), pane_flips, msg_done, msg_gone,
                (unsigned long long)GetTickCount64());   // (tick: against pc_input's context lines, the rewrite's latency)
-    bool missing = g_live.gki_at.empty() || (!g_live.cmap_now.empty() && g_live.cmap_at.empty()) || panes < (int)b.panes.size();
+    // (a pane object not found does not ask for a search: they are looked for every kPaneSearchGap at most)
+    bool missing = g_live.gki_at.empty() || (!g_live.cmap_now.empty() && g_live.cmap_at.empty());
     for (size_t i = 0; i < g_live.mask_now.size(); i++) missing |= !g_live.mask_now[i].empty() && g_live.mask_at[i].empty();
     return missing;
 }
 // A change: the copies known are written at once, then the others looked for (a scan of seconds) and written.
 static void glyph_live_apply(unsigned epoch) {
-    std::lock_guard<std::mutex> l(g_live.m);
     const int style = hid_glyph_active();
-    glyph_live_locate(false);
-    if (glyph_live_write(style, true)) {
-        glyph_live_locate(true);
-        glyph_live_write(style, false);
+    {
+        std::lock_guard<std::mutex> l(g_live.m);
+        LiveSearch known;
+        glyph_live_take(known, false);   // (the copies known checked; no search yet)
+        // a copy not found searched for at most every kRescanGap: each search is seconds of heap + alias scan, and a
+        // copy can stay missing (every device switch rescanned before, cpu-hot 11-02)
+        const auto now = std::chrono::steady_clock::now();
+        if (!glyph_live_write(style, true)) {
+            g_live.epoch = epoch;
+            return;
+        }
+        if (g_live.rescan_at != std::chrono::steady_clock::time_point() && now - g_live.rescan_at < kRescanGap) {
+            // (too soon: the live loop runs it once the gap has passed, so a moved copy does not wait for the next
+            // change)
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(kRescanGap - (now - g_live.rescan_at));
+            g_live.rescan_due = live_ms() + (long long)left.count() + 1;
+            g_live.epoch = epoch;
+            return;
+        }
+        g_live.rescan_at = now;
+        g_live.rescan_due = 0;
     }
+    glyph_live_search();
+    std::lock_guard<std::mutex> l(g_live.m);
+    glyph_live_write(style, false);
     g_live.epoch = epoch;
 }
 // pc_input's glyph intent (a key press naming the set it puts up): the rewrite at once, not at the next 20 ms look and
@@ -1082,12 +1187,17 @@ static void glyph_live_start() {
             }
             if (!g_live.served) continue;
             if (!g_live.located && std::chrono::steady_clock::now() - g_live.served_at > std::chrono::seconds(90)) {
+                glyph_live_search();
                 std::lock_guard<std::mutex> l(g_live.m);
-                glyph_live_locate();
                 g_live.located = true;
             }
             unsigned e = hid_glyph_epoch();
             static ULONGLONG seen_at;  // (when the new epoch was first seen: the glyph switch's latency)
+            if (const long long due = g_live.rescan_due.load(); due && live_ms() >= due) {
+                g_live.rescan_due = 0;
+                glyph_live_apply(e);   // (the rescan an earlier change was too soon for)
+                continue;
+            }
             if (e == g_live.epoch) { seen = e; continue; }
             if (e != seen) {   // (the same for two looks: a burst settles first; an intent's change is meant, at once)
                 seen = e;
@@ -1109,7 +1219,16 @@ static void glyph_live_start() {}
 // The resource size table: the bank's two archives are larger than the game's, and the game sizes a resource's buffer
 // from this table (a larger font archive overran its buffer at boot), so the bank carries the overlay's table with those
 // two entries raised and is served it (base.fnv's "rstb" line: the overlay table it was built on).
+// (the name is the build's version's: 1.0.0 .Product.100.rsizetable.zs; later versions, e.g. 1.4.3, add .Nin_NX_NVN:
+// .Product.143.Nin_NX_NVN.rsizetable.zs, so the player's mods' tables merge there too)
+#if NXR_GAME_TOTK && defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+#define TOTK_RSTB_VER2(v) #v
+#define TOTK_RSTB_VER(v) TOTK_RSTB_VER2(v)
+static const char* const kGlyphRstb =
+    "System/Resource/ResourceSizeTable.Product." TOTK_RSTB_VER(TOTK_GAME_VERSION) ".Nin_NX_NVN.rsizetable.zs";
+#else
 static const char* const kGlyphRstb = "System/Resource/ResourceSizeTable.Product.100.rsizetable.zs";
+#endif
 static std::pair<u64, u64> fnv_file(const std::string& path) {   // (size, FNV-1a 64); size 0 when missing
     u64 h = 0xcbf29ce484222325ull, n = 0;
     if (FILE* f = fopen(path.c_str(), "rb")) {
@@ -1156,11 +1275,13 @@ static const std::string& glyph_dir() {
     const char* gd = getenv("TOTK_GLYPHS_DIR");
     const std::string od = overlay_dir(), base = gd && *gd ? gd : od + "/../../glyphs";
     // the bank built on the overlay in use: an aspect overlay (graphics.aspect_ratio, romfs-aspect-<w>x<h>) has its own
-    // Common archive, so its own bank, engine+glyphs@aspect-<w>x<h> (build.py glyph_bank); the 16:9 one engine+glyphs
+    // Common archive, so its own bank, engine+glyphs@aspect-<w>x<h>[-center] (build.py glyph_bank; -center: the HUD in
+    // the middle 16:9, graphics.hud_layout); the 16:9 one engine+glyphs
     std::string bank = base + "/engine+glyphs";
     if (const size_t a = od.find("aspect-"); a != std::string::npos) {
         size_t e = a + 7;
         while (e < od.size() && (isdigit((unsigned char)od[e]) || od[e] == 'x')) e++;
+        if (od.compare(e, 7, "-center") == 0) e += 7;
         bank += "@" + od.substr(a, e - a);
     }
     if (FILE* t = fopen((bank + "/glyphs.txt").c_str(), "r")) {
@@ -1333,6 +1454,38 @@ static std::vector<u8> read_resolved(const std::string& hp) {
     }
     return read_host_file(hp);
 }
+// `z` written to the temp folder as <prefix><pid>.zs for the game to open: one file per game process, written beside
+// and renamed into place; the ones of that prefix a day old (games that were killed) are removed here. Its path, or
+// "" when it cannot be written.
+static std::string temp_file(const char* prefix, const std::vector<u8>& z) {
+    std::error_code ec;
+    const fsys::path dir = fsys::temp_directory_path(ec);
+    if (ec) return "";
+#ifdef _WIN32
+    const unsigned long pid = GetCurrentProcessId();
+#else
+    const unsigned long pid = (unsigned long)getpid();
+#endif
+    // (increment(ec), not a range-for: its operator++ throws on an iteration error, here inside call_once)
+    for (fsys::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string n = it->path().filename().string();
+        std::error_code e2;
+        if (n.rfind(prefix, 0) == 0 &&
+            fsys::last_write_time(it->path(), e2) < fsys::file_time_type::clock::now() - std::chrono::hours(24) && !e2)
+            fsys::remove(it->path(), e2);
+    }
+    ec.clear();
+    const fsys::path out = dir / (prefix + std::to_string(pid) + ".zs"), tmp = fsys::path(out) += ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary);
+        f.write((const char*)z.data(), (std::streamsize)z.size());
+        if (!f.good()) { f.close(); fsys::remove(tmp, ec); return ""; }
+    }
+    fsys::rename(tmp, out, ec);
+    if (ec) { fsys::remove(tmp, ec); return ""; }
+    const std::u8string u8 = out.u8string();
+    return std::string(u8.begin(), u8.end());
+}
 static std::string rstb_merged(const std::string& base) {
     const std::string rel = "/" + std::string(kGlyphRstb);
     rstb::Table t;
@@ -1358,56 +1511,47 @@ static std::string rstb_merged(const std::string& base) {
     printf("[fs] resource size table: %zu entries raised for the mods' files (%zu added files estimated, %zu from tables "
            "for another version)\n", computed, estimated, other);
     if (!n && !computed) return "";
-    std::error_code ec;
-    const fsys::path dir = fsys::temp_directory_path(ec);
-    if (ec) return "";
-    // One file per game process, written beside and renamed into place; the ones a day old (games that were killed)
-    // are removed here
-#ifdef _WIN32
-    const unsigned long pid = GetCurrentProcessId();
-#else
-    const unsigned long pid = (unsigned long)getpid();
-#endif
-    // (increment(ec), not a range-for: its operator++ throws on an iteration error, here inside call_once)
-    for (fsys::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-        const std::string n = it->path().filename().string();
-        std::error_code e2;
-        if (n.rfind("totk-rstb-merged-", 0) == 0 &&
-            fsys::last_write_time(it->path(), e2) < fsys::file_time_type::clock::now() - std::chrono::hours(24) && !e2)
-            fsys::remove(it->path(), e2);
-    }
-    ec.clear();
-    const fsys::path out = dir / ("totk-rstb-merged-" + std::to_string(pid) + ".zs"), tmp = fsys::path(out) += ".tmp";
-    const std::vector<u8> z = rstb::zstd_stored(rstb::serialize(t));
-    {
-        std::ofstream f(tmp, std::ios::binary);
-        f.write((const char*)z.data(), (std::streamsize)z.size());
-        if (!f.good()) { f.close(); fsys::remove(tmp, ec); return ""; }
-    }
-    fsys::rename(tmp, out, ec);
-    if (ec) { fsys::remove(tmp, ec); return ""; }
-    const std::u8string u8 = out.u8string();
-    const std::string path(u8.begin(), u8.end());
+    const std::string path = temp_file("totk-rstb-merged-", rstb::zstd_stored(rstb::serialize(t)));
+    if (path.empty()) return "";
     printf("[fs] resource size table: %s + %d mod table(s): %zu entries raised, %zu added; %zu raised for mod files -> %s\n",
            base.c_str(), n, c.raised, c.added, computed, path.c_str());
     return path;
 }
+// The game's own copy of a RomFS file, rebuilt by its glue at the first open (TotK: the player camera's pack with
+// controls.stick_camera_speed, totk_camera_speed.cpp), from the file that would be served (the RomFS's, our overlay's
+// or a player's mod's). "" (serve `base`): no rebuild wanted, or it failed (the glue logs why).
+extern "C" const char* totk_camera_pack_rel(void);                               // totk_camera_speed.cpp, game/none.cpp
+bool totk_camera_pack_build(const std::vector<uint8_t>& in, std::vector<uint8_t>* out);   // (none.cpp: never)
+static std::string game_rebuilt(const std::string& base) {
+    std::vector<u8> z;
+    if (!totk_camera_pack_build(read_resolved(base), &z)) return "";
+    const std::string path = temp_file("totk-camera-pack-", z);
+    if (!path.empty()) printf("[fs] %s rebuilt -> %s\n", base.c_str(), path.c_str());
+    return path;
+}
 
-// Every lookup but the resource size table's is host_path_ours; that one gets the mods' tables merged in (rstb_merged)
+// Every lookup but two is host_path_ours: the resource size table gets the mods' tables merged in (rstb_merged), and
+// the file the game glue rebuilds is served from its rebuilt copy (game_rebuilt)
 static bool host_path(const char* p, std::string* out) {
     if (!host_path_ours(p, out)) return false;
     static const std::string rstb_rel = "/" + std::string(kGlyphRstb);
+    static const char* const rebuilt_rel = totk_camera_pack_rel();   // (nullptr: none)
     const char* colon = strchr(p, ':');
-    if (!colon || rstb_rel != colon + 1 || user_mods().empty() || getenv("TOTK_NO_OVERLAY")) return true;
+    if (!colon) return true;
+    const bool rstb = rstb_rel == colon + 1 && !user_mods().empty() && !getenv("TOTK_NO_OVERLAY");
+    const bool rebuilt = rebuilt_rel && !strcmp(rebuilt_rel, colon + 1);
+    if (!rstb && !rebuilt) return true;
     {
         std::lock_guard<std::mutex> l(g_fs_mtx);
         auto it = g_mounts.find(std::string(p, (size_t)(colon - p)));
         if (it == g_mounts.end() || it->second != kRomDir) return true;
     }
-    static std::once_flag once;
-    static std::string merged;
-    std::call_once(once, [&] { merged = rstb_merged(*out); });
-    if (!merged.empty()) *out = merged;
+    static std::once_flag once, once_rebuilt;
+    static std::string merged, rebuilt_path;
+    if (rstb) std::call_once(once, [&] { merged = rstb_merged(*out); });
+    if (rebuilt) std::call_once(once_rebuilt, [&] { rebuilt_path = game_rebuilt(*out); });
+    const std::string& use = rstb ? merged : rebuilt_path;
+    if (!use.empty()) *out = use;
     return true;
 }
 bool hle_fs_host_path(const char* p, std::string* out) { bool r = host_path(p, out); if (r) ci_fix(*out); return r; }   // hle_movie.cpp (movie files)
@@ -1678,10 +1822,21 @@ static bool finish_locked(const std::vector<std::wstring>& copied, u64* ms = nul
     if (ms) { ms[0] = t1 - t0; ms[1] = t2 - t1; ms[2] = GetTickCount64() - t2; }
     return true;
 }
+// After snapshot_locked (mutex held): a snapshot equal to the committed save (save_tree.h: the game rewrote its files with
+// the same bytes, as it does at each start) is dropped instead of published, so it takes no backup's place; the committed
+// save already holds it. TOTK_SAVE_SAME=publish publishes it anyway (the old behaviour, for A/Bs).
+static bool snapshot_unchanged() {
+    static const bool off = getenv("TOTK_SAVE_SAME") && !strcmp(getenv("TOTK_SAVE_SAME"), "publish");
+    if (off || wexists(rd_dir()) || !save_tree_same(nw_dir(), g_committed)) return false;
+    if (!remove_tree(nw_dir())) printf("[fs] save commit: unchanged, but %ls could not be removed (the next commit does)\n", nw_dir().c_str());
+    printf("[fs] save commit: no change since the committed save; not published, no backup\n");
+    return true;
+}
 // publish `work` as the committed save in one go (mutex held). On failure the committed save is unchanged.
 static bool publish_locked(const std::wstring& work) {
     u64 t0 = GetTickCount64();
     if (!snapshot_locked(work, nullptr)) return false;
+    if (snapshot_unchanged()) return true;
     u64 t1 = GetTickCount64();
     if (!finish_locked({})) return false;
     u64 t2 = GetTickCount64();
@@ -1812,14 +1967,16 @@ static void commit_save() {
             static const DWORD delay = getenv("TOTK_SAVE_SNAP_DELAY_MS") ? (DWORD)atoi(getenv("TOTK_SAVE_SNAP_DELAY_MS")) : 0;
             if (delay) Sleep(delay);
             bool ok = snapshot_locked(g_work, copied.get());
+            const bool same = ok && snapshot_unchanged();
             u64 ts = GetTickCount64();
             { std::lock_guard<std::mutex> l(g_snap_mtx); g_snap_pending = false; }
             g_snap_cv.notify_all();
             u64 ms[3] = {};
             g_move_retries = 0; g_move_max_ms = 0;
-            ok = ok && finish_locked(*copied, ms);
+            ok = ok && (same || finish_locked(*copied, ms));
             commits_unlock();
-            if (ok) {
+            if (ok && same) pending(false);
+            else if (ok) {
                 pending(false);
                 printf("[fs] save commit published: %llu ms on the game thread, snapshot %llu ms + flush + rename + swap %llu ms in the"
                        " background (mutex %llu, flush %llu ms for %zu files, .ready %llu, swap + backup %llu; renames retried %u,"
@@ -1837,7 +1994,9 @@ static void commit_save() {
     }
     commits_lock();
     bool ok = snapshot_locked(g_work, copied.get());
+    const bool same = ok && snapshot_unchanged();
     commits_unlock();
+    if (same) { pending(false); return; }
     pending(true);   // until the background publish lands (a failed snapshot is retried at the next Commit / start)
     if (!ok) return;
     { std::lock_guard<std::mutex> p(g_pub_mtx); g_pub_busy = true; }
@@ -1912,12 +2071,18 @@ template <class T> struct Slots {
 // per file object: the loader threads would queue) GetFileSize, GetEntryType and directory listings come from the index. A
 // pack that fails its checks (magic, version, size, bounds) is logged and ignored. With a pack the open-ahead is off.
 // TOTK_ROMFS_PACK may also name the extraction's RomFS image (romfs.bin: romfs_image.h), indexed at start in ~0.1 s; the
-// default since 2026-10-27, no NXRP copy needed.
+// default since 2026-10-27, no NXRP copy needed. Since v0.1.8 it may name romfs-source.txt instead (rom_source.h): the same
+// image read straight from the player's dump, each read decrypted in place (AES-CTR), so a player's install keeps no 17 GB
+// romfs.bin.
 #ifdef _WIN32
 namespace {
 struct PackEntry { u64 hash; u32 path_off, path_len; u64 data_off, size; };
 static_assert(sizeof(PackEntry) == 32, "NXRP v1 entry");
-struct RomPack { HANDLE h = INVALID_HANDLE_VALUE; std::vector<PackEntry> ents; std::string paths; std::vector<u32> order; };
+struct RomPack {
+    HANDLE h = INVALID_HANDLE_VALUE;
+    const RomSource* src = nullptr;   // the image in the player's dump (romfs-source.txt), else h is the image itself
+    std::vector<PackEntry> ents; std::string paths; std::vector<u32> order;
+};
 u64 fnv1a64(const char* s, size_t n) {
     u64 h = 0xcbf29ce484222325ull;
     for (size_t i = 0; i < n; i++) { h ^= (u8)s[i]; h *= 0x100000001b3ull; }
@@ -1942,37 +2107,96 @@ u64 pack_read(HANDLE h, u64 off, void* buf, u64 size) {
     }
     return done;
 }
+// The game dump stopped answering during play (its drive unplugged, a network share gone: the open handle keeps the
+// file itself from being moved or deleted): one clear message, then the game ends with "DMP0" (the launcher shows no
+// second dialog, tries no older package, and checks the dump at the next start). Never a hang or a garbled file.
+[[noreturn]] static void dump_lost(const RomSource* src) {
+    static std::atomic<bool> once{false};
+    if (once.exchange(true))
+        for (;;) Sleep(INFINITE);   // (another reader is showing the message)
+    printf("[fatal] the game dump %s cannot be read any more (moved, deleted or its drive unplugged)\n", src->dump.c_str());
+    fflush(stdout);
+    EnumWindows([](HWND w, LPARAM) -> BOOL {   // (the game's own windows out of the way: a fullscreen one hides the box)
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid == GetCurrentProcessId() && IsWindowVisible(w)) ShowWindow(w, SW_HIDE);
+        return TRUE;
+    }, 0);
+    const std::wstring d = widen(src->dump);
+    const std::wstring msg =
+        L"No se puede leer tu copia del juego (el dump):\n" + d +
+        L"\n\nSe ha movido, borrado o se ha desconectado su unidad. El juego tiene que cerrarse. Vuelve a conectar la "
+        L"unidad, o elige el dump otra vez al abrir el juego.\n\n"
+        L"Your game dump can't be read any more:\n" + d +
+        L"\n\nIt was moved, deleted or its drive was unplugged. The game has to close. Plug the drive back in, or pick "
+        L"the dump again when you start the game.";
+    MessageBoxW(nullptr, msg.c_str(), L"TotK", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+    _exit((int)0x444D5030u);   // "DMP0" (launcher.c DUMP_LOST_CODE)
+}
+// image bytes at `off`: the file itself, or (src) the image in the player's dump: raw bytes, decrypted in place. A short
+// read inside the image is tried once more after a moment, then ends the game with a message (dump_lost).
+u64 rom_read(HANDLE h, const RomSource* src, u64 off, void* buf, u64 size) {
+    if (!src) return pack_read(h, off, buf, size);
+    if (off >= src->image_size) return 0;
+    const u64 want = std::min<u64>(size, src->image_size - off);
+    u64 n = pack_read(h, src->image_offset + off, buf, want);
+    if (n < want) {
+        Sleep(250);
+        n += pack_read(h, src->image_offset + off + n, (u8*)buf + n, want - n);
+        if (n < want) dump_lost(src);
+    }
+    rom_source_decrypt(*src, off, buf, n);
+    return n;
+}
+u64 pack_read(const RomPack* pk, u64 off, void* buf, u64 size) { return rom_read(pk->h, pk->src, off, buf, size); }
 RomPack* rompack() {
     static RomPack* pk = []() -> RomPack* {
         const char* e = getenv("TOTK_ROMFS_PACK");
         if (!e || !*e) return nullptr;
-        HANDLE h = CreateFileW(widen(e).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        RomSource* src = nullptr;   // romfs-source.txt: the image in the player's dump (never freed: the run's)
+        std::string file = e, src_why;
+        if (file.size() >= 16 && _stricmp(file.c_str() + file.size() - 16, "romfs-source.txt") == 0) {
+            rom_source_on_secret = pc_crash_secret;      // (the key never reaches a crash dump: pc_crash.cpp)
+            rom_source_on_busy = pc_crash_secret_busy;
+            src = new RomSource;
+            if (!rom_source_load(widen(file).c_str(), src, &src_why)) {
+                printf("[fs] romfs source %s: %s; serving the folder\n", e, src_why.c_str());
+                delete src;
+                return nullptr;
+            }
+            file = src->dump;
+        }
+        HANDLE h = CreateFileW(widen(file).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
         auto fail = [&](const char* why) -> RomPack* {
             printf("[fs] romfs pack %s: %s; serving the folder\n", e, why);
             if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            delete src;
             return nullptr;
         };
-        if (h == INVALID_HANDLE_VALUE) return fail("cannot open");
+        if (h == INVALID_HANDLE_VALUE) return fail(src ? "cannot open the game dump it reads (moved or deleted?)" : "cannot open");
+        LARGE_INTEGER sz{};
+        if (src && (!GetFileSizeEx(h, &sz) || (u64)sz.QuadPart != src->dump_size))
+            return fail("the game dump it reads changed size since Setup read it");
         u8 hd[128];
-        if (pack_read(h, 0, hd, sizeof hd) != sizeof hd) return fail("short header");
+        if (rom_read(h, src, 0, hd, sizeof hd) != sizeof hd) return fail("short header");
         u32 ver, n, pb; u64 io, po, oo, total;
         memcpy(&ver, hd + 8, 4); memcpy(&n, hd + 16, 4); memcpy(&pb, hd + 20, 4);
         memcpy(&io, hd + 24, 8); memcpy(&po, hd + 32, 8); memcpy(&oo, hd + 40, 8); memcpy(&total, hd + 56, 8);
-        LARGE_INTEGER sz{};
-        if (memcmp(hd, "NXRPACK1", 8) != 0) {
+        if (src || memcmp(hd, "NXRPACK1", 8) != 0) {
             // The extraction's own RomFS image (romfs.bin, romfs_image.h): the same index built from its tables, so the
             // pack needs no second 17 GB copy. The bytes are the ones the folder was unpacked from (every IVFC level
             // checked at extraction; tools/engine/romfs_image_verify.py compares all of them with the folder).
             u64 h0;
             memcpy(&h0, hd, 8);
-            if (h0 != 0x50) return fail("neither an NXRP v1 pack nor a RomFS image");
-            if (!GetFileSizeEx(h, &sz)) return fail("no file size");
+            if (h0 != 0x50) return fail(src ? "the image in the game dump does not decrypt to a RomFS" : "neither an NXRP v1 pack nor a RomFS image");
+            if (src) sz.QuadPart = (LONGLONG)src->image_size;
+            else if (!GetFileSizeEx(h, &sz)) return fail("no file size");
             const u64 t0 = GetTickCount64();
             std::vector<RomImageFile> files;
             std::string paths;
             const char* why = "";
-            if (!romfs_image_index([h](u64 off, void* buf, u64 n) { return pack_read(h, off, buf, n); }, (u64)sz.QuadPart,
+            if (!romfs_image_index([h, src](u64 off, void* buf, u64 n) { return rom_read(h, src, off, buf, n); }, (u64)sz.QuadPart,
                                    &files, &paths, &why))
                 return fail(why);
             RomPack* r = new RomPack;
@@ -2004,8 +2228,12 @@ RomPack* rompack() {
             if (!table_sorted)
                 std::sort(r->order.begin(), r->order.end(), [r](u32 a, u32 b) { return pack_path(r, a) < pack_path(r, b); });
             r->h = h;
+            r->src = src;
             printf("[fs] romfs image %s: %zu files, %.2f GiB, indexed in %llu ms; the folder is the fallback\n", e,
                    r->ents.size(), bytes / 1073741824.0, (unsigned long long)(GetTickCount64() - t0));
+            if (src)
+                printf("[fs] romfs image read from the game dump %s (%s)\n", src->dump.c_str(),
+                       !src->ctr ? "plain sections" : src->aesni ? "AES-CTR, AES-NI" : "AES-CTR, BCrypt");
             return r;
         }
         if (ver != 1) return fail("not an NXRP v1 pack");
@@ -2125,7 +2353,7 @@ static bool rom_base_head(const std::string& rel, u8* head, size_t n, size_t* go
         const PackEntry* e = pack_find(pk, rel.substr(rel.find_first_not_of('/')));
         if (!e) return false;
         *size = e->size;
-        *got = (size_t)pack_read(pk->h, e->data_off, head, std::min<u64>(n, e->size));
+        *got = (size_t)pack_read(pk, e->data_off, head, std::min<u64>(n, e->size));
         return true;
     }
 #endif
@@ -2201,7 +2429,9 @@ static const ModsIndex& mods_index() {
                 std::string p(g.begin(), g.end());
                 if (p.size() <= base.size()) continue;
                 const std::string rel = p.substr(base.size());
-                if (mods_scan::other_version(rel, ver.c_str())) {
+                // (another version's file: tagged .Product.<n>. with n not this build's AND not a file of this game: a
+                //  1.4.3 RomFS has its own .140. / .142. / .110. / .101. files besides .143.)
+                if (mods_scan::other_version(rel, ver.c_str()) && rom_base_type(rel) != 1) {
                     other++;
                     if (rel.rfind("/System/Resource/ResourceSizeTable.", 0) == 0) x.other_tables[i].push_back(p);
                     continue;
@@ -2343,7 +2573,15 @@ HLE_AS(fs_CommitSaveData, "_ZN2nn2fs14CommitSaveDataEPKc") { hle_fs_Commit(c); }
 // did not reach); the next session follows it. When the game opens a recorded file, TOTK_FS_PREOPEN_THREADS host
 // threads (default 8) open and close the next TOTK_FS_PREOPEN_AHEAD recorded files (default 512), so their scan is paid
 // in parallel, ahead of the loaders. The boot, Continue and any fast travel or shrine of an earlier session are
-// covered; a load never recorded is not.
+// covered; a load never recorded is not. Pre-read (stream-hitch, 2026-11-02; TOTK_FS_PREREAD, default on, =0 off): with
+// the RomFS served from a pack (the romfs.bin image, or since v0.1.8 the player's own dump, possibly on a slow or USB
+// drive) there is no scan to pay, but the pack's single handle reads with FILE_FLAG_RANDOM_ACCESS (no system
+// read-ahead) on the loader threads, one file after the other. The same record is kept and followed then; instead of
+// opening, TOTK_FS_PREREAD_THREADS threads (default 2) read the next recorded files' raw bytes (no decryption), up to
+// TOTK_FS_PREREAD_MB (default 128) ahead of the game, through their own handles at low I/O priority, so the system file
+// cache holds them when the game asks (an AES-CTR decrypt costs ~0.1 ms a MB with AES-NI: test_stream_hitch.py).
+// Nothing is kept in the process: the pages are the system cache's (standby memory), and the game's reads are
+// unchanged.
 #ifdef _WIN32
 namespace {
 struct Preopen {
@@ -2357,18 +2595,21 @@ struct Preopen {
     std::unordered_set<std::string> now_seen;
     size_t saved = 0;                            // now.size() at the last write
     u64 opened = 0, hits = 0, late = 0;          // files pre-opened; game opens of recorded files; of those, before the pre-open got there
+    bool pack = false;                           // pre-read (above): the record's files read ahead from the pack
+    std::vector<u64> off, cum;                   // (pack) each record entry's raw offset in the pack file; prefix sums of sizes
+    u64 window = 128ull << 20, read_bytes = 0;   // (pack) bytes ahead of the game; bytes pre-read
 };
 const char* const kOpenOrder = "cache/fs_openorder.txt";
 void preopen_write(Preopen* p) {
     std::vector<std::string> out;
-    u64 opened, hits, late;
+    u64 opened, hits, late, bytes;
     {
         std::lock_guard<std::mutex> l(p->m);
         if (p->now.size() == p->saved) return;
         p->saved = p->now.size();
         out = p->now;
         for (auto& r : p->rec) if (!p->now_seen.count(r)) out.push_back(r);
-        opened = p->opened; hits = p->hits; late = p->late;
+        opened = p->opened; hits = p->hits; late = p->late; bytes = p->read_bytes;
     }
     if (out.size() > 200000) out.resize(200000);
     std::error_code ec;
@@ -2379,18 +2620,31 @@ void preopen_write(Preopen* p) {
         bool ok = fclose(f) == 0;
         if (ok) MoveFileExA(tmp.c_str(), kOpenOrder, MOVEFILE_REPLACE_EXISTING);
     }
-    printf("[fs] preopen: %zu files recorded this session (%zu in %s); %llu pre-opened, %llu game opens followed the "
-           "record, %llu of them before the pre-open got there\n", p->saved, out.size(), kOpenOrder,
-           (unsigned long long)opened, (unsigned long long)hits, (unsigned long long)late);
+    if (p->pack)
+        printf("[fs] preread: %zu files recorded this session (%zu in %s); %llu pre-read (%.0f MB), %llu game opens followed "
+               "the record, %llu of them before the pre-read got there\n", p->saved, out.size(), kOpenOrder,
+               (unsigned long long)opened, bytes / 1048576.0, (unsigned long long)hits, (unsigned long long)late);
+    else
+        printf("[fs] preopen: %zu files recorded this session (%zu in %s); %llu pre-opened, %llu game opens followed the "
+               "record, %llu of them before the pre-open got there\n", p->saved, out.size(), kOpenOrder,
+               (unsigned long long)opened, (unsigned long long)hits, (unsigned long long)late);
+}
+// (pre-read) the record index past which `bytes` of file data from entry `from` on end; at least one entry past `from`
+u32 preread_end(const Preopen* p, u32 from, u64 bytes) {
+    const u32 e = (u32)(std::upper_bound(p->cum.begin() + from + 1, p->cum.end(), p->cum[from] + bytes) - p->cum.begin() - 1);
+    return std::min<u32>(std::max<u32>(e, from + 1), (u32)p->rec.size());
 }
 Preopen* preopen() {
     static Preopen* p = [] () -> Preopen* {
-        if (!fs_flag("TOTK_FS_PREOPEN")) return nullptr;
-        if (rompack()) { printf("[fs] preopen: off (the RomFS comes from a pack)\n"); return nullptr; }
+        RomPack* pk = rompack();   // (a pack: the pre-read instead of the pre-open, above)
+        if (pk ? !fs_flag("TOTK_FS_PREREAD") : !fs_flag("TOTK_FS_PREOPEN")) return nullptr;
         Preopen* p = new Preopen;
+        p->pack = pk != nullptr;
         if (const char* a = getenv("TOTK_FS_PREOPEN_AHEAD"); a && atoi(a) > 0) p->ahead = (u32)atoi(a);
-        int nt = 8;
-        if (const char* t = getenv("TOTK_FS_PREOPEN_THREADS"); t && atoi(t) > 0) nt = std::min(atoi(t), 32);
+        if (const char* a = getenv("TOTK_FS_PREREAD_MB"); a && atoi(a) > 0) p->window = (u64)atoi(a) << 20;
+        int nt = p->pack ? 2 : 8;
+        if (const char* t = getenv(p->pack ? "TOTK_FS_PREREAD_THREADS" : "TOTK_FS_PREOPEN_THREADS"); t && atoi(t) > 0)
+            nt = std::min(atoi(t), 32);
         if (FILE* f = fopen(kOpenOrder, "rb")) {
             char line[1024];
             while (fgets(line, sizeof line, f)) {
@@ -2400,12 +2654,56 @@ Preopen* preopen() {
             fclose(f);
         }
         p->target = std::min<u32>(p->ahead, (u32)p->rec.size());   // the boot's first files right away
-        printf("[fs] preopen: following %zu recorded files (%s) on %d threads, %u ahead\n", p->rec.size(), kOpenOrder,
-               nt, p->ahead);
+        if (p->pack) {   // each entry's bytes in the pack file (0 bytes: not in it, an overlay or mod file)
+            p->off.resize(p->rec.size()); p->cum.assign(p->rec.size() + 1, 0);
+            const u64 base = pk->src ? pk->src->image_offset : 0;
+            for (size_t i = 0; i < p->rec.size(); i++) {
+                std::string rel;
+                const PackEntry* e = pack_rel(p->rec[i], &rel) ? pack_find(pk, rel) : nullptr;
+                p->off[i] = e ? base + e->data_off : 0;
+                p->cum[i + 1] = p->cum[i] + (e ? e->size : 0);
+            }
+            p->target = std::min<u32>(p->target, preread_end(p, 0, p->window));
+            printf("[fs] preread: following %zu recorded files (%s, %.0f MB) on %d threads, %llu MB / %u files ahead\n",
+                   p->rec.size(), kOpenOrder, p->cum.back() / 1048576.0, nt, (unsigned long long)(p->window >> 20), p->ahead);
+        } else
+            printf("[fs] preopen: following %zu recorded files (%s) on %d threads, %u ahead\n", p->rec.size(), kOpenOrder,
+                   nt, p->ahead);
         for (int i = 0; i < nt; i++)
-            std::thread([p] {
+            std::thread([p, pk] {
                 SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                 cpu_place_thread(CPU_HELPER);   // (opens ahead of the game: the E-cores / the other CCD, cpu_place.h)
+                if (p->pack) {   // pre-read: its own synchronous handle (one per thread: a synchronous handle serializes)
+                    HANDLE wh = ReOpenFile(pk->h, GENERIC_READ, FILE_SHARE_READ, 0);
+                    if (wh == INVALID_HANDLE_VALUE) { printf("[fs] preread: ReOpenFile failed (%lu)\n", GetLastError()); return; }
+                    FILE_IO_PRIORITY_HINT_INFO hint{IoPriorityHintLow};   // (never in the way of the game's own reads)
+                    SetFileInformationByHandle(wh, FileIoPriorityHintInfo, &hint, sizeof hint);
+                    // (its cache pages are repurposed first: on an 8 GB PC the window yields to the game's other standby
+                    // pages)
+                    MEMORY_PRIORITY_INFORMATION mp{MEMORY_PRIORITY_LOW};
+                    SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &mp, sizeof mp);
+                    std::vector<u8> buf(1u << 20);
+                    for (;;) {
+                        u32 i;
+                        {
+                            std::unique_lock<std::mutex> l(p->m);
+                            p->cv.wait(l, [p] { return p->next < p->target; });
+                            i = p->next++;
+                        }
+                        const u64 size = p->cum[i + 1] - p->cum[i];
+                        u64 done = 0;
+                        while (done < size) {
+                            OVERLAPPED ov{}; const u64 o = p->off[i] + done; ov.Offset = (DWORD)o; ov.OffsetHigh = (DWORD)(o >> 32);
+                            DWORD n = 0, want = (DWORD)std::min<u64>(size - done, buf.size());
+                            if (!ReadFile(wh, buf.data(), want, &n, &ov) || n == 0) break;
+                            done += n;
+                        }
+                        if (size) {
+                            std::lock_guard<std::mutex> l(p->m);
+                            p->opened++; p->read_bytes += done;
+                        }
+                    }
+                }
                 for (;;) {
                     std::string path;
                     {
@@ -2442,7 +2740,8 @@ void preopen_note(const std::string& hp) {
     const u32 i = it->second;
     p->hits++;
     if (i >= p->next) { p->late++; p->next = i + 1; }   // behind the game (or a jump): what it has passed is no use
-    const u32 t = std::min<u32>(i + 1 + p->ahead, (u32)p->rec.size());
+    u32 t = std::min<u32>(i + 1 + p->ahead, (u32)p->rec.size());
+    if (p->pack) t = std::min<u32>(t, preread_end(p, i + 1, p->window));   // (TOTK_FS_PREREAD_MB of file bytes past it)
     if (t > p->target) { p->target = t; p->cv.notify_all(); }
 }
 }   // namespace
@@ -2467,6 +2766,7 @@ HLE_AS(fs_OpenFile, "_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci") {
             u64 v = g_files.put([&](HFile* f) { f->h = kClosed; f->mode = mode; f->path = hp; f->patch = patch;
                                                 f->packed = true; f->pk_off = pe->data_off; f->pk_size = pe->size; });
             if (!v) { printf("[fs] OpenFile %s: no free file handle\n", p); c->x[0] = kUnsupported; return; }
+            preopen_note(hp);   // (the pre-read's record and window)
             *(u64*)c->x[0] = v; c->x[0] = 0;
             return;
         }
@@ -2519,9 +2819,24 @@ HLE_AS(fs_CloseFile, "_ZN2nn2fs9CloseFileENS0_10FileHandleE") {
         f->h = kClosed; f->path.clear(); f->path.shrink_to_fit(); f->patch.reset(); f->packed = false;
     });
 }
+// Reads on the thread that presents the game's frames (stream-hitch): the hitch line's "game file reads" sums every
+// thread's, and the two loader threads' reads cost no frame unless the game waits for them; these do. nvn/objects.c
+// nvnQueuePresentTexture marks the thread. The longest is kept until exec.c's frame line takes it.
+static thread_local bool t_game_thread;
+static std::atomic<u64> g_rd_game_bytes{0}, g_rd_game_ns{0}, g_rd_game_calls{0}, g_rd_game_max_ns{0};
+extern "C" void hle_fs_mark_game_thread(void) { t_game_thread = true; }
+extern "C" void hle_fs_game_reads(unsigned long long out[4]) {   // bytes, ns, reads (cumulative); the longest since the last call
+    out[0] = g_rd_game_bytes.load(std::memory_order_relaxed); out[1] = g_rd_game_ns.load(std::memory_order_relaxed);
+    out[2] = g_rd_game_calls.load(std::memory_order_relaxed); out[3] = g_rd_game_max_ns.exchange(0, std::memory_order_relaxed);
+}
 // load-progress counters: a line every 64 MiB read (is the loading screen streaming or stalled?)
 static void count_read(u64 n, u64 ns) {
     static const u64 t0 = GetTickCount64();
+    if (t_game_thread) {
+        g_rd_game_bytes += n; g_rd_game_ns += ns; g_rd_game_calls++;
+        u64 m = g_rd_game_max_ns.load(std::memory_order_relaxed);
+        while (ns > m && !g_rd_game_max_ns.compare_exchange_weak(m, ns, std::memory_order_relaxed)) {}
+    }
     u64 before = g_rd_bytes.fetch_add(n); g_rd_calls++; g_rd_ns += ns;
     if ((before >> 26) != ((before + n) >> 26))
         printf("[fs] progress: %llu MiB in %llu reads, %llu opens, t=%.1f s\n", (unsigned long long)((before + n) >> 20),
@@ -2542,7 +2857,7 @@ static u64 host_pread(HFile* f, s64 off, void* buf, u64 size) {
     alias_soft_io(buf, size, 1);
     if (f->packed) {   // the file's bytes in the RomFS pack, clipped to its size
         u64 n = off < 0 || (u64)off >= f->pk_size ? 0 : std::min<u64>(size, f->pk_size - (u64)off);
-        done = n ? pack_read(rompack()->h, f->pk_off + (u64)off, buf, n) : 0;
+        done = n ? pack_read(rompack(), f->pk_off + (u64)off, buf, n) : 0;
         size = done;   // (no loose-file loop below)
     }
 #endif
@@ -2569,7 +2884,23 @@ static u64 host_pread(HFile* f, s64 off, void* buf, u64 size) {
         for (size_t i = std::lower_bound(p.off.begin(), p.off.end(), (u64)off) - p.off.begin(); i < p.off.size() && p.off[i] < (u64)off + done; i++)
             ((u8*)buf)[p.off[i] - (u64)off] = p.val[i];
     }
-    count_read(done, (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_start).count());
+    const u64 ns = (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_start).count();
+    count_read(done, ns);
+    if (ns > 30000000ull) {   // (stream-hitch: which read, from where, on which thread; the first 100, then every 100th)
+        static std::atomic<u32> slow{0};
+        const u32 k = ++slow;
+        if (k <= 100 || k % 100 == 0) {
+#ifdef _WIN32
+            const RomPack* pk = f->packed ? rompack() : nullptr;
+            const char* from = !pk ? "folder" : pk->src && pk->src->ctr ? "dump, decrypted" : pk->src ? "dump" : "romfs image";
+#else
+            const char* from = "folder";
+#endif
+            printf("[fs] slow read %u: %s, %llu KB at +%llu in %.1f ms (%s) on %s\n", k, f->path.c_str(),
+                   (unsigned long long)(done >> 10), (unsigned long long)off, ns / 1e6, from,
+                   t_game_thread ? "the game's presenting thread" : "another game thread (a loader?)");
+        }
+    }
     return done;
 }
 // ReadFile(size_t* out, FileHandle, s64 off, void* buf, size_t size[, ReadOption const&])
@@ -2817,7 +3148,7 @@ bool hle_fs_read_romfs(const char* rel, std::vector<u8>* out) {
     if (RomPack* pk = rompack()) {
         if (const PackEntry* e = pack_find(pk, rel)) {
             out->resize((size_t)e->size);
-            if (pack_read(pk->h, e->data_off, out->data(), e->size) == e->size) return true;
+            if (pack_read(pk, e->data_off, out->data(), e->size) == e->size) return true;
             out->clear();
             return false;
         }
@@ -2828,13 +3159,32 @@ bool hle_fs_read_romfs(const char* rel, std::vector<u8>* out) {
 }
 // hle_movie.cpp: a RomFS file the pack serves (hp under the RomFS folder and in the pack) as the pack's file handle,
 // offset and size, for a read-only mapping of that slice (a player's install keeps no unpacked folder). False: hp itself
-// is the file (an overlay's or a mod's, or the folder when no pack serves the RomFS). The handle stays the pack's.
+// is the file (an overlay's or a mod's, or the folder when no pack serves the RomFS), or the pack is the image in the
+// encrypted game dump (hle_fs_pack_bytes). The handle stays the pack's.
 bool hle_fs_pack_slice(const std::string& hp, void** h, u64* off, u64* size) {
 #ifdef _WIN32
     std::string rel;
-    if (RomPack* pk = rompack(); pk && pack_rel(hp, &rel))
-        if (const PackEntry* e = pack_find(pk, rel)) { *h = pk->h; *off = e->data_off; *size = e->size; return true; }
+    if (RomPack* pk = rompack(); pk && !(pk->src && pk->src->ctr) && pack_rel(hp, &rel))
+        if (const PackEntry* e = pack_find(pk, rel)) {
+            *h = pk->h; *off = (pk->src ? pk->src->image_offset : 0) + e->data_off; *size = e->size;
+            return true;
+        }
 #endif
     (void)hp; (void)h; (void)off; (void)size;
+    return false;
+}
+// hle_movie.cpp: a RomFS file the pack serves from the encrypted game dump (no mapping can show it decrypted): its
+// bytes, read whole and decrypted. False: not such a file (hle_fs_pack_slice or hp itself).
+bool hle_fs_pack_bytes(const std::string& hp, std::vector<u8>* out) {
+#ifdef _WIN32
+    std::string rel;
+    if (RomPack* pk = rompack(); pk && pk->src && pk->src->ctr && pack_rel(hp, &rel))
+        if (const PackEntry* e = pack_find(pk, rel)) {
+            out->resize((size_t)e->size);
+            if (pack_read(pk, e->data_off, out->data(), e->size) == e->size) return true;
+            out->clear();
+        }
+#endif
+    (void)hp; (void)out;
     return false;
 }

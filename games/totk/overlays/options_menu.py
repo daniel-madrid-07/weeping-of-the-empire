@@ -136,7 +136,8 @@ ENTRIES = [
                   'it': 'La frequenza di fotogrammi massima del gioco\n'
                         '(PC). Più alta costa prestazioni. Effetto\n'
                         'immediato.'},
-         choices=[{'en': '30'}, {'en': '60'}, {'en': '90'}, {'en': '120'},
+         choices=[{'en': '30'}, {'en': '40'}, {'en': '45'}, {'en': '60'}, {'en': '75'}, {'en': '90'}, {'en': '120'},
+                  {'en': '144'}, {'en': '165'}, {'en': '180'}, {'en': '200'}, {'en': '240'},
                   {'en': 'Unlocked', 'es': 'Sin límite', 'fr': 'Illimitée', 'de': 'Unbegrenzt', 'it': 'Illimitato',
                    'nl': 'Onbeperkt', 'ru': 'Без ограничения', 'ja': '無制限', 'ko': '무제한', 'zhs': '无限制',
                    'zht': '無限制'},
@@ -241,19 +242,19 @@ ENTRIES = [
                 'zht': '渲染解析度'},
          caption={'en': 'The resolution the 3D scene is drawn at,\n'
                         "relative to the game's own (PC). Higher costs\n"
-                        'performance. Applies at the next start.',
+                        'performance. Applies at once.',
                   'es': 'La resolución a la que se dibuja la escena 3D,\n'
                         'respecto a la del juego (PC). Más alta cuesta\n'
-                        'rendimiento. Se aplica al reiniciar el juego.',
+                        'rendimiento. Se aplica al momento.',
                   'fr': 'La résolution de la scène 3D, par rapport à\n'
                         'celle du jeu (PC). Plus haute coûte en\n'
-                        'performances. Au prochain démarrage du jeu.',
+                        "performances. S'applique aussitôt.",
                   'de': 'Die Auflösung der 3D-Szene, bezogen auf\n'
                         'die des Spiels (PC). Höher kostet\n'
-                        'Leistung. Gilt ab dem nächsten Spielstart.',
+                        'Leistung. Gilt sofort.',
                   'it': 'La risoluzione della scena 3D rispetto a\n'
                         'quella del gioco (PC). Più alta costa\n'
-                        'prestazioni. Al prossimo avvio del gioco.'},
+                        'prestazioni. Si applica subito.'},
          choices=[{'en': '67 %'}, {'en': '80 %'}, {'en': '90 %'},
                   {'en': '100 % (native)', 'es': '100 % (nativa)', 'fr': '100 % (native)', 'de': '100 % (nativ)',
                    'it': '100 % (nativa)', 'nl': '100 % (native)', 'ru': '100 % (исходное)', 'ja': '100 %（ネイティブ）',
@@ -262,48 +263,50 @@ ENTRIES = [
                   {'en': 'Window height', 'es': 'Altura de la ventana', 'fr': 'Hauteur de la fenêtre',
                    'de': 'Fensterhöhe', 'it': 'Altezza della finestra', 'nl': 'Vensterhoogte', 'ru': 'Высота окна',
                    'ja': 'ウィンドウの高さ', 'ko': '창 높이', 'zhs': '窗口高度', 'zht': '視窗高度'}]),
-    dict(type=64, key='graphics.dlss',  # the (pc_dlss.cpp), restart
-         label={'en': 'DLSS super resolution', 'es': 'Superresolución DLSS', 'fr': 'Super résolution DLSS',
-                'de': 'DLSS Super Resolution', 'it': 'Super risoluzione DLSS', 'nl': 'DLSS-superresolutie',
-                'ru': 'Суперразрешение DLSS', 'ja': 'DLSS 超解像', 'ko': 'DLSS 초해상도', 'zhs': 'DLSS 超分辨率',
-                'zht': 'DLSS 超解析度'},
-         caption={'en': 'Sharper upscaling with NVIDIA DLSS. NVIDIA\n'
-                        'RTX GPUs only; costs some performance (PC).\n'
-                        'Applies the next time the game starts.',
-                  'es': 'Reescalado más nítido con NVIDIA DLSS. Solo\n'
-                        'GPU NVIDIA RTX; cuesta algo de rendimiento\n'
-                        '(PC). Se aplica al reiniciar el juego.',
-                  'fr': "Mise à l'échelle plus nette avec NVIDIA\n"
-                        'DLSS, GPU RTX uniquement ; coûte un peu en\n'
-                        'performances (PC). Au prochain démarrage.',
-                  'de': 'Schärfere Hochskalierung mit NVIDIA DLSS.\n'
-                        'Nur NVIDIA-RTX-GPUs; kostet etwas\n'
-                        'Leistung (PC). Gilt nach Neustart.',
-                  'it': 'Upscaling più nitido con NVIDIA DLSS. Solo\n'
-                        "GPU NVIDIA RTX; costa un po' di prestazioni\n"
-                        '(PC). Si applica al prossimo avvio.'},
-         choices=[OFF, ON]),
-    dict(type=65, key='graphics.frame_gen',  # the (pc_dlss.cpp), restart
-         label={'en': 'DLSS frame generation', 'es': 'Generación de fotogramas DLSS',
-                'fr': "Génération d'images DLSS", 'de': 'DLSS Frame Generation',
-                'it': 'Generazione di fotogrammi DLSS', 'nl': 'DLSS-framegeneratie', 'ru': 'Генерация кадров DLSS',
-                'ja': 'DLSS フレーム生成', 'ko': 'DLSS 프레임 생성', 'zhs': 'DLSS 帧生成', 'zht': 'DLSS 影格生成'},
-         caption={'en': "Extra frames generated between the game's\n"
-                        'own. NVIDIA RTX 40 series and newer (PC).\n'
-                        'Adds some input latency. Applies at restart.',
-                  'es': 'Fotogramas extra, generados entre los del\n'
-                        'juego. NVIDIA RTX serie 40 o posterior (PC).\n'
-                        'Añade algo de latencia. Al reiniciar el juego.',
-                  'fr': 'Images en plus, générées entre celles du\n'
-                        'jeu. NVIDIA RTX série 40 et plus (PC).\n'
-                        'Un peu plus de latence. Au redémarrage.',
-                  'de': 'Zusätzliche Bilder zwischen denen des\n'
-                        'Spiels; RTX 40 und neuer (PC). Etwas mehr\n'
-                        'Latenz. Gilt ab dem nächsten Spielstart.',
-                  'it': 'Fotogrammi extra, generati tra quelli del\n'
-                        'gioco. NVIDIA RTX serie 40 o successive (PC).\n'
-                        "Un po' più di latenza. Al prossimo avvio."},
-         choices=[OFF, ON]),
+    dict(type=64, key='graphics.dlss',   # dlss's (pc_dlss.cpp): DLSS or FSR 3.1 (ffx.c), live; pc-ui's texts 11-02
+         label={'en': 'Upscaler', 'es': 'Escalador', 'fr': "Mise à l'échelle", 'de': 'Hochskalierung', 'it': 'Upscaler',
+                'nl': 'Opschaling', 'ru': 'Масштабирование', 'ja': 'アップスケーラー', 'ko': '업스케일러', 'zhs': '超分辨率',
+                'zht': '超解析度'},
+         caption={'en': 'Temporal upscaling of the 3D scene (PC).\n'
+                        'DLSS: NVIDIA RTX only; FSR: any GPU.\n'
+                        'Costs some GPU. Applies at once.',
+                  'es': 'Escalado temporal de la escena 3D (PC).\n'
+                        'DLSS: solo NVIDIA RTX; FSR: cualquier GPU.\n'
+                        'Cuesta algo de GPU. Se aplica al momento.',
+                  'fr': "Mise à l'échelle temporelle de la 3D (PC).\n"
+                        'DLSS : NVIDIA RTX seulement ; FSR : tout\n'
+                        "GPU. Coûte du GPU. S'applique aussitôt.",
+                  'de': 'Zeitliche Hochskalierung der 3D-Szene\n'
+                        '(PC). DLSS: nur NVIDIA RTX; FSR: jede GPU.\n'
+                        'Kostet GPU. Gilt sofort.',
+                  'it': 'Upscaling temporale della scena 3D (PC).\n'
+                        'DLSS: solo NVIDIA RTX; FSR: ogni GPU.\n'
+                        'Costa GPU. Si applica subito.'},
+         choices=[OFF, {'en': 'DLSS (NVIDIA RTX)', 'es': 'DLSS (NVIDIA RTX)'}, {'en': 'DLAA (NVIDIA RTX)', 'es': 'DLAA (NVIDIA RTX)'},
+                  {'en': 'FSR (any GPU)', 'es': 'FSR (cualquier GPU)', 'fr': 'FSR (tout GPU)', 'de': 'FSR (jede GPU)',
+                   'it': 'FSR (ogni GPU)', 'nl': 'FSR (elke GPU)', 'ru': 'FSR (любой GPU)', 'ja': 'FSR（全GPU）',
+                   'ko': 'FSR (모든 GPU)', 'zhs': 'FSR（任意 GPU）', 'zht': 'FSR（任何 GPU）'}]),
+    dict(type=65, key='graphics.frame_gen',   # dlss's (pc_dlss.cpp): DLSS-G or FSR 3.1 (ffx.c), live; pc-ui's texts 11-02
+         label={'en': 'Frame generation', 'es': 'Generación de fotogramas', 'fr': "Génération d'images",
+                'de': 'Bildgenerierung', 'it': 'Generazione fotogrammi', 'nl': 'Framegeneratie', 'ru': 'Генерация кадров',
+                'ja': 'フレーム生成', 'ko': '프레임 생성', 'zhs': '帧生成', 'zht': '影格生成'},
+         caption={'en': 'Generated frames between the real ones\n'
+                        '(PC); adds some input latency. DLSS x2:\n'
+                        'RTX 40+, x3/x4: RTX 50; FSR x2: any GPU.',
+                  'es': 'Fotogramas generados entre los reales (PC);\n'
+                        'añade algo de retraso. DLSS x2: RTX 40+,\n'
+                        'x3/x4: RTX 50; FSR x2: cualquier GPU.',
+                  'fr': 'Images générées entre les vraies (PC) ;\n'
+                        'ajoute de la latence. DLSS x2 : RTX 40+,\n'
+                        'x3/x4 : RTX 50 ; FSR x2 : tout GPU.',
+                  'de': 'Erzeugte Bilder zwischen den echten (PC);\n'
+                        'etwas mehr Latenz. DLSS x2: RTX 40+,\n'
+                        'x3/x4: RTX 50; FSR x2: jede GPU.',
+                  'it': 'Fotogrammi generati tra quelli veri (PC);\n'
+                        'più latenza. DLSS x2: RTX 40+, x3/x4:\n'
+                        'RTX 50; FSR x2: ogni GPU.'},
+         choices=[OFF, {'en': 'DLSS x2', 'es': 'DLSS x2'}, {'en': 'DLSS x3', 'es': 'DLSS x3'},
+                  {'en': 'DLSS x4', 'es': 'DLSS x4'}, {'en': 'FSR x2', 'es': 'FSR x2'}]),
     dict(type=67, key='graphics.fov',  # the live row (totk_engine.c); the engine adds the degrees
          label={'en': 'Field of view', 'es': 'Campo de visión', 'fr': 'Champ de vision', 'de': 'Sichtfeld',
                 'it': 'Campo visivo', 'nl': 'Gezichtsveld', 'ru': 'Поле зрения', 'ja': '視野角', 'ko': '시야각',
@@ -334,26 +337,74 @@ ENTRIES = [
          label={'en': 'Aspect ratio', 'es': 'Relación de aspecto', 'fr': "Format d'image", 'de': 'Seitenverhältnis',
                 'it': 'Proporzioni', 'nl': 'Beeldverhouding', 'ru': 'Соотношение сторон', 'ja': 'アスペクト比',
                 'ko': '화면 비율', 'zhs': '宽高比', 'zht': '長寬比'},
-         caption={'en': 'On a 21:9 or 32:9 screen the game fills it,\n'
-                        'HUD placed for it (PC). Wider costs\n'
-                        'performance. Applies at the next start.',
-                  'es': 'En una pantalla 21:9 o 32:9 el juego la llena,\n'
-                        'con el HUD adaptado (PC). Más ancha cuesta\n'
-                        'rendimiento. Se aplica al reiniciar el juego.',
-                  'fr': 'Sur un écran 21:9 ou 32:9, le jeu le remplit,\n'
-                        'HUD adapté (PC). Plus large coûte en\n'
-                        'performances. Au prochain démarrage du jeu.',
-                  'de': 'Füllt 21:9- und 32:9-Bildschirme, HUD\n'
-                        'angepasst (PC). Breiter kostet Leistung.\n'
-                        'Gilt ab dem nächsten Spielstart.',
-                  'it': 'Su uno schermo 21:9 o 32:9 il gioco lo\n'
-                        'riempie, HUD adattato (PC). Più largo costa\n'
-                        'prestazioni. Al prossimo avvio del gioco.'},
+         caption={'en': 'On a 16:10, 21:9 or 32:9 screen the game\n'
+                        'fills it, HUD placed for it (PC). Wider\n'
+                        'costs performance. Applies at next start.',
+                  'es': 'En pantallas 16:10, 21:9 o 32:9 el juego\n'
+                        'la llena, HUD adaptado (PC). Más ancha\n'
+                        'cuesta rendimiento. Al reiniciar el juego.',
+                  'fr': 'Sur un écran 16:10, 21:9 ou 32:9, le jeu\n'
+                        'le remplit, HUD adapté (PC). Plus large\n'
+                        'coûte en performances. Au redémarrage.',
+                  'de': 'Füllt 16:10-, 21:9- und 32:9-Bildschirme,\n'
+                        'HUD angepasst (PC). Breiter kostet\n'
+                        'Leistung. Gilt ab dem nächsten Start.',
+                  'it': 'Su schermi 16:10, 21:9 o 32:9 il gioco li\n'
+                        'riempie, HUD adattato (PC). Più largo\n'
+                        'costa prestazioni. Al prossimo avvio.'},
          choices=[{'en': '16:9'},
                   {'en': "Window's shape", 'es': 'Forma de la ventana', 'fr': 'Forme de la fenêtre',
                    'de': 'Fensterform', 'it': 'Forma della finestra', 'nl': 'Vorm van het venster', 'ru': 'Форма окна',
-                   'ja': 'ウィンドウの形', 'ko': '창 모양', 'zhs': '窗口形状', 'zht': '視窗形狀'}]),
-    dict(type=117, key='graphics.native_ui',  # the (textures.c TOTK_OUT_SCALE, pc_settings.cpp), restart
+                   'ja': 'ウィンドウの形', 'ko': '창 모양', 'zhs': '窗口形状', 'zht': '視窗形狀'},
+                  {'en': '16:10'}, {'en': '21:9'}, {'en': '32:9'}]),
+    dict(type=128, key='graphics.hud_layout',   # the ultrawide HUD at the edges or in the middle 16:9 (totk_engine.c)
+         label={'en': 'HUD position', 'es': 'Posición del HUD', 'fr': 'Position du HUD', 'de': 'HUD-Position',
+                'it': 'Posizione HUD', 'nl': 'HUD-positie', 'ru': 'Положение HUD', 'ja': 'HUDの位置', 'ko': 'HUD 위치',
+                'zhs': 'HUD 位置', 'zht': 'HUD 位置'},
+         caption={'en': 'On a 21:9 or 32:9 screen: the HUD at the\n'
+                        'edges, or in the middle 16:9 (PC).\n'
+                        'Applies at the next start.',
+                  'es': 'En una pantalla 21:9 o 32:9: el HUD en los\n'
+                        'bordes o en el centro 16:9 (PC).\n'
+                        'Se aplica al reiniciar el juego.',
+                  'fr': 'Sur un écran 21:9 ou 32:9 : le HUD sur les\n'
+                        'bords ou au centre 16:9 (PC).\n'
+                        'Au prochain démarrage du jeu.',
+                  'de': 'Bei 21:9 und 32:9: HUD an den Rändern\n'
+                        'oder in der 16:9-Mitte (PC).\n'
+                        'Gilt ab dem nächsten Spielstart.',
+                  'it': 'Su uno schermo 21:9 o 32:9: HUD ai bordi\n'
+                        'o al centro 16:9 (PC).\n'
+                        'Al prossimo avvio del gioco.'},
+         choices=[{'en': 'Screen edges', 'es': 'Bordes de la pantalla', 'fr': "Bords de l'écran", 'de': 'Bildschirmränder',
+                   'it': 'Bordi dello schermo', 'nl': 'Schermranden', 'ru': 'Края экрана', 'ja': '画面の端',
+                   'ko': '화면 가장자리', 'zhs': '屏幕边缘', 'zht': '螢幕邊緣'},
+                  {'en': 'Middle 16:9', 'es': 'Centro 16:9', 'fr': 'Centre 16:9', 'de': '16:9-Mitte', 'it': 'Centro 16:9',
+                   'nl': '16:9-midden', 'ru': 'Центр 16:9', 'ja': '中央16:9', 'ko': '가운데 16:9', 'zhs': '中间 16:9',
+                   'zht': '中間 16:9'}]),
+    dict(type=130, key='graphics.cutscene_aspect',   # ultrawide cutscenes wide or 16:9 (totk_engine.c, totk_hooks.c), live
+         label={'en': 'Cutscenes', 'es': 'Cinemáticas', 'fr': 'Cinématiques', 'de': 'Zwischensequenzen',
+                'it': 'Filmati', 'nl': 'Tussenfilmpjes', 'ru': 'Ролики', 'ja': 'カットシーン', 'ko': '컷신',
+                'zhs': '过场动画', 'zht': '過場動畫'},
+         caption={'en': 'On a 21:9 or 32:9 screen: cutscenes wide,\n'
+                        'or the original 16:9 framing with bars\n'
+                        '(PC). Videos are always 16:9.',
+                  'es': 'En una pantalla 21:9 o 32:9: cinemáticas\n'
+                        'panorámicas o con el encuadre 16:9 original\n'
+                        'y bandas (PC). Los vídeos siempre son 16:9.',
+                  'fr': 'Sur un écran 21:9 ou 32:9 : cinématiques\n'
+                        "larges, ou cadrage 16:9 d'origine avec\n"
+                        'bandes (PC). Les vidéos restent en 16:9.',
+                  'de': 'Bei 21:9 und 32:9: Sequenzen breit oder\n'
+                        'im originalen 16:9 mit Balken (PC).\n'
+                        'Videos sind immer 16:9.',
+                  'it': 'Su uno schermo 21:9 o 32:9: filmati larghi\n'
+                        "o l'inquadratura 16:9 originale con bande\n"
+                        '(PC). I video sono sempre 16:9.'},
+         choices=[{'en': 'Wide', 'es': 'Panorámicas', 'fr': 'Larges', 'de': 'Breit', 'it': 'Larghi', 'nl': 'Breed',
+                   'ru': 'Широкие', 'ja': 'ワイド', 'ko': '와이드', 'zhs': '宽屏', 'zht': '寬螢幕'},
+                  {'en': '16:9'}]),
+    dict(type=117, key='graphics.native_ui',  # the (textures.c TOTK_OUT_SCALE, pc_settings.cpp), live (live-settings 11-02)
          label={'en': 'Native-resolution interface', 'es': 'Interfaz a resolución nativa',
                 'fr': 'Interface en résolution native', 'de': 'Oberfläche in nativer Auflösung',
                 'it': 'Interfaccia a risoluzione nativa', 'nl': 'Interface op native resolutie',
@@ -361,19 +412,19 @@ ENTRIES = [
                 'zhs': '原生分辨率界面', 'zht': '原生解析度介面'},
          caption={'en': 'Above 1080p, menus, text and the HUD are\n'
                         "drawn at the screen's resolution, sharper\n"
-                        '(PC). Applies at the next start.',
+                        '(PC). Applies at once.',
                   'es': 'Por encima de 1080p, menús, textos y HUD se\n'
                         'dibujan a la resolución de la pantalla, más\n'
-                        'nítidos (PC). Se aplica al reiniciar el juego.',
+                        'nítidos (PC). Se aplica al momento.',
                   'fr': 'Au-delà de 1080p, menus, textes et HUD sont\n'
                         "affichés à la résolution de l'écran, plus\n"
-                        'nets (PC). Au prochain démarrage du jeu.',
+                        "nets (PC). S'applique aussitôt.",
                   'de': 'Über 1080p: Menüs, Texte und HUD in\n'
                         'Bildschirmauflösung, schärfer (PC).\n'
-                        'Gilt ab dem nächsten Spielstart.',
+                        'Gilt sofort.',
                   'it': 'Oltre 1080p, menu, testi e HUD sono disegnati\n'
                         'alla risoluzione dello schermo, più nitidi\n'
-                        '(PC). Al prossimo avvio del gioco.'},
+                        '(PC). Si applica subito.'},
          choices=[ON, OFF]),   # "" (the default) = on, "0" = off
     dict(type=53, key='controls.mouse_sensitivity',
          label={'en': 'Mouse sensitivity', 'es': 'Sensibilidad del ratón', 'fr': 'Sensibilité de la souris',
@@ -598,6 +649,133 @@ ENTRIES = [
                   'it': "L'audio passa alle cuffie collegate o tolte\ne torna dopo un dispositivo perso, senza\n"
                         'riavviare (PC).'},
          choices=[ON, OFF]),
+    # F10's graphics rows a player looks for first (v0.1.8, pc-ui), in the Graphics section
+    dict(type=140, key='graphics.dynamic_resolution',   # pc_settings.cpp, live (its frame-rate aim too, since 11-02)
+         label={'en': 'Dynamic resolution', 'es': 'Resolución dinámica', 'fr': 'Résolution dynamique',
+                'de': 'Dynamische Auflösung', 'it': 'Risoluzione dinamica', 'nl': 'Dynamische resolutie',
+                'ru': 'Динамическое разрешение', 'ja': '動的解像度', 'ko': '동적 해상도', 'zhs': '动态分辨率',
+                'zht': '動態解析度'},
+         caption={'en': 'Lowers the 3D resolution only when the GPU\nis short of time, never below the floor\n'
+                        'chosen (PC).',
+                  'es': 'Baja la resolución 3D solo cuando a la GPU\nle falta tiempo, nunca por debajo del\n'
+                        'mínimo elegido (PC).',
+                  'fr': 'Baisse la résolution 3D seulement quand\nle GPU manque de temps, jamais sous le\n'
+                        'minimum choisi (PC).',
+                  'de': 'Senkt die 3D-Auflösung nur, wenn der GPU\ndie Zeit fehlt, nie unter das gewählte\n'
+                        'Minimum (PC).',
+                  'it': 'Abbassa la risoluzione 3D solo quando la\nGPU è a corto di tempo, mai sotto il\n'
+                        'minimo scelto (PC).'},
+         choices=[{'en': 'Off (fixed)', 'es': 'No (fija)', 'fr': 'Non (fixe)', 'de': 'Aus (fest)', 'it': 'No (fissa)',
+                   'nl': 'Uit (vast)', 'ru': 'Выкл. (фикс.)', 'ja': 'オフ（固定）', 'ko': '끔 (고정)', 'zhs': '关（固定）',
+                   'zht': '關（固定）'},
+                  {'en': 'Down to 90 %', 'es': 'Hasta el 90 %', 'fr': "Jusqu'à 90 %", 'de': 'Bis 90 %',
+                   'it': 'Fino al 90 %', 'nl': 'Tot 90 %', 'ru': 'До 90 %', 'ja': '最低 90 %', 'ko': '최소 90 %',
+                   'zhs': '最低 90 %', 'zht': '最低 90 %'},
+                  {'en': 'Down to 75 %', 'es': 'Hasta el 75 %', 'fr': "Jusqu'à 75 %", 'de': 'Bis 75 %',
+                   'it': 'Fino al 75 %', 'nl': 'Tot 75 %', 'ru': 'До 75 %', 'ja': '最低 75 %', 'ko': '최소 75 %',
+                   'zhs': '最低 75 %', 'zht': '最低 75 %'},
+                  {'en': 'Down to 50 %', 'es': 'Hasta el 50 %', 'fr': "Jusqu'à 50 %", 'de': 'Bis 50 %',
+                   'it': 'Fino al 50 %', 'nl': 'Tot 50 %', 'ru': 'До 50 %', 'ja': '最低 50 %', 'ko': '최소 50 %',
+                   'zhs': '最低 50 %', 'zht': '最低 50 %'},
+                  {'en': "The game's own", 'es': 'La del juego', 'fr': 'Celle du jeu', 'de': 'Wie im Spiel',
+                   'it': 'Quella del gioco', 'nl': 'Die van het spel', 'ru': 'Как в игре', 'ja': 'ゲーム標準',
+                   'ko': '게임 기본', 'zhs': '游戏默认', 'zht': '遊戲預設'}]),
+    dict(type=141, key='graphics.shadow_fixed',  # the live row (totk_engine.c); patched main only
+         label={'en': 'Sun shadow map', 'es': 'Mapa de sombras del sol', 'fr': "Carte d'ombres du soleil",
+                'de': 'Sonnen-Schattenkarte', 'it': 'Mappa ombre del sole', 'nl': 'Schaduwkaart van de zon',
+                'ru': 'Карта теней солнца', 'ja': '太陽の影マップ', 'ko': '태양 그림자 맵', 'zhs': '太阳阴影贴图',
+                'zht': '太陽陰影貼圖'},
+         caption={'en': "Fixed keeps it at the largest size the game\npicks: steady, sharper leaf shadows. Costs\n"
+                        'some GPU (PC).',
+                  'es': 'Fijo lo deja en el tamaño mayor que usa el\njuego: sombras de hojas estables y más\n'
+                        'nítidas. Cuesta algo de GPU (PC).',
+                  'fr': 'Fixe la garde à la plus grande taille du\njeu : ombres des feuilles stables et plus\n'
+                        'nettes. Coûte un peu de GPU (PC).',
+                  'de': 'Fest: immer die größte Größe des Spiels,\nruhige, schärfere Blattschatten. Kostet\n'
+                        'etwas GPU (PC).',
+                  'it': 'Fissa la tiene alla dimensione massima del\ngioco: ombre delle foglie stabili e più\n'
+                        'nitide. Costa un po\' di GPU (PC).'},
+         choices=[{'en': "The game's", 'es': 'La del juego', 'fr': 'Celle du jeu', 'de': 'Wie im Spiel',
+                   'it': 'Quella del gioco', 'nl': 'Van het spel', 'ru': 'Как в игре', 'ja': 'ゲーム標準',
+                   'ko': '게임 기본', 'zhs': '游戏默认', 'zht': '遊戲預設'},
+                  {'en': 'Fixed', 'es': 'Fijo', 'fr': 'Fixe', 'de': 'Fest', 'it': 'Fissa', 'nl': 'Vast',
+                   'ru': 'Фиксированная', 'ja': '固定', 'ko': '고정', 'zhs': '固定', 'zht': '固定'}]),
+    dict(type=142, key='graphics.soft_shadows',  # shadows, live (exec.c knob variants, live-settings 11-02)
+         label={'en': 'Soft shadows', 'es': 'Sombras suaves', 'fr': 'Ombres douces', 'de': 'Weiche Schatten',
+                'it': 'Ombre morbide', 'nl': 'Zachte schaduwen', 'ru': 'Мягкие тени', 'ja': 'ソフトシャドウ',
+                'ko': '부드러운 그림자', 'zhs': '柔和阴影', 'zht': '柔和陰影'},
+         caption={'en': "Sun shadow edges widen with the distance\nto what casts them. Off is the game's look.\n"
+                        'Applies at once (PC).',
+                  'es': 'Los bordes de las sombras se ensanchan con\nla distancia. No: el aspecto del juego.\n'
+                        'Se aplica al momento (PC).',
+                  'fr': "Les bords des ombres s'élargissent avec la\ndistance. Non : l'aspect du jeu.\n"
+                        "S'applique aussitôt (PC).",
+                  'de': 'Schattenkanten werden mit dem Abstand\nbreiter. Aus: der Look des Spiels.\n'
+                        'Gilt sofort (PC).',
+                  'it': 'I bordi delle ombre si allargano con la\ndistanza. No: l\'aspetto del gioco.\n'
+                        'Si applica subito (PC).'},
+         choices=[OFF,
+                  {'en': 'Soft', 'es': 'Suaves', 'fr': 'Douces', 'de': 'Weich', 'it': 'Morbide', 'nl': 'Zacht',
+                   'ru': 'Мягкие', 'ja': '弱', 'ko': '약하게', 'zhs': '弱', 'zht': '弱'},
+                  {'en': 'Softer', 'es': 'Más suaves', 'fr': 'Plus douces', 'de': 'Weicher', 'it': 'Più morbide',
+                   'nl': 'Zachter', 'ru': 'Мягче', 'ja': '中', 'ko': '중간', 'zhs': '中', 'zht': '中'},
+                  {'en': 'Softest', 'es': 'Muy suaves', 'fr': 'Très douces', 'de': 'Am weichsten',
+                   'it': 'Molto morbide', 'nl': 'Zachtst', 'ru': 'Очень мягкие', 'ja': '強', 'ko': '강하게',
+                   'zhs': '强', 'zht': '強'}]),
+    dict(type=143, key='graphics.contact_shadows',  # shadows, live (contact.c, live-settings 11-02)
+         label={'en': 'Contact shadows', 'es': 'Sombras de contacto', 'fr': 'Ombres de contact',
+                'de': 'Kontaktschatten', 'it': 'Ombre di contatto', 'nl': 'Contactschaduwen', 'ru': 'Контактные тени',
+                'ja': 'コンタクトシャドウ', 'ko': '접촉 그림자', 'zhs': '接触阴影', 'zht': '接觸陰影'},
+         caption={'en': "Small sun shadows at feet, under stones\nand in grass. Off is the game's look; costs\n"
+                        'some GPU. Applies at once (PC).',
+                  'es': 'Pequeñas sombras a los pies, bajo piedras\ny en la hierba. No: el aspecto del juego.\n'
+                        'Cuesta GPU. Se aplica al momento (PC).',
+                  'fr': "Petites ombres aux pieds, sous les pierres\net dans l'herbe. Non : l'aspect du jeu.\n"
+                        "Coûte du GPU. S'applique aussitôt (PC).",
+                  'de': 'Kleine Schatten an Füßen, unter Steinen,\nim Gras. Aus: der Look des Spiels.\n'
+                        'Kostet GPU. Gilt sofort (PC).',
+                  'it': "Piccole ombre ai piedi, sotto i sassi e\nnell'erba. No: l'aspetto del gioco.\n"
+                        'Costa GPU. Si applica subito (PC).'},
+         choices=[OFF,
+                  {'en': 'Subtle', 'es': 'Sutiles', 'fr': 'Subtiles', 'de': 'Dezent', 'it': 'Leggere',
+                   'nl': 'Subtiel', 'ru': 'Слабые', 'ja': '弱', 'ko': '약하게', 'zhs': '弱', 'zht': '弱'},
+                  {'en': 'Medium', 'es': 'Medias', 'fr': 'Moyennes', 'de': 'Mittel', 'it': 'Medie',
+                   'nl': 'Gemiddeld', 'ru': 'Средние', 'ja': '中', 'ko': '중간', 'zhs': '中', 'zht': '中'},
+                  {'en': 'Strong', 'es': 'Fuertes', 'fr': 'Fortes', 'de': 'Stark', 'it': 'Forti', 'nl': 'Sterk',
+                   'ru': 'Сильные', 'ja': '強', 'ko': '강하게', 'zhs': '强', 'zht': '強'}]),
+    dict(type=131, key='graphics.shader_wait',  # pc_window.cpp's row, live
+         label={'en': 'Shader wait', 'es': 'Espera de sombreadores', 'fr': 'Attente des shaders',
+                'de': 'Shader-Wartezeit', 'it': 'Attesa shader', 'nl': 'Shader-wachttijd', 'ru': 'Ожидание шейдеров',
+                'ja': 'シェーダー待機', 'ko': '셰이더 대기', 'zhs': '着色器等待', 'zht': '著色器等待'},
+         caption={'en': 'A new shader can freeze the picture while\nit builds. Limit: after 0.1 s some objects\n'
+                        'appear a moment later. Always: no limit (PC).',
+                  'es': 'Un sombreador nuevo puede congelar la\nimagen. Límite: tras 0,1 s algunos objetos\n'
+                        'aparecen un instante después (PC).',
+                  'fr': "Un nouveau shader peut figer l'image.\nLimite : après 0,1 s, des objets\n"
+                        'apparaissent un instant plus tard (PC).',
+                  'de': 'Ein neuer Shader kann das Bild einfrieren.\nLimit: nach 0,1 s erscheinen manche\n'
+                        'Objekte einen Moment später (PC).',
+                  'it': "Uno shader nuovo può bloccare l'immagine.\nLimite: dopo 0,1 s alcuni oggetti\n"
+                        'appaiono un attimo dopo (PC).'},
+         choices=[{'en': 'Limit to 0.1 s', 'es': 'Límite 0,1 s', 'fr': 'Limite 0,1 s', 'de': 'Limit 0,1 s',
+                   'it': 'Limite 0,1 s', 'nl': 'Limiet 0,1 s', 'ru': 'Предел 0,1 с', 'ja': '0.1秒まで', 'ko': '0.1초 제한',
+                   'zhs': '最多0.1秒', 'zht': '最多0.1秒'},
+                  {'en': 'Always wait', 'es': 'Esperar siempre', 'fr': 'Toujours attendre', 'de': 'Immer warten',
+                   'it': 'Attendi sempre', 'nl': 'Altijd wachten', 'ru': 'Всегда ждать', 'ja': '常に待つ',
+                   'ko': '항상 대기', 'zhs': '总是等待', 'zht': '總是等待'}]),
+    dict(type=129, key='game.temperature_unit',  # pc_settings.cpp's row, live (the tempunit patch, v0.1.8)
+         label={'en': 'Temperature unit', 'es': 'Unidad de temperatura', 'fr': 'Unité de température',
+                'de': 'Temperatureinheit', 'it': 'Unità di temperatura', 'nl': 'Temperatuureenheid',
+                'ru': 'Единицы температуры', 'ja': '温度の単位', 'ko': '온도 단위', 'zhs': '温度单位', 'zht': '溫度單位'},
+         caption={'en': "The Purah Pad map's temperature. Automatic:\nthe game's (°F in English (US)) (PC).",
+                  'es': 'La temperatura del mapa de la tableta.\nAutomática: la del juego (°F en inglés de\n'
+                        'EE. UU.) (PC).',
+                  'fr': 'La température de la carte de la\ntablette. Auto : celle du jeu (°F en\nanglais US) (PC).',
+                  'de': 'Die Temperatur der Karte des Tablets.\nAutomatisch: die des Spiels (°F in\nEnglisch (US)) (PC).',
+                  'it': 'La temperatura della mappa del tablet.\nAutomatica: quella del gioco (°F in\ninglese USA) (PC).'},
+         choices=[{'en': 'Automatic', 'es': 'Automática', 'fr': 'Automatique', 'de': 'Automatisch', 'it': 'Automatica',
+                   'nl': 'Automatisch', 'ru': 'Автоматически', 'ja': '自動', 'ko': '자동', 'zhs': '自动', 'zht': '自動'},
+                  {'en': '°C', 'es': '°C'}, {'en': '°F', 'es': '°F'}]),   # (the same everywhere)
     dict(type=66, key='controls.gameplay',  # the (pc_input.cpp), live; the key block's first row
          label={'en': 'Keyboard controls', 'es': 'Controles de teclado', 'fr': 'Commandes clavier',
                 'de': 'Tastatursteuerung', 'it': 'Comandi da tastiera', 'nl': 'Toetsenbordbediening',
@@ -852,6 +1030,38 @@ KEY_RESET = dict(
     choices=[{'en': 'Reset', 'es': 'Restablecer', 'fr': 'Rétablir', 'de': 'Zurücksetzen', 'it': 'Ripristina',
               'nl': 'Herstellen', 'ru': 'Сбросить', 'ja': '初期化', 'ko': '초기화', 'zhs': '恢复', 'zht': '恢復'}])
 
+# The Mods section (v0.1.8, pc-ui): its first row opens the mods folder (kModsFolderType; the section's only row while
+# no mod is installed), then one row per usable mod (kModFirst + its place, up to kMaxMods), its label the mod's folder
+# name written by the engine over MOD_ROW's placeholder, Off / On for the next start. The order and the reasons a mod
+# is not used stay in F10's Mods tab.
+MODS_FOLDER = dict(
+    type=144,
+    label={'en': 'Mods folder', 'es': 'Carpeta de mods', 'fr': 'Dossier des mods', 'de': 'Mod-Ordner',
+           'it': 'Cartella delle mod', 'nl': 'Modmap', 'ru': 'Папка модов', 'ja': 'Modフォルダー', 'ko': '모드 폴더',
+           'zhs': '模组文件夹', 'zht': '模組資料夾'},
+    caption={'en': 'One folder per mod, loaded at the next\nstart. Select this row to open it. The\n'
+                   'order and any problem: F10, Mods tab (PC).',
+             'es': 'Una carpeta por mod; se cargan al reiniciar\nel juego. Elige esta fila para abrirla.\n'
+                   'El orden y los problemas: F10, Mods (PC).',
+             'fr': 'Un dossier par mod, chargé au prochain\ndémarrage. Choisissez cette ligne pour\n'
+                   "l'ouvrir. Ordre et problèmes : F10, Mods (PC).",
+             'de': 'Ein Ordner pro Mod, geladen beim nächsten\nStart. Diese Zeile wählen öffnet ihn.\n'
+                   'Reihenfolge, Probleme: F10, Mods (PC).',
+             'it': 'Una cartella per mod, caricata al prossimo\navvio. Scegli questa riga per aprirla.\n'
+                   'Ordine e problemi: F10, scheda Mods (PC).'},
+    choices=[{'en': 'Open', 'es': 'Abrir', 'fr': 'Ouvrir', 'de': 'Öffnen', 'it': 'Apri', 'nl': 'Openen',
+              'ru': 'Открыть', 'ja': '開く', 'ko': '열기', 'zhs': '打开', 'zht': '開啟'}])
+MOD_FIRST, MOD_MAX = 145, 32   # kModFirst, kMaxMods
+MOD_ROW = dict(
+    label={'en': 'Mod'},   # (the engine writes the mod's folder name over it)
+    caption={'en': 'This mod on or off, from the next start.\nThe load order: F10, Mods tab (PC).',
+             'es': 'Este mod activado o no, al reiniciar el\njuego. El orden de carga: F10, Mods (PC).',
+             'fr': 'Ce mod activé ou non, au prochain\ndémarrage. Ordre de chargement : F10 (PC).',
+             'de': 'Diese Mod an oder aus, ab dem nächsten\nStart. Ladereihenfolge: F10, Mods (PC).',
+             'it': 'Questa mod attiva o no, dal prossimo\navvio. Ordine di caricamento: F10 (PC).'},
+    choices=[OFF, ON])
+MOD_ENTRIES = [dict(MOD_ROW, type=MOD_FIRST + i) for i in range(MOD_MAX)]
+
 # The section row (kZoneType): the first row of every section of the Options screen; its choices are the sections,
 # in the order of the C file's Zone enum (Z_GENERAL.. Z_INTERFACE)
 ZONES = dict(
@@ -881,7 +1091,9 @@ ZONES = dict(
               'ru': 'Клавиши', 'ja': 'キー設定', 'ko': '키 설정', 'zhs': '按键', 'zht': '按鍵'},
              {'en': 'Interface', 'es': 'Interfaz', 'fr': 'Interface', 'de': 'Oberfläche', 'it': 'Interfaccia',
               'nl': 'Interface', 'ru': 'Интерфейс', 'ja': 'インターフェース', 'ko': '인터페이스', 'zhs': '界面',
-              'zht': '介面'}])
+              'zht': '介面'},
+             {'en': 'Mods', 'es': 'Mods', 'fr': 'Mods', 'de': 'Mods', 'it': 'Mod', 'nl': 'Mods', 'ru': 'Моды',
+              'ja': 'Mod', 'ko': '모드', 'zhs': '模组', 'zht': '模組'}])
 
 # Key rows no longer in kKeyRows (as RETIRED below): parry left the PC scheme; aim went with 4.23 (A): LMB is attack,
 # and with the bow in hand its draw
@@ -983,7 +1195,14 @@ def check_c_table(path=C_TABLE):
     sections = re.search(r'enum Zone : s32 \{([^}]*)\}', src)[1].split(',')
     if len(sections) != len(ZONES['choices']) + 1:  # (+1: Z_COUNT)
         raise ValueError(f'ZONES has {len(ZONES["choices"])} section names, the Zone enum {len(sections) - 1}')
-    taken = [r[0] for r in rows] + [k[0] for k in keys] + [STATUS_TYPE, link, reset, zone]
+    folder = int(re.search(r'constexpr s32 kModsFolderType = (\d+);', src)[1])
+    first = int(re.search(r'constexpr s32 kModFirst = (\d+);', src)[1])
+    most = int(re.search(r'constexpr size_t kMaxMods = (\d+);', src)[1])
+    if (folder, first, most) != (MODS_FOLDER['type'], MOD_FIRST, MOD_MAX):
+        raise ValueError(f'MODS_FOLDER / MOD_FIRST / MOD_MAX {MODS_FOLDER["type"], MOD_FIRST, MOD_MAX} are not '
+                         f'kModsFolderType / kModFirst / kMaxMods {folder, first, most} of {path}')
+    taken = [r[0] for r in rows] + [k[0] for k in keys] + [STATUS_TYPE, link, reset, zone, folder] + \
+        list(range(first, first + most))
     if len(set(taken)) != len(taken):
         raise ValueError(f'a type is used twice: {sorted(taken)}')
     reused = set(taken) & {e['type'] for e in RETIRED + RETIRED_KEYS}
@@ -1027,7 +1246,7 @@ def text(d, lang):
 def messages(lang):
     """[(label, text)] that this set adds for one Mals language."""
     out = []
-    for e in ENTRIES + RETIRED + [ZONES]:
+    for e in ENTRIES + RETIRED + [ZONES, MODS_FOLDER] + MOD_ENTRIES:
         t = e['type']
         assert 50 <= t <= 999, 'PC entries use types 50..999 ("10%02d": 1050 .. 10999, past the game\'s 1000 .. 1013)'
         out.append((f'10{t:02d}', text(e['label'], lang)))
@@ -1072,7 +1291,8 @@ def check_captions(lang, shipped):
     of the game's own captions in it (USen 50, EUes 49, EUfr 47, EUde 42 characters ...). Archives that show the
     English fallback are covered by the check of the English ones."""
     width = max(len(ln) for label, raw in shipped if re.fullmatch(r'\d{4}', label) for ln in plain(raw).split('\n'))
-    for e in ENTRIES + RETIRED + [KEY_LINK, KEY_RESET, ZONES] + [dict(type=k['type'], caption=KEY_CAPTION) for k in KEY_ENTRIES] + \
+    for e in ENTRIES + RETIRED + [KEY_LINK, KEY_RESET, ZONES, MODS_FOLDER, MOD_ENTRIES[0]] + \
+            [dict(type=k['type'], caption=KEY_CAPTION) for k in KEY_ENTRIES] + \
             [dict(type=int(label), caption=t) for label, t in SHIPPED.items() if len(label) == 4 and label[0] == '0']:
         if LANG_KEY[lang] in e['caption']:
             for ln in e['caption'][LANG_KEY[lang]].split('\n'):

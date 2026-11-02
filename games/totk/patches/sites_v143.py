@@ -11,11 +11,11 @@ which sits after 1.4.3's own span (DATA_PAGE_OFFSET; the runtime finds it from T
 version with its own sites module takes them instead of the porter); like every version table it never ships. Not
 here yet: fps60 (1.4.3's controller has no place for the 1.0.0 runtime's minimum interval hook, and the frame-count
 hooks 1.4.3 lost keep it at 30 anyway: engine-map safe_mode cap30), output_res (an output above 1920x1080 needs the
-HeapDef overlay, made from 1.0.0's files), shadowres (1.4.3 sizes the map differently), the LOD / mouse features.
+HeapDef overlay, made from 1.0.0's files), the LOD / mouse features.
 """
 from . import arm64 as a
 from .sites_v100 import (DP_ASPECT, DP_FOV_BASE, DP_FOV_SCALE, DP_FRAME_RATIO, DP_FRAME_SECONDS, DP_RENDER_SIZE,
-                         DP_RES_FLOOR, FMOV_S31_FOV_MAX, Layout, Orig, Patch)
+                         DP_RES_FLOOR, DP_SHADOW_FIXED, DP_SHADOW_SCALE, FMOV_S31_FOV_MAX, VK_GUARD, Layout, Orig, Patch)
 
 VERSION = '1.4.3'
 MAIN_NSO_SHA256 = 'e84a90d551fed0824b4b74933b9c6d043c458521363a7cea58b2faca1822dc9e'
@@ -33,6 +33,7 @@ PAD_FADE = 160        # 4 x 20-byte fade veneers (to +240)
 PAD_DYNRES = 240      # 20-byte dynamic-resolution floor veneer
 PAD_ASPECT = 272      # 4 x 32-byte aspect stubs (to +400)
 PAD_FOV = 400         # 2 x 64-byte field-of-view veneers (to +528)
+PAD_SHADOW = 528      # 76 + 44 + 60-byte shadow map size veneers (to +708)
 
 
 def layout():
@@ -246,6 +247,106 @@ def aspect(lay):
     return p
 
 
+# vk_guard (sites_v100.vk_guard, PC controls G1): guard reads its own virtual key 27, so a PC key can lock on (VK 2)
+# without raising the shield; the engine's hook on the virtual-key writer copies the pad's VK 2 to 27 (totk_pc_vk.cpp,
+# its 1.4.3 place by pins_v143.json). 1.4.3 places of every 1.0.0 site: 0x1cfe320 -> 0x23eb604 (its function's only
+# such call) 0x1cfe6c4 -> 0x23ebba8, 0x1cfe6dc -> 0x23ebbc8 (the function's two calls, same order) 0x1cfdf00 ->
+# 0x23eb010, 0x1d080e0 -> 0x23f5220 (exact function pairs, each its only call) 0x211e534 -> 0x27891bc (the first of two
+# calls; the second, 0x27891e8, stays VK 2 as 1.0.0's 0x211e560 does; the function has a near twin in both builds, told
+# apart by address order and alignment) the inline shield-draw read 0x8f5a20 / 0x8f5a24 -> 0x3e3edc 'ldrb w8, [x8]' /
+# 0x3e3ee0 'tbnz w8, #2, 0x3e41a0' (the four-word stretch around it is unique in both mains) Engine-only like 1.0.0's:
+# `engine --features default` adds it only when this build's engine map kept the hook it needs (engine.HOOKS_NEEDED; a
+# pin refused on the player's main leaves it off, else the shield would never rise).
+GUARD_SITES = (0x23eb604, 0x23ebba8, 0x23ebbc8, 0x23eb010, 0x23f5220, 0x27891bc)
+GUARD_INLINE, GUARD_INLINE_TO = 0x3e3edc, 0x3e41a0
+
+
+def vk_guard(lay=None):
+    p = Patch('vk_guard')
+    for site in GUARD_SITES:
+        p.put(site, a.movz_w(1, VK_GUARD), f'vk_guard: mov w1, #2 -> #{VK_GUARD} (guard: VK hold)')
+    p.put(GUARD_INLINE, a.ldrb_w(8, 8, VK_GUARD // 8), 'vk_guard: ldrb w8, [x8] -> [x8, #3] (hold byte 3)')
+    p.put(GUARD_INLINE + 4, a.tbnz(8, VK_GUARD % 8, GUARD_INLINE + 4, GUARD_INLINE_TO),
+          'vk_guard: tbnz w8, #2 -> #3 (shield wanted: VK 27)')
+    return p
+
+
+# shadowres (sites_v100.shadowres: the data page's size multiplier +72, 0 = the game's; fixed size +208). 1.4.3 has two
+# writers of the sun shadow map's per-view size (cascade stride 0xbb0, width / height at +0x3d8 / +0x3f8); which one
+# sizes the sun cascades depends on a per-object flag, so both get 1.0.0's semantics and the one not live is harmless:
+# A (the function at 0xbfca8): 1.0.0's sizing, structure for structure: factor = the larger of the view rect's x / y
+# extents over a reference, size = min(factor * base, base) per axis (bases: two ints of the shadow config), at least
+# 32, rounded up to 8. Its veneer, after the factor's fcsel at 0xbfd60: fixed -> factor 1.0 (the cap, the largest it
+# picks); the multiplier scales both bases (the float ones the sizes are made from and the int caps), so size =
+# min(factor * base, base) * k as 1.0.0's min(factor, cap) * k * base. B (in the function at 0x68318c, new in 1.4.x):
+# size = lo + (hi - lo) * t with t from the camera's field of view (0 when zoomed in), then a height-dependent boost,
+# rounded up to 8 at 0x683604; the height is the same value (square). Fixed: at the fmadd 0x6835a0, t = 1 and the
+# boost's flag bit cleared (skipped); the multiplier scales the integer size just before the round-up.
+SHADOW_A_SITE = 0xbfd60     # fcsel s0, s0, s1, gt (the factor)
+SHADOW_B_LERP = 0x6835a0    # fmadd s18, s20, s18, s19 (lo + (hi - lo) * t)
+SHADOW_B_ROUND = 0x683604   # add w11, w11, #7 (the size, before the round-up to 8)
+
+
+def shadowres(lay):
+    p = Patch('shadowres')
+    d = lay.data_off
+    at = lay.pad + PAD_SHADOW
+    va = [0xd100c3ff,                                  # sub sp, sp, #48
+          0xa90037ec,                                  # stp x12, x13, [sp]
+          0x3d8007e4,                                  # str q4, [sp, #16]
+          Orig(SHADOW_A_SITE),                         # the factor (fcsel)
+          a.adrp(13, at + 16, d),
+          a.ldr_w(12, 13, DP_SHADOW_FIXED),
+          a.cbz_w(12, at + 24, at + 32),               # the game's view-derived factor
+          0x1e2e1000,                                  # fmov s0, #1.0 (fixed: the cap)
+          a.ldr_w(12, 13, DP_SHADOW_SCALE),
+          a.cbz_w(12, at + 36, at + 60),               # off: to the restore
+          a.fmov_s_w(4, 12),
+          a.fmul_s(2, 2, 4),                           # base width (float) *= k
+          a.fmul_s(3, 3, 4),                           # base height (float) *= k
+          0x1e38004a,                                  # fcvtzs w10, s2 (the width cap)
+          0x1e380068,                                  # fcvtzs w8, s3 (the height cap)
+          0x3dc007e4,                                  # ldr q4, [sp, #16]
+          0xa94037ec,                                  # ldp x12, x13, [sp]
+          0x9100c3ff,                                  # add sp, sp, #48
+          a.b(at + 72, SHADOW_A_SITE + 4)]
+    b1 = at + 4 * len(va)
+    vb1 = [0xd10043ff,                                 # sub sp, sp, #16
+           0xf90003ea,                                 # str x10, [sp]
+           a.adrp(10, b1 + 8, d),
+           a.ldr_w(10, 10, DP_SHADOW_FIXED),
+           a.cbz_w(10, b1 + 16, b1 + 28),              # the game's t and boost
+           0x1e2e1012,                                 # fmov s18, #1.0 (fixed: t = 1)
+           0x120019ce,                                 # and w14, w14, #0x7f (the boost's flag bit 7 off: skipped)
+           0xf94003ea,                                 # ldr x10, [sp]
+           0x910043ff,                                 # add sp, sp, #16
+           Orig(SHADOW_B_LERP),
+           a.b(b1 + 40, SHADOW_B_LERP + 4)]
+    b2 = b1 + 4 * len(vb1)
+    vb2 = [0xd100c3ff,                                 # sub sp, sp, #48
+           0xf90003ea,                                 # str x10, [sp]
+           0xad00fffe,                                 # stp q30, q31, [sp, #16]
+           a.adrp(10, b2 + 12, d),
+           a.ldr_w(10, 10, DP_SHADOW_SCALE),
+           a.cbz_w(10, b2 + 20, b2 + 40),              # off: to the restore
+           a.fmov_s_w(31, 10),
+           0x1e22017e,                                 # scvtf s30, w11
+           a.fmul_s(30, 30, 31),                       # size *= k
+           0x1e3803cb,                                 # fcvtzs w11, s30
+           0xad40fffe,                                 # ldp q30, q31, [sp, #16]
+           0xf94003ea,                                 # ldr x10, [sp]
+           0x9100c3ff,                                 # add sp, sp, #48
+           Orig(SHADOW_B_ROUND),
+           a.b(b2 + 56, SHADOW_B_ROUND + 4)]
+    p.put(SHADOW_A_SITE, a.b(SHADOW_A_SITE, at), 'shadowres A: fcsel s0, s0, s1, gt (the factor) -> b <veneer>')
+    p.code(at, va, 'shadow map size veneer A (view-derived sizing)')
+    p.put(SHADOW_B_LERP, a.b(SHADOW_B_LERP, b1), 'shadowres B: fmadd (lo + (hi - lo) * t) -> b <veneer>')
+    p.code(b1, vb1, 'shadow map size veneer B1 (fixed: t = 1, no height boost)')
+    p.put(SHADOW_B_ROUND, a.b(SHADOW_B_ROUND, b2), 'shadowres B: add w11, w11, #7 (size before round-up) -> b <veneer>')
+    p.code(b2, vb2, 'shadow map size veneer B2 (multiplier)')
+    return p
+
+
 FEATURES = {
     # name: (builder, default on, needs); the names are the 1.0.0 set's where the fix is the same
     'realtime': (realtime, True, ()),
@@ -256,6 +357,8 @@ FEATURES = {
     'dynres': (dynres, True, ()),
     'fov': (fov, True, ()),
     'aspect': (aspect, True, ()),
+    'shadowres': (shadowres, True, ()),
+    'vk_guard': (vk_guard, False, ()),
 }
 
 

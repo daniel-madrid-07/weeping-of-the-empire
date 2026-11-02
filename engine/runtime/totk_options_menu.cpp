@@ -20,14 +20,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #ifdef _WIN32
 #include <excpt.h>  // GetExceptionCode (cbdiag)
 #endif
 #include <vector>
 
+#include "mods.h"
 #include "pc.h"  // pc_fault_guard (cbdiag)
 #include "pc_bind_ui.h"
+#include "pc_mods_ui.h"
 #include "pc_overlay.h"
 #include "pc_input.h"
 #include "pc_lang.h"
@@ -57,7 +60,8 @@ struct PcRow {
 // (min..max) must have them in its range, and the choice shown is the nearest one.
 // "steady" (the highest rate the scene holds, in whole refreshes of the monitor) so Options shows every frame-rate mode
 // F10 has, a first run's detected one included
-const char *const kFps[] = {"30", "60", "90", "120", "unlocked", "steady", nullptr};
+const char *const kFps[] = {"30", "40", "45", "60", "75", "90", "120", "144", "165", "180", "200", "240", "unlocked",
+                            "steady", nullptr};   // (300 / 360: v0.1.9, pc_settings.cpp V_FPS)
 const char *const kPreset[] = {"low", "medium", "high", "ultra", "ultra+", "custom", nullptr};
 const char *const kScale[] = {"0.67", "0.8", "0.9", "1", "1.5", "2", "auto", nullptr};
 // Mouse sensitivity: 0.1 steps up to 2 (10 % or less a step around the default), coarser above, up to 20
@@ -77,8 +81,11 @@ const char *const kFast[] = {"0", "1", nullptr};
 const char *const kOffOn[] = {"0", "1", nullptr};
 const char *const kVsync[] = {"", "off", nullptr};            // On (default), Off
 const char *const kVrr[] = {"", "on", nullptr};               // Off (default), On
+const char *const kShaderWait[] = {"", "always", nullptr};   // Limit to 0.1 s (default), Always wait
 const char *const kOffYes[] = {"", "1", nullptr};             // Off (default), On
 const char *const kOnDef[] = {"", "0", nullptr};              // On (default), Off
+const char *const kFrameGen[] = {"", "1", "2", "3", "fsr", nullptr};   // Off (default), DLSS x2 / x3 / x4, FSR x2
+const char *const kUpscaler[] = {"", "1", "dlaa", "fsr", nullptr};    // Off (default), DLSS, DLAA, FSR
 const char *const kHdr[] = {"", "hdr10", "scrgb", nullptr};   // Off (default), HDR10, scRGB
 const char *const kHdrPeak[] = {"400", "500", "600", "700", "800", "1000", "1200", "1500", "2000", "2500", "3000", "4000",
                                 nullptr};                     // nits, a 400 .. 4000 slider (step 50), default 1000
@@ -87,15 +94,23 @@ const char *const kHdrPaper[] = {"80", "100", "120", "140", "160", "180", "200",
 const char *const kGameplay[] = {"console", "pc", nullptr};  // Console layout, PC
 const char *const kGyro[] = {"0.25", "0.5", "0.75", "1", "1.25", "1.5", "1.75", "2", "2.5", "3", nullptr};
 const char *const kFov[] = {"0.8", "0.9", "1", "1.1", "1.2", "1.3", "1.4", "1.5", nullptr};  // of a 0.5 .. 2 slider
-const char *const kWide[] = {"16:9", "window", nullptr};      // the game's (default), the window's shape
+const char *const kWide[] = {"16:9", "window", "16:10", "21:9", "32:9", nullptr};   // the game's (default), the window's shape
+const char *const kHud[] = {"corner", "center", nullptr};    // the ultrawide HUD at the screen's edges (default), middle 16:9
+const char *const kCut[] = {"wide", "16:9", nullptr};        // ultrawide cutscenes: wide (default), the original 16:9
 const char *const kWindowMode[] = {"windowed", "borderless", "exclusive", nullptr};  // borderless: the default
 // The volumes: 0 .. 100 % in 5 % steps of a 0 .. 1 slider (audio.volume / music / effects; the default 1)
 const char *const kVolume[] = {"0", "0.05", "0.1", "0.15", "0.2", "0.25", "0.3", "0.35", "0.4", "0.45", "0.5", "0.55",
                                "0.6", "0.65", "0.7", "0.75", "0.8", "0.85", "0.9", "0.95", "1", nullptr};
 const char *const kFollow[] = {"1", "0", nullptr};          // On (default), Off
+const char *const kTempUnit[] = {"", "c", "f", nullptr};      // the game's (default), °C, °F
 const char *const kFpsReadout[] = {"0", "minimal", "detailed", nullptr};   // Off (default), Minimal, Detailed
 const char *const kFpsCorner[] = {"top_right", "top_left", "bottom_right", "bottom_left", nullptr};
 const char *const kFpsSize[] = {"small", "medium", "large", nullptr};
+// Off (fixed size), floors of 90 / 75 / 50 %, the game's own (pc_settings.cpp V_DYNRES)
+const char *const kDynRes[] = {"off", "90", "75", "50", "game", nullptr};
+const char *const kSunMap[] = {"0", "1", nullptr};                   // the game's (default), fixed: a 0 .. 1 slider
+const char *const kSoftShadow[] = {"", "50", "100", "200", nullptr};  // Off (the game's), soft, softer, softest
+const char *const kContact[] = {"", "35", "60", "100", nullptr};      // Off (the game's), subtle, medium, strong
 // A row whose choices are its setting's own values / names (pc_window.cpp builds them from the hardware in its static
 // initializer, before any game code, and never changes them). Only choice 0 ("" Remember / the desktop's) has overlay
 // texts; every other choice shows the setting's name (show_dynamic).
@@ -112,12 +127,14 @@ const PcRow kRows[] = {
     {126, "display.fps_position", kFpsCorner},   // live
     {127, "display.fps_size", kFpsSize},         // live
     {51, "graphics.preset", kPreset},           // live: sets its members (some of them restart)
-    {52, "graphics.render_scale", kScale},      // restart
-    {64, "graphics.dlss", kOffYes},  // restart
-    {65, "graphics.frame_gen", kOffYes},  // restart
+    {52, "graphics.render_scale", kScale},      // live (totk_hooks.c, textures.c rescale_image; live-settings 11-02)
+    {64, "graphics.dlss", kUpscaler},           // live (pc_dlss.cpp -> ngx.c, between frames: DLSS super resolution)
+    {65, "graphics.frame_gen", kFrameGen},      // live (pc_dlss.cpp -> ngx.c, between frames: DLSS frame generation)
     {67, "graphics.fov", kFov},  // live
     {68, "graphics.aspect_ratio", kWide},  // restart (totk_engine.c, the ultrawide; patched main only)
-    {117, "graphics.native_ui", kOnDef},  // restart
+    {128, "graphics.hud_layout", kHud},         // restart (totk_engine.c: the ultrawide HUD at the edges / middle 16:9)
+    {130, "graphics.cutscene_aspect", kCut},    // live (totk_engine.c, totk_hooks.c: ultrawide cutscenes wide / 16:9)
+    {117, "graphics.native_ui", kOnDef},  // live
     {53, "controls.mouse_sensitivity", kSens},  // live (hle_hid.cpp), a slider of 0.1 .. 20
     {116, "controls.mouse_aim_scale", kAimScale},  // live: the mouse while the bow is drawn
     {119, "controls.key_min_hold_ms", kKeyHold},  // live: the W / A / D tap slide
@@ -137,6 +154,13 @@ const PcRow kRows[] = {
     {121, "audio.music", kVolume},              // hle_audio.cpp: the music sub mix
     {122, "audio.effects", kVolume},            // hle_audio.cpp: the effects sub mix
     {123, "audio.follow_device", kFollow},      // hle_audio.cpp: a new or lost Windows device followed
+    // F10's graphics rows a player looks for first (v0.1.8, pc-ui)
+    {140, "graphics.dynamic_resolution", kDynRes},  // live (pc_settings.cpp dynres_apply; its aim the next start)
+    {141, "graphics.shadow_fixed", kSunMap},  // live
+    {142, "graphics.soft_shadows", kSoftShadow},    // live (shadows, ea3f0193; exec.c knob variants)
+    {143, "graphics.contact_shadows", kContact},    // live (shadows, ea3f0193; contact.c)
+    {131, "graphics.shader_wait", kShaderWait},     // live (pc_window.cpp; device.c held-frame limit)
+    {129, "game.temperature_unit", kTempUnit},  // live (pc_settings.cpp -> totk_patches.c's data page slot; v0.1.8)
     {66, "controls.gameplay", kGameplay},  // live: the key block's first row
 };
 constexpr s32 kKeyBlockType = 66;  // a separator goes in front of it
@@ -180,8 +204,9 @@ constexpr size_t kMaxKeys = 64;
 // the cull pass (namespace cull) only the rows near the screen are drawn: 65 entries peaked at 1074432, 63% (cull2),
 // and a longer list only adds hidden rows. 80 holds the patched key with the patch sets (35 settings rows incl. The 4
 // display rows, the 35 key rows and the reset row: 75) with room. TOTK_OPTIONS_CULL=0 draws every row again, and then
-// the old 48 holds.
-constexpr u32 kSafeEntriesCulled = 80, kSafeEntriesDrawn = 48, kSafeEntriesZoned = 120;
+// the old 48 holds. With sections only one section is drawn (Keys, ~38 rows, the largest; Mods at most 33): 160 holds
+// every section with the Mods rows (v0.1.8: ~130).
+constexpr u32 kSafeEntriesCulled = 80, kSafeEntriesDrawn = 48, kSafeEntriesZoned = 160;
 // The row that stands for the key rows when they don't fit: A opens F10 at its Keys tab (pc_overlay_open_keys). Its
 // texts: KEY_LINK in options_menu.py
 constexpr s32 kKeyLinkType = 105;
@@ -198,20 +223,21 @@ std::atomic<bool> g_key_reset{false};  // likewise
 // game's own types 0.. 13 and ours); a key row, the keys link and the reset row are Keys'; a row no section lists (a
 // new one) goes to General, at its end, never lost. The game's separators are left out (a section is short).
 // TOTK_OPTIONS_ZONES=0: the one long list again.
-enum Zone : s32 { Z_GENERAL, Z_DISPLAY, Z_GRAPHICS, Z_AUDIO, Z_CONTROLS, Z_KEYS, Z_INTERFACE, Z_COUNT };
+enum Zone : s32 { Z_GENERAL, Z_DISPLAY, Z_GRAPHICS, Z_AUDIO, Z_CONTROLS, Z_KEYS, Z_INTERFACE, Z_MODS, Z_COUNT };
 constexpr s32 kZoneType = 118;
 struct ZoneRow {
     s32 type, zone;
 };
 const ZoneRow kZoneRows[] = {
     // General: amiibo (game 0), fast travel, pause when the window loses focus
-    {0, Z_GENERAL}, {55, Z_GENERAL}, {114, Z_GENERAL},
+    {0, Z_GENERAL}, {55, Z_GENERAL}, {114, Z_GENERAL}, {129, Z_GENERAL},
     // Display: the window and its resolution, the monitor, frame rate, the FPS counter, sync, HDR, the picture's shape
     {108, Z_DISPLAY}, {124, Z_DISPLAY}, {109, Z_DISPLAY}, {110, Z_DISPLAY}, {111, Z_DISPLAY}, {50, Z_DISPLAY},
     {125, Z_DISPLAY}, {126, Z_DISPLAY}, {127, Z_DISPLAY}, {57, Z_DISPLAY}, {58, Z_DISPLAY}, {61, Z_DISPLAY},
-    {62, Z_DISPLAY}, {63, Z_DISPLAY}, {68, Z_DISPLAY},
-    // Graphics
-    {51, Z_GRAPHICS}, {52, Z_GRAPHICS}, {117, Z_GRAPHICS}, {64, Z_GRAPHICS}, {65, Z_GRAPHICS}, {67, Z_GRAPHICS},
+    {62, Z_DISPLAY}, {63, Z_DISPLAY}, {68, Z_DISPLAY}, {128, Z_DISPLAY}, {130, Z_DISPLAY},
+    // Graphics: the preset, the resolutions, the interface's, DLSS, the field of view, the shadows
+    {51, Z_GRAPHICS}, {52, Z_GRAPHICS}, {140, Z_GRAPHICS}, {117, Z_GRAPHICS}, {64, Z_GRAPHICS}, {65, Z_GRAPHICS},
+    {67, Z_GRAPHICS}, {141, Z_GRAPHICS}, {142, Z_GRAPHICS}, {143, Z_GRAPHICS}, {131, Z_GRAPHICS},
     // Audio: the volumes, voice language (game 11), the Windows device, muted when the window loses focus
     {120, Z_AUDIO}, {121, Z_AUDIO}, {122, Z_AUDIO}, {11, Z_AUDIO}, {123, Z_AUDIO}, {115, Z_AUDIO},
     // Controls: the scheme, the mouse, the game's camera / gyro / jump / Ultrahand rows (1 2 3 4 5 12 13)
@@ -257,6 +283,49 @@ const KeyLines &key_lines() {
     static const KeyLines lines;
     return lines;
 }
+
+// The Mods section (v0.1.8, pc-ui: a player should not need F10 for them): the mods folder row (A opens it in the file
+// manager; the section's only row while no mod is installed), then one row per usable mod in load order, its folder name
+// written into the label, Off / On (mods_set_on: the next start). The order, and why a mod is not used, stay in F10's
+// Mods tab. Texts: MODS_FOLDER and MOD_ROW in options_menu.py (MOD_ROW once per type kModFirst .. + kMaxMods). Only
+// with sections (a screen holds one section) and a mods folder in use, not with the launcher's own list (read-only).
+constexpr s32 kModsFolderType = 144;
+constexpr s32 kModFirst = 145;
+constexpr size_t kMaxMods = 32;
+struct ModLines {
+    std::string name[kMaxMods];  // mods.order's key of each row
+    size_t n = 0;
+    bool folder = false;
+    ModLines() {
+        if (mods_read_only() || mods_folder().empty()) return;
+        folder = true;
+        size_t usable = 0;
+        for (const nxr_mod &m : mods_list())
+            if (m.problem == NXR_MOD_OK && usable++ < kMaxMods) name[n++] = m.name;
+        if (usable > n) printf("[options-menu] mods: %zu usable, the first %zu get a row (F10 > Mods has all)\n", usable, n);
+    }
+};
+const ModLines &mod_lines() {
+    static const ModLines lines;
+    return lines;
+}
+std::atomic<bool> g_mods{false};  // append_rows added the Mods section's rows
+// The mod row of an OptionType: its index in mod_lines(), -1 if none
+int mod_index(s32 type) {
+    if (!g_mods || type < kModFirst) return -1;
+    const size_t i = static_cast<size_t>(type - kModFirst);
+    return i < mod_lines().n ? static_cast<int>(i) : -1;
+}
+// A mod's place in mods_list() now (F10 may have moved it), -1 if gone
+int mod_now(size_t i, bool *on) {
+    const std::vector<nxr_mod> list = mods_list();
+    for (size_t k = 0; k < list.size(); k++)
+        if (list[k].name == mod_lines().name[i]) {
+            if (on) *on = list[k].on;
+            return static_cast<int>(k);
+        }
+    return -1;
+}
 // "1069_%02d": the key rows' status texts (no row of type 69); the order of STATUS in options_menu.py
 enum KeyStatus {
     KS_PRESS, KS_UNBOUND, KS_NOT_READY, KS_LAST_KEY, KS_RESERVED, KS_FIXED, KS_CHAIN, KS_KIND, KS_UNKNOWN,
@@ -269,6 +338,14 @@ enum KeyStatus {
 bool enabled() {
 #ifdef TOTK_BETA_OFF_OPTIONS_SCREEN
     return false;   // (a beta of another game version without the options screen's hooks)
+#endif
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    static const bool placed = [] {
+        const bool ok = totk_field_known(OptionSelect, 0x40) && totk_field_known(OptionsOwner, 0x5a0);
+        if (!ok) printf("[options-menu] the Options fields are not placed in this game version: PC rows off\n");
+        return ok;
+    }();
+    if (!placed) return false;
 #endif
     static const bool on = !getenv("TOTK_OPTIONS_MENU") || strcmp(getenv("TOTK_OPTIONS_MENU"), "0") != 0;
     return on;
@@ -414,6 +491,7 @@ s32 zone_of(s32 type) {
     for (const ZoneRow &z : kZoneRows)
         if (z.type == type) return z.zone;
     if (key_row(type) || type == kKeyLinkType || type == kKeyResetType) return Z_KEYS;
+    if (type == kModsFolderType || mod_index(type) >= 0) return Z_MODS;
     return Z_GENERAL;
 }
 bool listed(s32 type) {
@@ -807,7 +885,15 @@ void add(s32 type, u32 index, const void *layout) {
 // either). A section change opens a new screen, whose parts start shown.
 namespace orphans {
 constexpr u64 kPaneName = 0xb0;  // nn::ui2d::Pane's name (totk_menu_cursor.cpp's kPaneName)
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+// 1.4.3's layout has a fifth part, Pa_AppOptionBtn_00, for its Zelda Notes guide button; that row is dropped on PC
+// (drop_web_rows), so the part is never bound: kind 4, never in has, hidden in every list (sections or not)
+constexpr int kParts = 5;
+const char *const kPart[kParts] = {"Pa_ToggleBtn_00", "Pa_SelectBtn_00", "Pa_AmiiboBtn_00", "Pa_Separator_00",
+                                   "Pa_AppOptionBtn_00"};
+#else
 const char *const kPart[4] = {"Pa_ToggleBtn_00", "Pa_SelectBtn_00", "Pa_AmiiboBtn_00", "Pa_Separator_00"};  // by buttonType
+#endif
 
 // list's children (cull::member_try's walk) named for a kind not in has: hidden. False on any fault or bad link
 bool hide_try(u64 list, const bool *has, s32 zone) {
@@ -820,7 +906,11 @@ bool hide_try(u64 list, const bool *has, s32 zone) {
             if (!cull::ok(node)) return false;
             const u64 pane = node - 8;
             const char *const name = reinterpret_cast<const char *>(pane + kPaneName);
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+            for (int k = 0; k < kParts; k++) {
+#else
             for (int k = 0; k < 4; k++) {
+#endif
                 if (has[k] || strncmp(name, kPart[k], 24) != 0) continue;
                 const u8 f = cull::rd<u8>(pane + cull::kFlag);
                 if (!(f & 1)) continue;
@@ -840,6 +930,20 @@ bool hide_try(u64 list, const bool *has, s32 zone) {
 
 // A row of the open screen was bound (layout: its part's LayoutEx; its root pane's parent is the rows' list)
 void hide(const void *layout) {
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    // (also without sections: the fifth part is unused in the game's one list too; z -1 then)
+    if (!layout) return;
+    const bool zoned = zones::on() && zones::g_ok;
+    const s32 z = zoned ? zones::g_zone.load() : -1;
+    bool has[kParts] = {true, true, true, true, false};
+    if (zoned) {
+        const OptionsMgr &v = zones::g_view[z >= 0 && z < Z_COUNT ? z : Z_GENERAL];
+        if (!v.entries) return;
+        for (int k = 0; k < 4; k++) has[k] = false;
+        for (u32 i = 0; i < v.count; i++)
+            if (const u32 k = static_cast<u32>(v.entries[i].buttonType); k < 4) has[k] = true;
+    }
+#else
     if (!zones::on() || !zones::g_ok || !layout) return;
     const s32 z = zones::g_zone.load();
     const OptionsMgr &v = zones::g_view[z >= 0 && z < Z_COUNT ? z : Z_GENERAL];
@@ -848,6 +952,7 @@ void hide(const void *layout) {
     for (u32 i = 0; i < v.count; i++)  // (buttonType is signed: a stray negative one must not index has)
         if (const u32 k = static_cast<u32>(v.entries[i].buttonType); k < 4) has[k] = true;
     if (has[0] && has[1] && has[2] && has[3]) return;
+#endif
     const u64 root = cull::rd<u64>(reinterpret_cast<u64>(layout) + cull::kRoot);
     if (!cull::ok(root)) return;
     const u64 list = cull::rd<u64>(root + cull::kParent);
@@ -857,6 +962,30 @@ void hide(const void *layout) {
     pc_fault_guard(0);
 }
 }  // namespace orphans
+
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+// 1.4.3's Zelda Notes guide row: a game button row (buttonType 2, like amiibo's) whose press opens the Nintendo Switch
+// Online app page through nn::web's web applet, which a PC has not. Dropped from the game's list, the later rows moved
+// up and renumbered: in 1.4.3 the one game button row other than amiibo (type 0). The Zelda Notes toggle (type 14)
+// stays.
+void drop_web_rows(OptionsMgr *mgr) {
+    OptionEntry *const e = mgr->entries;
+    if (!e) return;
+    u32 n = 0;
+    for (u32 i = 0; i < mgr->count; i++) {
+        if (e[i].buttonType == 2 && e[i].type != 0 && e[i].type < 50) {
+            printf("[options-menu] game row %d (a button to a Switch Online web page) dropped on PC\n", e[i].type);
+            continue;
+        }
+        if (n != i) {
+            e[n] = e[i];
+            e[n].index = n;
+        }
+        n++;
+    }
+    mgr->count = n;
+}
+#endif
 
 void append_rows(OptionsMgr *mgr, u64 heap) {
     cbdiag::start();
@@ -871,7 +1000,8 @@ void append_rows(OptionsMgr *mgr, u64 heap) {
     const bool keys = key_block_shown();
     // Settings that act only through game patches' RomFS sets (totk_engine.c: the canvas's heap set, the fast-travel
     // set): without TOTK_PATCH_SETS (the package sets none) choosing them would change nothing, so no row
-    static const char *const kNeedSets[] = {"graphics.aspect_ratio", "game.fast_travel"};
+    static const char *const kNeedSets[] = {"graphics.aspect_ratio", "graphics.hud_layout", "graphics.cutscene_aspect",
+                                            "game.fast_travel"};
     const char *const sets = getenv("TOTK_PATCH_SETS");
     const bool have_sets = sets && *sets;
     for (const PcRow &r : kRows) {
@@ -882,6 +1012,13 @@ void append_rows(OptionsMgr *mgr, u64 heap) {
             printf("[options-menu] %s: needs TOTK_PATCH_SETS (game patches' RomFS sets), not set; not added\n", r.key);
             continue;
         }
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+        // another game version places neither the unit patch nor the sign hook: no row
+        if (!strcmp(r.key, "game.temperature_unit")) {
+            printf("[options-menu] %s: not in this game version (no unit patch); not added\n", r.key);
+            continue;
+        }
+#endif
         const pc_setting *d;
         if (!row_of(r.type, &d)) {
             printf("[options-menu] %s: no such setting, or it does not take the row's values; not added\n", r.key);
@@ -923,6 +1060,13 @@ void append_rows(OptionsMgr *mgr, u64 heap) {
                 printf("[options-menu] %s: not an on-foot pc_bind_pages.inc entry; no row\n", r.action);
     } else {
         printf("[options-menu] key rows not added: the rebinding API is not ready (TOTK_OPTIONS_KEYS=1 shows them)\n");
+    }
+    // the Mods section: its folder row, then the mods (the last rows: the cap below drops them first)
+    if (zones::on() && mod_lines().folder) {
+        add.push_back({kModsFolderType, 1, 1, "mods folder"});
+        for (size_t i = 0; i < mod_lines().n; i++)
+            add.push_back({kModFirst + static_cast<s32>(i), 1, 2, mod_lines().name[i].c_str()});  // Off, On
+        g_mods = true;
     }
     const u32 n = mgr->count;
     // the cap holds for the whole screen: settings rows past it are dropped too (the key rows already stopped at it)
@@ -1030,6 +1174,7 @@ const char *label_pane() { return guest_mem::guest_data<const char>(0x1003700670
 
 char16_t g_key_text[kMaxKeys][64];    // each key row's shown text (kept: the pane may read it later)
 char16_t g_key_label[kMaxKeys][64];   // the page label of a key row without overlay texts
+char16_t g_mod_label[kMaxMods][64];   // each mod row's label: the mod's folder name
 
 void show_text(OptionSelect *sel, const char16_t *text, u32 length, const char *pane = nullptr) {
     const MsgText m = {text, length, 0, -1};
@@ -1527,12 +1672,18 @@ namespace game::ui::pc_rows {
 
 bool owns(s32 type) {
     return type >= 50 && (row_of(type, nullptr) != nullptr || key_row(type) || (type == kKeyLinkType && g_key_link) ||
-                          (type == kKeyResetType && g_key_reset) || (type == kZoneType && zones::on()));
+                          (type == kKeyResetType && g_key_reset) || (type == kZoneType && zones::on()) ||
+                          (type == kModsFolderType && g_mods) || mod_index(type) >= 0);
 }
 
 s32 choice(s32 type) {
     if (type == kZoneType) return zones::g_zone.load();  // the section this screen shows
     if (key_row(type) || type == kKeyLinkType || type == kKeyResetType) return 0;  // one choice (a key row: its key)
+    if (type == kModsFolderType) return 0;                                         // one choice: Open
+    if (const int i = mod_index(type); i >= 0) {                                   // Off, On
+        bool on = false;
+        return mod_now(static_cast<size_t>(i), &on) >= 0 ? on : -1;
+    }
     const pc_setting *d;
     const PcRow *r = row_of(type, &d);
     return r ? index_of(*r, d) : -1;
@@ -1540,6 +1691,14 @@ s32 choice(s32 type) {
 
 void set_choice(s32 type, s32 choice) {
     if (type == kZoneType) return reopen::request(choice);  // another section: another screen
+    if (const int i = mod_index(type); i >= 0) {            // a mod on / off: saved at once, used at the next start
+        const int now = mod_now(static_cast<size_t>(i), nullptr);
+        if (now < 0 || choice < 0 || choice > 1) return;
+        mods_set_on(now, choice == 1);
+        printf("[options-menu] mod %s: %s at the next start\n", mod_lines().name[i].c_str(), choice ? "on" : "off");
+        if (mods_changed()) pc_overlay_restart_notice();
+        return;
+    }
     const pc_setting *d;
     const PcRow *r = row_of(type, &d);
     if (!r || choice < 0 || static_cast<u32>(choice) >= count_of(values_of(*r, d))) return;
@@ -1670,6 +1829,9 @@ void hook_f_f6092c(Ctx *__restrict c) {  // OptionsMgr::initialize(mgr, heap) ->
     if (!enabled() || !(ok & 1) || !mgr) return;
     {
         guest_bridge::Enter e(c);
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+        drop_web_rows(mgr);
+#endif
         append_rows(mgr, heap);
     }
     c->x[0] = ok;
@@ -1713,7 +1875,9 @@ OPTIONS_HOOK(1a85b3c, {   // a selection row's bind
     if (const int i = key_index(self->type); i >= 0) show_key(static_cast<size_t>(i));  // over the placeholder
     if (self->type == kFovType) show_fov(self);
     show_dynamic(self);
-    if (self->type == kKeyLinkType || self->type == kKeyResetType) {  // one choice: < and > change nothing
+    if (const int i = mod_index(self->type); i >= 0)  // over showLabel's "Mod": the mod's own name
+        show_text(self, g_mod_label[i], put_utf8(g_mod_label[i], 0, 64, mod_lines().name[i].c_str()), label_pane());
+    if (self->type == kKeyLinkType || self->type == kKeyResetType || self->type == kModsFolderType) {  // one choice
         guest::ArrowSetDisabled(self->arrowNext, true);
         guest::ArrowSetDisabled(self->arrowPrev, true);
     }
@@ -1748,6 +1912,11 @@ OPTIONS_HOOK(1a85e4c, {   // A on a selection row (x1 the cursor's button)
         }
     } else if (self->type == kKeyResetType) {
         reset_decide(self, button);
+    } else if (self->type == kModsFolderType) {  // A: the mods folder in the file manager, on a thread of its own
+        if (guest::FindButton(self->parts->buttonGroup, self->layout) == button)  // (the shell may take a while)
+            std::thread([] {
+                printf("[options-menu] mods folder: %s\n", pc_mods_open_folder() ? "opened" : "not opened");
+            }).detach();
     } else {
         ctl::select_decide(self, button);
         show_dynamic(self);

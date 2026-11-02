@@ -81,13 +81,16 @@ _ensure_python()
 sys.path.insert(0, str(REPO))
 
 from pipeline import extract, modules  # noqa: E402
+from pipeline.nx import romsource  # noqa: E402
 from pipeline.locks import FileLock  # noqa: E402
 from pipeline.manifest import Manifest  # noqa: E402
 from pipeline.sync import sync_tree  # noqa: E402
 from pipeline.nx.common import (GiB, below_normal_priority, free_disk_bytes, read_json, require,  # noqa: E402
                                 sha256_file, wait_for_ram, write_json)
 
-MIN_FREE_DISK = 40 * GiB
+# tools/builder sets NXR_MIN_FREE_GB to what its steps still need (it checked the whole install's sum already): the
+# fixed 40 stopped PCs at step 1 that Setup and builder.py had passed with their 35 (the game's files keep 17 GB)
+MIN_FREE_DISK = float(os.environ.get('NXR_MIN_FREE_GB') or 40) * GiB
 HEAVY = REPO / 'tools' / 'heavy.py'
 LIGHT_OBJECTS = 24          # up to this many objects to compile is a small build (no slot limiter)
 QUICK_STEPS = ('patch', 'recompile', 'configure', 'build', 'package')
@@ -302,7 +305,7 @@ class Build:
         self.work.mkdir(parents=True, exist_ok=True)
         free = free_disk_bytes(self.work)
         if free < MIN_FREE_DISK:
-            raise BuildError(f'Only {free / GiB:.0f} GB free on the work drive (< 40 GB): stopping')
+            raise BuildError(f'Only {free / GiB:.0f} GB free on the work drive (< {MIN_FREE_DISK / GiB:.0f} GB): stopping')
         t_all = time.monotonic()
         with self.tree_lock:
             if any(s in QUICK_STEPS for s in steps):   # the extract-only steps (the Builder's) use neither
@@ -471,18 +474,32 @@ class Build:
     def step_romfs(self):
         inputs = self.nsp_inputs()
         inputs['expected'] = self.expected['romfs']
-        inputs['unpack'] = not self.a.no_unpack
+        in_dump = bool(self.a.romfs_in_dump and not self.a.update)
+        inputs['unpack'] = not (self.a.no_unpack or in_dump)
+        if in_dump:   # (the image stays in the dump: romfs-source.txt; the key only then, so copies stay fresh)
+            inputs['in_dump'] = True
         if self.skip_or_force('romfs', inputs):
             return 'up to date'
         report_path = self.ext / 'romfs-report.json'
-        image = self.ext / 'romfs.bin'
+        image = self.ext / (romsource.SOURCE if in_dump else 'romfs.bin')
         exp = self.expected['romfs']
         status = 'adopted existing (verified when written)'
         rep = read_json(report_path) if report_path.exists() else None
+
+        def image_there():
+            if not image.is_file():
+                return False
+            if not in_dump:
+                return image.stat().st_size == exp['size']
+            try:   # the dump it names is still there, at the size it was read at
+                src = romsource.read_source(image)
+                return src['image_size'] == exp['size'] and os.path.getsize(src['dump']) == src['dump_size']
+            except (OSError, ValueError):
+                return False
         adopt = (rep and rep.get('status') == 'pass' and rep['romfs_sha256'] == exp['sha256']
                  and rep['romfs_size'] == exp['size'] and rep['source']['size'] == inputs['nsp']['size']
-                 and image.is_file() and image.stat().st_size == exp['size']
-                 and (self.a.no_unpack or rep.get('tree') == 'romfs'))
+                 and rep.get('image', 'romfs.bin') == image.name and image_there()
+                 and (self.a.no_unpack or in_dump or rep.get('tree') == 'romfs'))
         if not adopt:
             self.need('--keys', self.a.keys)
             # Heavy job: run the extractor as a child of the slot limiter (keys passed as a path only).
@@ -490,6 +507,8 @@ class Build:
                    str(self.a.keys), '--out', str(self.ext), '--expected', str(self.a.expected)]
             if self.a.no_unpack:
                 cmd.append('--no-unpack')
+            if in_dump:
+                cmd.append('--in-dump')
             if self.a.update:   # the update's RomFS merged over the base game's (BKTR)
                 cmd += ['--update', str(self.a.update)]
             p = subprocess.run(heavy(cmd, log), cwd=REPO)
@@ -547,7 +566,7 @@ class Build:
         layout = read_json(layout_path) if layout_path.exists() else None
         ready = dict(
             status='ready', title_id=self.expected['title_id'], version=self.expected['display_version'],
-            romfs=dict(tree=str(self.ext / 'romfs') if rom.get('tree') else None, image=str(self.ext / 'romfs.bin'),
+            romfs=dict(tree=str(self.ext / 'romfs') if rom.get('tree') else None, image=str(self.ext / rom.get('image', 'romfs.bin')),
                        index=str(self.ext / 'romfs-index.json'), size=rom['romfs_size'], sha256=rom['romfs_sha256'],
                        sha256_matches_pinned=rom['romfs_sha256'] == self.expected['romfs']['sha256'],
                        file_count=rom['file_count'], total_file_bytes=rom['total_file_bytes']),
@@ -1241,6 +1260,9 @@ def parse(argv=None):
     p.add_argument('--steps', default='all', help=f'comma list or "all": {",".join(STEPS)}; "from:<step>" also works')
     p.add_argument('--force', type=lambda s: s.split(','), default=[], help='steps to redo even when up to date')
     p.add_argument('--no-unpack', action='store_true', help='keep only romfs.bin + index (no unpacked tree)')
+    p.add_argument('--romfs-in-dump', action='store_true',
+                   help='the RomFS stays in the dump: romfs-source.txt + index, no romfs.bin, no tree (a base game; '
+                        'the player\'s install since v0.1.8)')
     p.add_argument('--jobs', type=int, default=6, help='parallel compiles (shared machine: default 6)')
     p.add_argument('--patch-features', default='default',
                    help='the patch feature set passed to `games.totk.patches apply --features` ("none" = unpatched)')

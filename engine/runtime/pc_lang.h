@@ -12,6 +12,9 @@ const char *pc_lang_code(void);   // the Switch language code: "en-US", "en-GB",
 const char *pc_lang_key(void);    // pc_input.cpp's key-name languages: "en", "es", "fr", "de", "it", "nl", "ru", "ja",
                                   // "ko", "zh-Hans", "zh-Hant"
 int pc_lang_es(void);             // the port's own texts in Spanish (es, es-419); else English
+// the port's own texts' language (pc_text.cpp): "es", "ru", "pt" (Brazilian Portuguese: a Portuguese Windows, the game
+// following it), "zh-Hans"; "" English (and the few texts of pc_text_langs.inc in the game's other languages)
+const char *pc_ui_lang(void);
 
 #ifdef __cplusplus
 }

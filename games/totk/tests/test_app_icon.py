@@ -86,12 +86,16 @@ class AppIcon(unittest.TestCase):
     def test_ring_from_romfs(self):
         ring, shadow = A.ring_masks(ROMFS)
         self.assertEqual((ring.size, shadow.size), ((427, 427), (547, 547)))
-        img = np.asarray(A.compose(ring, shadow, 256))
-        a = img[..., 3]
-        self.assertEqual(a[128, 128], 0)                                      # the hole
-        self.assertTrue(0.3 < (a > 128).mean() < 0.8)
-        mint = (img[..., 1] > 180) & (a > 200)
-        self.assertGreater(mint.mean(), 0.15)                                 # the ring is mint over the teal shadow
+        for simple in (False, True):
+            img = np.asarray(A.compose(ring, 256, simple))
+            a = img[..., 3]
+            self.assertEqual(a[128, 128], 0)                                  # the hole
+            self.assertTrue(0.3 < (a > 128).mean() < 0.8)
+            near = lambda c: (abs(img[..., :3].astype(int) - c) <= 12).all(-1) & (a == 255)
+            mint, teal = near(A.MINT), near(A.TEAL)
+            self.assertGreater(mint.mean(), 0.15)                             # the ring flat mint ...
+            self.assertGreater(teal.mean(), 0.05)                             # ... on a flat teal halo
+            self.assertGreater((mint | teal | (a == 0)).mean(), 0.8)          # 2 colours, the rest edges
 
     def test_bad_romfs_falls_back(self):
         with tempfile.TemporaryDirectory() as t:

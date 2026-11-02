@@ -1,20 +1,29 @@
-// Texture pre-upload on the loading screen (warmup 2026-10-30, hitch_kak1: the world's first frame after a load carried
-// a 112 MB first-use upload of 558 textures, 64.5 ms of backend execute, identify + hash 13.7 ms and deswizzle / staging
-// / decode 12.7 ms on the render thread: the only frame over 50 ms in warm Kakariko). A texture the guest initializes
-// while the loading screen is up (hle_vi.cpp vi_loading_screen: the render-pass rule's loading state, title left) is
-// queued here (backend_texture_created, guest thread); at each game present on the render thread (backend_present), the
-// queue's textures from earlier frames get their image and first upload (vk_tex, as a first sampled use would), up to
-// LARECOMP_TEX_PREUPLOAD ms of render-thread time a frame (default 6: the loading screen draws 2 passes a frame). Then
-// the first draw only checks them: a pre-uploaded texture's first real use skips the 1-in-8 check shortcut (textures.c
+// Texture pre-upload on the loading screen (warmup 2026-10-30, hitch_kak1: the world's first frame after a load carried a
+// 112 MB first-use upload of 558 textures, 64.5 ms of backend execute, identify + hash 13.7 ms and deswizzle / staging /
+// decode 12.7 ms on the render thread: the only frame over 50 ms in warm Kakariko). A texture the guest initializes while
+// the loading screen is up (hle_vi.cpp vi_loading_screen: the render-pass rule's loading state, title left) is queued here
+// (backend_texture_created, guest thread); at each game present on the render thread (backend_present), the queue's
+// textures from earlier frames get their image and first upload (vk_tex, as a first sampled use would), up to
+// LARECOMP_TEX_PREUPLOAD ms of render-thread time a frame (default 6: the loading screen draws 2 passes a frame). Then the
+// first draw only checks them: a pre-uploaded texture's first real use skips the 1-in-8 check shortcut (textures.c
 // upload_texture_), so a texel the guest wrote after the pre-upload is uploaded again there, as now: what a frame shows
-// does not change. Only sampled data: block-compressed (BC / ASTC), or another colour format whose NVN flags say no
-// render target, storage image, display or CPU-linear texture (DISPLAY 0x1, IMAGE 0x4, COMPRESSIBLE 0x8, LINEAR 0x10,
+// does not change. Only sampled data: block-compressed (BC / ASTC), or another colour format whose NVN flags say no render
+// target, storage image, display or CPU-linear texture (DISPLAY 0x1, IMAGE 0x4, COMPRESSIBLE 0x8, LINEAR 0x10,
 // LINEAR_RENDER_TARGET 0x40, ADAPTIVE_ZCULL 0x80), never depth / stencil; none another object renders into, none with an
 // image already, none while residency reports VRAM / commit pressure. Only while the loading screen is up: what is left
-// when it ends is dropped (its first use uploads it, as before), so no world frame pays for it. Fast-travel arrivals
-// take the same path (their loading screen). LARECOMP_TEX_PREUPLOAD=0: off. Each load's account: at its end the skips by
+// when it ends is dropped (its first use uploads it, as before), so no world frame pays for it. Fast-travel arrivals take
+// the same path (their loading screen). LARECOMP_TEX_PREUPLOAD=0: off. Each load's account: at its end the skips by
 // reason, then over the 240 frames after it the first uploads that were not pre-uploaded, split into created before the
-// end (eligible, or not) and after it ("[tex] pre-upload account").
+// end (eligible, or not) and after it ("[tex] pre-upload account"). In play (stream-hitch, 2026-11-02): the textures the
+// game streams in while the world is up took their image and first upload in the frame that first drew them, all at once
+// when an area's set arrived (issue #9 RX 6800: 69 MB / 50 images in one frame: 1 image 77 ms, 29 images 50 ms). The same
+// queue now also takes textures initialized outside the loading screen, and the leftovers of a load stay queued: each game
+// present gives them their image and first upload within a small budget, LARECOMP_TEX_STREAM ms (default 1.0) and
+// LARECOMP_TEX_STREAM_MB guest bytes (default 8; the first texture of a frame is taken whatever its size, as its first use
+// would have) a frame, so a burst becomes a few frames of a millisecond. A texture first drawn before the stream reached
+// it uploads at that use, as before: nothing drawn is ever missing or older, the first use checks a pre-uploaded texture
+// (write watch) like the loading screen's. "[tex] stream pre-upload" lines (one per 10 s with work) give what it took.
+// LARECOMP_TEX_STREAM=0: loading screen only.
 #include <SDL3/SDL_timer.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -42,6 +51,26 @@ static uint64_t fs_n[3], fs_bytes[3], re_n, re_bytes;   // (re_: pre-uploaded, c
                                         // [1] made before it, not eligible, [2] made after it
 extern uint64_t vk_preupload_next_id(void);   // objects.c: the next NvnTexture debug id
 
+// in play (above): LARECOMP_TEX_STREAM ms and LARECOMP_TEX_STREAM_MB guest bytes a frame
+static int64_t stream_budget_ns(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = getenv("LARECOMP_TEX_STREAM");
+        v = (int64_t)((e ? atof(e) : 1.0) * 1e6);
+        if (v < 0) v = 0;
+        LOG("[tex] in-play texture stream pre-upload: %.1f ms a frame%s (LARECOMP_TEX_STREAM)\n", v / 1e6, v ? "" : ": off");
+    }
+    return v;
+}
+static uint64_t stream_cap_bytes(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = getenv("LARECOMP_TEX_STREAM_MB");
+        v = (int64_t)((e ? atof(e) : 8.0) * 1048576.0);
+        if (v < 0) v = 0;
+    }
+    return (uint64_t)v;
+}
 static int64_t pre_budget_ns(void) {
     static int64_t v = -1;
     if (v < 0) {
@@ -55,7 +84,8 @@ static int64_t pre_budget_ns(void) {
 
 // nvnTextureInitialize (objects.c, the guest's thread)
 void backend_texture_created(NvnTexture *t) {
-    if (!t || t->target == 10 || (t->flags & 2) || !vi_loading_screen() || !backend_async_on() || !pre_budget_ns()) return;
+    if (!t || t->target == 10 || (t->flags & 2) || !backend_async_on() || !(vi_loading_screen() ? pre_budget_ns() : stream_budget_ns()))
+        return;
     pthread_mutex_lock(&pre_mu);
     if (pre_n == pre_cap) {
         int cap = pre_cap ? pre_cap * 2 : 1024;
@@ -127,21 +157,38 @@ void vk_preupload_first_sight(NvnTexture *t, uint64_t bytes) {
 static void pre_load_end(void) {
     pthread_mutex_lock(&pre_mu);
     pre_left = (uint64_t)pre_n;
-    pre_n = 0;
+    if (!stream_budget_ns()) pre_n = 0;   // (else they stay for the in-play stream)
     pthread_mutex_unlock(&pre_mu);
     pre_end_frame = vk_frame_counter();
     pre_end_id = vk_preupload_next_id();
     memset(fs_n, 0, sizeof fs_n);
     memset(fs_bytes, 0, sizeof fs_bytes);
     re_n = re_bytes = 0;
-    LOG("[tex] pre-upload account, load end: %llu textures, %.1f MB pre-uploaded; %llu left (dropped); skipped: %s %llu, "
+    LOG("[tex] pre-upload account, load end: %llu textures, %.1f MB pre-uploaded; %llu left (%s); skipped: %s %llu, "
         "%s %llu, %s %llu, %s %llu, %s %llu, %s %llu\n",
-        (unsigned long long)pre_load_done, pre_load_bytes / 1048576.0, (unsigned long long)pre_left, sk_name[1],
+        (unsigned long long)pre_load_done, pre_load_bytes / 1048576.0, (unsigned long long)pre_left,
+        stream_budget_ns() ? "kept for the in-play stream" : "dropped", sk_name[1],
         (unsigned long long)pre_sk[1], sk_name[2], (unsigned long long)pre_sk[2], sk_name[3], (unsigned long long)pre_sk[3],
         sk_name[4], (unsigned long long)pre_sk[4], sk_name[5], (unsigned long long)pre_sk[5], sk_name[6],
         (unsigned long long)pre_sk[6]);
     pre_load_done = pre_load_bytes = 0;
     memset(pre_sk, 0, sizeof pre_sk);
+}
+
+// the in-play stream's account (render thread): one line per 10 s that had work
+static uint64_t st_t0, st_done, st_bytes, st_ns, st_max_ns, st_frames, st_late, st_skip, st_unsettled;
+static void stream_report(uint64_t now) {
+    if (!st_t0) { st_t0 = now; return; }
+    if (now - st_t0 < 10000000000ull) return;
+    if (st_done || st_late || st_skip)
+        LOG("[tex] stream pre-upload, last %.0f s: %llu textures, %.1f MB in %.1f ms over %llu frames (at most %.1f ms a frame); "
+            "first drawn before it took them %llu, not taken %llu, still being written %llu; %d queued; pre-uploaded textures' "
+            "first uses so far %llu\n",
+            (now - st_t0) / 1e9, (unsigned long long)st_done, st_bytes / 1048576.0, st_ns / 1e6, (unsigned long long)st_frames,
+            st_max_ns / 1e6, (unsigned long long)st_late, (unsigned long long)st_skip, (unsigned long long)st_unsettled, pre_n,
+            (unsigned long long)pre_first_used);
+    st_t0 = now;
+    st_done = st_bytes = st_ns = st_max_ns = st_frames = st_late = st_skip = st_unsettled = 0;
 }
 
 // backend_present (device.c), render thread, before the frame. The entries are taken out under the lock and uploaded
@@ -152,10 +199,15 @@ void vk_preupload_frame(void) {
     const bool loading = vi_loading_screen() != 0;
     if (loading) pre_loading = true;
     else if (pre_loading) { pre_loading = false; pre_load_end(); }
-    if (!pre_n || !loading) return;
     const uint64_t frame = vk_frame_counter(), t0 = SDL_GetTicksNS();
-    const int64_t budget = pre_budget_ns();
-    const bool pressure = vk_residency_pressure(NULL) > 0;
+    if (!loading) stream_report(t0);
+    if (!pre_n || (!loading && !stream_budget_ns())) return;
+    const int64_t budget = loading ? pre_budget_ns() : stream_budget_ns();
+    const uint64_t cap = loading ? ~0ull : stream_cap_bytes();
+    // (tight, not pressure: pressure reads 0 in a residency round's cool-down and once the round's frees answer it on
+    // paper, so pre-uploads would restart in the middle of a shortage, as 346fa0ae for blocks)
+    extern bool vk_residency_tight(void);
+    const bool pressure = vk_residency_tight();
     enum { BATCH = 256 };
     PreEnt take[BATCH];
     int nt = 0;
@@ -172,11 +224,15 @@ void vk_preupload_frame(void) {
         NvnTexture *t = take[k].t;
         const int why = pre_reject(t, pressure);
         if (why) {
-            pre_skipped++;
-            pre_sk[why]++;
+            if (loading) pre_skipped++, pre_sk[why]++;
+            else if (why == SK_IMAGE) st_late++;
+            else st_skip++;
             continue;
         }
+        const uint64_t sz = tegra_total_size(&t->layout);
+        if (done && bytes + sz > cap) break;   // (this frame's share is spent: it and the rest go back)
         if (!pre_settled(&take[k])) {   // (written since the last look: back, looked at again next frame)
+            st_unsettled += !loading;
             take[k].frame = frame;
             pthread_mutex_lock(&pre_mu);
             if (pre_n < pre_cap) pre_q[pre_n++] = take[k];
@@ -187,7 +243,7 @@ void vk_preupload_frame(void) {
         if (b && b->uploaded) {
             b->preuploaded = true;
             done++;
-            bytes += tegra_total_size(&t->layout);
+            bytes += sz;
         }
     }
     if (k < nt) {   // (the budget's leftovers: back for the next frame)
@@ -199,6 +255,12 @@ void vk_preupload_frame(void) {
         pthread_mutex_unlock(&pre_mu);
     }
     if (!done) return;
+    if (!loading) {
+        const uint64_t dt = SDL_GetTicksNS() - t0;
+        st_done += (uint64_t)done; st_bytes += bytes; st_ns += dt; st_frames++;
+        if (dt > st_max_ns) st_max_ns = dt;
+        return;
+    }
     pre_done += (uint64_t)done;
     pre_bytes += bytes;
     pre_load_done += (uint64_t)done;

@@ -1093,6 +1093,11 @@ void vi_present_pace(int interval);   // hle_vi.cpp: blocks for the window's pre
 static volatile uint64_t g_presents;   // TotK: frames presented by the game (scripted input keys on it, hle_hid.cpp)
 uint64_t nvn_present_count(void) { return g_presents; }
 NVN(nvnQueuePresentTexture) {
+    {   // (hle_fs.cpp: this thread's file reads are the ones a frame waits for: the hitch log names them)
+        static _Thread_local bool marked;
+        extern void hle_fs_mark_game_thread(void);
+        if (!marked) { marked = true; hle_fs_mark_game_thread(); }
+    }
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
     if (i >= 0 && i < w->num) {

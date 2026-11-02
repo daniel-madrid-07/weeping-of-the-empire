@@ -219,3 +219,7 @@ void tegra_swizzle(const uint8_t *src, uint8_t *dst, uint32_t wb, uint32_t hb, u
                    uint32_t bh_log2, uint32_t bd_log2) {
     copy_surface(src, dst, wb, hb, d, bpb, bh_log2, bd_log2, false);
 }
+
+uint64_t tegra_block_linear_offset(uint32_t xb, uint32_t y, uint32_t wb, uint32_t bpb, uint32_t bh_log2) {
+    return gob_offset(xb, y, 0, (wb * bpb + 63) / 64, bh_log2, 0, 0);   // (depth 1: the slice term is 0)
+}

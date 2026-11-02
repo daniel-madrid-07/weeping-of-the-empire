@@ -102,6 +102,10 @@ void scan_locked() {
             nxr_mod m;
             m.name = name;
             m.dir = ms::u8(dir);
+            if (dir.parent_path() != ms::from_u8(folder)) {   // (from a collection: its place, for the F10 row)
+                const std::u8string rel = dir.lexically_relative(ms::from_u8(folder)).generic_u8string();
+                m.collection.assign(rel.begin(), rel.end());
+            }
             ms::Found f = ms::scan_mod(dir, kTitle);
             m.romfs = f.romfs.empty() ? "" : ms::u8(f.romfs);
             m.exefs = f.exefs.empty() ? "" : ms::u8(f.exefs);

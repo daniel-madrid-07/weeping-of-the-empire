@@ -299,7 +299,8 @@ inline std::vector<std::string> order(std::vector<std::string> names, const std:
 }
 
 // A RomFS file made for another version of the game: its name has ".Product.<n>." with n not this game's
-// ("/Mals/USen.Product.121.sarc.zs" in a mod for 1.2.1; the 1.0.0 game asks for .Product.100.)
+// ("/Mals/USen.Product.121.sarc.zs" in a mod for 1.2.1; the 1.0.0 game asks for .Product.100.). hle_fs also requires
+// the game itself not to have that file: a later version's RomFS keeps older tags on some files (1.4.3: .140., .110.)
 inline bool other_version(const std::string& rel, const char* ver) {
     for (size_t at = 0; (at = rel.find(".Product.", at)) != std::string::npos; at += 9) {
         size_t a = at + 9, b = a;

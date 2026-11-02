@@ -19,7 +19,7 @@ from pathlib import Path
 from games.totk import patches as P
 from games.totk.patches import __main__ as cli
 
-from . import verify_cloth, verify_fps60, verify_realtime, verify_sites
+from . import verify_camblend, verify_cloth, verify_fps60, verify_realtime, verify_sites
 
 
 def _apply_cli(args):
@@ -103,7 +103,8 @@ def main(argv=None):
     def verifiers():
         original, patched = image_in.read_bytes(), out_img.read_bytes()
         results = [verify_fps60.verify(original, patched), verify_realtime.verify(original, patched),
-                   verify_cloth.verify(original, patched), *verify_sites.verify(original, patched)]
+                   verify_cloth.verify(original, patched), verify_camblend.verify(original, patched),
+                   *verify_sites.verify(original, patched)]
         return dict(status='fail' if any(r['status'] != 'pass' for r in results) else 'pass', results=results)
     step('verifiers', verifiers)
 

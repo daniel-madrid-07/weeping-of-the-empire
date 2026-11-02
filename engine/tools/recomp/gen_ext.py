@@ -2,7 +2,8 @@
 "0x<b>"],...]}: code outside the function's FDE that is part of it. TotK's game patches put veneers in the text padding
 (no FDE), entered by a `b` from the middle of a function and left by a `b` back into it; gen.py would turn both
 branches into call_ind traps. Here the FDE range and its extension ranges are decoded as one body, and branches between
-them are labels.
+them are labels. It may also carry `switch` (see ExtEmitter): switch sites, words chosen at run time (the mods' code
+cheats, switched live in the F10 Cheats tab).
 
 A wrapper, not an edit of gen.py: gen.py is part of every shared game-object key (tools/engine/build.py), so only the
 patched keys that need this pay for it. Functions without `ext` go through gen.py's own code (byte-identical output,
@@ -26,7 +27,7 @@ def shape(fn):
     return hashlib.sha256(ast.dump(tree).encode()).hexdigest()[:16]
 
 
-UPSTREAM = {'function': '1e3da005df9a5e0f', 'tail': 'b06f536b1ecf4910'}   # shape() of the gen.py methods this copies
+UPSTREAM = {'function': 'b97cdeca74c6b20e', 'tail': 'b06f536b1ecf4910'}   # shape() of the gen.py methods this copies
 for name, want in UPSTREAM.items():
     have = shape(getattr(G.Emitter, name))
     if have != want:
@@ -36,12 +37,48 @@ for name, want in UPSTREAM.items():
 class ExtEmitter(G.Emitter):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
+        funcs = json.load(open(sys.argv[2]))
         self.ext = {int(k, 16): [(int(x, 16), int(y, 16)) for x, y in v]
-                    for k, v in json.load(open(sys.argv[2])).get('ext', {}).items()}
+                    for k, v in funcs.get('ext', {}).items()}
+        # `switch` = {"0x<address>": [[<slot>, "<word, hex bytes>"], ...]}: switch sites (the mods' code cheats,
+        # tools/engine/mods_exefs.py): the word of the first alternative whose run-time flag is on
+        # (nxr_code_switch(<slot>): engine/runtime/mods_exefs.cpp, the F10 Cheats tab), else the image's own
+        self.switch = {int(k, 16): [(int(s), bytes.fromhex(w)) for s, w in v] for k, v in funcs.get('switch', {}).items()}
+        self.has_switch = False   # (the function being emitted has switch sites)
         self.ranges = []
 
     def in_function(self, t):
         return any(a <= t < b for (a, b) in self.ranges)
+
+    def abi_dead_ok(self, a, part):
+        """--lso-abi: a function with switch sites keeps x9-x18 and NZCV at every LSO, as one with extension ranges does
+        (abi_scan.py reads the image's words, never an alternative's: a cheat's call may rely on them)"""
+        return not self.has_switch and super().abi_dead_ok(a, part)
+
+    def switch_alts(self, a):
+        """(slot, mnemonic, operands) of each alternative at switch site a"""
+        out = []
+        for slot, word in self.switch[a]:
+            d = list(self.md.disasm_lite(word, a))
+            out.append((slot, d[0][2], d[0][3]) if d else (slot, '.byte', ''))
+        return out
+
+    def switched(self, a, m, o, jt):
+        """a switch site's code: each alternative under its flag, the image's word last. A fused compare (--fcfuse)
+        never reaches across it. An alternative that cannot be lifted stops the build (its cheat would trap)."""
+        parts = []
+        for slot, m2, o2 in self.switch_alts(a):
+            self.fc = None
+            try:
+                code = self.insn(a, m2, o2, None)
+            except (G.Unhandled, ValueError, KeyError, IndexError) as e:
+                sys.exit(f'gen_ext.py: switch site {a:#x}: {m2} {o2} (slot {slot}) cannot be lifted ({e})')
+            parts.append(f'if (nxr_code_switch({slot})) {{ {code} }}')
+        self.fc = None
+        code = self.insn(a, m, o, jt)
+        self.fc = None
+        self.stats['switch_sites'] += 1
+        return ' else '.join(parts) + f' else {{ {code} }}'
 
     def tail(self, t, pc):
         if self.ranges[1:] and self.in_function(t) and t in self.labels:
@@ -50,9 +87,11 @@ class ExtEmitter(G.Emitter):
 
     def function(self, start):
         self.ranges = [(start, start + self.fde[start])] + self.ext.get(start, [])
-        if len(self.ranges) == 1:
+        sites = sorted(s for s in self.switch if self.in_function(s))
+        self.has_switch = bool(sites)
+        if len(self.ranges) == 1 and not sites:
             return super().function(start)
-        # gen.py's Emitter.function, with the extension ranges decoded after the body
+        # gen.py's Emitter.function, with the extension ranges decoded after the body (never --split)
         size = self.fde[start]
         end = start + size
         insns = list(self.md.disasm_lite(self.img[start:end], start))
@@ -86,13 +125,24 @@ class ExtEmitter(G.Emitter):
                     t = G.imm(G.split_ops(o)[-1])
                     if self.in_function(t):
                         labels.add(t)
+        for s in sites:   # (an alternative's branch into the function: a label too)
+            for _, m, o in self.switch_alts(s):
+                if m == 'b' or m.startswith('b.') or m in ('cbz', 'cbnz', 'tbz', 'tbnz'):
+                    t = G.imm(G.split_ops(o)[-1])
+                    if self.in_function(t):
+                        labels.add(t)
         self.labels = labels
         self.fstart, self.fend = start, end
         items = []
         for part, (a0, a1), table in [(insns, (start, end), jt)] + [(p, r, {}) for p, r in zip(ext, self.ranges[1:])]:
             for (a, sz, m, o) in part:
                 try:
-                    code = self.insn(a, m, o, table.get(a))
+                    if a in self.switch:   # (falls through when any of its words does)
+                        code = self.switched(a, m, o, table.get(a))
+                        if any(m2 not in ('ret', 'b', 'br', '.byte') for _, m2, _ in self.switch_alts(a)):
+                            m = 'nop'
+                    else:
+                        code = self.insn(a, m, o, table.get(a))
                 except (G.Unhandled, ValueError, KeyError, IndexError) as e:
                     shape = re.sub(r'\b[xw]\d+\b', 'R', o)
                     shape = re.sub(r'#-?[0-9a-fx.e+]+', '#', shape)
@@ -104,6 +154,9 @@ class ExtEmitter(G.Emitter):
                 self.stats['insns'] += 1
                 items.append((a, code, m not in ('ret', 'b', 'br', '.byte')))
             last = part[-1][2] if part else ''           # fall-through off the end of the body or of a range
+            if part and part[-1][0] in self.switch and \
+                    any(m2 not in ('ret', 'b', 'br', '.byte') for _, m2, _ in self.switch_alts(part[-1][0])):
+                last = 'nop'
             if last not in ('ret', 'b', 'br'):
                 items.append((a1, self.tail(a1, a1), False))
         self.stats['ext_functions'] += 1
@@ -115,6 +168,9 @@ class ExtEmitter(G.Emitter):
             body.append(f'/*{a:x}*/ {code}')
         text = self.prologue(start) + '\n'.join(body)
         FN, ALIAS_FN = G.FN, G.ALIAS_FN
+        # (the switch sites' flags, engine/runtime/mods_exefs.cpp: a declaration line in the function's block, the
+        # form tools/engine/tusplit.py moves to its TU's declarations)
+        decl = 'int nxr_code_switch(unsigned slot);\n' if sites else ''
         # --alias, as in gen.py (another game version: the 1.0.0 name f_<old> forwards here)
         old = self.alias.get(start)
         names = ('',) if start in self.hooks else ('', '_orig')
@@ -124,15 +180,15 @@ class ExtEmitter(G.Emitter):
                       for sfx in names) if old is not None else ''
         hname = f'{ALIAS_FN}{old:x}' if old is not None else f'{FN}{start:x}'
         if start in self.hooks:
-            return (f'void hook_{hname}(Ctx* __restrict c);\n'
+            return decl + (f'void hook_{hname}(Ctx* __restrict c);\n'
                     f'void {FN}{start:x}(Ctx* __restrict c) {{ hook_{hname}(c); }}\n'
                     f'void {hname}_orig(Ctx* __restrict cx) {{\n' + text + '\n}\n' + fwd)
         if start in self.timed:
-            return (f'void {FN}{start:x}_t(Ctx* __restrict cx);\n'
+            return decl + (f'void {FN}{start:x}_t(Ctx* __restrict cx);\n'
                     f'void {FN}{start:x}(Ctx* __restrict cx) {{ u64 t_ = __builtin_ia32_rdtsc(); {FN}{start:x}_t(cx); '
                     f'rt_time(IMGBASE + {start:#x}ull, __builtin_ia32_rdtsc() - t_); }}\n'
                     f'__attribute__((noinline)) void {FN}{start:x}_t(Ctx* __restrict cx) {{\n' + text + '\n}\n' + fwd)
-        return f'void {FN}{start:x}(Ctx* __restrict cx) {{\n' + text + '\n}\n' + fwd
+        return decl + f'void {FN}{start:x}(Ctx* __restrict cx) {{\n' + text + '\n}\n' + fwd
 
 
 G.Emitter = ExtEmitter

@@ -6,7 +6,7 @@
 // game returns nothing), biquad, buffer mixer, delay, reverb / I3DL2 reverb (Freeverb-style approximations), light limiter
 // (TOTK_AUDIO_LIMITER=0 passes it dry). Struct layouts, AdpcmParameter u16[16], AdpcmContext 6 B, BiquadFilterParameter 0xC, PlayState
 // Play 0 / Stop 1 / Pause 2, SampleFormat PcmInt16 2 / PcmFloat 5 / Adpcm 6). Env: TOTK_AUDIO=null (no device, old pacing only),
-// TOTK_AUX=interleaved (default)|planar|bypass, TOTK_AUDIO_LOG=1 (calls), TOTK_AUDIO_LOG=graph (the mix graph with per-mix peaks every 10
+// TOTK_AUX=planar (default)|interleaved|bypass, TOTK_AUDIO_LOG=1 (calls), TOTK_AUDIO_LOG=graph (the mix graph with per-mix peaks every 10
 // s, no call log), TOTK_VOLUME=<0..2> master gain. PC output: TOTK_AUDIO_CHANNELS=auto|2|6|8 (default 2; the game is told 6 channels for
 // 6 and 8 and fills its 5.1 sink), TOTK_AUDIO_LATENCY_MS (queued ahead of the device, default 20), TOTK_AUDIO_FOLLOW (default 1: follow
 // Windows default-device changes; 0 = off; a lost device is reopened either way), TOTK_AUDIO_STALL_MS (default 1000: a device that takes
@@ -19,6 +19,7 @@
 #include <mmreg.h>
 #include <audioclient.h>
 #include <mmdeviceapi.h>
+#include <avrt.h>
 #else
 #include <SDL3/SDL.h>     // Linux: the device sink is an SDL3 audio stream (PipeWire / PulseAudio / ALSA)
 #endif
@@ -50,6 +51,8 @@ constexpr int kMaxCh = 24, kMaxVoiceCh = 6, kFrameMax = 1024;
 std::mutex g_mtx;
 int g_rate = 48000, g_count = 240;
 std::atomic<u64> g_event{0}, g_frames{0}, g_appends{0}, g_releases{0};
+std::atomic<u64> g_updates{0};   // RequestUpdateAudioRenderer calls (the output thread paces its frames on them)
+std::atomic<void*> g_upd_ev{nullptr};   // (HANDLE) set by each RequestUpdateAudioRenderer; made by the output thread
 std::atomic<bool> g_running{false};
 bool g_log = getenv("TOTK_AUDIO_LOG") && strcmp(getenv("TOTK_AUDIO_LOG"), "graph") != 0;
 bool g_graph = getenv("TOTK_AUDIO_LOG") && !strcmp(getenv("TOTK_AUDIO_LOG"), "graph");
@@ -79,7 +82,8 @@ std::mutex g_io_mtx; std::condition_variable g_io_cv;
 std::string g_io_text; std::vector<float> g_io_cap, g_io_stem; std::vector<s32> g_io_aux; FILE* g_io_wav = nullptr; bool g_io_busy = false;
 // TOTK_AUDIO_AUXCAP=<file>: every block the game reads from an aux send (ReadAuxSendBuffer) and writes to its return
 // (WriteAuxReturnBuffer), as records of s32: tag (1 send, 2 return), the aux's mix index, the renderer frame, the sample
-// count n, then n samples (interleaved by the aux's channels). For tools/audio/auxcap.py (the 6-channel divergence).
+// count n, then n samples (in the ring's layout: per renderer frame, one block of 240 per channel; TOTK_AUX=interleaved:
+// interleaved by the aux's channels). For tools/audio/auxcap.py (the 6-channel divergence).
 FILE* g_auxcap = [] { const char* e = getenv("TOTK_AUDIO_AUXCAP"); return e && *e ? fopen(e, "wb") : nullptr; }();
 // TOTK_AUDIO_STEMS=<file>: every mix as one channel (s0 .. s10, then the final mix: the mono sum of its buffers after its
 // effects, before its volume), raw float32 at 48 kHz, frames while the renderer runs. Which sub mix carries music, effects
@@ -142,7 +146,18 @@ int bus_of_submix(int index) {
     }
     return -1;
 }
-int g_aux_mode = [] { const char* e = getenv("TOTK_AUX"); return !e ? 2 : !strcmp(e, "bypass") ? 0 : !strcmp(e, "planar") ? 1 : 2; }();  // default interleaved
+// The aux send / return ring as the console's DSP lays it out: per renderer frame, channel c's n samples at c * n (yuzu
+// and Ryujinx GenerateAuxCommand: write_offset += sample_count per channel, the ring offset advanced by channels x n
+// after the last one; platform/src/audio_mixer.c mix_aux the same). Until 2026-11-02 the default was interleaved
+// (sample i of channel c at i * channels + c, from the upstream import, never measured): the game's reverb then read
+// its channels scrambled and time-chopped, and its return was unscrambled wrongly, a noise that followed the effect
+// input on every sound with reverb (public #18 'crispy' / 'static', #28's steady -54 dBFS floor on the effects bus).
+// TOTK_AUX=interleaved restores it for a bisect.
+int g_aux_mode = [] { const char* e = getenv("TOTK_AUX"); return !e ? 1 : !strcmp(e, "bypass") ? 0 : !strcmp(e, "interleaved") ? 2 : 1; }();
+// A ring over its size drops its oldest samples in whole renderer frames (blk = channels x n), so the reader keeps its
+// place in the per-channel blocks: the send ring of a stereo aux is 4096 samples, not a multiple of a 480-sample frame,
+// and the game writes its return in pieces of its own
+size_t aux_drop(size_t excess, size_t blk) { return blk ? (excess + blk - 1) / blk * blk : excess; }
 std::atomic<int> g_logs{0};
 #define ALOG(...) do { if (g_log && g_logs++ < 3000) printf(__VA_ARGS__); } while (0)
 
@@ -169,7 +184,7 @@ struct Effect {
     std::map<std::string, float> f; std::map<std::string, s64> t; std::map<std::string, int> i;
     u64 buffer = 0, size = 0;
     // aux: host rings of s32 samples
-    std::vector<s32> send, ret; size_t send_w = 0, send_r = 0, ret_w = 0, ret_r = 0; bool returned = false;
+    std::vector<s32> send, ret; size_t send_w = 0, send_r = 0, ret_w = 0, ret_r = 0; bool returned = false, ret_live = false; int ret_need = 2;
     // biquad
     s16 num[3] = {16384, 0, 0}, den[2] = {0, 0}; float bq_s[kMaxCh][2] = {};
     // buffer mixer
@@ -183,13 +198,14 @@ struct Effect {
     // light limiter (on unless TOTK_AUDIO_LIMITER=0): envelope follower and smoothed gain per channel behind a lookahead line
     bool lim_on = false; float lim_det[kMaxCh] = {}, lim_gain[kMaxCh] = {}; std::vector<float> lim_line[kMaxCh]; size_t lim_pos = 0;
     // aux guard: the send's block RMS, peak-held with a -3 dB/s decay; muting, and the frames a mute holds at least
-    float aux_send_pk = 0; bool aux_muting = false; int aux_hold = 0;
+    float aux_send_pk = 0; bool aux_muting = false, aux_heard = false; int aux_hold = 0;   // aux_heard: the send has carried sound
 };
 std::unordered_map<u64, Mix*> g_mixes;
 // level meters (peak since the last [audio] line): raw decoded voice, voice after volume/filters, mixes, device out
 float g_pk_raw = 0, g_pk_voice = 0, g_pk_sub = 0, g_pk_final = 0, g_pk_out = 0; double g_render_us = 0, g_render_max = 0; u64 g_render_n = 0;
-u64 g_starved = 0, g_nodest = 0, g_aux_wild = 0, g_aux_muted = 0, g_overs = 0;
-u64 g_dry = 0, g_cap_dropped = 0; double g_wake_max = 0;   // device found empty at a wake; longest gap between wakes (ms); capture frames dropped
+u64 g_starved = 0, g_nodest = 0, g_aux_wild = 0, g_aux_muted = 0, g_aux_late = 0, g_overs = 0;
+u64 g_paced = 0, g_pace_late = 0; double g_pace_max = 0;   // frames that waited for the game's update; waits that ran out; the longest (ms)
+u64 g_dry = 0, g_low = 0, g_cap_dropped = 0; double g_wake_max = 0, g_pad_min_ms = 1e9;   // device found empty at a wake; under a renderer frame queued at a wake (a click risk); longest gap between wakes (ms); the least queued at a wake (ms); capture frames dropped
 float peak(const float* x, int n) { float p = 0; for (int i = 0; i < n; i++) p = std::max(p, std::fabs(x[i])); return p; }
 std::unordered_map<u64, Splitter> g_splitters;
 std::unordered_map<u64, Effect> g_effects;
@@ -220,6 +236,21 @@ Mix* mix_get(u64 a, bool final) {
 struct WaveBuf {
     u64 guest; u64 data, size; s32 start, end; bool loop, eos; u64 ctx, ctx_size; bool sent;
 };
+// Decoded samples not yet consumed, oldest first: a vector and the index of its first live entry. A std::deque<float>
+// (MSVC: a heap block every 4 floats) plus a new deque per voice channel per frame for the samples kept was an
+// allocation storm on the mixer thread, which holds g_mtx meanwhile.
+struct SampleFifo {
+    std::vector<float> b;
+    size_t h = 0;
+    bool empty() const { return h == b.size(); }
+    float pop() { return b[h++]; }
+    void clear() { b.clear(); h = 0; }
+    void put_front(const float* p, size_t n) {   // p[0..n) before the live entries
+        if (empty()) b.assign(p, p + n), h = 0;
+        else if (n <= h) h -= n, std::copy(p, p + n, b.begin() + h);
+        else b.insert(b.begin() + h, p, p + n);
+    }
+};
 struct Voice {
     int rate = 48000, nch = 1, fmt = 2, prio = 0;
     int state = 1, pending_state = 1;      // PlayState: 0 play, 1 stop, 2 pause
@@ -232,7 +263,7 @@ struct Voice {
     std::deque<WaveBuf> done;              // finished by the mixer, not yet published (g_rel_snapshot)
     s32 cur = -1;                          // sample cursor in pending.front() (-1: not started)
     s16 hist1 = 0, hist2 = 0;              // ADPCM history
-    std::deque<float> look[kMaxVoiceCh];   // decoded but not yet consumed
+    SampleFifo look[kMaxVoiceCh];          // decoded but not yet consumed
     float prevs[kMaxVoiceCh] = {};          // sample before the current position
     double frac = 0;
     u64 played = 0;                        // the mixer's count
@@ -296,13 +327,20 @@ void voice_render(Voice& v, int n, float out[][kFrameMax]) {
     int have = 0;
     for (; have < need; have++) {
         bool got;
-        if (!v.look[0].empty()) { for (int c = 0; c < v.nch; c++) { s[c] = v.look[c].front(); v.look[c].pop_front(); } got = true; }
+        if (!v.look[0].empty()) { for (int c = 0; c < v.nch; c++) s[c] = v.look[c].pop(); got = true; }
         else got = next_sample(v, s);
         if (!got) break;
         for (int c = 0; c < v.nch; c++) T[c][have + 1] = s[c];
     }
     if (have < need && !v.pending.empty()) g_starved++;
-    for (int c = 0; c < v.nch; c++) { for (int k = 0; k < have; k++) g_pk_raw = std::max(g_pk_raw, std::fabs(T[c][k + 1])); for (int k = have; k < need; k++) T[c][k + 1] = 0; }
+    // past the last decoded sample (the voice starved, or its buffers ended): a 2 ms fade from that sample to silence
+    // instead of a step to 0, which clicks (a voice starving frame after frame on a busy PC crackles: public issue #18)
+    constexpr int kTail = 96;
+    for (int c = 0; c < v.nch; c++) {
+        for (int k = 0; k < have; k++) g_pk_raw = std::max(g_pk_raw, std::fabs(T[c][k + 1]));
+        const float last = T[c][have];   // (T[c][0] = the sample before this frame when nothing was decoded)
+        for (int k = have; k < need; k++) T[c][k + 1] = k - have < kTail ? last * (1.f - (float)(k - have + 1) / kTail) : 0.f;
+    }
     for (int c = 0; c < v.nch; c++) {
         const float* t = T[c].data();
         for (int i = 0; i < n; i++) {
@@ -314,9 +352,7 @@ void voice_render(Voice& v, int n, float out[][kFrameMax]) {
     // keep decoded-but-unconsumed samples (positions adv..have-1) and the sample before the new position
     for (int c = 0; c < v.nch; c++) {
         v.prevs[c] = adv >= 1 && adv <= have ? T[c][adv] : (adv == 0 ? v.prevs[c] : 0);
-        std::deque<float> keep;
-        for (int k = adv; k < have; k++) keep.push_back(T[c][k + 1]);
-        v.look[c].insert(v.look[c].begin(), keep.begin(), keep.end());
+        if (adv < have) v.look[c].put_front(T[c].data() + adv + 1, (size_t)(have - adv));
     }
     // biquads
     for (int b = 0; b < 2; b++) {
@@ -374,24 +410,51 @@ void effect_run(Effect& e, Mix* m, int n) {
     case E_AUX: {
         if (g_aux_mode == 0 || e.send.empty()) { copy_through(); return; }
         size_t cap = e.send.size();
+        // (a channel's samples sit every st entries of the ring: planar, 1, from channel k's block at k * n (the console's
+        // layout, the default), or interleaved, st = count; the ring index is stepped and wrapped instead of a division
+        // per sample)
+        const size_t st = g_aux_mode == 2 ? (size_t)e.count : 1;
         double send_e = 0;
         for (int k = 0; k < e.count; k++) {                         // send: planar blocks of n samples per channel
             int a = e.in[k]; if (a < 0 || a >= m->nbuf) continue;
+            size_t j = (g_aux_mode == 2 ? e.send_w + k : e.send_w + (size_t)k * n) % cap;
             for (int i = 0; i < n; i++) {
-                size_t idx = g_aux_mode == 2 ? e.send_w + (size_t)i * e.count + k : e.send_w + (size_t)k * n + i;
                 float x = m->buf[a][i]; x = x > 1 ? 1 : x < -1 ? -1 : x;
-                e.send[idx % cap] = (s32)(x * 32767.0f);             // 16-bit range in s32, like the DSP mix buffers (yuzu)
+                e.send[j] = (s32)(x * 32767.0f);                    // 16-bit range in s32, like the DSP mix buffers (yuzu)
                 send_e += (double)x * x;
+                for (j += st; j >= cap;) j -= cap;
             }
         }
         const float send_rms = e.count ? (float)std::sqrt(send_e / ((double)e.count * n)) : 0.f;
         e.aux_send_pk = std::max(send_rms, e.aux_send_pk * std::pow(10.0f, -3.0f / 20.0f * n / g_rate));
+        e.aux_heard = e.aux_heard || send_rms > 1e-6f;   // (above -120 dBFS)
         e.send_w += (size_t)e.count * n;
-        if (e.send_w - e.send_r > cap) e.send_r = e.send_w - cap;  // reader too slow: drop oldest
-        size_t avail = e.ret_w - e.ret_r;
-        if (e.returned && avail >= (size_t)e.count * n) {
+        if (e.send_w - e.send_r > cap) e.send_r += aux_drop(e.send_w - e.send_r - cap, (size_t)e.count * n);  // reader too slow: drop oldest
+        // The return: the game's DSP writes it on its own thread after reading the send, in bursts (its pump takes all the
+        // waiting blocks once a game frame: ~7 blocks at 30 fps), so it reaches us a frame or more later. Until the game has
+        // returned anything the effect passes its input through (bypass). Then it plays one block a frame once ret_need
+        // blocks wait; a block the game has not written yet plays as silence (as the DSP's own return read zero-fills) and
+        // raises ret_need by one (up to 16 = 80 ms of slack: the reverb's return a little later, never chopped), refilling
+        // first. Before 2026-11-02 a late block passed the dry input through instead: blocks alternating between the dry
+        // send and the wet return, a buzz at the block rate on the effects bus that followed the Effects slider and grew
+        // with a sword swing (public #28; likely #18's 'crispy' sound at 60 / 30 fps)
+        const size_t avail = e.ret_w - e.ret_r, blk = (size_t)e.count * n;
+        if (e.returned && !e.ret_live && avail >= (size_t)e.ret_need * blk) e.ret_live = true;
+        if (e.returned && (!e.ret_live || avail < blk)) {
+            if (e.ret_live) {
+                g_aux_late++; e.ret_live = false;
+                if (e.ret_need < 16) {
+                    e.ret_need++;
+                    static int told = 0;
+                    if (told++ < 12) rt_log("[audio] aux on mix s%d: a return block came late: %d blocks of slack now\n", m->index, e.ret_need);
+                }
+            }
+            for (int k = 0; k < e.count; k++) { int b = e.out[k]; if (b >= 0 && b < m->nbuf) memset(m->buf[b], 0, n * sizeof(float)); }
+            return;
+        }
+        if (e.ret_live && avail >= blk) {
             size_t rc = e.ret.size();
-            auto at = [&](int k, int i) { return e.ret[(g_aux_mode == 2 ? e.ret_r + (size_t)i * e.count + k : e.ret_r + (size_t)k * n + i) % rc]; };
+            auto first = [&](int k) { return (g_aux_mode == 2 ? e.ret_r + k : e.ret_r + (size_t)k * n) % rc; };   // (channel k's sample 0)
             // Guard: a returned block is muted, not mixed, when (1) any sample is beyond +-2^17 (4x the 16-bit full scale the
             // send is clamped to; w2 had returns of 0x80000000), or (2) its RMS is over 4x (+12 dB) the send's peak-held RMS
             // (-3 dB/s decay: slower than any reverb tail, which never exceeds its input) plus -50 dBFS. A mute holds at
@@ -400,9 +463,10 @@ void effect_run(Effect& e, Mix* m, int n) {
             // audio_c6 / audio_g6 (TOTK_AUDIO_CHANNELS=6): the game's DSP on s4 diverges from ~60 s, growing inside full
             // scale for ~15 s (10 s RMS -11.8 dBFS, against -40 for the game's sends) before any sample passes 2^17.
             u64 wild = 0; double ret_e = 0;
-            for (int k = 0; k < e.count; k++) for (int i = 0; i < n; i++) {
-                s32 r = at(k, i); wild += r > (1 << 17) || r < -(1 << 17);
+            for (int k = 0; k < e.count; k++) for (size_t i = 0, j = first(k); i < (size_t)n; i++) {
+                s32 r = e.ret[j]; wild += r > (1 << 17) || r < -(1 << 17);
                 const double v = r * (1.0 / 32768.0); ret_e += v * v;
+                for (j += st; j >= rc;) j -= rc;
             }
             const float ret_rms = e.count ? (float)std::sqrt(ret_e / ((double)e.count * n)) : 0.f;
             const bool hot = ret_rms > 4.0f * e.aux_send_pk + 0.00316f;
@@ -419,11 +483,16 @@ void effect_run(Effect& e, Mix* m, int n) {
                 if (n_back++ < 12) rt_log("[audio] aux on mix s%d back in range at frame %llu: unmuted\n", m->index, (unsigned long long)g_frames.load());
             }
             g_aux_wild += wild;
-            const bool mute = e.aux_muting;
+            // until the send has carried any sound, a return can only be the game's DSP state from before it was
+            // cleared: played as silence, the guard's thresholds aside
+            const bool mute = e.aux_muting || !e.aux_heard;
             if (mute) { if (e.aux_hold > 0) e.aux_hold--; g_aux_muted++; }
             for (int k = 0; k < e.count; k++) {
                 int b = e.out[k]; if (b < 0 || b >= m->nbuf) continue;
-                for (int i = 0; i < n; i++) m->buf[b][i] = mute ? 0.0f : at(k, i) * (1.0f / 32768.0f);
+                for (size_t i = 0, j = first(k); i < (size_t)n; i++) {
+                    m->buf[b][i] = mute ? 0.0f : e.ret[j] * (1.0f / 32768.0f);
+                    for (j += st; j >= rc;) j -= rc;
+                }
             }
             e.ret_r += (size_t)e.count * n;
         } else copy_through();
@@ -453,13 +522,13 @@ void effect_run(Effect& e, Mix* m, int n) {
         for (int k = 0; k < e.count; k++) {
             int a = e.in[k], b = e.out[k]; if (a < 0 || b < 0 || a >= m->nbuf || b >= m->nbuf) continue;
             auto& L = e.line[k]; if (L.size() != len) L.assign(len, 0.f);
-            size_t p = e.pos;
+            size_t p = e.pos % len;   // (the line position, stepped and wrapped: no division per sample)
             for (int i = 0; i < n; i++) {
-                float x = m->buf[a][i], d = L[p % len];
+                float x = m->buf[a][i], d = L[p];
                 e.lp[k] = d * (1 - lpa) + e.lp[k] * lpa;
-                L[p % len] = x * in_g + e.lp[k] * fb;
+                L[p] = x * in_g + e.lp[k] * fb;
                 m->buf[b][i] = x * dry + d;
-                p++;
+                if (++p == len) p = 0;
             }
         }
         e.pos += n;
@@ -496,6 +565,11 @@ void effect_run(Effect& e, Mix* m, int n) {
             }
         }
         static const float tap_t[4] = {1.0f, 1.37f, 1.73f, 2.21f}, tap_g[4] = {0.8f, 0.6f, 0.45f, 0.3f};
+        // (the predelay line's read offsets, the same each sample: v % plen for any v without a division when v < 2 plen,
+        // which P.i < plen and offsets <= plen keep)
+        size_t tap_o[4];
+        for (int q = 0; q < 4; q++) tap_o[q] = plen - std::min(plen - 1, (size_t)(ed * tap_t[q]));
+        auto wrap = [plen](size_t v) { return v < plen ? v : v < 2 * plen ? v - plen : v % plen; };
         for (int k = 0; k < e.count; k++) {
             int a = e.in[k], b = e.out[k]; if (a < 0 || b < 0 || a >= m->nbuf || b >= m->nbuf) continue;
             auto& L = (*e.verb)[k];
@@ -506,9 +580,9 @@ void effect_run(Effect& e, Mix* m, int n) {
                 float x = m->buf[a][i];
                 P.b[P.i] = x;
                 float er = 0;
-                for (int q = 0; q < 4; q++) er += tap_g[q] * P.b[(P.i + plen - std::min(plen - 1, (size_t)(ed * tap_t[q]))) % plen];
-                float in = P.b[(P.i + plen - ld) % plen] * 0.015f;
-                P.i = (P.i + 1) % plen;
+                for (int q = 0; q < 4; q++) er += tap_g[q] * P.b[wrap(P.i + tap_o[q])];
+                float in = P.b[wrap(P.i + plen - ld)] * 0.015f;
+                P.i = wrap(P.i + 1);
                 float acc = 0;
                 for (int j = 0; j < 8; j++) {
                     auto& c = L[j]; float y = c.b[c.i];
@@ -552,13 +626,14 @@ void effect_run(Effect& e, Mix* m, int n) {
             int a = e.in[k], b = e.out[k]; if (a < 0 || b < 0 || a >= m->nbuf || b >= m->nbuf) continue;
             auto& L = e.lim_line[k]; if (L.size() != len) L.assign(len, 0.f);
             float det = e.lim_det[k], gain = e.lim_gain[k];
-            size_t p = e.lim_pos;
+            size_t p = e.lim_pos % len;   // (stepped and wrapped, as the delay's)
             for (int i = 0; i < n; i++) {
                 float x = m->buf[a][i] * gin, lvl = std::fabs(x);
                 det += (lvl > det ? ca : cr) * (lvl - det);
                 float att = det > thr ? thr / det : 1.0f;
                 gain += (gain > att ? ca : cr) * (att - gain);
-                float& slot = L[p++ % len]; float y = slot; slot = x;
+                float& slot = L[p]; float y = slot; slot = x;
+                if (++p == len) p = 0;
                 m->buf[b][i] = y * gain * gout;
             }
             e.lim_det[k] = det; e.lim_gain[k] = gain;
@@ -764,13 +839,16 @@ void frame_done() {
         static double t_prev = 0; static u64 f_prev = 0;
         double now = qpc_s();
         if (t_prev > 0 && now > t_prev)
-            rt_log("[audio]   clock: %.1f Hz over %.2f s wall | out %d ch, queue %u frames, device opened %d x | overs %llu, wild aux returns %llu (%llu blocks muted) | dry %llu, longest wake %.1f ms\n",
+            rt_log("[audio]   clock: %.1f Hz over %.2f s wall | out %d ch, queue %u frames, device opened %d x | overs %llu, wild aux returns %llu (%llu blocks muted, %llu late) | dry %llu, low %llu, least queued %.1f ms, longest wake %.1f ms | paced %llu (%llu late, %.1f ms max)\n",
                    (double)(g_frames.load() - f_prev) * g_count / (now - t_prev), now - t_prev, g_out_ch.load(), g_out_target.load(), g_dev_opens.load(),
-                   (unsigned long long)g_overs, (unsigned long long)g_aux_wild, (unsigned long long)g_aux_muted, (unsigned long long)g_dry, g_wake_max);
+                   (unsigned long long)g_overs, (unsigned long long)g_aux_wild, (unsigned long long)g_aux_muted, (unsigned long long)g_aux_late, (unsigned long long)g_dry,
+                   (unsigned long long)g_low, g_pad_min_ms < 1e8 ? g_pad_min_ms : 0.0, g_wake_max,
+                   (unsigned long long)g_paced, (unsigned long long)g_pace_late, g_pace_max);
         t_prev = now; f_prev = g_frames.load();
         if (g_graph) graph_log();
         g_pk_raw = g_pk_voice = g_pk_sub = g_pk_final = g_pk_out = 0; g_render_us = g_render_max = 0; g_render_n = 0; g_starved = g_nodest = 0;
-        g_overs = g_aux_wild = g_aux_muted = g_dry = 0; g_wake_max = 0;
+        g_overs = g_aux_wild = g_aux_muted = g_aux_late = g_dry = g_low = 0; g_wake_max = 0; g_pad_min_ms = 1e9;
+        g_paced = g_pace_late = 0; g_pace_max = 0;
     }
 }
 
@@ -847,6 +925,18 @@ int mix_format(IAudioClient* ac, DWORD* mask) {
     }
     return n;
 }
+// The endpoint's own mix format, for the log: Windows converts our 48 kHz float to it (a 44.1 / 96 / 192 kHz device goes
+// through its resampler; a crackle report needs to say which)
+std::string mix_desc(IAudioClient* ac) {
+    WAVEFORMATEX* mf = nullptr; char b[96] = "unknown";
+    if (SUCCEEDED(ac->GetMixFormat(&mf)) && mf) {
+        const bool fl = mf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT || (mf->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mf->cbSize >= 22 &&
+                        ((const WAVEFORMATEXTENSIBLE*)mf)->SubFormat.Data1 == WAVE_FORMAT_IEEE_FLOAT);
+        snprintf(b, sizeof b, "%lu Hz %d-bit %s %d ch", (unsigned long)mf->nSamplesPerSec, mf->wBitsPerSample, fl ? "float" : "PCM", mf->nChannels);
+        CoTaskMemFree(mf);
+    }
+    return b;
+}
 // The game asks for the channel count before the output thread has a device; this opens the default endpoint once to see.
 int device_channels() {
     HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -859,6 +949,21 @@ int device_channels() {
     if (SUCCEEDED(ci)) CoUninitialize();
     return n;
 }
+// a Bluetooth endpoint (A2DP or hands-free): its enumerator, BTHENUM / BTHHFENUM / BTHLEDevice...
+bool device_bluetooth(IMMDevice* dev) {
+    static const PROPERTYKEY kEnum = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 24};   // PKEY_Device_EnumeratorName
+    bool bt = false;
+    IPropertyStore* ps = nullptr;
+    if (dev && SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) {
+        PROPVARIANT v; PropVariantInit(&v);
+        if (SUCCEEDED(ps->GetValue(kEnum, &v)) && v.vt == VT_LPWSTR && v.pwszVal) bt = _wcsnicmp(v.pwszVal, L"BTH", 3) == 0;
+        PropVariantClear(&v); ps->Release();
+    }
+    return bt;
+}
+std::mutex g_dev_id_mtx;
+std::wstring g_dev_id;                  // the open endpoint's id (its format-change notices reopen it)
+std::atomic<bool> g_fmt_changed{false};
 std::string device_name(IMMDevice* dev) {
     static const PROPERTYKEY kName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};   // PKEY_Device_FriendlyName
     std::string out = "?";
@@ -873,7 +978,7 @@ std::string device_name(IMMDevice* dev) {
     }
     return out;
 }
-struct Dev { IMMDevice* dev = nullptr; IAudioClient* ac = nullptr; IAudioRenderClient* rc = nullptr; UINT32 bufn = 0, target = 0; int ch = 2; };
+struct Dev { IMMDevice* dev = nullptr; IAudioClient* ac = nullptr; IAudioRenderClient* rc = nullptr; UINT32 bufn = 0, target = 0, target0 = 0, floor = 0, period_n = 0; double bad_t = 0, ease_t = 0; int ch = 2; };   // target0: the open-time queue; floor: what low wakes found (never eased); bad_t: the last stall
 void dev_close(Dev& d) {
     if (d.ac) d.ac->Stop();
     if (d.rc) d.rc->Release(); if (d.ac) d.ac->Release(); if (d.dev) d.dev->Release();
@@ -896,8 +1001,10 @@ HRESULT dev_open(IMMDeviceEnumerator* en, HANDLE ev, Dev& d, bool quiet) {
     wf.Format.wBitsPerSample = 32; wf.Format.nBlockAlign = (WORD)(4 * d.ch); wf.Format.nAvgBytesPerSec = (DWORD)g_rate * 4 * d.ch; wf.Format.cbSize = 22;
     static const GUID kFloat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};   // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
     wf.Samples.wValidBitsPerSample = 32; wf.dwChannelMask = mask; wf.SubFormat = kFloat;
-    // the device buffer holds twice the queue (40 ms at the default 20 ms, as before)
-    const REFERENCE_TIME dur = std::max<REFERENCE_TIME>(400000, (REFERENCE_TIME)latency_ms * 20000);
+    // the device buffer: room for the queue to grow (a low wake adds a renderer frame up to it, public issue #18): 120 ms or
+    // twice the queue; only the queue (target) sets the latency, the buffer's unused part costs nothing
+    const bool bt = device_bluetooth(d.dev);
+    const REFERENCE_TIME dur = std::max<REFERENCE_TIME>(1200000, (REFERENCE_TIME)latency_ms * 20000);
     if (SUCCEEDED(hr)) hr = d.ac->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
                                              dur, 0, &wf.Format, nullptr);
     if (SUCCEEDED(hr)) hr = d.ac->SetEventHandle(ev);
@@ -914,16 +1021,39 @@ HRESULT dev_open(IMMDeviceEnumerator* en, HANDLE ev, Dev& d, bool quiet) {
     // queue: the latency setting, but at least one device period plus a renderer frame (the event comes once a period)
     const UINT32 floor_n = (UINT32)(period * g_rate / 10000000) + (UINT32)g_count;
     d.target = std::min<UINT32>(d.bufn, std::max<UINT32>(floor_n, (UINT32)((s64)g_rate * latency_ms / 1000)));
+    // a Bluetooth endpoint takes audio in bursts (its own radio buffering behind the shared engine): it starts at 60 ms
+    // instead of finding that margin through clicks (a Reddit report on #18: crackling with a BT headset at any frame rate)
+    if (bt) d.target = std::min<UINT32>(d.bufn - (UINT32)g_count, std::max<UINT32>(d.target, (UINT32)(g_rate * 60 / 1000)));
+    {
+        LPWSTR id = nullptr;
+        std::lock_guard<std::mutex> l(g_dev_id_mtx);
+        g_dev_id.clear();
+        if (SUCCEEDED(d.dev->GetId(&id)) && id) { g_dev_id = id; CoTaskMemFree(id); }
+    }
     g_out_ch = d.ch; g_out_target = d.target; g_dev_opens++;
     set_game_channels(d.ch);
-    printf("[audio] WASAPI: %s, %d Hz float %d ch (mask %lx; device mix %d ch, mask %lx), device buffer %u frames (%.1f ms), period %.1f ms, "
-           "queue %u frames (%.1f ms), renderer frame %d samples\n", device_name(d.dev).c_str(), g_rate, d.ch, (unsigned long)mask, dev_ch,
+    d.period_n = (UINT32)(period * g_rate / 10000000);
+    d.target0 = d.floor = d.target;
+    printf("[audio] WASAPI: %s%s, %d Hz float %d ch (mask %lx; device mix %s, mask %lx), device buffer %u frames (%.1f ms), period %.1f ms, "
+           "queue %u frames (%.1f ms), renderer frame %d samples\n", device_name(d.dev).c_str(), bt ? " (Bluetooth)" : "", g_rate, d.ch, (unsigned long)mask, mix_desc(d.ac).c_str(),
            (unsigned long)dev_mask, d.bufn, d.bufn * 1000.0 / g_rate, period / 10000.0, d.target, d.target * 1000.0 / g_rate, g_count);
     return S_OK;
 }
 // TOTK_AUDIO_FOLLOW: Windows calls this when the default device changes (headphones plugged in, a USB DAC, the user's choice)
 std::atomic<bool> g_dev_changed{false};
 HANDLE g_dev_wake = nullptr;
+// The output thread's wait for the game's next RequestUpdateAudioRenderer (g_updates past upd_prev), at most budget_ms;
+// returns the ms waited. Bounded by a high-resolution timer: the process keeps the default timer resolution, so a wait's
+// own timeout could round up to 15.6 ms, past what the device holds
+double pace_wait(HANDLE timer, u64 upd_prev, double budget_ms) {
+    const double t0 = qpc_s();
+    LARGE_INTEGER due; due.QuadPart = -(LONGLONG)(budget_ms * 10000);
+    const HANDLE hs[2] = {(HANDLE)g_upd_ev.load(), timer};
+    if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+        while (g_updates.load() == upd_prev && WaitForMultipleObjects(2, hs, FALSE, INFINITE) == WAIT_OBJECT_0) {}   // (a set left from an earlier update: wait again)
+    CancelWaitableTimer(timer);
+    return (qpc_s() - t0) * 1000;
+}
 struct DevNotify final : IMMNotificationClient {
     ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
     ULONG STDMETHODCALLTYPE Release() override { return 1; }   // static lifetime
@@ -938,7 +1068,16 @@ struct DevNotify final : IMMNotificationClient {
     HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+    // the open endpoint's own format changed (a Bluetooth headset going to hands-free at 16 kHz when a mic opens, a new
+    // rate in Windows' sound settings): a clean reopen at the new format instead of a stream converted on the fly
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR id, const PROPERTYKEY key) override {
+        static const PROPERTYKEY kFmt = {{0xf19f064d, 0x082c, 0x4e27, {0xbc, 0x73, 0x68, 0x82, 0xa1, 0xbb, 0x8e, 0x4c}}, 0};   // PKEY_AudioEngine_DeviceFormat
+        if (id && key.fmtid == kFmt.fmtid && key.pid == kFmt.pid) {
+            std::lock_guard<std::mutex> l(g_dev_id_mtx);
+            if (!g_dev_id.empty() && !_wcsicmp(id, g_dev_id.c_str())) { g_fmt_changed = true; if (g_dev_wake) SetEvent(g_dev_wake); }
+        }
+        return S_OK;
+    }
 };
 void output_thread() {
     if (getenv("TOTK_AUDIO") && !strcmp(getenv("TOTK_AUDIO"), "null")) { printf("[audio] TOTK_AUDIO=null: no device\n"); null_ticker(); return; }
@@ -955,6 +1094,11 @@ void output_thread() {
     if (SUCCEEDED(hr)) hr = dev_open(en, ev, d, false);
     if (FAILED(hr) && (!cfg.follow || !en)) { printf("[audio] WASAPI init failed (hr %08lx): no sound, null pacing\n", (unsigned long)hr); null_ticker(); return; }
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    // MMCSS ("Pro Audio"): Windows' scheduler for audio threads, which keeps them running when every core is busy (a
+    // fast PC with the frame rate unlocked; public issue #18, static on most sounds). Without the service: as before.
+    DWORD mm_task = 0;
+    const HANDLE mm = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mm_task);
+    printf("[audio] output thread: MMCSS %s\n", mm ? "Pro Audio" : "not available");
     std::vector<float> scratch((size_t)kFrameMax * 8);
     const auto period = std::chrono::nanoseconds((s64)g_count * 1000000000ll / g_rate);
     auto next = std::chrono::steady_clock::now(), retry = next;
@@ -965,6 +1109,10 @@ void output_thread() {
     static const auto stall = std::chrono::milliseconds(std::max(0, env_int("TOTK_AUDIO_STALL_MS", 1000)));
     auto t_fed = std::chrono::steady_clock::now();
     IAudioClient* fed_ac = nullptr;   // (the device t_fed belongs to: a new one starts its own count)
+    static const bool pace = env_int("TOTK_AUDIO_PACE", 1) != 0;
+    g_upd_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    const HANDLE pace_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    u64 upd_prev = g_updates.load();   // the game's update count when the last frame was rendered
     for (;;) {
         if (!d.ac) {
             // no device (lost, stalled or none yet): the renderer runs on the wall clock (the game's audio thread keeps its
@@ -982,11 +1130,12 @@ void output_thread() {
         }
         WaitForSingleObject(ev, 20);
         const double t_now = qpc_s();
-        if (primed) g_wake_max = std::max(g_wake_max, (t_now - t_wake) * 1000);
+        const double gap_ms = primed ? (t_now - t_wake) * 1000 : 0;   // (since the last wake: the period, unless something stalled)
+        if (primed) g_wake_max = std::max(g_wake_max, gap_ms);
         t_wake = t_now;
-        const bool changed = cfg.follow && g_dev_changed.exchange(false), asked = g_reopen.exchange(false);
-        if (changed || asked) {
-            printf("[audio] %s: reopening\n", changed ? "default device changed" : "output settings changed");
+        const bool changed = cfg.follow && g_dev_changed.exchange(false), asked = g_reopen.exchange(false), fmt = g_fmt_changed.exchange(false);
+        if (changed || asked || fmt) {
+            printf("[audio] %s: reopening\n", changed ? "default device changed" : fmt ? "the device's format changed" : "output settings changed");
             dev_close(d); primed = false; fed_ac = nullptr;
             if (SUCCEEDED(dev_open(en, ev, d, false))) last_ch = d.ch;
             else { printf("[audio] no device: wall-clock pacing until one comes back\n"); next = retry = std::chrono::steady_clock::now(); }
@@ -1003,9 +1152,74 @@ void output_thread() {
             continue;
         }
         if (primed && pad == 0) g_dry++;
+        if (primed) {
+            g_pad_min_ms = std::min(g_pad_min_ms, pad * 1000.0 / g_rate);
+            // under a renderer frame (5 ms) queued at a wake: the device may run dry before the next one (a click). The
+            // queue then grows by a frame, up to the device buffer (eased back after 30 quiet seconds, below; public issue
+            // #18; TOTK_AUDIO_LATENCY_MS still sets where it starts)
+            // (a wake that ends a stall finds the queue drained by the stall itself, not by this PC's floor: the stall rule
+            //  below covers it, and the never-eased floor is not raised, else each hiccup would add 5 ms for the session)
+            const double period_ms = d.period_n * 1000.0 / g_rate;
+            const bool stalled = gap_ms > 2 * period_ms + 5;
+            if (pad < (UINT32)g_count && !stalled) {
+                g_low++;
+                if (d.target + (UINT32)g_count <= d.bufn - (UINT32)g_count) {
+                    d.target += (UINT32)g_count; g_out_target = d.target; d.floor = std::max(d.floor, d.target);
+                    static int told;
+                    if (told++ < 12)
+                        rt_log("[audio] the queue ran low (%.1f ms left at a wake): now %u frames (%.1f ms)\n", pad * 1000.0 / g_rate,
+                               d.target, d.target * 1000.0 / g_rate);
+                }
+            }
+            // a stall: a wake far behind the period (the renderer waited on the game's side of the audio lock, or the PC
+            // paged; a #18 log: longest wake 49-56 ms against a 20 ms queue, the clock at 47.6 kHz). The queue then covers
+            // that stall at once instead of 5 ms per low wake, up to the device buffer
+            if (stalled && gap_ms < 2000) {   // (minutes: a laptop waking up, not load)
+                d.bad_t = t_now;
+                UINT32 want = (UINT32)((gap_ms + period_ms) * g_rate / 1000);
+                want = std::min<UINT32>((want + (UINT32)g_count - 1) / (UINT32)g_count * (UINT32)g_count, d.bufn - (UINT32)g_count);
+                if (want > d.target) {
+                    d.target = want; g_out_target = want;
+                    static int told_stall;
+                    if (told_stall++ < 12)
+                        rt_log("[audio] a %.0f ms stall between wakes: the queue now %u frames (%.1f ms)\n", gap_ms, d.target, d.target * 1000.0 / g_rate);
+                }
+            }
+            // easing back: after 30 s without a stall, a renderer frame less every 5 s down to the floor (the open-time queue,
+            // raised only by low wakes: that part this PC needs and keeps), so one hiccup (an alt-tab, a compile hitch) does
+            // not leave the sound ~0.1 s behind the picture for the session; a PC that keeps stalling (the #18 logs: every
+            // few 10 s windows) stays up
+            if (d.target > d.floor && t_now - d.bad_t > 30 && t_now - d.ease_t > 5) {
+                d.ease_t = t_now;
+                d.target = std::max<UINT32>(d.floor, d.target - (UINT32)g_count); g_out_target = d.target;
+                static int told_ease;
+                if (d.target == d.floor && told_ease++ < 12)
+                    rt_log("[audio] 30 s without a stall: the queue back at %u frames (%.1f ms)\n", d.target, d.target * 1000.0 / g_rate);
+            }
+        }
         const auto now = std::chrono::steady_clock::now();
         if (fed_ac != d.ac) fed_ac = d.ac, t_fed = now;
+        double t_pad = t_now;   // (when pad was read from the device)
         while (pad + (UINT32)g_count <= d.target) {
+            // Pacing: the console's DSP renders one frame per update of the game's, and a wave buffer the game appends
+            // plays only from its next RequestUpdateAudioRenderer. Frames rendered back to back (two a 10 ms wake, more
+            // after a stall or with a longer device period) gave the game no update between them, so a voice whose
+            // committed buffers ran out inside the run starved although the next one was queued (a 2 ms fade, still a
+            // click: public #18's 'starved' counts), and its aux pump fell behind. So, before a frame with no update
+            // since the last one, wait for the game's update up to 3 ms, while the device still holds over 4 ms past
+            // the wait; a device near empty is filled at once, as before (TOTK_AUDIO_PACE=0: never wait)
+            if (pace && g_upd_ev.load() && pace_timer && g_running.load() && !oe_host_paused() && g_updates.load() == upd_prev) {
+                const double t0 = qpc_s(), left_ms = pad * 1000.0 / g_rate - (t0 - t_pad) * 1000, budget = std::min(3.0, left_ms - 4);
+                if (budget > 0.2) {
+                    const double waited = pace_wait(pace_timer, upd_prev, budget);
+                    g_paced++; g_pace_late += g_updates.load() == upd_prev; g_pace_max = std::max(g_pace_max, waited);
+                    UINT32 now_pad = 0;   // (the device played on meanwhile: fill to the target from what it holds now)
+                    if (FAILED(d.ac->GetCurrentPadding(&now_pad))) break;
+                    pad = now_pad; t_pad = qpc_s();
+                    if (pad + (UINT32)g_count > d.target) break;
+                }
+            }
+            upd_prev = g_updates.load();
             BYTE* p = nullptr;
             if (FAILED(d.rc->GetBuffer((UINT32)g_count, &p))) break;
             out_frame((float*)p, d.ch);
@@ -1083,7 +1297,7 @@ HLE_AS(audio_RequestUpdateAudioRenderer, "_ZN2nn5audio26RequestUpdateAudioRender
             // play-state log (user 2026-10-15: skipped cooking cutscene keeps its full audio -> which voices stop when)
             static int n_ps = 0;
             if (n_ps++ < 600)
-                printf("[audio] frame %llu: voice %llx %s -> %s (%d Hz %d ch fmt %d, volume %.2f, %zu buffers queued, %llu samples played)\n",
+                rt_log("[audio] frame %llu: voice %llx %s -> %s (%d Hz %d ch fmt %d, volume %.2f, %zu buffers queued, %llu samples played)\n",
                        (unsigned long long)g_frames.load(), (unsigned long long)a, v.state == 0 ? "play" : v.state == 1 ? "stop" : "pause",
                        v.pending_state == 0 ? "play" : v.pending_state == 1 ? "stop" : "pause", v.rate, v.nch, v.fmt, v.volume,
                        v.pending.size(), (unsigned long long)v.played);
@@ -1095,6 +1309,10 @@ HLE_AS(audio_RequestUpdateAudioRenderer, "_ZN2nn5audio26RequestUpdateAudioRender
             v.state = v.pending_state;
         }
     }
+    g_updates++;
+#ifdef _WIN32
+    if (void* e = g_upd_ev.load()) SetEvent((HANDLE)e);
+#endif
     c->x[0] = 0;
 }
 
@@ -1311,7 +1529,15 @@ static void eff_remove(Ctx* c) {
 static void eff_io_set(Ctx* c) {        // (effect, const int8* in, const int8* out, int count)
     std::lock_guard<std::mutex> l(g_mtx); Effect& e = eff(c->x[0]); e.count = std::clamp((int)c->x[3], 0, kMaxCh);
     memcpy(e.in, (const void*)c->x[1], e.count); memcpy(e.out, (const void*)c->x[2], e.count);
-    if (e.kind == E_AUX && e.send.empty()) { size_t cap = std::max<size_t>((size_t)g_count * e.count * 8, 4096); e.send.assign(cap, 0); e.ret.assign(cap, 0); }
+    // The send ring stays 8 blocks: GetAuxSampleCount reports what it holds, and the game sizes its read from that count
+    // into its own buffer (main 0x29de0e8: blocks = count / (6 * 5)), so a ring that holds more than the game's buffer
+    // lets a slow frame's backlog overrun it (2026-11-02, a null read in the aux code after garbage returns: 68.6 dBFS).
+    // Only the return ring, written by the game and read by us alone, holds 32 (the up to 16 blocks of slack,
+    // effect_run).
+    if (e.kind == E_AUX && e.send.empty()) {
+        e.send.assign(std::max<size_t>((size_t)g_count * e.count * 8, 4096), 0);
+        e.ret.assign(std::max<size_t>((size_t)g_count * e.count * 32, 4096), 0);
+    }
 }
 static void eff_io_get(Ctx* c) {        // (effect, int8* in, int8* out, int* count, int max)
     std::lock_guard<std::mutex> l(g_mtx); Effect& e = eff(c->x[0]); int n = std::min(e.count, (int)c->x[4]);
@@ -1333,20 +1559,32 @@ static void eff_io_get(Ctx* c) {        // (effect, int8* in, int8* out, int* co
 #define EFF_IOGET(id, sym) HLE_AS(id, sym) { eff_io_get(c); }
 
 // aux
-EFF_ADD(audio_AddAuxSub, "_ZN2nn5audio6AddAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_10SubMixTypeEPvS7_m", E_AUX, false)
-EFF_ADD(audio_AddAuxFinal, "_ZN2nn5audio6AddAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_12FinalMixTypeEPvS7_m", E_AUX, false)
+// (AddAux(config, aux, mix, send buffer, return buffer, size): the size bounds what the game reads at once, aux_cap)
+#define EFF_ADD_AUX(id, sym) HLE_AS(id, sym) { eff_add(c, E_AUX, c->x[2], 0, c->x[5]); }
+EFF_ADD_AUX(audio_AddAuxSub, "_ZN2nn5audio6AddAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_10SubMixTypeEPvS7_m")
+EFF_ADD_AUX(audio_AddAuxFinal, "_ZN2nn5audio6AddAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_12FinalMixTypeEPvS7_m")
 EFF_REMOVE(audio_RemoveAuxSub, "_ZN2nn5audio9RemoveAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_10SubMixTypeE")
 EFF_REMOVE(audio_RemoveAuxFinal, "_ZN2nn5audio9RemoveAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_12FinalMixTypeE")
 EFF_ENABLE(audio_SetAuxEnabled, "_ZN2nn5audio13SetAuxEnabledEPNS0_7AuxTypeEb")
 EFF_ISEN(audio_IsAuxEnabled, "_ZN2nn5audio12IsAuxEnabledEPKNS0_7AuxTypeE")
 EFF_TRUE(audio_IsAuxRemovable, "_ZN2nn5audio14IsAuxRemovableEPKNS0_7AuxTypeE")
 EFF_IO(audio_SetAuxInputOutput, "_ZN2nn5audio17SetAuxInputOutputEPNS0_7AuxTypeEPKaS4_i")
-HLE_AS(audio_GetAuxSampleCount, "_ZN2nn5audio17GetAuxSampleCountEPKNS0_7AuxTypeE") {
-    std::lock_guard<std::mutex> l(g_mtx); Effect& e = eff(c->x[0]); c->x[0] = (u64)(e.send_w - e.send_r);
+// The most samples the game's own aux buffer takes at once: its AddAux size (bytes of s32) and its AuxType's channels
+// (+0x20) x frames (+0x24) x the renderer frame, the smaller; the console's DSP ring cannot hold more, and the game
+// sizes its reads from GetAuxSampleCount (2026-11-02: a count past its buffer overran it, c306b4dd)
+static size_t aux_cap(const Effect& e, u64 aux) {
+    size_t cap = e.size ? (size_t)(e.size / 4) : (size_t)-1;
+    const s32 ch = *(const s32*)(aux + 0x20), fr = *(const s32*)(aux + 0x24);
+    if (ch > 0 && ch <= 24 && fr > 0 && fr <= 64) cap = std::min(cap, (size_t)ch * fr * g_count);
+    return cap;
 }
-// Count convention: aux+0x20 = channels (6), aux+0x24 = frames (5); blocks = GetAuxSampleCount / (6 * 5), Read/Write
-// count = 6 * blocks (288 of 1440 available) -> counts are ALL channels and always a multiple of the channel count =
-// interleaved samples. Treating the count as per channel (TOTK_AUX_COUNT=perch) wrote 6x past the game's buffer and
+HLE_AS(audio_GetAuxSampleCount, "_ZN2nn5audio17GetAuxSampleCountEPKNS0_7AuxTypeE") {
+    std::lock_guard<std::mutex> l(g_mtx); Effect& e = eff(c->x[0]); c->x[0] = (u64)std::min<size_t>(e.send_w - e.send_r, aux_cap(e, c->x[0]));
+}
+// Count convention: aux+0x20 = channels (6), aux+0x24 = frames (5); blocks = GetAuxSampleCount / (6 * 5), Read/Write count
+// = 6 * blocks (288 of 1440 available) -> counts are ALL channels: the pump only moves the waiting samples to its DSP
+// thread in pieces, it never indexes them, so the counts say nothing of the layout inside (g_aux_mode: planar per frame,
+// as the console's DSP). Treating the count as per channel (TOTK_AUX_COUNT=perch) wrote 6x past the game's buffer and
 // crashed.
 static bool g_aux_total = !(getenv("TOTK_AUX_COUNT") && !strcmp(getenv("TOTK_AUX_COUNT"), "perch"));
 static double rms_s32(const s32* p, size_t n) { double a = 0; for (size_t i = 0; i < n; i++) a += (double)p[i] * p[i]; return n ? sqrt(a / n) : 0; }
@@ -1373,8 +1611,11 @@ HLE_AS(audio_ReadAuxSendBuffer, "_ZN2nn5audio17ReadAuxSendBufferEPNS0_7AuxTypeEP
     std::lock_guard<std::mutex> l(g_mtx); u64 aux = c->x[0]; Effect& e = eff(aux); s32* out = (s32*)c->x[1];
     int count = std::max(0, (int)c->x[2]); size_t mul = g_aux_total ? 1 : (size_t)std::max(1, e.count);
     size_t want = (size_t)count * mul, avail = (size_t)(e.send_w - e.send_r), cap = e.send.size();
-    size_t n = cap ? std::min(want, avail) / mul * mul : 0;
-    for (size_t i = 0; i < n; i++) out[i] = e.send[(e.send_r + i) % cap];
+    size_t n = cap ? std::min(std::min(want, avail), aux_cap(e, aux)) / mul * mul : 0;   // (never past the game's buffer)
+    for (size_t i = 0, o = n ? e.send_r % cap : 0, k; i < n; i += k, o = 0) {   // (the ring in up to two pieces)
+        k = std::min(n - i, cap - o);
+        memcpy(out + i, e.send.data() + o, k * sizeof(s32));
+    }
     e.send_r += n; c->x[0] = n / mul;
     auxcap_record(1, e, c->x[30], c->x[19], out, n);
     static std::atomic<int> logged{0};
@@ -1388,8 +1629,11 @@ HLE_AS(audio_WriteAuxReturnBuffer, "_ZN2nn5audio20WriteAuxReturnBufferEPNS0_7Aux
     int count = std::max(0, (int)c->x[2]); size_t mul = g_aux_total ? 1 : (size_t)std::max(1, e.count);
     size_t n = (size_t)count * mul, cap = e.ret.size();
     if (!cap) { c->x[0] = 0; return; }
-    for (size_t i = 0; i < n; i++) e.ret[(e.ret_w + i) % cap] = in[i];
-    e.ret_w += n; if (e.ret_w - e.ret_r > cap) e.ret_r = e.ret_w - cap;
+    for (size_t i = 0, o = e.ret_w % cap, k; i < n; i += k, o = 0) {   // (in pieces up to the ring's end, in order)
+        k = std::min(n - i, cap - o);
+        memcpy(e.ret.data() + o, in + i, k * sizeof(s32));
+    }
+    e.ret_w += n; if (e.ret_w - e.ret_r > cap) e.ret_r += aux_drop(e.ret_w - e.ret_r - cap, (size_t)std::max(1, e.count) * g_count);
     e.returned = true; c->x[0] = (u64)count;
     auxcap_record(2, e, c->x[30], c->x[19], in, n);
     static std::atomic<int> logged{0};

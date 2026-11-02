@@ -248,6 +248,11 @@ const char *const N_LL[] = {"Off (default)", "On (NVIDIA Reflex; other GPUs: the
 const char *const V_HDR[] = {"", "hdr10", "scrgb", nullptr};
 const char *const N_HDR[] = {"Off (SDR, default)", "HDR10", "scRGB", nullptr};
 
+const char *const V_SHADER_WAIT[] = {"", "always", nullptr};
+const char *const N_SHADER_WAIT[] = {"Limit to 0.1 s (default)", "Always wait (nothing missing)", nullptr};
+extern "C" void vk_shader_wait_changed(void);   // nvn/vulkan/device.c (the present re-reads the row)
+void shader_wait_apply(const char *) { vk_shader_wait_changed(); }
+
 const unsigned R = PC_SET_RESTART;
 const pc_setting k_present[] = {
     // key, page, section, label, help, default, values, names, min, max, step, flags, env, to_env, apply, live_value
@@ -287,6 +292,11 @@ const pc_setting k_present[] = {
      "before it reads input, by as much as it would otherwise wait for the GPU, the render thread or the frame cap "
      "later. NVIDIA: Reflex's sleep (VK_NV_low_latency2); other GPUs, or jit: the engine's own. Boost keeps the GPU "
      "clocks up (Reflex).", "", V_LL, N_LL, 0, 0, 0, 0, "TOTK_REFLEX", nullptr, low_latency_apply, nullptr},
+    {"graphics.shader_wait", "Graphics", "Shaders", "Shader wait", "A frame that needs a shader still being built waits "
+     "for it. Limit to 0.1 s: past that, the frame is shown and the objects whose shaders are not ready yet appear a moment "
+     "later (fullscreen passes and compute always wait). Always wait: nothing is ever drawn incomplete, but a shader the "
+     "first time can freeze the picture for a second or more. TOTK_HOLD_MAX_MS overrides.", "", V_SHADER_WAIT,
+     N_SHADER_WAIT, 0, 0, 0, 0, nullptr, nullptr, shader_wait_apply, nullptr},
     {"display.hdr", "Graphics", "HDR", "HDR output", "TOTK_HDR: needs Windows HDR on for the monitor.", "", V_HDR, N_HDR, 0, 0,
      0, 0, "TOTK_HDR", nullptr, hdr_apply, nullptr},
     {"display.hdr_peak", "Graphics", "HDR", "Peak brightness (nits)", "TOTK_HDR_PEAK: the display's peak.", "1000", nullptr,

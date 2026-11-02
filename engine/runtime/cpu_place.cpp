@@ -3,6 +3,7 @@
 // CPU Sets for hot, SetThreadSelectedCpuSets for helpers. Both are soft (no affinity mask), and a CPU Set id comes from
 // the system's own list, so nothing names a core a 6- or 8-core part lacks. Linux: the plan only (no placement yet).
 #include "cpu_place.h"
+#include "host_wine.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -186,6 +187,11 @@ extern "C" void cpu_place_init(void) {
     auto gsi = (BOOL(WINAPI *)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG))GetProcAddress(
         k32, "GetSystemCpuSetInformation");
     auto spd = (BOOL(WINAPI *)(HANDLE, const ULONG *, ULONG))GetProcAddress(k32, "SetProcessDefaultCpuSets");
+    // Wine / Proton: SetProcessDefaultCpuSets and SetThreadSelectedCpuSets are stubs that return TRUE and place nothing
+    // (kernelbase memory.c), so a plan would size pools to a split (hot, helpers, a free render core) that never happens:
+    // nothing placed there, as without CPU Sets
+    const bool wine = host_is_wine();
+    if (wine) spd = nullptr;
     // Only the logical processors the process may run on (boot.py --affinity's PC tiers, Task Manager, start
     // /affinity): every class, count and CPU Set is inside that mask. A process in several groups (Windows 11 on > 64
     // logical processors) keeps those groups whole (no per-group mask to read).
@@ -249,7 +255,8 @@ extern "C" void cpu_place_init(void) {
     uint32_t big = 0;
     for (const cpu_lp &l : lps) big = l.llc_kb > big ? l.llc_kb : big;
     printf("[cpu] %s; largest last-level cache %u KB%s\n", plan.why, big,
-           !g_on ? (spd ? " (TOTK_CPU_PLACE=0: nothing placed)" : " (no CPU Sets: nothing placed)") : "");
+           !g_on ? (spd ? " (TOTK_CPU_PLACE=0: nothing placed)" : wine ? " (Wine: its CPU Sets are stubs, nothing placed)"
+                                                              : " (no CPU Sets: nothing placed)") : "");
     // the render core (cpu_place.h): out of every other set, the process default included
     const char *rp = getenv("LARECOMP_RENDER_PIN");
     const bool render_thread = backend_async_on();   // (exec.c: whether there is a render thread at all)
@@ -294,7 +301,7 @@ extern "C" void cpu_place_init(void) {
                                   : "alone on the last SMT core of hot (LARECOMP_RENDER_PIN=0: off)")
            : r_off           ? "not placed (LARECOMP_RENDER_PIN=0)"
            : !render_thread  ? "none (synchronous execute)"
-           : !spd            ? "not placed (no CPU Sets)"
+           : !spd            ? (wine ? "not placed (Wine: its CPU Sets are stubs)" : "not placed (no CPU Sets)")
            : manual          ? "not placed (LARECOMP_RENDER_PIN: no such logical processor)"
                              : "not placed (fewer than 4 SMT cores in hot)");
     printf("[cpu] counts: hot %d, any %d, helper %d of %d logical processors in the process affinity (%d outside it)%s\n",

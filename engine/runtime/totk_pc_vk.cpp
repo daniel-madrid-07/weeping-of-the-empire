@@ -171,6 +171,23 @@ void hook_f_1ccf894(Ctx *__restrict c) {   // ExecutePlayerCalcKey::updateImpl_(
         return m;
     }();
     if (!mode) return;
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    // Another version: the whole hook needs every field placed and a verb table (its verb ids, 0x34 / 0x35 and the
+    // outcome reads, are 1.0.0's: totk_version.h TOTK_VERBS_KNOWN). Short of that, only the vk_guard mirror while its
+    // three masks are placed (a vk_guard key would otherwise leave the pad's ZL without a guard), else the original alone
+    const bool full = fields_known() && TOTK_VERBS_KNOWN;
+    if (!full) {
+        const bool masks = totk_field_known(ExecutePlayerCalcKey, 0x28) &&
+                           totk_field_known(ExecutePlayerCalcKey, 0x38) && totk_field_known(ExecutePlayerCalcKey, 0x48);
+        static bool said;
+        if (!said) {
+            said = true;
+            printf("[pc-vk] fields or verbs not placed in this version: %s\n",
+                   masks ? "the original and the vk_guard mirror only" : "the original alone");
+        }
+        if (!masks) return;
+    }
+#else
     if (!fields_known()) {   // (as TOTK_PCVK=orig: no VK 2 -> 27 mirror, so on a vk_guard key the pad's ZL stops guarding)
         static bool said;
         if (!said) {
@@ -179,6 +196,7 @@ void hook_f_1ccf894(Ctx *__restrict c) {   // ExecutePlayerCalcKey::updateImpl_(
         }
         return;
     }
+#endif
     const u64 ret = c->x[0];
     static bool entered;
     if (!entered) {
@@ -197,6 +215,9 @@ void hook_f_1ccf894(Ctx *__restrict c) {   // ExecutePlayerCalcKey::updateImpl_(
         for (const u64 m : {trig, hold, rel})
             if (ld64(m) & kVkZl) st64(m, ld64(m) | kVkGuard);
     if (mode == 1) return;
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    if (!full) return;
+#endif
     const u64 pad_h = ld64(hold);   // the pad's hold, for the ZL tail below
     const u64 a = ld64(node + totk_field(ExecutePlayerCalcKey, 0x8)),
               b = ptr_ok(a) ? ld64(a + totk_field(CalcKeyOwner, 0x8)) : 0,

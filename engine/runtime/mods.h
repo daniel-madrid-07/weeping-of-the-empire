@@ -28,6 +28,8 @@ struct nxr_mod {
     std::string romfs;           // its RomFS root ("" none)
     std::string exefs, cheats;   // its ExeFS and cheats folders ("" none)
     std::string layout;          // where its RomFS was found ("romfs", "atmosphere/contents/<id>/romfs", "folder", ...)
+    std::string collection;      // a mod of a copied emulator collection: its folder below the mods folder
+                                 // ("yuzu/load/0100F2C0115B6000/<mod>"), shown in its F10 row; "" a mod of its own
     std::string other_title;     // NXR_MOD_OTHER_GAME: the title id it is for
     int kind = 0;                // mods_scan::Kind bits
     bool on = true;              // the player's switch
