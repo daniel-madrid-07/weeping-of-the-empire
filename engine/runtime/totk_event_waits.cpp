@@ -11,9 +11,10 @@
 // = floor(elapsed - 1) with elapsed = the ready 30 Hz frames including this one (so the original's limit test sees
 // what the Switch's would), after it 0 resets the twin and anything else adds the frame's 30 Hz ratio r. An outside
 // write to +0x20 (the enter's reset) resyncs the twin. At 30 fps and below (r >= 1) the original exactly. gen.py
-// --hook 1d97648,1c17fb0 in GEN_MAIN; TOTK_EVENT_WAITS=0: the original alone. tools/oracle/test_event_waits.py. The
-// count logic is totk_count_in_game_time, shared with totk_pouch_player.cpp and totk_envsound.cpp. Its twins sit in a
-// 64-slot table, least recently used out; a twin lost mid-count makes its node's next call count a whole frame.
+// --hook 1d97648,1c17fb0 in GEN_MAIN; off by default since v0.1.8.1 (#47: the game's original waits;
+// TOTK_EVENT_WAITS=1 turns them on). tools/oracle/test_event_waits.py. The count logic is totk_count_in_game_time,
+// shared with totk_pouch_player.cpp and totk_envsound.cpp. Its twins sit in a 64-slot table, least recently used out;
+// a twin lost mid-count makes its node's next call count a whole frame.
 #include "rt.h"
 #include "totk_globals.h"
 
@@ -58,8 +59,8 @@ Twin &twin(u64 node, bool &fresh) {
 bool enabled() {
     static const bool on = [] {
         const char *e = getenv("TOTK_EVENT_WAITS");
-        const bool v = !e || strcmp(e, "0");
-        printf("[event-waits] cutscene load / terrain / actor-equipment waits %s\n", v ? "counted in game time" : "counted in frames, as the game (TOTK_EVENT_WAITS=0)");
+        const bool v = e && strcmp(e, "0");   // (#47, v0.1.8.1: off unless TOTK_EVENT_WAITS=1)
+        printf("[event-waits] cutscene load / terrain / actor-equipment waits %s\n", v ? "counted in game time (TOTK_EVENT_WAITS=1)" : "counted in frames, as the game (the default; TOTK_EVENT_WAITS=1: in game time)");
         return v;
     }();
     return on;
@@ -147,7 +148,7 @@ void hook_f_13bd680(Ctx *__restrict c) {   // game::event::EventContext::isLoadF
 // +0x408 at 599 before the call once it reached 600, so the fallback waits for 600 frames of game time; the counter's
 // 0 and every value under 600 are the original's (the first-call setup is untouched). A twin lost mid-count starts at
 // the counter (never later than the original). At 30 fps and below (r >= 1) the original exactly. gen.py --hook
-// 10bc078; TOTK_EVENT_WAITS=0: the original alone.
+// 10bc078; off by default (the original alone), TOTK_EVENT_WAITS=1 turns it on.
 namespace {
 constexpr u64 kEquipCount = 0x408;
 constexpr u32 kEquipLimit = 600;

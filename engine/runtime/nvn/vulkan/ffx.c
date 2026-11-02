@@ -14,6 +14,8 @@
 #include <string.h>
 #include <SDL3/SDL.h>
 
+#include "../../pc.h"   // (pc_fault_guard: the guarded context creations below)
+
 #include "../../../third_party/fidelityfx/include/ffx_api.h"
 #include "../../../third_party/fidelityfx/include/ffx_upscale.h"
 // (the Vulkan header names its structs C++-style, without the tag: the typedefs C needs, the header itself untouched)
@@ -37,10 +39,40 @@ static HMODULE load_from(const wchar_t *dir) {
     return LoadLibraryExW(p, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
 }
 
+// A crash inside FidelityFX's context creation (public #45, Arc B580 + an AMD iGPU: c0000005 at address 0 inside
+// ffxCreateContext, the first FSR use) is caught (create_guarded) and the GPU and driver it happened on are listed in
+// cache/ffx_quarantine.txt, one "<vendor> <device> <driver version> <pipeline cache UUID>" line each (as exec.c's
+// precompile_stuck.txt names its GPU): FSR is then unavailable there, at once and at later starts, and the game's own
+// upscale pass draws. Another driver version, or deleting the file, tries again.
+#define FFXQ_PATH "cache/ffx_quarantine.txt"
+static char g_dev_key[96];
+static const char *dev_key(void) {
+    if (!g_dev_key[0]) {
+        int at = snprintf(g_dev_key, sizeof g_dev_key, "%04x %04x %08x ", g_vk.props.vendorID, g_vk.props.deviceID,
+                          g_vk.props.driverVersion);
+        for (int i = 0; i < VK_UUID_SIZE; i++) at += snprintf(g_dev_key + at, sizeof g_dev_key - at, "%02x", g_vk.props.pipelineCacheUUID[i]);
+    }
+    return g_dev_key;
+}
+static bool ffxq_listed(void) {
+    FILE *f = fopen(FFXQ_PATH, "rb");
+    if (!f) return false;
+    char line[256];
+    bool hit = false;
+    while (!hit && fgets(line, sizeof line, f)) hit = !strncmp(line, dev_key(), strlen(dev_key()));
+    fclose(f);
+    return hit;
+}
+
 // The DLL, once: beside totk.exe, then TOTK_FFX_DIR
 static bool ffx_load(void) {
     if (g_load >= 0) return g_load == 1;
     g_load = 0;
+    if (ffxq_listed()) {
+        LOG("[fsr] FidelityFX crashed on this GPU and driver before (%s, %s): FSR unavailable; a new driver, or deleting "
+            "the file, tries again\n", g_vk.props.deviceName, FFXQ_PATH);
+        return false;
+    }
     wchar_t exe[MAX_PATH], dir[MAX_PATH];
     DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
     while (n && exe[n - 1] != L'\\' && exe[n - 1] != L'/') n--;
@@ -71,12 +103,79 @@ static void ffx_message(uint32_t type, const wchar_t *msg) {
     if (n++ < 64) LOG("[fsr] %s: %ls\n", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", msg);
 }
 
+// FidelityFX's Vulkan backend looks its device commands up by name through the vkGetDeviceProcAddr it is given (the
+// loader's, for our device: the DLL's own physical-device queries go through the same loader, so a second GPU does not
+// mix in), KHR / EXT / AMD names among them (vkGetBufferMemoryRequirements2KHR, the debug-utils labels and object names,
+// the AMD buffer markers), and calls some without checking for NULL. Our device is Vulkan 1.3 and enables none of those
+// extensions: a driver that gives a promoted command's KHR name only with its extension enabled (as the spec says;
+// NVIDIA's and AMD's give it anyway) answers NULL. So a KHR / EXT name gets its core command, the labels, names and markers
+// (diagnostics only) a no-op, and each name still unresolved one log line.
+static VkResult VKAPI_CALL ffx_noop_name(VkDevice d, const VkDebugUtilsObjectNameInfoEXT *i) { (void)d; (void)i; return VK_SUCCESS; }
+static void VKAPI_CALL ffx_noop_label(VkCommandBuffer cb, const VkDebugUtilsLabelEXT *l) { (void)cb; (void)l; }
+static void VKAPI_CALL ffx_noop_end(VkCommandBuffer cb) { (void)cb; }
+static void VKAPI_CALL ffx_noop_marker(VkCommandBuffer cb, VkPipelineStageFlagBits st, VkBuffer b, VkDeviceSize o, uint32_t m) {
+    (void)cb; (void)st; (void)b; (void)o; (void)m;
+}
+static void VKAPI_CALL ffx_noop_marker2(VkCommandBuffer cb, VkPipelineStageFlags2 st, VkBuffer b, VkDeviceSize o, uint32_t m) {
+    (void)cb; (void)st; (void)b; (void)o; (void)m;
+}
+static PFN_vkVoidFunction VKAPI_CALL ffx_device_proc(VkDevice dev, const char *name) {
+    PFN_vkVoidFunction f = vkGetDeviceProcAddr(dev, name);
+    if (f || !name) return f;
+    const size_t n = strlen(name);
+    const char *how = "none: NULL";
+    if (n > 3 && n < 128 && (!strcmp(name + n - 3, "KHR") || !strcmp(name + n - 3, "EXT"))) {
+        char core[128];
+        memcpy(core, name, n - 3);
+        core[n - 3] = 0;
+        if ((f = vkGetDeviceProcAddr(dev, core))) how = "its core command";
+    }
+    if (!f) {
+        static const struct { const char *name; PFN_vkVoidFunction fn; } noop[] = {
+            {"vkSetDebugUtilsObjectNameEXT", (PFN_vkVoidFunction)ffx_noop_name},
+            {"vkCmdBeginDebugUtilsLabelEXT", (PFN_vkVoidFunction)ffx_noop_label},
+            {"vkCmdEndDebugUtilsLabelEXT", (PFN_vkVoidFunction)ffx_noop_end},
+            {"vkCmdInsertDebugUtilsLabelEXT", (PFN_vkVoidFunction)ffx_noop_label},
+            {"vkCmdWriteBufferMarkerAMD", (PFN_vkVoidFunction)ffx_noop_marker},
+            {"vkCmdWriteBufferMarker2AMD", (PFN_vkVoidFunction)ffx_noop_marker2}};
+        for (size_t i = 0; i < sizeof noop / sizeof *noop && !f; i++)
+            if (!strcmp(name, noop[i].name)) f = noop[i].fn, how = "a no-op";
+    }
+    static int nlog;
+    if (nlog++ < 16) LOG("[fsr] FidelityFX asked for %s, which this device does not give by that name: %s\n", name, how);
+    return f;
+}
+
 static void backend_desc(struct ffxCreateBackendVKDesc *be) {
     memset(be, 0, sizeof *be);
     be->header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     be->vkDevice = g_vk.dev;
     be->vkPhysicalDevice = g_vk.phys;
-    be->vkDeviceProcAddr = vkGetDeviceProcAddr;
+    be->vkDeviceProcAddr = ffx_device_proc;
+}
+
+// p_create with an access violation inside it caught (pc_fault_guard lets it reach the __except): the GPU and driver
+// listed (FFXQ_PATH), FSR off from then on (g_load 0: every entry here returns false), the context left unmade
+static int av_filter(DWORD code) { return code == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH; }
+static ffxReturnCode_t create_guarded(ffxContext *c, ffxCreateContextDescHeader *h, const char *what) {
+    ffxReturnCode_t r = FFX_API_RETURN_ERROR;
+    bool crashed = false;
+    pc_fault_guard(1);
+    __try {
+        r = p_create(c, h, NULL);
+    } __except (av_filter(GetExceptionCode())) {
+        crashed = true;
+    }
+    pc_fault_guard(0);
+    if (!crashed) return r;
+    *c = NULL;
+    g_load = 0;
+    FILE *f = fopen(FFXQ_PATH, "ab");
+    if (f) { fprintf(f, "%s %s\n", dev_key(), g_vk.props.deviceName); fclose(f); }
+    LOG("[fsr] FidelityFX crashed making its %s context on %s (access violation inside amd_fidelityfx_vk.dll): FSR off "
+        "for this GPU and driver (%s%s), the game's own upscale draws\n", what, g_vk.props.deviceName, FFXQ_PATH,
+        f ? "" : ": the file could not be written, this run only");
+    return FFX_API_RETURN_ERROR;
 }
 
 // a GENERAL-layout image as FFX sees it: state UNORDERED_ACCESS = GENERAL in its Vulkan backend, which puts every user
@@ -128,7 +227,7 @@ static bool sr_create(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, uint32
     cd.maxUpscaleSize.width = ow; cd.maxUpscaleSize.height = oh;
     cd.fpMessage = ffx_message;
     uint64_t t0 = SDL_GetTicksNS();
-    ffxReturnCode_t r = p_create(&g_ctx, &cd.header, NULL);
+    ffxReturnCode_t r = create_guarded(&g_ctx, &cd.header, "upscale");
     if (r != FFX_API_RETURN_OK) {
         g_ctx = NULL;
         g_fails++;
@@ -231,7 +330,7 @@ static bool fg_create(uint32_t dw, uint32_t dh, uint32_t rw, uint32_t rh, VkForm
     cd.maxRenderSize.width = rw; cd.maxRenderSize.height = rh;
     cd.backBufferFormat = ffxApiGetSurfaceFormatVK(fmt);
     uint64_t t0 = SDL_GetTicksNS();
-    ffxReturnCode_t r = p_create(&g_fgctx, &cd.header, NULL);
+    ffxReturnCode_t r = create_guarded(&g_fgctx, &cd.header, "frame generation");
     if (r != FFX_API_RETURN_OK) {
         g_fgctx = NULL;
         g_fg_fails++;

@@ -1606,11 +1606,25 @@ static const bool g_save_async = !(getenv("TOTK_SAVE_ASYNC") && !strcmp(getenv("
 static std::mutex g_pub_mtx;
 static std::condition_variable g_pub_cv;
 static bool g_pub_busy;
-static void wait_publisher(DWORD ms = INFINITE) {
+static bool wait_publisher(DWORD ms = INFINITE) {   // true: no publish under way
     std::unique_lock<std::mutex> l(g_pub_mtx);
-    if (ms == INFINITE) g_pub_cv.wait(l, [] { return !g_pub_busy; });
-    else g_pub_cv.wait_for(l, std::chrono::milliseconds(ms), [] { return !g_pub_busy; });
+    if (ms == INFINITE) { g_pub_cv.wait(l, [] { return !g_pub_busy; }); return true; }
+    return g_pub_cv.wait_for(l, std::chrono::milliseconds(ms), [] { return !g_pub_busy; });
 }
+// No unbounded wait on the save path (#47, v0.1.8: an autosave never committed and the game waited forever while the
+// picture went on). The commit lock (a named mutex shared with other processes), a Commit's wait for the previous
+// publish and for the changes under way, and a change's wait for a pending snapshot each give up after
+// TOTK_SAVE_WAIT_MS (default 5000) with a "[fs] save ..." line saying what it waited for and where the commit was
+// (g_save_stage). The guest then goes on. A commit that could not be made safely is left for the next Commit / start
+// (.pending), and a snapshot that a change could not wait for is dropped, never published (it may hold a mix of saves).
+static const DWORD g_save_wait_ms = getenv("TOTK_SAVE_WAIT_MS") && atoi(getenv("TOTK_SAVE_WAIT_MS")) > 0
+                                        ? (DWORD)atoi(getenv("TOTK_SAVE_WAIT_MS")) : 5000;
+static std::atomic<const char*> g_save_stage{"idle"};   // the commit's step, for those lines
+static std::atomic<u32> g_commit_no;                    // the commits of this run, numbered in the lines
+static std::atomic<bool> g_commit_skipped;              // a Commit gave up waiting: the save stays .pending
+static std::mutex g_pending_mtx;                        // pending() from the game thread and the publisher
+static std::atomic<bool> g_pub_stuck;                   // a Commit gave up on the publish under way: later ones do not wait
+static bool g_never_publish;   // this run started empty while another held the lock mid-swap: it never publishes over that save
 // The snapshot in the background (TOTK_SAVE_SNAP_BG, default on with the async publish; =0: on the game thread as
 // before; stutter plan fix 6: 31 and 63 ms frames at autosaves). The working copy must not change while it is taken, or
 // a commit could hold some files of the game's next save and not others. So Commit starts it only after the changes
@@ -1623,6 +1637,7 @@ static const bool g_snap_bg = g_save_async && !(getenv("TOTK_SAVE_SNAP_BG") && !
 static std::mutex g_snap_mtx;
 static std::condition_variable g_snap_cv;
 static bool g_snap_pending;    // a Commit's snapshot not taken yet: changes wait
+static bool g_snap_torn;       // a change gave up waiting for the pending snapshot: that snapshot is dropped
 static int g_snap_writers;     // changes to the save mount under way
 static std::atomic<u32> g_snap_waits;      // changes that waited for a snapshot, and how long in all (the publish line)
 static std::atomic<u64> g_snap_wait_ms;
@@ -1637,9 +1652,14 @@ struct SaveWrite {   // a change to the save mount: waits while a snapshot is pe
         if (save) g_save_changes++;
         if (!save || !g_snap_bg) return;
         std::unique_lock<std::mutex> l(g_snap_mtx);
-        if (g_snap_pending) {
+        if (g_snap_pending && !g_snap_torn) {
             u64 t = GetTickCount64();
-            g_snap_cv.wait(l, [] { return !g_snap_pending; });
+            if (!g_snap_cv.wait_for(l, std::chrono::milliseconds(g_save_wait_ms), [] { return !g_snap_pending || g_snap_torn; })) {
+                g_snap_torn = true;   // (later changes go on at once; the publisher drops this snapshot)
+                printf("[fs] save write: waited %lu ms for commit #%u's snapshot (it is at: %s); writing now, that commit is "
+                       "dropped and the next one publishes\n", (unsigned long)g_save_wait_ms, g_commit_no.load(), g_save_stage.load());
+                fflush(stdout);
+            }
             g_snap_waits++; g_snap_wait_ms += GetTickCount64() - t;
         }
         g_snap_writers++; on = true;
@@ -1786,11 +1806,40 @@ static bool swap_ready() {
     if (wexists(g_committed) && !retire_committed()) return false;
     return move_retry(rd_dir(), g_committed);
 }
-static void commits_lock() {
-    DWORD r = WaitForSingleObject(g_save_mutex, INFINITE);   // abandoned: the on-disk state is recoverable (.new / .ready)
-    if (r != WAIT_OBJECT_0 && r != WAIT_ABANDONED) printf("[fs] save commit mutex: wait failed (%lu)\n", GetLastError());
+// Who holds the commit lock, for the line of one that waits too long: process, thread and since when, in a small named
+// mapping beside the mutex (every process that takes it writes it).
+struct SaveLockOwner { DWORD pid, tid; u64 since_ms; };
+static SaveLockOwner* lock_owner() {
+    static SaveLockOwner* p = [] {
+        HANDLE m = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(SaveLockOwner), L"Local\\totk-recomp-save-commit-owner");
+        return m ? (SaveLockOwner*)MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SaveLockOwner)) : nullptr;
+    }();
+    return p;
 }
-static void commits_unlock() { ReleaseMutex(g_save_mutex); }
+// true: held (or no lock to take); false: still held elsewhere after g_save_wait_ms (said, with the holder)
+static bool commits_lock(const char* who) {
+    DWORD r = WaitForSingleObject(g_save_mutex, g_save_wait_ms);   // abandoned: the on-disk state is recoverable (.new / .ready)
+    if (r == WAIT_TIMEOUT) {
+        SaveLockOwner o{};
+        if (SaveLockOwner* p = lock_owner()) memcpy(&o, p, sizeof o);   // (another process writes it: a hint only)
+        printf("[fs] save %s: the commit lock is still held after %lu ms, by process %lu%s thread %lu for %llu ms; %s\n", who,
+               (unsigned long)g_save_wait_ms, (unsigned long)o.pid, o.pid == GetCurrentProcessId() ? " (this one)" : "",
+               (unsigned long)o.tid, (unsigned long long)(o.since_ms ? GetTickCount64() - o.since_ms : 0),
+               strcmp(who, "data") ? "going on without it" : "the start waits up to 60 s for it");
+        fflush(stdout);
+        return false;
+    }
+    if (r != WAIT_OBJECT_0 && r != WAIT_ABANDONED) {
+        printf("[fs] save commit mutex: wait failed (%lu)\n", GetLastError());
+        return true;   // (no lock to take: as before, the commit goes on)
+    }
+    if (SaveLockOwner* p = lock_owner()) *p = SaveLockOwner{GetCurrentProcessId(), GetCurrentThreadId(), GetTickCount64()};
+    return true;
+}
+static void commits_unlock() {
+    if (SaveLockOwner* p = lock_owner()) *p = SaveLockOwner{};
+    ReleaseMutex(g_save_mutex);
+}
 // Step 1 (mutex held): the snapshot of `work` in save.new. With `copied` the copies are not flushed (the async publish
 // flushes them in step 2); files equal to the committed ones are hard links either way.
 static bool snapshot_locked(const std::wstring& work, std::vector<std::wstring>* copied) {
@@ -1894,25 +1943,41 @@ static void save_init() {
     g_save_work = std::string(kUserDir) + "/save.work." + std::to_string(GetCurrentProcessId());
     std::error_code ec; fsys::create_directories(ud, ec);
     g_save_mutex = CreateMutexW(nullptr, FALSE, L"Local\\totk-recomp-save-commit");
-    commits_lock();
+    // Held elsewhere: another process is in a commit (an earlier run's exit publish, say). The start is not frame-critical,
+    // so it waits up to 60 s (a line every TOTK_SAVE_WAIT_MS). Still held: that process's .new / .ready are its own and it
+    // may be mid-swap (save moved away, save.ready not in place yet), so nothing is created or recovered here; the working
+    // copy starts read-only from the committed save, else from a complete save.ready, else empty with a loud line.
+    bool locked = false;
+    for (u64 t = GetTickCount64(); !(locked = commits_lock("data")) && GetTickCount64() - t < 60000;) {}
     std::wstring source = g_committed;   // the newest complete save: the working copy starts from it
-    if (wexists(rd_dir())) {
+    if (!locked && !wexists(g_committed)) {
+        if (wexists(rd_dir())) {
+            source = rd_dir();
+            printf("[fs] save data: another process holds the commit lock and is putting its save in place; playing from its save.ready\n");
+        } else {
+            g_never_publish = true;
+            printf("[fs] save data: WARNING: another process holds the commit lock and there is no committed save to start from: "
+                   "this run starts with no save and publishes none (yours is not deleted: it is put in place when that "
+                   "process finishes; restart the game then)\n");
+        }
+    }
+    if (locked && wexists(rd_dir())) {
         printf("[fs] save data: finishing a commit interrupted after it was complete (save.ready)\n");
         if (!swap_ready()) { printf("[fs] save data: the interrupted commit cannot be put in place now (error %lu): playing from save.ready\n", GetLastError()); source = rd_dir(); }
     }
-    if (wexists(nw_dir()) && wexists(complete_marker()) && !wexists(rd_dir())) {   // a finished snapshot whose rename failed
+    if (locked && wexists(nw_dir()) && wexists(complete_marker()) && !wexists(rd_dir())) {   // a finished snapshot whose rename failed
         printf("[fs] save data: finishing a commit whose snapshot was complete (save.new)\n");
         if (move_retry(nw_dir(), rd_dir())) { mark(complete_marker(), false); if (swap_ready()) source = g_committed; else source = rd_dir(); }
     }
-    if (wexists(nw_dir()) && !wexists(complete_marker()) && !remove_tree(nw_dir()))
+    if (locked && wexists(nw_dir()) && !wexists(complete_marker()) && !remove_tree(nw_dir()))
         printf("[fs] save data: an incomplete commit (save.new) could not be removed; the previous commit stays\n");
-    fsys::create_directories(g_committed, ec);
-    drop_stale_work(ud);
+    if (locked) fsys::create_directories(g_committed, ec);
+    if (locked) drop_stale_work(ud);
     g_work_lock = CreateFileW((g_work + L".lock").c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
     remove_tree(g_work);
     if (!copy_tree(source, g_work) && !(source != g_committed && remove_tree(g_work) && copy_tree(g_committed, g_work)))
         printf("[fs] save data: making the working copy %ls failed (error %lu)\n", g_work.c_str(), GetLastError());
-    commits_unlock();
+    if (locked) commits_unlock();
     if (g_save_async) std::atexit([] { wait_publisher(5000); });
     printf("[fs] save data: committed %ls, working copy %ls, %d backups kept in %ls\n", g_committed.c_str(), g_work.c_str(), backups_kept(), g_backups.c_str());
 }
@@ -1926,73 +1991,133 @@ static const std::string& save_mount_dir() {
 // unflushed copies) and a background thread flushes and publishes it; the next Commit waits for that publish first, and
 // an exit waits up to 5 s for it. A crash before it finishes loses that commit only (the previous one stays committed),
 // as a power cut before the console's commit would.
-static void pending(bool on) {   // (g_commit_mtx held, or the publisher thread while g_pub_busy keeps Commit waiting)
+static void pending(bool on) {   // (the game thread's Commit or the publisher)
+    std::lock_guard<std::mutex> l(g_pending_mtx);
     std::wstring pend = g_work + L".pending";
     if (on && !g_commit_pending) { mark(pend, true); g_commit_pending = true; }   // retried at the next Commit / start
-    if (!on && g_commit_pending) { DeleteFileW(pend.c_str()); g_commit_pending = false; }
+    // (not while a Commit that gave up waiting is uncovered: an earlier snapshot's publish does not hold its changes)
+    if (!on && g_commit_pending && !g_commit_skipped) { DeleteFileW(pend.c_str()); g_commit_pending = false; }
 }
+// A Commit that gave up waiting (said): the save is left .pending for the next Commit / start, the game goes on
+static void commit_skipped(u32 n, const char* what) {
+    { std::lock_guard<std::mutex> l(g_pending_mtx); g_commit_skipped = true; }
+    pending(true);
+    printf("[fs] save commit #%u: %s for %lu ms (the previous commit is at: %s); not committed now, the next commit or "
+           "the next start does it\n", n, what, (unsigned long)g_save_wait_ms, g_save_stage.load());
+    fflush(stdout);
+}
+// A snapshot is about to be taken: it holds every change so far, a skipped Commit's too
+static void commit_covers_skipped() { std::lock_guard<std::mutex> l(g_pending_mtx); g_commit_skipped = false; }
 static void commit_save() {
     std::lock_guard<std::mutex> l(g_commit_mtx);
+    const u32 n = ++g_commit_no;
+    if (g_never_publish) {   // (save_init's WARNING: the player's real save is being put in place by another process)
+        if (n == 1 || n % 10 == 0) printf("[fs] save commit #%u: not published: this run started without your save (see the WARNING at start)\n", n);
+        return;
+    }
     if (!g_save_async) {
-        commits_lock();
+        if (!commits_lock("commit")) { commit_skipped(n, "waited for the commit lock"); return; }
+        commit_covers_skipped();
         bool ok = publish_locked(g_work);
         commits_unlock();
         pending(!ok);
         return;
     }
     u64 tw = GetTickCount64();
-    wait_publisher();
+    if (!wait_publisher(g_pub_stuck ? 0 : g_save_wait_ms)) {
+        g_pub_stuck = true;
+        commit_skipped(n, "waited for the previous commit's background publish");
+        return;
+    }
     u64 t0 = GetTickCount64();
-    if (t0 - tw >= 50) printf("[fs] save commit: waited %llu ms for the previous commit's background publish\n", (unsigned long long)(t0 - tw));
+    if (t0 - tw >= 50) printf("[fs] save commit #%u: waited %llu ms for the previous commit's background publish\n", n, (unsigned long long)(t0 - tw));
     auto copied = std::make_shared<std::vector<std::wstring>>();
     if (g_snap_bg) {   // the snapshot too in the background (SaveWrite above)
         {
             std::unique_lock<std::mutex> l(g_snap_mtx);
             g_snap_pending = true;
-            g_snap_cv.wait(l, [] { return g_snap_writers == 0; });   // (a change under way on another thread finishes)
+            g_snap_torn = false;
+            // (a change under way on another thread finishes)
+            if (!g_snap_cv.wait_for(l, std::chrono::milliseconds(g_save_wait_ms), [] { return g_snap_writers == 0; })) {
+                g_snap_pending = false;
+                l.unlock();
+                g_snap_cv.notify_all();
+                commit_skipped(n, "waited for a change to the save that does not finish");
+                return;
+            }
         }
+        commit_covers_skipped();
+        g_save_stage = "starting";
         { std::lock_guard<std::mutex> p(g_pub_mtx); g_pub_busy = true; }
         const u64 game = GetTickCount64() - t0;
         const u32 changes = g_save_changes.exchange(0);
         g_snap_waits = 0; g_snap_wait_ms = 0;
-        std::thread([copied, game, changes] {
+        printf("[fs] save commit #%u: start (%u changes to the save since the last commit; snapshot in the background)\n", n, changes);
+        std::thread([copied, game, changes, n] {
             // the.pending marker (its create + flush: the commit's last game-thread stall) first: it only has to be on
             // disk before finish_locked touches the published save; the snapshot writes save.new alone. Until the
             // publish lands; a failed snapshot is retried at the next Commit / start.
             pending(true);
             u64 t1 = GetTickCount64();
-            commits_lock();
+            g_save_stage = "waiting for the commit lock";
+            const bool locked = commits_lock("commit");
             u64 tl = GetTickCount64();
-            // TOTK_SAVE_SNAP_DELAY_MS=<ms> (tests): the snapshot starts that much later, so the game's next changes wait
-            static const DWORD delay = getenv("TOTK_SAVE_SNAP_DELAY_MS") ? (DWORD)atoi(getenv("TOTK_SAVE_SNAP_DELAY_MS")) : 0;
-            if (delay) Sleep(delay);
-            bool ok = snapshot_locked(g_work, copied.get());
-            const bool same = ok && snapshot_unchanged();
+            bool ok = false, same = false;
+            if (locked) {
+                // TOTK_SAVE_SNAP_DELAY_MS=<ms> (tests): the snapshot starts that much later, so the game's next changes
+                // wait (past TOTK_SAVE_WAIT_MS: they go on, and this snapshot is dropped)
+                static const DWORD delay = getenv("TOTK_SAVE_SNAP_DELAY_MS") ? (DWORD)atoi(getenv("TOTK_SAVE_SNAP_DELAY_MS")) : 0;
+                if (delay) Sleep(delay);
+                g_save_stage = "taking the snapshot";
+                ok = snapshot_locked(g_work, copied.get());
+                g_save_stage = "comparing the snapshot with the committed save";
+                same = ok && snapshot_unchanged();
+            }
             u64 ts = GetTickCount64();
-            { std::lock_guard<std::mutex> l(g_snap_mtx); g_snap_pending = false; }
+            bool torn;
+            {
+                std::lock_guard<std::mutex> l(g_snap_mtx);
+                torn = g_snap_torn;
+                g_snap_torn = false;
+                g_snap_pending = false;
+            }
             g_snap_cv.notify_all();
+            if (!locked) printf("[fs] save commit #%u: no snapshot without the commit lock; the next commit or start does it\n", n);
+            else if (!ok) printf("[fs] save commit #%u: the snapshot failed (error %lu); the next commit or start does it\n", n, GetLastError());
+            else if (torn) {   // a change went on during the snapshot: it may hold a mix of two saves
+                if (!same) remove_tree(nw_dir());
+                printf("[fs] save commit #%u: dropped, a change to the save could not wait for the snapshot; the next commit does it\n", n);
+                ok = false;
+            } else if (!same) printf("[fs] save commit #%u: snapshot taken in %llu ms (lock %llu ms), publishing\n", n,
+                                     (unsigned long long)(ts - tl), (unsigned long long)(tl - t1));
             u64 ms[3] = {};
             g_move_retries = 0; g_move_max_ms = 0;
-            ok = ok && (same || finish_locked(*copied, ms));
-            commits_unlock();
+            if (ok && !same) {
+                g_save_stage = "flushing and publishing";
+                ok = finish_locked(*copied, ms);
+            }
+            if (locked) commits_unlock();
+            g_save_stage = "idle";
             if (ok && same) pending(false);
             else if (ok) {
                 pending(false);
-                printf("[fs] save commit published: %llu ms on the game thread, snapshot %llu ms + flush + rename + swap %llu ms in the"
-                       " background (mutex %llu, flush %llu ms for %zu files, .ready %llu, swap + backup %llu; renames retried %u,"
+                printf("[fs] save commit #%u published: %llu ms on the game thread, snapshot %llu ms + flush + rename + swap %llu ms in"
+                       " the background (mutex %llu, flush %llu ms for %zu files, .ready %llu, swap + backup %llu; renames retried %u,"
                        " longest %u ms; %u changes to the save since the last commit; %u later ones waited %llu ms for the"
-                       " snapshot)\n",
+                       " snapshot)\n", n,
                        (unsigned long long)game, (unsigned long long)(ts - tl), (unsigned long long)(GetTickCount64() - ts),
                        (unsigned long long)(tl - t1), (unsigned long long)ms[0], copied->size(), (unsigned long long)ms[1],
                        (unsigned long long)ms[2], g_move_retries.load(), g_move_max_ms.load(), changes, g_snap_waits.load(),
                        (unsigned long long)g_snap_wait_ms.load());
             }
             { std::lock_guard<std::mutex> p(g_pub_mtx); g_pub_busy = false; }
+            g_pub_stuck = false;
             g_pub_cv.notify_all();
         }).detach();
         return;
     }
-    commits_lock();
+    if (!commits_lock("commit")) { commit_skipped(n, "waited for the commit lock"); return; }
+    commit_covers_skipped();
     bool ok = snapshot_locked(g_work, copied.get());
     const bool same = ok && snapshot_unchanged();
     commits_unlock();
@@ -2001,22 +2126,33 @@ static void commit_save() {
     if (!ok) return;
     { std::lock_guard<std::mutex> p(g_pub_mtx); g_pub_busy = true; }
     u64 snap = GetTickCount64() - t0;
-    std::thread([copied, snap] {
+    std::thread([copied, snap, n] {
         u64 t1 = GetTickCount64();
-        commits_lock();
+        g_save_stage = "waiting for the commit lock";
+        if (!commits_lock("commit")) {   // (save.new stays incomplete: the next snapshot or start removes it)
+            printf("[fs] save commit #%u: not published without the commit lock; the next commit or start does it\n", n);
+            g_save_stage = "idle";
+            { std::lock_guard<std::mutex> p(g_pub_mtx); g_pub_busy = false; }
+            g_pub_stuck = false;
+            g_pub_cv.notify_all();
+            return;
+        }
         u64 tl = GetTickCount64(), ms[3] = {};
         g_move_retries = 0; g_move_max_ms = 0;
+        g_save_stage = "flushing and publishing";
         bool ok = finish_locked(*copied, ms);
         commits_unlock();
+        g_save_stage = "idle";
         if (ok) {
             pending(false);
-            printf("[fs] save commit published: snapshot %llu ms on the game thread, flush + rename + swap %llu ms in the background"
-                   " (mutex %llu, flush %llu ms for %zu files, .ready %llu, swap + backup %llu; renames retried %u, longest %u ms)\n",
+            printf("[fs] save commit #%u published: snapshot %llu ms on the game thread, flush + rename + swap %llu ms in the background"
+                   " (mutex %llu, flush %llu ms for %zu files, .ready %llu, swap + backup %llu; renames retried %u, longest %u ms)\n", n,
                    (unsigned long long)snap, (unsigned long long)(GetTickCount64() - t1), (unsigned long long)(tl - t1),
                    (unsigned long long)ms[0], copied->size(), (unsigned long long)ms[1], (unsigned long long)ms[2],
                    g_move_retries.load(), g_move_max_ms.load());
         }
         { std::lock_guard<std::mutex> p(g_pub_mtx); g_pub_busy = false; }
+        g_pub_stuck = false;
         g_pub_cv.notify_all();
     }).detach();
 }
