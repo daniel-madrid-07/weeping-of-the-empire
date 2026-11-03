@@ -48,4 +48,21 @@ std::string pc_mask_user(const std::string &text, const std::wstring &profile, c
 }
 
 std::string pc_mask_user(const std::string &text) { return pc_mask_user(text, env(L"USERPROFILE"), env(L"USERNAME")); }
+#else
+// Linux: the home folder becomes ~ and the user name <user> (a path is matched as is: Linux paths are case-sensitive)
+#include "pc_sysinfo.h"
+#include <stdlib.h>
+#include <string.h>
+namespace {
+void replace_all(std::string &s, const std::string &what, const std::string &with) {
+    for (size_t at = 0; !what.empty() && (at = s.find(what, at)) != std::string::npos; at += with.size()) s.replace(at, what.size(), with);
+}
+}  // namespace
+std::string pc_mask_user(const std::string &text) {
+    std::string t = text;
+    const char *home = getenv("HOME"), *user = getenv("USER");
+    if (home && strlen(home) >= 3) replace_all(t, home, "~");
+    if (user && strlen(user) >= 3) replace_all(t, user, "<user>");   // (a shorter name would hit ordinary words)
+    return t;
+}
 #endif

@@ -127,8 +127,14 @@ PC_TR("While a D-pad quick menu is held open (weapons, shields, items, bows), ea
       "Пока открыто быстрое меню D-pad (оружие, щиты, предметы, луки), щелчок колеса сдвигает выбор на одну позицию.")
 PC_TR("Map with the mouse",
       "Карта мышью")
-PC_TR("On the map the mouse moves it as the left stick does (the reticle stays at the centre), the wheel zooms, a left click places a pin or stamp and a right click goes back.",
-      "На карте мышь двигает её как левый стик (прицел остаётся по центру), колесо масштабирует, левый щелчок ставит метку или значок, правый возвращает назад.")
+PC_TR("On the map the mouse moves the map under the reticle (it stays at the centre) as far as the pointer would move, the wheel zooms, a left click places a pin or stamp and a right click goes back.",
+      "На карте мышь двигает карту под прицелом (он остаётся по центру) настолько, насколько сдвинулся бы указатель, колесо масштабирует, левый щелчок ставит метку или штамп, правый — назад.")
+PC_TR("Map cursor sensitivity",
+      "Чувствительность курсора карты")
+PC_TR("How far the map moves for the mouse's motion: 1 = as far as the desktop pointer would move on the screen, 2 = twice as far.",
+      "Насколько карта сдвигается от движения мыши: 1 = как указатель на рабочем столе, 2 = вдвое дальше.")
+PC_TR("How far the map moves under the reticle for the mouse's motion: 1 = like the desktop pointer, 2 = twice as far.",
+      "Насколько карта сдвигается под прицелом от движения мыши: 1 = как указатель на рабочем столе, 2 = вдвое дальше.")
 PC_TR("Menu keys",
       "Клавиши меню")
 PC_TR("In the pause menu and the Purah Pad: Esc goes back, PageUp / PageDown (and the wheel in the pause menu) switch tabs, and in the pause menu clicks select (left) and go back (right).",
@@ -283,6 +289,8 @@ PC_TR("Compiling shaders %d %%",
       "Компиляция шейдеров %d %%")
 PC_TR("Loading shaders %d %%",
       "Загрузка шейдеров %d %%")
+PC_TR("(paused: low memory)",
+      "(пауза: мало памяти)")
 PC_TR("Windows runs your monitor at %lu Hz: set it to %lu Hz in Settings > Display > Advanced display",
       "Windows запускает монитор на %lu Hz: установите %lu Hz в Параметры > Дисплей > Дополнительные параметры дисплея")
 PC_TR("It writes the NSO header.",
@@ -649,8 +657,14 @@ PC_TR("The resolution the monitor switches to in exclusive fullscreen. Borderles
       "Разрешение, на которое переключается монитор в эксклюзивном полноэкранном режиме. Режимы без рамки и оконный сохраняют разрешение рабочего стола.")
 PC_TR("The refresh rate in exclusive fullscreen. Higher is smoother when the frame rate keeps up.",
       "Частота обновления в эксклюзивном полноэкранном режиме. Выше — плавнее, если частота кадров успевает.")
-PC_TR("The most frames per second the game shows. Higher is smoother and costs more GPU and CPU; 30 is the Switch's. Unlocked follows the monitor's refresh rate (240 at most); steady holds a rate the scene can keep.",
-      "Максимум кадров в секунду, которые показывает игра. Выше — плавнее, но больше нагрузка на GPU и CPU; 30 — как на Switch. «Без лимита» следует частоте обновления монитора (максимум 240); «Без лимита, стабильно» держит частоту, которую сцена может выдержать.")
+PC_TR("The most frames per second the game shows. Higher is smoother and costs more GPU and CPU; 30 is the Switch's. Unlocked follows the monitor's refresh rate (240 at most); steady holds a rate the scene can keep. For an even picture pick a cap that divides the refresh rate (30 or 60 on 60 Hz, 40 on 120 Hz), or turn VRR on. Steam Deck: 60 (OLED: 90) at first; if it is not held, lower it to 40 with the screen at 40 Hz (Quick Access > Performance).",
+      "Максимум кадров в секунду, которые показывает игра. Выше — плавнее, но больше нагрузка на GPU и CPU; 30 — как на Switch. «Без лимита» следует частоте обновления монитора (максимум 240); «Без лимита, стабильно» держит частоту, которую сцена может выдержать. Для ровной картинки выберите лимит, на который делится частота обновления (30 или 60 при 60 Гц, 40 при 120 Гц), или включите VRR. Steam Deck: сначала 60 (OLED: 90); если не держится, снизьте до 40 и поставьте экран на 40 Гц (Быстрый доступ > Производительность).")
+PC_TR("Frame rate \"Unlocked, steady\" only: the lowest rate it holds. 30 (default) suits most PCs. On one that cannot hold 30, 20 or 15 show every frame for the same time (3 or 4 refreshes on 60 Hz) instead of an uneven 15-20.",
+      "Только для частоты кадров «Без лимита, стабильно»: наименьшая частота, которую он держит. 30 (по умолчанию) подходит большинству ПК. На ПК, не тянущем 30, при 20 или 15 каждый кадр показывается одинаковое время (3 или 4 обновления при 60 Hz) вместо неровных 15-20.")
+PC_TR("%d fps on this %d Hz monitor shows frames unevenly (one refresh, then two). Even: %s, steady, VRR on, or the monitor at %d Hz or a multiple (Steam Deck: Quick Access > Performance).",
+      "%d кадр/с на этом мониторе %d Гц показываются неравномерно (одно обновление, затем два). Равномерно: %s, «стабильно», VRR вкл. или монитор на %d Гц или кратной частоте (Steam Deck: Быстрый доступ > Производительность).")
+PC_TR("uneven",
+      "неровно")
 PC_TR("On (default): no tearing. Off: slightly less input latency, with tearing lines.",
       "Вкл. (по умолчанию): без разрывов. Выкл.: чуть меньше задержка ввода, но с линиями разрывов.")
 PC_TR("Variable refresh rate (G-SYNC, FreeSync): the monitor waits for each frame, smooth below its refresh rate and without tearing. Needs a VRR monitor with VRR on in Windows or the driver.",
@@ -677,8 +691,8 @@ PC_TR("The resolution the 3D scene is drawn at, against the game's own. Higher i
       "Разрешение, в котором рисуется 3D-сцена, относительно разрешения игры. Выше — чётче, но намного больше нагрузка на GPU; ниже — быстрее и размытее. 100 % — нативное.")
 PC_TR("Lowers the 3D resolution only when the GPU falls behind, never below the floor chosen, to hold the frame rate. Off keeps the picture sharp all the time; On is smoother on a slower GPU.",
       "Снижает 3D-разрешение, только когда GPU не успевает, но не ниже выбранного минимума, чтобы удержать частоту кадров. «Выкл.» сохраняет чёткую картинку всегда; «Вкл.» плавнее на слабом GPU.")
-PC_TR("Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the game's 1080p stretched. Sharper text for a little GPU.",
-      "Выше 1080p меню, текст и HUD рисуются в разрешении окна, а не растягиваются из 1080p игры. Чётче текст за небольшую нагрузку на GPU.")
+PC_TR("Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the game's 1080p stretched. Sharper text for a little GPU. Off by default for now: at some resolutions it can show broken text (being fixed).",
+      "Выше 1080p меню, текст и HUD рисуются в разрешении окна, а не растягиваются из 1080p игры. Чётче текст за небольшую нагрузку на GPU. Пока выключено по умолчанию: при некоторых разрешениях текст может отображаться с искажениями (исправляется).")
 PC_TR("NVIDIA RTX only: DLSS upscales the 3D scene with AI, sharper and steadier than the other upscalers. At 100 % render resolution it is DLAA: the best image, for more GPU.",
       "Только NVIDIA RTX: DLSS масштабирует 3D-сцену с помощью ИИ, чётче и стабильнее других апскейлеров. При разрешении рендера 100 % это DLAA: лучшее изображение за большую нагрузку на GPU.")
 PC_TR("NVIDIA RTX 40 series or newer: generated frames between the real ones (x2; x3 and x4 on RTX 50) make motion look smoother, but the game itself does not run faster and input latency rises a little. Best when the game already runs well.",
@@ -725,12 +739,12 @@ PC_TR("Your monitor's peak brightness in nits, so highlights are neither clipped
       "Пиковая яркость монитора в nits, чтобы света не обрезались и не тускнели. Берите значение, указанное для монитора.")
 PC_TR("How bright ordinary white (menus, the sky) is in HDR. Raise it if the picture looks dim, lower it if it is too bright.",
       "Яркость обычного белого (меню, небо) в HDR. Повысьте, если картинка тусклая, понизьте, если слишком яркая.")
-PC_TR("Wide screens: The window's draws a 21:9 or 32:9 picture with a wider view on such a window or monitor; 16:9 keeps the game's own. A wider picture costs more GPU.",
-      "Широкие экраны: «Как у окна» рисует картинку 21:9 или 32:9 с более широким обзором на таком окне или мониторе; 16:9 оставляет вид игры. Более широкая картинка нагружает GPU.")
-PC_TR("On 21:9 or 32:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a very wide screen). Nothing changes at 16:9.",
-      "На 21:9 или 32:9: HUD по краям экрана или посередине в 16:9 (удобнее на очень широком экране). На 16:9 ничего не меняется.")
-PC_TR("On 21:9 or 32:9: real-time cutscenes wide like the rest of the game, or the original 16:9 with bars at the sides.",
-      "На 21:9 или 32:9: заставки в реальном времени широкие, как остальная игра, или оригинальные 16:9 с полосами по бокам.")
+PC_TR("The window's (the default): on a 16:10, 21:9, 32:9 or 48:9 window or monitor the picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9: that shape whatever the window. A new shape's layouts are made at its first start (about 30 s, once). A wider picture costs more GPU.",
+      "«Как у окна» (по умолчанию): в окне или на мониторе 16:10, 21:9, 32:9 или 48:9 картинка принимает эту форму, 21:9, 32:9 и 48:9 — с более широким обзором; другие формы, в том числе 16:9, оставляют картинку игры. 16:9 / 16:10 / 21:9 / 32:9 / 48:9: эта форма при любом окне. Интерфейс для новой формы готовится при её первом запуске (около 30 с, один раз). Более широкая картинка сильнее нагружает GPU.")
+PC_TR("On 21:9, 32:9 or 48:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a very wide screen). Nothing changes at 16:9. Automatic (the default): the middle on 48:9, the edges otherwise.",
+      "На 21:9, 32:9 или 48:9: HUD по краям экрана или посередине в 16:9 (удобнее на очень широком экране). На 16:9 ничего не меняется. Автоматически (по умолчанию): по центру на 48:9, по краям на остальных.")
+PC_TR("On 21:9, 32:9 or 48:9: real-time cutscenes wide like the rest of the game, or the original 16:9 with bars at the sides.",
+      "На 21:9, 32:9 или 48:9: заставки в реальном времени широкие, как остальная игра, или оригинальные 16:9 с полосами по бокам.")
 PC_TR("Widens or narrows the camera's view (1 = the game's). Wider shows more of the world and costs some GPU and CPU.",
       "Расширяет или сужает обзор камеры (1 = как в игре). Шире — видно больше мира, но нагрузка на GPU и CPU растёт.")
 PC_TR("More memory for textures: fewer blurry textures when you turn around, for about 490 MiB of video memory per step.",
@@ -739,6 +753,8 @@ PC_TR("More grass, flowers and pebbles. Higher looks fuller and costs GPU and CP
       "Больше травы, цветов и камешков. Выше — гуще, но нагружает GPU и CPU.")
 PC_TR("Sharper shadows: 2 doubles the shadow map's width and height, for 4x its memory and more GPU.",
       "Чётче тени: 2 удваивает ширину и высоту карты теней, то есть в 4x больше памяти и больше нагрузка на GPU.")
+PC_TR("Moves the lines where the sun's sharp near shadows hand over to coarser ones further away (1 = the game's, 2 = twice as far). Near shadows get a little softer: raise Shadow resolution with it. Costs a little GPU and CPU.",
+      "Отодвигает линии, где чёткие ближние тени от солнца сменяются более грубыми (1 = как в игре, 2 = вдвое дальше). Ближние тени становятся немного мягче: повышайте вместе с этим Разрешение теней. Немного нагружает GPU и CPU.")
 PC_TR("Fixed keeps the sun's shadow map at its largest size: steadier, sharper leaf shadows for some GPU. The game's changes its size with the view.",
       "«Фиксированный» держит карту теней солнца максимального размера: стабильнее и чётче тени листвы за часть GPU. «Как в игре» меняет её размер вместе с обзором.")
 PC_TR("How far the sharp shadows reach. Higher looks better in the distance and costs GPU.",
@@ -821,12 +837,18 @@ PC_TR("A pad's motion controls (aiming, some puzzles). Off ignores the gyro.",
       "Управление геймпада движением (прицеливание, некоторые головоломки). Выкл. игнорирует гироскоп.")
 PC_TR("How far motion aim turns for a turn of the pad: 1 = the pad's own, 2 = twice as far.",
       "Насколько поворачивается гироприцел при повороте геймпада: 1 = как у геймпада, 2 = вдвое сильнее.")
+PC_TR("How light rumbles feel next to strong ones: below 1 light ones come through stronger, above 1 only strong ones do. 1 = the game's own.",
+      "Как слабая вибрация ощущается рядом с сильной: ниже 1 слабая становится заметнее, выше 1 остаётся только сильная. 1 = как в игре.")
+PC_TR("Xbox One / Series pads: the trigger motors buzz with the game's rumble. Off by default (the Switch pad has none).",
+      "Геймпады Xbox One / Series: моторы курков вибрируют вместе с вибрацией игры. По умолчанию выкл. (у геймпада Switch их нет).")
+PC_TR("How fast the right stick turns the camera: 1 = the game's own, 2 = twice as fast. The mouse keeps its own sensitivity.",
+      "Скорость поворота камеры правым стиком: 1 = как в игре, 2 = вдвое быстрее. У мыши своя чувствительность.")
 PC_TR("How far the left stick must move before it counts. Raise it if Link moves with the stick at rest; lower it for finer steps. 0 = the pad's own.",
       "Насколько нужно отклонить левый стик, чтобы это засчитывалось. Увеличьте, если Линк движется при неотклонённом стике; уменьшите для точных шагов. 0 = как у геймпада.")
 PC_TR("How far the right stick must move before it counts. Raise it if the camera turns with the stick at rest; lower it for finer aiming. 0 = the pad's own.",
       "Насколько нужно отклонить правый стик, чтобы это засчитывалось. Увеличьте, если камера поворачивается при неотклонённом стике; уменьшите для точного прицеливания. 0 = как у геймпада.")
-PC_TR("The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Simplified Chinese; Brazilian Portuguese on a Portuguese Windows). Automatic: Windows' language if the game has it, else English.",
-      "Тексты и субтитры игры, а также тексты этих настроек (English, испанский, русский, китайский (упрощённый); бразильский португальский в португальской Windows). «Автоматически»: язык Windows, если он есть в игре, иначе английский.")
+PC_TR("The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' language if the game has it, else English.",
+      "Тексты и субтитры игры, а также тексты этих настроек (английский, испанский, русский, бразильский португальский, китайский упрощённый). Português (Brasil): тексты версии 1.4.3; для 1.0.0 нужно обновление 1.4.3, переданное в Setup (иначе английский); голоса остаются английскими. Автоматически: язык Windows, если он есть в игре, иначе английский.")
 PC_TR("A new game skips the opening and starts on the Great Sky Island. F2 or Minus on the title screen also switch it.",
       "Новая игра пропускает вступление и начинается на Great Sky Island. F2 или Минус на титульном экране тоже переключают.")
 PC_TR("Docked (default) or handheld: handheld renders at the Switch's lower handheld resolution (faster, blurrier).",
@@ -861,8 +883,8 @@ PC_TR("Console layout",
       "Консольная")
 PC_TR("Language",
       "Язык")
-PC_TR("TOTK_LANG: the game's texts and voices' subtitles, and the PC settings' own texts (English, Spanish, Russian, Simplified Chinese; Brazilian Portuguese on a Portuguese Windows). Automatic: Windows' display language if the game has it, else English.",
-      "TOTK_LANG: тексты игры и субтитры голосов, а также тексты настроек ПК (English, испанский, русский, китайский (упрощённый); бразильский португальский в португальской Windows). «Автоматически»: язык интерфейса Windows, если он есть в игре, иначе английский.")
+PC_TR("TOTK_LANG: the game's texts and voices' subtitles, and the PC settings' own texts (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' display language if the game has it, else English.",
+      "TOTK_LANG: тексты игры и субтитры голосов, а также тексты настроек ПК (английский, испанский, русский, бразильский португальский, китайский упрощённый). Português (Brasil): тексты версии 1.4.3; для 1.0.0 нужно обновление 1.4.3, переданное в Setup (иначе английский); голоса остаются английскими. Автоматически: язык интерфейса Windows, если он есть в игре, иначе английский.")
 PC_TR("Automatic (Windows' language)",
       "Автоматически (язык Windows)")
 PC_TR("Russian",
@@ -953,6 +975,8 @@ PC_TR("frame",
       "кадр")
 PC_TR("worst",
       "худший")
+PC_TR("real",
+      "реальных")
 PC_TR("Press a key or mouse button (Esc: cancel)",
       "Нажмите клавишу или кнопку мыши (Esc: отмена)")
 PC_TR("(the layout's keys)",
@@ -1095,6 +1119,12 @@ PC_TR("Unlocked (monitor rate)",
       "Без лимита (частота монитора)")
 PC_TR("Unlocked, steady (a rate it can hold)",
       "Без лимита, стабильно")
+PC_TR("Steady's lowest rate",
+      "Нижний предел стабильного режима")
+PC_TR("TOTK_STEADY_FLOOR. Frame rate Steady only: the lowest rate it holds. 20 or 15 keep a PC that cannot hold 30 even (3 or 4 refreshes a frame on 60 Hz).",
+      "TOTK_STEADY_FLOOR. Только для режима «Без лимита, стабильно»: наименьшая частота, которую он держит. 20 или 15 делают картинку ровной на ПК, не тянущем 30 (3 или 4 обновления на кадр при 60 Hz).")
+PC_TR("30 (default)",
+      "30 (по умолчанию)")
 PC_TR("Perf overlay (F9)",
       "Perf-оверлей (F9)")
 PC_TR("Fps, 1% low and the frame-time graph.",
@@ -1141,8 +1171,8 @@ PC_TR("Follow the window height",
       "По высоте окна")
 PC_TR("Native-resolution interface",
       "Интерфейс в нативном разрешении")
-PC_TR("TOTK_OUT_SCALE: above 1080p, menus, text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched. Applies at once.",
-      "TOTK_OUT_SCALE: выше 1080p меню, текст и HUD рисуются в разрешении окна, а не растягиваются из 1920 x 1080 игры. Применяется сразу.")
+PC_TR("TOTK_OUT_SCALE: above 1080p, menus, text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched. Off by default: at some resolutions it can show broken text (being fixed). Applies at once.",
+      "TOTK_OUT_SCALE: выше 1080p меню, текст и HUD рисуются в разрешении окна, а не растягиваются из 1920 x 1080 игры. Выключено по умолчанию: при некоторых разрешениях текст может отображаться с искажениями (исправляется). Применяется сразу.")
 PC_TR("Dynamic resolution",
       "Динамическое разрешение")
 PC_TR("Off: the scene always at the render resolution. On: the game lowers it only when the GPU is short of time, never below the chosen floor, aiming at the frame rate (that aim takes effect at the next start).",
@@ -1307,6 +1337,20 @@ PC_TR("Texture LOD bias",
       "Смещение LOD текстур")
 PC_TR("TOTK_LOD_BIAS: below 0 is sharper. Applies at once.",
       "TOTK_LOD_BIAS: ниже 0 — чётче. Применяется сразу.")
+PC_TR("Compact textures (low VRAM)",
+      "Компактные текстуры (мало VRAM)")
+PC_TR("LARECOMP_ASTC_BC3: the game's textures kept in a quarter of the video memory (BC3), with slightly softer "
+      "colour detail. Automatic: on only for graphics cards with 4 GB or less. Takes effect at the next start.",
+      "LARECOMP_ASTC_BC3: текстуры игры занимают четверть видеопамяти (BC3), мелкие цветовые детали чуть мягче. "
+      "Автоматически: включено только на видеокартах с 4 ГБ или меньше. Применяется при следующем запуске.")
+PC_TR("Automatic (on with 4 GB of VRAM or less)",
+      "Автоматически (включено при 4 ГБ VRAM или меньше)")
+PC_TR("For graphics cards with 4 GB of video memory or less: the textures take a quarter of the memory, so the game "
+      "no longer runs out of it (stutters, blurry or late textures). Fine colour detail gets a little softer. "
+      "Automatic turns it on only on such cards.",
+      "Для видеокарт с 4 ГБ видеопамяти или меньше: текстуры занимают четверть памяти, и игре её больше хватает (нет "
+      "рывков, размытых или запаздывающих текстур). Мелкие цветовые детали становятся чуть мягче. Автоматически "
+      "включает это только на таких картах.")
 PC_TR("Scene upscaler",
       "Апскейлер сцены")
 PC_TR("TOTK_SCENE_UPSCALE. Applies at once.",
@@ -1337,6 +1381,10 @@ PC_TR("TOTK_PC_CRASH: a report and a minidump per crash.",
       "TOTK_PC_CRASH: отчёт и minidump на каждый сбой.")
 PC_TR("Automatic updates",
       "Автообновления")
+PC_TR("Discord status",
+      "Статус в Discord")
+PC_TR("Shows \"Playing\" and the time played on your Discord profile while Discord runs. Nothing else is sent.",
+      "Показывает «Играет» и время игры в профиле Discord, пока Discord запущен. Больше ничего не отправляется.")
 PC_TR("Key bindings (Custom layout)",
       "Привязки клавиш (раскладка «Свой»)")
 PC_TR("TOTK_KBM_A. Used by the console scheme, and in the world with Gameplay keys: Console. Empty: the PC layout's keys.",
@@ -1507,6 +1555,10 @@ PC_TR("Shadow resolution",
       "Разрешение теней")
 PC_TR("Multiplier of the shadow map's width and height (2 = sharper, 4x the memory).",
       "Множитель ширины и высоты карты теней (2 = чётче, памяти в 4x больше).")
+PC_TR("Near shadow reach",
+      "Дальность ближних теней")
+PC_TR("Multiplier of how far the sun's sharpest shadow cascades reach (1 = the game's: the first two hand over 32 m and 64 m away, where the change in sharpness shows as a line, mostly at 4K). 2 moves those lines to 64 m and 128 m; the far shadows stay. The same shadow map then covers more ground, so near shadows get softer by that factor: raise Shadow resolution with it. Costs a little GPU and CPU (more objects drawn into the near shadow maps).",
+      "Множитель того, как далеко доходят самые чёткие каскады теней от солнца (1 = как в игре: первые два сменяются на 32 м и 64 м, где смена чёткости видна как линия, особенно в 4K). 2 переносит эти линии на 64 м и 128 м; дальние тени не меняются. Та же карта теней тогда покрывает больше земли, поэтому ближние тени становятся мягче во столько же раз: повышайте вместе с этим Разрешение теней. Немного нагружает GPU и CPU (в ближние карты теней рисуется больше объектов).")
 PC_TR("Sun shadow map size",
       "Размер карты теней солнца")
 PC_TR("The game's: the sun's shadow map shrinks and grows with the area its cascades cover, so near the ground foliage shadows turn coarse, and every size change moves the shadow texels (leaf shadows jump instead of sliding). Fixed: always the largest size the game picks (times the shadow resolution), steady and sharper; costs some GPU.",
@@ -1539,12 +1591,12 @@ PC_TR("Game patches",
       "Патчи игры")
 PC_TR("Aspect ratio",
       "Формат кадра")
-PC_TR("The window's: on a 16:10, 21:9 or 32:9 window or monitor the game draws a canvas of that shape at start (1920x1200, 3440x1440 or 5120x1440), the HUD laid out for it: 21:9 and 32:9 a wider view, 16:10 a taller one (the same height of view, a little less at the sides). Other shapes, and 16:9, keep the game's 16:9 picture. 16:10 / 21:9 / 32:9: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9 and 32:9 are heavier than the window's own shape: the whole canvas is drawn, then shown smaller). Needs the game patches' RomFS sets (TOTK_PATCH_SETS) and the overlay's layout for that shape. At the next start: the canvas and the game files laid out for it are chosen as the game starts.",
-      "Как у окна: в окне или на мониторе 16:10, 21:9 или 32:9 игра при запуске рисует холст такой формы (1920x1200, 3440x1440 или 5120x1440), HUD расставлен под него: 21:9 и 32:9 дают более широкий обзор, 16:10 — более высокий (та же высота обзора, по бокам чуть меньше). Другие форматы и 16:9 сохраняют картинку игры 16:9. 16:10 / 21:9 / 32:9: этот холст при любом окне (в другом формате он показывается целиком, с полосами; 21:9 и 32:9 тяжелее формата самого окна: рисуется весь холст, затем показывается меньше). Нужны наборы RomFS из патчей игры (TOTK_PATCH_SETS) и раскладка оверлея для этого формата. При следующем запуске: холст и подогнанные под него файлы игры выбираются при старте игры.")
-PC_TR("HUD position (21:9, 32:9)",
-      "Позиция HUD (21:9, 32:9)")
-PC_TR("Where the HUD goes on a 21:9 or 32:9 canvas: at the screen's edges, or in the middle 16:9 (closer to the eyes on a very wide screen). Menus are the same either way. Nothing changes at 16:9. At the next start: it picks game files the game reads once, as it starts.",
-      "Где находится HUD на холсте 21:9 или 32:9: по краям экрана или в центральной области 16:9 (ближе к глазам на очень широком экране). Меню одинаковы в обоих случаях. При 16:9 ничего не меняется. При следующем запуске: выбирает файлы игры, которые игра читает один раз при старте.")
+PC_TR("The window's: on a 16:10, 21:9, 32:9 or 48:9 window or monitor the game draws a canvas of that shape at start (1920x1200, 3440x1440, 5120x1440 or 7680x1440), the HUD laid out for it: 21:9, 32:9 and 48:9 a wider view, 16:10 a taller one (the same height of view, a little less at the sides). Other shapes, and 16:9, keep the game's 16:9 picture. 16:10 / 21:9 / 32:9 / 48:9: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9, 32:9 and 48:9 are heavier than the window's own shape: the whole canvas is drawn, then shown smaller). Needs the game patches' RomFS sets (TOTK_PATCH_SETS) and the overlay's layout for that shape. At the next start: the canvas and the game files laid out for it are chosen as the game starts.",
+      "Как у окна: в окне или на мониторе 16:10, 21:9, 32:9 или 48:9 игра при запуске рисует холст такой формы (1920x1200, 3440x1440, 5120x1440 или 7680x1440), HUD расставлен под него: 21:9, 32:9 и 48:9 дают более широкий обзор, 16:10 — более высокий (та же высота обзора, по бокам чуть меньше). Другие форматы и 16:9 сохраняют картинку игры 16:9. 16:10 / 21:9 / 32:9 / 48:9: этот холст при любом окне (в другом формате он показывается целиком, с полосами; 21:9, 32:9 и 48:9 тяжелее формата самого окна: рисуется весь холст, затем показывается меньше). Нужны наборы RomFS из патчей игры (TOTK_PATCH_SETS) и раскладка оверлея для этого формата. При следующем запуске: холст и подогнанные под него файлы игры выбираются при старте игры.")
+PC_TR("HUD position (21:9, 32:9, 48:9)",
+      "Позиция HUD (21:9, 32:9, 48:9)")
+PC_TR("Where the HUD goes on a 21:9, 32:9 or 48:9 canvas: at the screen's edges, or in the middle 16:9 (closer to the eyes on a very wide screen). Menus are the same either way. Nothing changes at 16:9. At the next start: it picks game files the game reads once, as it starts.",
+      "Где находится HUD на холсте 21:9, 32:9 или 48:9: по краям экрана или в центральной области 16:9 (ближе к глазам на очень широком экране). Меню одинаковы в обоих случаях. При 16:9 ничего не меняется. При следующем запуске: выбирает файлы игры, которые игра читает один раз при старте.")
 PC_TR("Texture cache",
       "Кэш текстур")
 PC_TR("Multiplier of the game's texture cache (fewer blurry textures when turning back; 490 MiB more per step). Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: it picks game files the game reads once, as it starts.",
@@ -1565,9 +1617,29 @@ PC_TR("Fast-travel speed",
       "Скорость перемещения")
 PC_TR("Fast: Link's departure when travelling is about 2.5 s shorter (its long waits halved, his dissolve as on the Switch); Normal is the game's own. Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: it picks game files the game reads once, as it starts.",
       "«Быстрая»: отправление Линка при быстром перемещении примерно на 2.5 с короче (долгие паузы вдвое меньше, растворение как на Switch); «Обычная» — как в игре. Нужны наборы RomFS из патчей игры (TOTK_PATCH_SETS). При следующем запуске: выбирает файлы игры, которые игра читает один раз при старте.")
-PC_TR("Cutscenes (21:9, 32:9)",
-      "Заставки (21:9, 32:9)")
-PC_TR("On a 21:9 or 32:9 canvas, real-time cutscenes and conversations: wide like the rest of the game, or the original 16:9 framing with bars at the sides (for a scene that looks odd at the edges). Pre-rendered movies are 16:9 video: always shown in the middle with bars.",
-      "На холсте 21:9 или 32:9 заставки и разговоры в реальном времени: широкие, как остальная игра, или исходный кадр 16:9 с полосами по бокам (для сцены, которая странно выглядит по краям). Заранее отрендеренные видеоролики — 16:9: всегда по центру, с полосами.")
+PC_TR("Cutscenes (21:9, 32:9, 48:9)",
+      "Заставки (21:9, 32:9, 48:9)")
+PC_TR("On a 21:9, 32:9 or 48:9 canvas, real-time cutscenes and conversations: wide like the rest of the game, or the original 16:9 framing with bars at the sides (for a scene that looks odd at the edges). Pre-rendered movies are 16:9 video: always shown in the middle with bars.",
+      "На холсте 21:9, 32:9 или 48:9 заставки и разговоры в реальном времени: широкие, как остальная игра, или исходный кадр 16:9 с полосами по бокам (для сцены, которая странно выглядит по краям). Заранее отрендеренные видеоролики — 16:9: всегда по центру, с полосами.")
 PC_TR("Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR: any GPU. All cost some GPU; Off is the game's own.",
       "Масштабирует 3D-сцену временным апскейлером, который накапливает детали за несколько кадров. DLSS: только NVIDIA RTX; DLAA: DLSS в полном разрешении, лучшее изображение ценой большей нагрузки на GPU. FSR: любой GPU. Все режимы нагружают GPU; «Выкл.» — как в игре.")
+PC_TR("Safe mode (if the game crashes)",
+      "Безопасный режим (если игра вылетает)")
+PC_TR("For a game that crashes or hangs: the renderer without its faster paths, DLSS, FSR and frame generation, and without the driver paths some GPUs crash in. Slower. At the next start.",
+      "Для игры, которая вылетает или зависает: рендерер без быстрых путей, без DLSS, FSR и генерации кадров и без путей драйвера, на которых падают некоторые GPU. Медленнее. При следующем запуске.")
+PC_TR("Wide picture: F10 > Restart the game now to use %s",
+      "Широкая картинка: F10 > «Перезапустить игру сейчас», чтобы использовать %s")
+PC_TR("The window changed shape: F10 > Restart the game now to fit it",
+      "Окно изменило форму: F10 > «Перезапустить игру сейчас», чтобы подогнать картинку")
+PC_TR("Safe mode is on: DLSS, FSR and frame generation stay off",
+      "Безопасный режим включён: DLSS, FSR и генерация кадров остаются выключенными")
+PC_TR("Frame generation mode",
+      "Режим генерации кадров")
+PC_TR("Smooth (matched to the refresh)",
+      "Плавный (по частоте обновления)")
+PC_TR("Maximum fps",
+      "Максимум кадров")
+PC_TR("TOTK_FG_PACE. Smooth: the frames shown match the monitor (real ones at the cap divided by the multiplier). Maximum fps: the real frames as without frame generation and the multiplier's generated ones after each, past the refresh rate, with VRR too (mailbox, else immediate, which can tear; the panel may leave VRR; TOTK_FG_MAX_VRR_FIFO=1 keeps VRR's FIFO).",
+      "TOTK_FG_PACE. Плавный: выводимые кадры идут в такт с монитором (реальные — с ограничением, делённым на множитель). Максимум кадров: реальные кадры как без генерации кадров, а после каждого — сгенерированные кадры множителя, выше частоты обновления, в том числе с VRR (mailbox, иначе immediate, при котором возможны разрывы изображения; монитор может выйти из режима VRR; TOTK_FG_MAX_VRR_FIFO=1 сохраняет FIFO режима VRR).")
+PC_TR("Smooth keeps the frames shown in step with the monitor's refresh. Maximum fps adds the generated frames to every real frame the PC makes, even past the refresh rate: more frames than the screen shows (the fps readout counts them all), for VRR panels or low latency; Smooth looks steadier on a fixed refresh. With V-sync off the picture can tear.",
+      "Плавный держит выводимые кадры в такт с обновлением монитора. Максимум кадров добавляет сгенерированные кадры к каждому реальному кадру, который делает ПК, даже выше частоты обновления: кадров больше, чем показывает экран (счётчик кадров считает все), для мониторов с VRR или низкой задержки; при фиксированной частоте Плавный выглядит ровнее. При выключенной вертикальной синхронизации возможны разрывы изображения.")

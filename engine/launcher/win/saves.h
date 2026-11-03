@@ -9,6 +9,8 @@
 #include <wchar.h>
 #include <windows.h>
 
+#include "savever.h"
+
 #define TOTK_TITLE_ID 0x0100F2C0115B6000ull
 
 typedef struct SaveCandidate {
@@ -47,6 +49,8 @@ void saves_recover(const wchar_t *base);
 /* Copies the current save to <base>\backups\save-<time>-NN-<why> (through a .tmp folder, renamed when complete).
  * Returns 1 and the backup's path, 0 when there is no save to back up, -1 on error. */
 int saves_backup(const wchar_t *base, const wchar_t *why, wchar_t *out_path, size_t n);
+/* The same for any save folder src (the original of an import from a later game version). */
+int saves_backup_from(const wchar_t *base, const wchar_t *src, const wchar_t *why, wchar_t *out_path, size_t n);
 /* Deletes all but the newest keep backups whose why is "auto"; other backups are kept. */
 void saves_prune(const wchar_t *base, int keep);
 /* Backups, newest first. */
@@ -55,10 +59,15 @@ int saves_list_backups(const wchar_t *base, SaveBackup *out, int max);
  * step leaves a complete save in place (the old one, or the new one). The caller makes a backup first.
  * 0 ok, else the failed step (1 copy, 2 move old away, 3 move new in). */
 int saves_replace(const wchar_t *base, const wchar_t *src);
+/* saves_replace, with the copy's files of later game versions converted to 1.0.0 before it goes in (savever.h; src
+ * itself is never written). 4: the conversion refused the save, *r says why (r may be NULL); nothing changed. */
+int saves_replace_report(const wchar_t *base, const wchar_t *src, SaveConvReport *r);
 
 /* Recursive copy / delete (used above; also by tests). 0 ok. */
 int saves_copy_tree(const wchar_t *src, const wchar_t *dst);
 int saves_delete_tree(const wchar_t *dir);
+/* A directory entry that is a link (symbolic link, junction): never followed. OneDrive's cloud files are not links. */
+int saves_is_link(const WIN32_FIND_DATAW *fd);
 
 /* Tests: make step k of saves_replace fail (0 = none). */
 extern int g_saves_fail_step;

@@ -30,7 +30,6 @@ extern "C" void *totk_data_page_current(void);   // games/totk/runtime/totk_patc
 
 namespace {
 constexpr u64 kWalkStopCall = totk_main(0x21225a8);   // return address of the Walk scheduler's check
-constexpr u64 kFrameDelta = 0x45577c0;                 // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 constexpr u64 kPresents = 88;                          // data_page.h TOTK_DP_PRESENTS (u32, one per game present)
 
 struct Hold { u64 player = 0; u32 frame = 0; float rel = 0; bool seen = false; };
@@ -73,11 +72,11 @@ void hook_f_16e4728(Ctx *__restrict c) {   // Player::checkPreLeftStickLengthGre
         return v;
     }();
     const u8 *page = (const u8 *)totk_data_page_current();
-    const u64 fd = totk_global(kFrameDelta);
+    const u64 fd = totk_frame_delta();
     if (!on || !page || !totk_ptr_ok(fd)) return;
     u32 frame;
     memcpy(&frame, page + kPresents, 4);
-    if (totk_walk_hold_step(player, frame, ldf32(fd + 8), (int)(c->x[0] & 1)) && !(c->x[0] & 1)) {
+    if (totk_walk_hold_step(player, frame, totk_frame_ratio(fd), (int)(c->x[0] & 1)) && !(c->x[0] & 1)) {
         c->x[0] = 1;
         static int logs;
         if (logs < 3 && ++logs) printf("[walk-hold] stop held (frame %u)\n", frame);

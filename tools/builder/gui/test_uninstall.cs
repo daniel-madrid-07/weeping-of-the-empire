@@ -100,6 +100,22 @@ static class UninstallTest
                !Directory.Exists(Path.Combine(root, "tools")) && !Directory.Exists(Path.Combine(root, "game")) &&
                Directory.GetFileSystemEntries(root).Length == 1 && r.Failed.Count == 0, string.Join(" | ", r.Kept));
 
+        // Setup's real shortcuts (BuilderForm.Shortcut into a temp desktop): the game's and '<game> - Settings' (the same
+        // launcher with --settings), and uninstall finds both by what they point at (Win32.ShortcutTarget)
+        root = Make(Path.Combine(t, "e"), out links, out desktop, out local, out roaming, out outside);
+        string desk = Path.Combine(t, "e", "RealDesktop"), launcher = Path.Combine(root, @"game\TotK-PC-1\TotK Launcher.exe");
+        Directory.CreateDirectory(desk);
+        string game = Path.Combine(desk, Release.Product + ".lnk"), settings = Path.Combine(desk, Release.Product + " - Settings.lnk");
+        Expect("17 Setup saves the game's shortcut and '- Settings'", BuilderForm.Shortcut(launcher, desk) && File.Exists(game) &&
+               File.Exists(settings), string.Join(" | ", Directory.GetFiles(desk).Select(Path.GetFileName)));
+        Expect("18 both start the launcher; only '- Settings' passes --settings",
+               string.Equals(Win32.ShortcutTarget(game), launcher, StringComparison.OrdinalIgnoreCase) &&
+               string.Equals(Win32.ShortcutTarget(settings), launcher, StringComparison.OrdinalIgnoreCase) &&
+               Win32.ShortcutArgs(game) == "" && Win32.ShortcutArgs(settings) == "--settings",
+               Win32.ShortcutArgs(game) + " / " + Win32.ShortcutArgs(settings));
+        r = Uninstaller.Run(root, new[] { links }, desk, Release.Product, local, null, Win32.ShortcutTarget);
+        Expect("19 uninstall removes both", !File.Exists(game) && !File.Exists(settings), string.Join(" | ", r.Failed));
+
         // never a folder Setup did not install into: no mark, a mark naming another folder, a mark but no stamp
         string home = Path.Combine(t, "c", "Documents");
         foreach (var f in new[] { @"src\thesis.tex", @"work\notes.txt", @"game\save.dat", @"tools\x.txt" }) Write(Path.Combine(home, f));

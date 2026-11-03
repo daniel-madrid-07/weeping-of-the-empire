@@ -3,6 +3,7 @@
 #include "pc_settings.h"
 #include "pc_overlay.h"
 #include "pc_display_caps.h"
+#include "host_wine.h"
 #include "../../games/totk/include/totk/totk_patches.h"  // totk_quality_presets() (the preset table)
 #include <windows.h>
 #include <algorithm>
@@ -16,7 +17,12 @@
 
 // Before every ordinary static initializer of the runtime: hle_audio.cpp's g_master, hle_fs.cpp's skip-opening flag
 // and hle_osd.cpp's recomp_settings.ini loader read the environment in theirs.
+#ifdef _WIN32
 #pragma init_seg(lib)
+#define PC_SETTINGS_FIRST
+#else
+#define PC_SETTINGS_FIRST __attribute__((init_priority(101)))   // (the same on Linux: the first initializer priority)
+#endif
 
 namespace {
 
@@ -201,6 +207,31 @@ bool first_run_display(pcd_caps *c) {
 // as fixed. A 60 Hz panel keeps 60.
 const char *first_run_fps_cap(const pcd_caps &c) {
     return c.vrr == PCD_VRR_ON && c.top_hz >= 62 ? "unlocked" : fps_cap_for_hz(c.top_hz);
+}
+
+// A Steam Deck (rival parity; host_steam_deck: the board's name, SteamDeck=1 only when it cannot be read): non-zero a
+// Deck, *oled for a Galileo, *height the height its desktop gives the game (Game Mode: gamescope's output, 800 on the
+// panel), in physical pixels: the primary's mode (boot() runs from a static initializer, before shim_win.c's SDL_Init
+// makes the process DPI-aware, so GetSystemMetrics would give a 1080p TV at 150 % as 720; the native Linux build's own
+// GetSystemMetrics answers from SDL). NXR_FIRST_RUN_DECK (test_pc_settings.py) stands in: "1" an LCD, "1o" an OLED, "0"
+// not a Deck, then ":<height>" (800 without).
+int steam_deck(bool *oled, int *height) {
+    if (const char *t = getenv("NXR_FIRST_RUN_DECK")) {
+        *oled = strchr(t, 'o') != nullptr;
+        const char *h = strchr(t, ':');
+        *height = h ? atoi(h + 1) : 800;
+        return atoi(t);
+    }
+    const int deck = host_steam_deck();
+    *oled = deck == HOST_DECK_OLED;
+#ifdef _WIN32
+    DEVMODEW dm = {};
+    dm.dmSize = sizeof dm;
+    *height = EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsHeight > 0 ? (int)dm.dmPelsHeight : 800;
+#else
+    *height = GetSystemMetrics(SM_CYSCREEN) > 0 ? GetSystemMetrics(SM_CYSCREEN) : 800;
+#endif
+    return deck;
 }
 
 void boot() {
@@ -392,6 +423,89 @@ void boot() {
             }
         }
     }
+    // controls.event.confirm: the events' E / Enter row is "interact" since v0.1.9.1 (public #58: held, so on foot's held
+    // E carries into the Temple of Time door's event), so a saved "Advance (events)" key moves to controls.event.interact,
+    // unless that is set already (then the old line goes). No marker: nothing writes the old key any more, so it cannot
+    // come back after an F10 reset
+    if (g_file_on) {
+        const std::string from = "controls.event.confirm", to = "controls.event.interact";
+        bool have_to = false, moved = false;
+        for (const auto &e : kv) have_to |= e.first == to;
+        for (size_t i = kv.size(); i-- > 0;)
+            if (kv[i].first == from) {
+                printf("[pc] settings: %s = %s %s%s (the events' E row is interact now)\n", from.c_str(),
+                       kv[i].second.c_str(), have_to ? "dropped, set already: " : "-> ", to.c_str());
+                if (have_to) kv.erase(kv.begin() + (long)i);
+                else { kv[i].first = to; have_to = true; }
+                moved = true;
+            }
+        for (size_t i = g_lines.size(); i-- > 0;) {
+            std::string k, v;
+            if (!parse(g_lines[i], &k, &v) || k != from) continue;
+            bool line_to = false;
+            for (const std::string &l : g_lines) { std::string k2, v2; line_to |= parse(l, &k2, &v2) && k2 == to; }
+            if (line_to) g_lines.erase(g_lines.begin() + (long)i);
+            else g_lines[i] = to + " = " + v;
+        }
+        if (moved && !g_first_run) {
+            g_dirty = true;
+            g_dirty_at = GetTickCount64();
+        }
+    }
+    // graphics.aspect_ratio: "window" by default since v0.1.9, but every file saved before holds "16:9" (a save writes
+    // every row), so the old default would stay. Once per file (the marker graphics.aspect_rev = 1): 16:9 becomes window,
+    // which on a 16:9 screen is the same picture; 16:10 / 21:9 / 32:9 stay, and a 16:9 picked after this stays.
+    if (g_file_on) {
+        bool done = false;
+        for (const auto &e : kv) done |= e.first == "graphics.aspect_rev" && atoi(e.second.c_str()) >= 1;
+        if (!done) {
+            for (auto &e : kv)
+                if (e.first == "graphics.aspect_ratio" && e.second == "16:9") {
+                    e.second = "window";
+                    printf("[pc] settings: graphics.aspect_ratio 16:9 -> window (the new default follows the screen's "
+                           "shape; aspect rev 1)\n");
+                }
+            for (size_t i = g_lines.size(); i-- > 0;) {
+                std::string k, v;
+                if (!parse(g_lines[i], &k, &v)) continue;
+                if (k == "graphics.aspect_ratio" && v == "16:9") g_lines[i] = "graphics.aspect_ratio = window";
+                if (k == "graphics.aspect_rev") g_lines.erase(g_lines.begin() + (long)i);
+            }
+            kv.push_back({"graphics.aspect_rev", "1"});
+            g_lines.push_back("graphics.aspect_rev = 1   # (graphics.aspect_ratio's default became window)");
+            if (!g_first_run) {
+                g_dirty = true;
+                g_dirty_at = GetTickCount64();
+            }
+        }
+    }
+    // graphics.hud_layout: "auto" by default since v0.1.9 (the middle 16:9 on 48:9, the edges otherwise: support #7), but
+    // every file saved before holds "corner" (a save writes every row), so 48:9 would keep the edges. Once per file (the
+    // marker graphics.hud_rev = 1): corner becomes auto, the same HUD on 21:9 / 32:9; center stays, and a corner picked
+    // after this stays.
+    if (g_file_on) {
+        bool done = false;
+        for (const auto &e : kv) done |= e.first == "graphics.hud_rev" && atoi(e.second.c_str()) >= 1;
+        if (!done) {
+            for (auto &e : kv)
+                if (e.first == "graphics.hud_layout" && e.second == "corner") {
+                    e.second = "auto";
+                    printf("[pc] settings: graphics.hud_layout corner -> auto (the new default; hud rev 1)\n");
+                }
+            for (size_t i = g_lines.size(); i-- > 0;) {
+                std::string k, v;
+                if (!parse(g_lines[i], &k, &v)) continue;
+                if (k == "graphics.hud_layout" && v == "corner") g_lines[i] = "graphics.hud_layout = auto";
+                if (k == "graphics.hud_rev") g_lines.erase(g_lines.begin() + (long)i);
+            }
+            kv.push_back({"graphics.hud_rev", "1"});
+            g_lines.push_back("graphics.hud_rev = 1   # (graphics.hud_layout's default became auto)");
+            if (!g_first_run) {
+                g_dirty = true;
+                g_dirty_at = GetTickCount64();
+            }
+        }
+    }
     // The package's settings.ini says display.fps_cap = 120 for every PC and nothing of VRR or HDR (package.py); on its
     // first start (no pc.welcome_done yet) the monitor decides:
     //  - Frame rate (only the package's 120): first_run_fps_cap.
@@ -418,6 +532,9 @@ void boot() {
             has_peak |= kv[i].first == "display.hdr_peak";
         }
         const bool scripted = getenv("TOTK_PRESS") || getenv("TOTK_CTL");
+        bool oled = false;
+        int deck_h = 0;
+        const int deck = g_fresh_file && !scripted ? steam_deck(&oled, &deck_h) : 0;
         pcd_caps c;
         if (g_fresh_file && cap >= 0 && first_run_display(&c)) {
             // A new key goes into the lines too: pc_window.cpp's rows come after this start's save, which keeps a line
@@ -434,7 +551,7 @@ void boot() {
             const bool vrr = !scripted && !has_vrr && c.vrr == PCD_VRR_ON;   // (MONITOR: suggested only)
             pcd_caps fixed = c;   // (VRR left off: the frame rate of a fixed refresh)
             if (!vrr) fixed.vrr = PCD_VRR_NONE;
-            if (kv[cap].second == "120") {
+            if (kv[cap].second == "120" && !deck) {
                 if (const char *fps = first_run_fps_cap(fixed)) {
                     kv[cap].second = fps;
                     set("display.fps_cap", fps, false);
@@ -447,6 +564,45 @@ void boot() {
                 snprintf(p, sizeof p, "%d", std::clamp((c.peak_nits + 25) / 50 * 50, 400, 4000));   // (the row's steps)
                 set("display.hdr_peak", p, true);
             }
+        }
+        // A Steam Deck's first start, the Deck profile (rival parity, PARITY.md 4.2 #3): fullscreen, vsync on, the
+        // scene drawn for the 1280 x 800 panel, and the panel's own rate: 60 on the LCD, 90 on the OLED. Only the
+        // package's own values move (its 120 and auto, windowed; any value for vsync, whose default is on); not the
+        // iGPU's steady (g_first_cap stays empty). The package's render scale auto is max(1, window height / 1080)
+        // (totk_hooks.c res_scale): 900 lines on the 800-line panel and on a 1080p TV, 2160 / 1080 x 900 on a 4K one,
+        // more than the Deck's GPU holds and no more than the panel shows. On its own panel (the desktop 800 lines or
+        // less) 0.8: 1:1 with the panel in both shapes, the 16:10 scene's 1600 x 1000 -> 1280 x 800 and the 16:9 one's
+        // 1600 x 900 -> 1280 x 720 (its letterboxed area), nothing the panel could show lost, 21 % fewer pixels than
+        // 0.9. Docked (a taller desktop) 0.9, 810 lines: 0.8 would be a visible step down on a TV (LEAD 11-02). Only
+        // the first start's screen counts: a Deck first started on its panel and docked later keeps 0.8 until the
+        // player changes it.
+        if (deck) {
+            // (from: the one value replaced, nullptr any; no line: added unless from is nullptr. The line itself too: a
+            // row pc_window.cpp registers after this start's save keeps its line as it was until then)
+            auto put = [&](const char *k, const char *v, const char *from) {
+                int at = -1;
+                for (size_t i = 0; i < kv.size(); i++)
+                    if (kv[i].first == k) at = (int)i;
+                if (at < 0 ? !from : kv[at].second == v || (from && kv[at].second != from)) return;
+                printf("[pc-settings] first start: %s -> %s (a Steam Deck)\n", k, *v ? v : "on");
+                const std::string line = std::string(k) + " = " + v;
+                if (at >= 0) {
+                    kv[at].second = v;
+                    for (std::string &l : g_lines) {
+                        std::string lk, lv;
+                        if (parse(l, &lk, &lv) && lk == k) l = line;
+                    }
+                } else {
+                    kv.push_back({k, v});
+                    g_lines.push_back(line);
+                }
+                g_dirty = true;
+                g_dirty_at = GetTickCount64();
+            };
+            put("display.window_mode", "borderless", "windowed");
+            put("display.fps_cap", oled ? "90" : "60", "120");
+            put("display.vsync", "", nullptr);
+            put("graphics.render_scale", deck_h <= 800 ? "0.8" : "0.9", "auto");
         }
     }
     g_kv = kv;
@@ -641,6 +797,31 @@ extern "C" void pc_settings_first_start_igpu(void) {
     pc_settings_set("display.fps_cap", "steady");
 }
 
+// graphics.safe_mode (rival parity, the launcher's settings before play, 2026-11-02): the renderer's crash-avoiding switches for a game that crashes or hangs, at a
+// cost in fps. The recording thread (vkq) and the render thread off, no graphics pipeline libraries (Intel's driver crashes, #34), no pipeline pre-build from the
+// shader archive at the start, no DLSS / DLAA / FSR / frame generation (their variables removed: some code only asks whether they exist; pc_dlss.cpp keeps them off
+// when changed in F10), hang markers on every draw so a crash still leaves a report. Not here, on purpose: frames in flight (its own row, cures no crash), float
+// preserve (correctness, Intel's default already) and the AMD defaults (turning those off makes AMD less safe).
+extern "C" void pc_safe_mode_env(void) {
+    const char *on = getenv("TOTK_SAFE_MODE");
+    if (!on || strcmp(on, "1")) return;
+    static const char *const kv[][2] = {
+        {"LARECOMP_VKQ", "0"}, {"LARECOMP_ASYNC_EXEC", "0"}, {"LARECOMP_NO_GPL", "1"}, {"TOTK_PRECOMPILE_ARCHIVE", "0"},
+        {"LARECOMP_CHECKPOINTS", "draw"}, {"TOTK_DLSS", ""}, {"TOTK_DLSS_SR", ""}, {"TOTK_DLSS_DLAA", ""},
+        {"TOTK_DLSS_FG", ""}, {"TOTK_FSR_SR", ""}, {"TOTK_FSR_FG", ""},
+    };
+    std::string said;
+    for (const auto &e : kv) {
+#ifdef _WIN32
+        _putenv_s(e[0], e[1]);   // ("": removed)
+#else
+        if (*e[1]) setenv(e[0], e[1], 1); else unsetenv(e[0]);
+#endif
+        said += std::string(" ") + e[0] + "=" + (*e[1] ? e[1] : "(off)");
+    }
+    printf("[settings] safe mode:%s\n", said.c_str());
+}
+
 const char *pc_settings_file() { return g_file_on && !g_path.empty() ? g_path.c_str() : nullptr; }
 bool pc_settings_first_run() { return g_first_run || g_fresh_file; }
 
@@ -698,8 +879,18 @@ extern "C" void hle_audio_set_mute_unfocused(bool on);   // hle_audio.cpp: silen
 namespace {
 
 const char *window_mode_now() { return shim_window_fullscreen() ? "borderless" : "windowed"; }
+#ifndef _WIN32
+}  // namespace
+extern "C" void shim_set_window_mode(int mode, int monitor);   // linux/shim_sdl3.c
+extern "C" void shim_set_window_size(int w, int h);
+namespace {
+#endif
 void window_mode_apply(const char *v) {   // shim_win.c's WM_TOTK_FULLSCREEN (WM_APP + 2): apply_fullscreen on the window thread
+#ifdef _WIN32
     if (HWND h = (HWND)pc_overlay_hwnd()) PostMessageA(h, WM_APP + 2, strcmp(v, "borderless") == 0, 0);
+#else
+    shim_set_window_mode(strcmp(v, "borderless") == 0 ? 1 : 0, -1);
+#endif
 }
 void window_mode_env(const char *v) { env_put("TOTK_FULLSCREEN", strcmp(v, "borderless") == 0 ? "1" : "0"); }
 void window_size_env(const char *v) {
@@ -710,6 +901,12 @@ void window_size_env(const char *v) {
 // Live: the window's client area to WxH ("" = the engine's 1280 x 720), windowed only. SWP_ASYNCWINDOWPOS: the window
 // thread does it, the present thread does not wait; vk_frame_begin then follows the new size with a new swapchain.
 void window_size_apply(const char *v) {
+#ifndef _WIN32
+    const char *m = pc_settings_get("display.window_mode");
+    int w = 1280, ht = 720;
+    if (!m || strcmp(m, "windowed") || (*v && sscanf(v, "%dx%d", &w, &ht) != 2)) return;
+    shim_set_window_size(w, ht);
+#else
     HWND h = (HWND)pc_overlay_hwnd();
     const char *m = pc_settings_get("display.window_mode");
     int w = 1280, ht = 720;
@@ -718,6 +915,7 @@ void window_size_apply(const char *v) {
     AdjustWindowRectEx(&r, (DWORD)GetWindowLongW(h, GWL_STYLE), FALSE, (DWORD)GetWindowLongW(h, GWL_EXSTYLE));
     SetWindowPos(h, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS);
+#endif
 }
 const char *perf_now() { return pc_overlay_perf() ? "1" : "0"; }   // F9 toggles it behind the overlay's back
 void perf_apply(const char *v) { pc_overlay_set_perf(strcmp(v, "1") == 0); }
@@ -763,8 +961,10 @@ extern "C" void hle_fs_set_save_backups(int n);  // hle_fs.cpp: from the next sa
 void crash_reports_apply(const char *v) { pc_crash_set_enabled(strcmp(v, "0") != 0); }
 void save_backups_apply(const char *v) { hle_fs_set_save_backups(atoi(v)); }
 void volume_apply(const char *v) { hle_audio_set_master((float)atof(v)); }   // (one aligned float: a mix sees the old or the new)
-// textures.c: TOTK_OUT_SCALE, on by default (unset). The default leaves the variable alone, so a TOTK_OUT_SCALE=0 / 1
-// given at start (tests, A/B boots) is not undone by a settings file that holds the default row; Off writes the 0.
+// textures.c: TOTK_OUT_SCALE, off by default (unset) since 2026-11-03 (public #62: broken text at x1.333). The default
+// leaves the variable alone, so a TOTK_OUT_SCALE=0 / 1 given at start (tests, A/B boots) is not undone by a settings file
+// that holds the default row; On writes the 1. A file from before holds "" (the old On default: Off now, as the LEAD
+// asked for every install) or "0" (no value of the row now: ignored, so the default, Off).
 void native_ui_env(const char *v) { if (*v) env_put("TOTK_OUT_SCALE", v); }
 void fps_env(const char *v) {   // hle_vi.cpp: TOTK_FPS (unset: the game's own 30) and TOTK_UNLOCK_FPS (no pacing)
     // "steady": unlocked, paced at a rate the frames hold (hle_vi.cpp steady_fps, TOTK_UNLOCK_STEADY)
@@ -789,7 +989,7 @@ extern "C" void vk_set_dynres_clock(const char *v);         // exec.c: the resol
 extern "C" void renderer_set_aniso(const char *v);          // textures.c: samplers re-made at the next present
 extern "C" void renderer_set_lod_bias(const char *v);
 void render_scale_apply(const char *v) { output_set_res_scale(v); }
-void native_ui_apply(const char *v) { renderer_set_native_ui(strcmp(v, "0") != 0); }
+void native_ui_apply(const char *v) { renderer_set_native_ui(strcmp(v, "1") == 0); }
 void soft_shadows_apply(const char *v) { vk_set_soft_shadows(v); }
 void upscaler_3d_apply(const char *v) { vk_set_upscaler_3d(v); }
 void scene_upscaler_apply(const char *v) { vk_set_scene_upscaler(v); }
@@ -799,6 +999,8 @@ void dynres_clock_apply(const char *v) { vk_set_dynres_clock(v); }
 void aniso_apply(const char *v) { renderer_set_aniso(v); }
 void lod_bias_apply(const char *v) { renderer_set_lod_bias(v); }
 void fps_apply(const char *v) { vi_set_frame_rate(v); }  // (live since 2026-10-27)
+extern "C" void vi_set_steady_floor(const char *v);   // hle_vi.cpp: steady's lowest rung from its next judgement
+void steady_floor_apply(const char *v) { vi_set_steady_floor(v); }
 
 const char *const V_WINDOW[] = {"windowed", "borderless", nullptr};
 const char *const N_WINDOW[] = {"Windowed", "Borderless fullscreen", nullptr};
@@ -814,6 +1016,10 @@ const char *const V_FPS[] = {"30", "40", "45", "60", "75", "90", "120", "144", "
                              "steady", nullptr};
 const char *const N_FPS[] = {"30 (the game's own)", "40", "45", "60", "75", "90", "120", "144", "165", "180", "200",
                              "240", "Unlocked (monitor rate)", "Unlocked, steady (a rate it can hold)", nullptr};
+// Steady's lowest rung (hle_vi.cpp steady_floor, #23): 30 by default; 20 / 15 for a PC that cannot hold 30, each frame
+// on 3 / 4 refreshes of a 60 Hz panel (whole refreshes on others: 20.6 and 16 at 144 Hz) instead of 3, 4 or 5 unevenly
+const char *const V_STEADY_FLOOR[] = {"30", "20", "15", nullptr};
+const char *const N_STEADY_FLOOR[] = {"30 (default)", "20", "15", nullptr};
 // The fps readout: off by default (nothing over the game's image), F3 shows the last style chosen; the corner and
 // size are read by the overlay as it draws
 const char *const V_FPSOSD[] = {"0", "minimal", "detailed", nullptr};
@@ -825,8 +1031,8 @@ const char *const V_FPSSIZE[] = {"small", "medium", "large", nullptr};
 const char *const N_FPSSIZE[] = {"Small (default)", "Medium size", "Large size", nullptr};
 const char *const V_SCALE[] = {"0.67", "0.8", "0.9", "1", "1.5", "2", "auto", nullptr};
 const char *const N_SCALE[] = {"67 %", "80 %", "90 %", "100 % (native)", "150 %", "200 %", "Follow the window height", nullptr};
-const char *const V_NATIVE_UI[] = {"", "0", nullptr};
-const char *const N_NATIVE_UI[] = {"On (default)", "Off", nullptr};
+const char *const V_NATIVE_UI[] = {"", "1", nullptr};
+const char *const N_NATIVE_UI[] = {"Off (default)", "On", nullptr};
 const char *const V_OFFON[] = {"0", "1", nullptr};
 // Dynamic resolution as one row. The row writes both; its value is read back from them (a preset, F11 or an old settings
 // file moves them), the floor to the nearest step. Both are live: the floor through the data page, the clock's aim
@@ -851,6 +1057,10 @@ const char *dynres_now() {
     return x >= 0.825 ? "90" : x >= 0.625 ? "75" : "50";
 }
 const char *const N_OFFON[] = {"Off", "On", nullptr};
+// graphics.compact_textures (ram-diet, RIVAL-034): "" = Automatic (vulkan/textures.c astc_bc3_on: on for a discrete
+// GPU with 4.5 GB of VRAM or less), never on by default where the room is there (BC3 is lossy)
+const char *const V_COMPACT[] = {"", "0", "1", nullptr};
+const char *const N_COMPACT[] = {"Automatic (on with 4 GB of VRAM or less)", "Off", "On", nullptr};
 const char *const V_SSAA[] = {"", "fetch", nullptr};
 const char *const N_SSAA[] = {"Bicubic (recomp)", "FSR 1 (the game's)", nullptr};
 const char *const V_UPSCALE[] = {"", "fsr", nullptr};
@@ -899,6 +1109,9 @@ const pc_setting k_engine[] = {
      "the scene keeps, in whole refreshes of the monitor (240, 120, 80, 60 on a 240 Hz one), instead of swinging. 40 and 45: "
      "for a PC that cannot hold 60; smooth on a monitor whose refresh they divide (40 on 120 Hz, 45 on 90 or 180 Hz) or "
      "with VRR, uneven on a fixed 60 Hz.", "30", V_FPS, N_FPS, 0, 0, 0, 0, nullptr, fps_env, fps_apply, nullptr},
+    {"display.steady_floor", "Graphics", "Display", "Steady's lowest rate", "TOTK_STEADY_FLOOR. Frame rate Steady only: "
+     "the lowest rate it holds. 20 or 15 keep a PC that cannot hold 30 even (3 or 4 refreshes a frame on 60 Hz).", "30",
+     V_STEADY_FLOOR, N_STEADY_FLOOR, 0, 0, 0, 0, "TOTK_STEADY_FLOOR", nullptr, steady_floor_apply, nullptr},
     {"display.perf_overlay", "Graphics", "Display", "Perf overlay (F9)", "Fps, 1% low and the frame-time graph.", "0",
      V_OFFON, N_OFFON, 0, 0, 0, 0, nullptr, perf_apply, perf_apply, perf_now},
     {"display.fps_readout", "Graphics", "Display", "Fps readout (F3)", "TOTK_FPS_OVERLAY. F3 shows or hides it in game.",
@@ -910,7 +1123,8 @@ const pc_setting k_engine[] = {
     {"graphics.render_scale", "Graphics", "Rendering", "Render resolution", "TOTK_RES_SCALE, of the game's 1600 x 900. "
      "Applies at once.", "1", V_SCALE, N_SCALE, 0, 0, 0, 0, "TOTK_RES_SCALE", nullptr, render_scale_apply, nullptr},
     {"graphics.native_ui", "Graphics", "Rendering", "Native-resolution interface", "TOTK_OUT_SCALE: above 1080p, menus, "
-     "text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched. Applies at once.", "",
+     "text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched. Off by default: at "
+     "some resolutions it can show broken text (being fixed). Applies at once.", "",
      V_NATIVE_UI, N_NATIVE_UI, 0, 0, 0, 0, nullptr, native_ui_env, native_ui_apply, nullptr},
     {"graphics.dynamic_resolution", "Graphics", "Rendering", "Dynamic resolution", "Off: the scene always at the render "
      "resolution. On: the game lowers it only when the GPU is short of time, never below the chosen floor, aiming at the "
@@ -1011,6 +1225,10 @@ const pc_setting k_pc[] = {
      "once.", "0", V_ANISO, N_ANISO, 0, 0, 0, 0, "TOTK_ANISO", nullptr, aniso_apply, nullptr},
     {"graphics.lod_bias", "Graphics", "Rendering", "Texture LOD bias", "TOTK_LOD_BIAS: below 0 is sharper. Applies at "
      "once.", "0", nullptr, nullptr, -2.0f, 2.0f, 0.25f, 0, "TOTK_LOD_BIAS", nullptr, lod_bias_apply, nullptr},
+    {"graphics.compact_textures", "Graphics", "Rendering", "Compact textures (low VRAM)", "LARECOMP_ASTC_BC3: the game's "
+     "textures kept in a quarter of the video memory (BC3), with slightly softer colour detail. Automatic: on only for "
+     "graphics cards with 4 GB or less. Takes effect at the next start.", "", V_COMPACT, N_COMPACT, 0, 0, 0, R,
+     "LARECOMP_ASTC_BC3", nullptr, nullptr, nullptr},
     {"graphics.scene_upscaler", "Graphics", "Rendering", "Scene upscaler", "TOTK_SCENE_UPSCALE. Applies at once.", "", V_SCENEUP,
      N_SCENEUP, 0, 0, 0, 0, "TOTK_SCENE_UPSCALE", nullptr, scene_upscaler_apply, nullptr},
     {"game.pause_unfocused", "Game", "Window", "Pause when the window loses focus", "TOTK_PAUSE_UNFOCUSED.", "", V_OFF_DEF,
@@ -1031,6 +1249,11 @@ const pc_setting k_pc[] = {
 #endif
     {"game.crash_reports", "Game", "PC", "Crash reports", "TOTK_PC_CRASH: a report and a minidump per crash.", "1",
      V_OFFON, N_OFFON, 0, 0, 0, 0, "TOTK_PC_CRASH", nullptr, crash_reports_apply, nullptr},
+    // (pc_safe_mode_env, from rt_main once every row's variables are set: it wins over the upscaler rows)
+    {"graphics.safe_mode", "Game", "PC", "Safe mode (if the game crashes)", "For a game that crashes or hangs: the "
+     "renderer without its faster paths, DLSS, FSR and frame generation, and without the driver paths some GPUs crash "
+     "in. Slower. At the next start.", "0",
+     V_OFFON, N_OFFON, 0, 0, 0, R, "TOTK_SAFE_MODE", nullptr, nullptr, nullptr},
     // (read by the launcher at its next start, installer's auto-update; nothing in the game)
     {"launcher.auto_update", "Game", "PC", "Automatic updates", "Checks GitHub for a newer version when the game "
      "starts (at most once a day); asks first if the update rebuilds the game.", "1", V_OFFON, N_OFFON, 0, 0, 0, R,
@@ -1103,6 +1326,6 @@ struct AddEngine {
         add_rows(k_kbm, (int)(sizeof k_kbm / sizeof k_kbm[0]), true);
         boot();
     }
-} g_add_engine;
+} g_add_engine PC_SETTINGS_FIRST;
 
 }  // namespace

@@ -14,9 +14,13 @@
 // (TOTK_KEYBOARD_LAYOUT=pc / custom, hle_hid.cpp) count only while captured, not the capturing click. The game window
 // (shim_win.c) is subclassed from here, not edited. Windows only.
 #include <cstdint>
-#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include <windows.h>   // (Linux: runtime/linux/windows.h; the parts below that are Windows' own are marked _WIN32)
+#ifndef _WIN32
+#include <SDL3/SDL_mouse.h>
+#include <SDL3/SDL_video.h>
+extern "C" void* shim_window_hwnd(void);   // linux/shim_sdl3.c: the game window (an SDL_Window*), NULL before it exists
+#endif
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -57,7 +61,9 @@ std::atomic<unsigned> g_swallow{0};    // mouse buttons held when the pointer wa
                                        // ignored until released (the capturing click; a right click that closed a menu)
 std::atomic<ULONGLONG> g_injected_until{0};   // TOTK_CTL "mouse dx dy": counts as captured until this tick (ms)
 HWND g_hwnd;
+#ifdef _WIN32
 WNDPROC g_orig;
+#endif
 std::atomic<bool> g_on{false};
 std::atomic<bool> g_menu{false};   // a menu screen has the mouse (pc_mouse_menu)
 std::atomic<unsigned> g_presses[3];   // DOWN messages so far, per button (left, right, middle): pc_mouse_presses
@@ -251,6 +257,7 @@ bool enabled() {
     return g_on.load();
 }
 
+#ifdef _WIN32
 bool client_rect(HWND h, RECT* s) {   // the client area on screen
     RECT r;
     if (!GetClientRect(h, &r)) return false;
@@ -317,6 +324,7 @@ void clip_guard(HWND h) {
     if (!g_clip_ours.load() || !GetClipCursor(&have) || EqualRect(&have, &g_clip_rect)) return;
     if (clip_apply(h) == pcclip::CLIP) clip_again_log(h, have, "at a mouse event");
 }
+#endif
 // The raw mouse's load on the window thread (a 1000-8000 Hz mouse sends that many WM_INPUT a second while it moves;
 // r/decomps 11-01 on v0.1.5: the game slowed down while the mouse moved fast): per second, the events, the time in
 // their handling and the slowest one, and how many did the pointer's user32 work. Logged when a second had 500 or more:
@@ -357,6 +365,7 @@ std::atomic<bool> g_recentre_posted{false};   // the keeper's WM_APP_RECENTRE is
 // where the pointer already is (recentre's move, without moving it). A boot behind other windows is never captured, so
 // without this its events skip that work; with the keeper on, the keeper makes them, every 4 ms.)
 bool g_flood_emul;
+#ifdef _WIN32
 void flood_emulate() {
     static unsigned n;
     RECT r;
@@ -364,6 +373,7 @@ void flood_emulate() {
     GetClipCursor(&r);
     if (GetCursorPos(&p) && ++n % 8 == 0) SetCursorPos(p.x, p.y);
 }
+#endif
 // The pointer's user32 work at a raw event (clip_guard's GetClipCursor, recentre's GetCursorPos / SetCursorPos) at most
 // once a millisecond, not at every event: at 8000 Hz that was 8000+ calls a second into win32k, which the input reads'
 // own user32 calls (GetForegroundWindow, GetAsyncKeyState, GetClipCursor) wait behind. A millisecond is far under what a
@@ -383,6 +393,7 @@ bool user32_due() {
 // recentre), so a flick in a dropped-confinement gap can't reach another monitor. The box is the confinement's (the
 // client cut to the virtual screen: a client larger than the desktop, the 4K canvas, would centre past the clip), the
 // client area only while there is none of ours.
+#ifdef _WIN32
 void recentre(HWND h) {
     RECT s;
     POINT p;
@@ -553,6 +564,70 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     return CallWindowProcW(g_orig, h, m, w, l);
 }
+#else
+// ---- Linux (linux-port, 2026-11-02): the pointer through SDL. Captured = SDL's relative mouse mode: the pointer hidden
+// and held in the window, the motion as raw device counts (X11 XInput2 raw events, Wayland's relative pointer,
+// unaccelerated), so there is no confinement to redo or pointer to recentre (no keeper, no clip checks). Released, the
+// pointer is held in the window by SDL's mouse grab as pc_clip.h's rule wants it (every context while in front).
+// linux/shim_sdl3.c, on the thread that pumps SDL's events, calls the pc_mouse_sdl_* entries at the end of this file:
+// the events (WM_INPUT's and the button messages' work below) and the WM_APP_* requests PostMessageW queued for g_hwnd.
+extern "C" int shim_mouse_state(float* nx, float* ny, unsigned* buttons);   // linux/shim_sdl3.c: the pump thread's copy
+unsigned held_buttons() {   // (the shim's button state and the button events: one space, bit 1 left, 2 right, 4 middle;
+    unsigned b = 0;          //  the shim's bits 0..2 are the same three)
+    shim_mouse_state(nullptr, nullptr, &b);
+    return (g_buttons.load() & 7) | (b & 7);
+}
+void grab_apply() {   // UI thread
+    SDL_Window* w = (SDL_Window*)g_hwnd;
+    if (!w) return;
+    const SDL_WindowFlags f = SDL_GetWindowFlags(w);
+    const pcclip::State st = {(f & SDL_WINDOW_INPUT_FOCUS) != 0, (f & SDL_WINDOW_MINIMIZED) != 0, (f & SDL_WINDOW_FULLSCREEN) != 0,
+                              g_captured.load(), g_armed.load(), false};
+    SDL_SetWindowMouseGrab(w, pcclip::want(st));
+}
+void set_capture(HWND h, bool on, const char* why) {   // UI thread
+    if (on == g_captured.load()) return;
+    AcquireSRWLockExclusive(&g_lock); g_dx = g_dy = 0; ReleaseSRWLockExclusive(&g_lock);
+    if (on) g_swallow.store(held_buttons());
+    g_captured.store(on);
+    SDL_SetWindowRelativeMouseMode((SDL_Window*)h, on);
+    grab_apply();
+    page_captured(on);
+    printf("[mouse] pointer %s (%s)\n", on ? "captured" : "released", why);
+}
+void want(bool on, const char* why) {   // any thread: the UI thread applies it (linux_msg)
+    if (on == g_captured.load() || !g_hwnd || g_pending.exchange(true)) return;
+    if (!PostMessageW(g_hwnd, WM_APP_CAPTURE, on, (LPARAM)why)) g_pending.store(false);
+}
+void show_pointer() {   // the released pointer: shown, unless a pad is in use (pc_mouse_pad_in_use)
+    if (g_pad_hide.load()) SDL_HideCursor(); else SDL_ShowCursor();
+}
+void linux_msg(unsigned m, uintptr_t w, intptr_t l) {   // UI thread: proc's WM_APP_* cases
+    SDL_Window* win = (SDL_Window*)g_hwnd;
+    switch (m) {
+    case WM_APP_CAPTURE:   // (a capture posted just before an alt-tab lands after it: not while another window is in front)
+        g_pending.store(false);
+        if (!w || GetForegroundWindow() == g_hwnd) set_capture(g_hwnd, w != 0, (const char*)l);
+        break;
+    case WM_APP_CURSOR:    // the menu cursor on / off; from a capture, the pointer at the window's centre
+        if (w && l && win) {
+            int ww = 0, hh = 0;
+            SDL_GetWindowSize(win, &ww, &hh);
+            SDL_WarpMouseInWindow(win, ww / 2.0f, hh / 2.0f);
+        }
+        grab_apply();
+        if (w && !g_captured.load()) show_pointer();
+        break;
+    case WM_APP_POINTER:   // the device in use changed
+        if (released() && !g_captured.load()) show_pointer();
+        break;
+    case WM_APP_RECLIP:    // (a window mode change: the grab again)
+        grab_apply();
+        break;
+    default: break;
+    }
+}
+#endif
 
 // TOTK_CAMLOG=<ms>[:<hex offset>[i],...] (tests): every <ms>, the PlayerCamera's (data page +136) processed stick +0x840 /
 // +0x844 (where the veneer adds the mouse) and the floats at the offsets given (with i: the 32-bit word in hex; +0x88 ..
@@ -747,6 +822,7 @@ DWORD WINAPI latch_feed(void*) {
 // then none for <off> s (default 20), and again; each runs a raw event's work on the window thread with <counts>
 // (default 8) of x motion, the sign alternating (the camera shakes in place), as TOTK_CTL "mouse" injects them. Without
 // GetRawInputData (posted messages carry no raw input) and never moving the system pointer. Each phase is logged.
+#ifdef _WIN32
 void flood_start(HWND h) {
     const char* e = getenv("TOTK_MOUSE_FLOOD");
     double hz = 0, counts = 8, on = 20, off = 20, emul = 0;
@@ -830,6 +906,7 @@ DWORD WINAPI keeper(LPVOID) {
         }
     }
 }
+#endif
 // Input thread: finds the game window (class TotKRecomp, this process) once it exists and subclasses it.
 // (from the input thread and, through the menu cursor's calls, the game thread: one at a time, or the window could be
 // subclassed twice and its procedure call itself)
@@ -851,6 +928,7 @@ void attach() {
     static ULONGLONG next;
     if (g_hwnd || GetTickCount64() < next) return;
     next = GetTickCount64() + 500;
+#ifdef _WIN32
     HWND h = NULL;
     while ((h = FindWindowExW(NULL, h, L"TotKRecomp", NULL))) {
         DWORD pid = 0;
@@ -865,6 +943,14 @@ void attach() {
     if (GetForegroundWindow() == h) g_armed.store(true);
     flood_start(h);
     if (keeper_on()) CreateThread(nullptr, 0, keeper, nullptr, 0, nullptr);
+#else
+    // (Linux: the window from the shim; its events reach the pc_mouse_sdl_* entries, no subclassing or raw input)
+    HWND h = (HWND)shim_window_hwnd();
+    if (!h) return;
+    g_hwnd = h;
+    if (GetForegroundWindow() == h) g_armed.store(true);
+    printf("[mouse] SDL window: relative mouse mode while captured\n");
+#endif
 }
 // Input thread, every read: the pointer captured exactly when it should be, and still confined.
 void policy() {
@@ -884,11 +970,15 @@ void policy() {
 // thread redoes it (Windows drops it on an app switch, and on its own). A few calls per read (GetForegroundWindow,
 // GetClientRect, GetClipCursor); one fix posted at a time.
 void clip_check() {
+#ifndef _WIN32
+    return;   // (Linux: SDL holds the pointer: grab_apply at the events that change the rule)
+#else
     if (!g_hwnd) return;
     RECT want_r = {};
     if (clip_decide(g_hwnd, false, &want_r) != pcclip::KEEP && !g_reclip_posted.exchange(true) &&
         !PostMessageW(g_hwnd, WM_APP_RECLIP, 0, 0))
         g_reclip_posted.store(false);
+#endif
 }
 bool captured_now() { return g_captured.load() || GetTickCount64() < g_injected_until.load(); }
 }   // namespace
@@ -1084,12 +1174,30 @@ extern "C" bool pc_mouse_client_pos(float* nx, float* ny) {
         *ny = g_cur_y0.load() + (g_cur_y.load() - g_cur_y0.load()) * k;
         return *nx >= 0 && *ny >= 0 && *nx < 1 && *ny < 1;
     }
+#ifndef _WIN32
+    // (the shim's copy of the pointer, kept by the thread that pumps SDL's events: none while it is over another window)
+    if (!g_hwnd || !shim_mouse_state(nx, ny, nullptr)) return false;
+    return *nx >= 0 && *ny >= 0 && *nx < 1 && *ny < 1;
+#else
     POINT p;
     RECT r;
     if (!g_hwnd || !GetCursorPos(&p) || !ScreenToClient(g_hwnd, &p) || !GetClientRect(g_hwnd, &r) || r.right <= 0 || r.bottom <= 0)
         return false;
     *nx = (float)p.x / (float)r.right; *ny = (float)p.y / (float)r.bottom;
     return p.x >= 0 && p.y >= 0 && p.x < r.right && p.y < r.bottom;
+#endif
+}
+// totk_map_speed.cpp, the map's view from the mouse: the game window's client area in pixels (false: no window)
+extern "C" bool pc_mouse_client_size(int* w, int* h) {
+#ifndef _WIN32
+    (void)w; (void)h;
+    return false;   // (Linux: the map keeps the stick emulation)
+#else
+    RECT r;
+    if (!g_hwnd || !GetClientRect(g_hwnd, &r) || r.right <= 0 || r.bottom <= 0) return false;
+    *w = r.right; *h = r.bottom;
+    return true;
+#endif
 }
 // hle_hid.cpp keyboard_read: a menu screen has the mouse (the map's cursor, the menu keys): the stick from the mouse
 // (the cursor) ignores the camera's Y inversion there.
@@ -1128,31 +1236,76 @@ extern "C" void pc_mouse_stick_counts(int32_t* rx, int32_t* ry, double* cdx, dou
     *rx = (int32_t)(fmax(-1.0, fmin(1.0, sx * k)) * 32767); *ry = (int32_t)(fmax(-1.0, fmin(1.0, sy * k)) * 32767);
 }
 extern "C" void pc_mouse_stick(int32_t* rx, int32_t* ry) { double x, y; pc_mouse_stick_counts(rx, ry, &x, &y); }
-#else
-extern "C" void pc_mouse_stick(int32_t*, int32_t*) {}
-extern "C" void pc_mouse_stick_counts(int32_t*, int32_t*, double* cdx, double* cdy) { *cdx = *cdy = 0; }
-extern "C" bool pc_mouse_button_ok(int) { return true; }
-extern "C" bool pc_mouse_take(double* dx, double* dy) { *dx = *dy = 0; return false; }
-extern "C" bool pc_mouse_enabled(void) { return false; }
-extern "C" void pc_mouse_menu(bool) {}
-extern "C" void pc_mouse_inject(double, double) {}
-extern "C" void pc_mouse_inject_wheel(double) {}
-extern "C" int pc_mouse_wheel_take(void) { return 0; }
-extern "C" bool pc_mouse_injected(void) { return false; }
-extern "C" void pc_mouse_cursor_mode(bool) {}
-extern "C" bool pc_mouse_client_pos(float*, float*) { return false; }
-extern "C" void pc_mouse_inject_cursor(double, double, double) {}
-extern "C" unsigned pc_mouse_buttons(void) { return 0; }
-extern "C" unsigned pc_mouse_presses(int) { return 0; }
-extern "C" bool pc_mouse_cursor_on(void) { return false; }
-extern "C" void pc_mouse_redirect(bool) {}
-extern "C" void pc_mouse_redirect_take(double* dx, double* dy) { *dx = *dy = 0; }
-extern "C" void pc_mouse_ui(bool) {}
-extern "C" void pc_mouse_pad_in_use(bool) {}
-extern "C" bool pc_mouse_pointer_moved(void) { return false; }
-extern "C" bool pc_mouse_pointer_hidden(void) { return false; }
-extern "C" void pc_mouse_mode_change(bool) {}
-extern "C" void pc_mouse_cursor_over_item(bool) {}
-extern "C" bool pc_mouse_cursor_on_item(void) { return false; }
-extern "C" void pc_mouse_cursor_stick(int32_t*, int32_t*, double* cdx, double* cdy) { *cdx = *cdy = 0; }
+
+#ifndef _WIN32
+// ---- Linux: SDL's mouse events, from linux/shim_sdl3.c on the thread that pumps them (the window procedure's WM_INPUT
+// and button messages above)
+// motion: the counts while captured (relative mode); released, only the pointer's "moved on purpose" gate
+extern "C" void pc_mouse_sdl_motion(float xrel, float yrel) {
+    if (!g_hwnd) return;
+    const bool cap = g_captured.load();
+    if (!cap) {
+        if (released() && g_pointer_gate.add((int)(fabsf(xrel) + fabsf(yrel) + 0.5f), (double)GetTickCount64())) {
+            g_pointer_moved.store(true);
+            if (g_pad_hide.exchange(false)) SDL_ShowCursor();
+        }
+        return;
+    }
+    AcquireSRWLockExclusive(&g_lock);
+    if (g_redirect.load()) {
+        g_rx += xrel; g_ry += yrel;
+    } else {
+        g_dx += xrel; g_dy += yrel;
+        if (!g_menu.load()) {   // (a menu screen's mouse: its stick only, never the camera's totals)
+            double gx, gy;
+            mode_gain(&gx, &gy);
+            g_tx += xrel * g_sens * gx; g_ty += yrel * g_sens * g_inv * gy;
+            page_totals();
+        }
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+}
+// buttons: b 0 left, 1 right, 2 middle; a press arms the window and captures, as WM_LBUTTONDOWN does
+extern "C" void pc_mouse_sdl_button(int b, bool down) {
+    if (!g_hwnd || b < 0 || b > 2) return;
+    const unsigned bit = 1u << b;
+    if (!down) { g_buttons.fetch_and(~bit); return; }
+    g_buttons.fetch_or(bit);
+    g_presses[b].fetch_add(1);
+    if (released() && !g_captured.load()) {   // (a click is a deliberate use of the released pointer)
+        g_pointer_moved.store(true);
+        if (g_pad_hide.exchange(false)) SDL_ShowCursor();
+    }
+    g_armed.store(true);
+    if (!g_captured.load() && g_on.load() && !released() && GetForegroundWindow() == g_hwnd && !pc_overlay_open())
+        set_capture(g_hwnd, true, "click");
+    grab_apply();
+}
+// wheel notches (+ = away from the player): a rebinding capture waiting for one takes it; else the game's, captured or
+// in a menu (pc_mouse_wheel_take)
+extern "C" void pc_mouse_sdl_wheel(float notches) {
+    if (!g_hwnd || notches == 0) return;
+    if (pc_input_capture_wants_wheel() && pc_input_capture_wheel(notches > 0 ? 1 : -1)) return;
+    if (!g_captured.load() && !released()) return;
+    AcquireSRWLockExclusive(&g_lock); g_wheel += notches; ReleaseSRWLockExclusive(&g_lock);
+}
+// the window's keyboard focus: lost releases the pointer and every button; fullscreen arms at once
+extern "C" void pc_mouse_sdl_focus(bool on) {
+    if (!g_hwnd) return;
+    if (!on) {
+        g_armed.store(false); g_buttons.store(0);
+        set_capture(g_hwnd, false, "focus lost");
+    } else if (shim_window_fullscreen()) {
+        g_armed.store(true);
+    }
+    grab_apply();
+}
+// the requests posted to g_hwnd (PostMessageW in linux/shim_sdl3.c queues WM_APP_* for the UI thread)
+extern "C" void pc_mouse_sdl_msg(unsigned m, uintptr_t w, intptr_t l) { linux_msg(m, w, l); }
+// WM_SETCURSOR's answer: 0 hidden (captured, or a pad in use in a menu), 1 shown (released for a menu), -1 not ours
+extern "C" int pc_mouse_sdl_cursor(void) {
+    if (!g_hwnd) return -1;
+    if (g_captured.load()) return 0;
+    return released() ? (g_pad_hide.load() ? 0 : 1) : -1;
+}
 #endif

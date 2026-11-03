@@ -130,6 +130,30 @@ default = true
 needs = []
 original_sha256 = "335004b6fa2761d2fa219eb60112d1cadd6a6a27971c997018a493b6538b04cc"
 
+[[feature]]
+name = "cascade"
+default = true
+needs = []
+original_sha256 = "417783b5b57e95ee89351ab75c6163ac0f940c0ee74de810d8e78c005cc08d58"
+
+[[feature]]
+name = "havok_dt"
+default = false
+needs = []
+original_sha256 = "3765f4a47eaa46155f3145e649d3fcc2f39e931173dd490a2cd0e2f05b9f4afe"
+
+[[feature]]
+name = "havok_tau"
+default = false
+needs = []
+original_sha256 = "61d87cd87de8146f5f17621358b2e20e45ccafad752f2a63587f8eb8606aff2e"
+
+[[feature]]
+name = "effectease"
+default = true
+needs = []
+original_sha256 = "0230f6e6c91e52b687b6ae374ed484455873449539e58b1bdacd18ac9b743db6"
+
 [[patch]]
 feature = "fps60"
 module = "main"
@@ -3757,4 +3781,914 @@ offset = 0xaa8218
 new = "01102e1e"
 new_asm = "fmov s1, #1.00000000"
 reason = "camera blend: mov v1.16b, v8.16b (powf exponent dt) -> fmov s1, #1.0"
+
+[[veneer]]
+feature = "cascade"
+module = "main"
+start = 0x4666030
+end = 0x4666084
+
+[[veneer]]
+feature = "cascade"
+module = "main"
+start = 0x4666090
+end = 0x466617c
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0xa14fd4
+new = "1744f114"
+new_asm = "b #0x4666030"
+reason = "cascade: ldp s0, s1, [x8] (cascade 0: d[0], d[1]) -> b <veneer>"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666030
+copy_of = 0xa14fd4
+new_asm = "(the word at main+0xa14fd4)"
+reason = "cascade split veneer, cascade 0 [0]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666034
+new = "60020054"
+new_asm = "b.eq #0x4666080"
+reason = "cascade split veneer, cascade 0 [1]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666038
+new = "0a0000d0"
+new_asm = "adrp x10, #0x4668000"
+reason = "cascade split veneer, cascade 0 [2]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466603c
+new = "4bd940b9"
+new_asm = "ldr w11, [x10, #0xd8]"
+reason = "cascade split veneer, cascade 0 [3]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666040
+new = "0b020034"
+new_asm = "cbz w11, #0x4666080"
+reason = "cascade split veneer, cascade 0 [4]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666044
+new = "6301271e"
+new_asm = "fmov s3, w11"
+reason = "cascade split veneer, cascade 0 [5]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666048
+new = "090b0051"
+new_asm = "sub w9, w24, #2"
+reason = "cascade split veneer, cascade 0 [6]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466604c
+new = "040940bd"
+new_asm = "ldr s4, [x8, #8]"
+reason = "cascade split veneer, cascade 0 [7]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666050
+new = "e9000034"
+new_asm = "cbz w9, #0x466606c"
+reason = "cascade split veneer, cascade 0 [8]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666054
+new = "050d40bd"
+new_asm = "ldr s5, [x8, #0xc]"
+reason = "cascade split veneer, cascade 0 [9]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666058
+new = "06102d1e"
+new_asm = "fmov s6, #0.75000000"
+reason = "cascade split veneer, cascade 0 [10]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466605c
+new = "a508261e"
+new_asm = "fmul s5, s5, s6"
+reason = "cascade split veneer, cascade 0 [11]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666060
+new = "8708231e"
+new_asm = "fmul s7, s4, s3"
+reason = "cascade split veneer, cascade 0 [12]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666064
+new = "e778251e"
+new_asm = "fminnm s7, s7, s5"
+reason = "cascade split veneer, cascade 0 [13]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666068
+new = "8468271e"
+new_asm = "fmaxnm s4, s4, s7"
+reason = "cascade split veneer, cascade 0 [14]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466606c
+new = "06102d1e"
+new_asm = "fmov s6, #0.75000000"
+reason = "cascade split veneer, cascade 0 [15]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666070
+new = "8508261e"
+new_asm = "fmul s5, s4, s6"
+reason = "cascade split veneer, cascade 0 [16]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666074
+new = "2708231e"
+new_asm = "fmul s7, s1, s3"
+reason = "cascade split veneer, cascade 0 [17]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666078
+new = "e778251e"
+new_asm = "fminnm s7, s7, s5"
+reason = "cascade split veneer, cascade 0 [18]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466607c
+new = "2168271e"
+new_asm = "fmaxnm s1, s1, s7"
+reason = "cascade split veneer, cascade 0 [19]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666080
+new = "d6bb0e17"
+new_asm = "b #0xa14fd8"
+reason = "cascade split veneer, cascade 0 [20]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0xa1505c
+new = "0d44f114"
+new_asm = "b #0x4666090"
+reason = "cascade: ldp s0, s2, [x9, #4] (cascade i + 1: d[i+1], d[i+2]) -> b <veneer>"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666090
+copy_of = 0xa1505c
+new_asm = "(the word at main+0xa1505c)"
+reason = "cascade split veneer, cascades 1 .. [0]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666094
+new = "0a0000d0"
+new_asm = "adrp x10, #0x4668000"
+reason = "cascade split veneer, cascades 1 .. [1]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666098
+new = "4bd940b9"
+new_asm = "ldr w11, [x10, #0xd8]"
+reason = "cascade split veneer, cascades 1 .. [2]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466609c
+new = "0b030034"
+new_asm = "cbz w11, #0x46660fc"
+reason = "cascade split veneer, cascades 1 .. [3]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660a0
+new = "6301271e"
+new_asm = "fmov s3, w11"
+reason = "cascade split veneer, cascades 1 .. [4]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660a4
+new = "480100b4"
+new_asm = "cbz x8, #0x46660cc"
+reason = "cascade split veneer, cascades 1 .. [5]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660a8
+new = "0b0500d1"
+new_asm = "sub x11, x8, #1"
+reason = "cascade split veneer, cascades 1 .. [6]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660ac
+new = "4b0000b4"
+new_asm = "cbz x11, #0x46660b4"
+reason = "cascade split veneer, cascades 1 .. [7]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660b0
+new = "13000014"
+new_asm = "b #0x46660fc"
+reason = "cascade split veneer, cascades 1 .. [8]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660b4
+new = "06102d1e"
+new_asm = "fmov s6, #0.75000000"
+reason = "cascade split veneer, cascades 1 .. [9]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660b8
+new = "4508261e"
+new_asm = "fmul s5, s2, s6"
+reason = "cascade split veneer, cascades 1 .. [10]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660bc
+new = "0708231e"
+new_asm = "fmul s7, s0, s3"
+reason = "cascade split veneer, cascades 1 .. [11]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660c0
+new = "e778251e"
+new_asm = "fminnm s7, s7, s5"
+reason = "cascade split veneer, cascades 1 .. [12]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660c4
+new = "0068271e"
+new_asm = "fmaxnm s0, s0, s7"
+reason = "cascade split veneer, cascades 1 .. [13]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660c8
+new = "0d000014"
+new_asm = "b #0x46660fc"
+reason = "cascade split veneer, cascades 1 .. [14]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660cc
+new = "e0000054"
+new_asm = "b.eq #0x46660e8"
+reason = "cascade split veneer, cascades 1 .. [15]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660d0
+new = "250d40bd"
+new_asm = "ldr s5, [x9, #0xc]"
+reason = "cascade split veneer, cascades 1 .. [16]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660d4
+new = "06102d1e"
+new_asm = "fmov s6, #0.75000000"
+reason = "cascade split veneer, cascades 1 .. [17]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660d8
+new = "a508261e"
+new_asm = "fmul s5, s5, s6"
+reason = "cascade split veneer, cascades 1 .. [18]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660dc
+new = "4708231e"
+new_asm = "fmul s7, s2, s3"
+reason = "cascade split veneer, cascades 1 .. [19]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660e0
+new = "e778251e"
+new_asm = "fminnm s7, s7, s5"
+reason = "cascade split veneer, cascades 1 .. [20]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660e4
+new = "4268271e"
+new_asm = "fmaxnm s2, s2, s7"
+reason = "cascade split veneer, cascades 1 .. [21]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660e8
+new = "06102d1e"
+new_asm = "fmov s6, #0.75000000"
+reason = "cascade split veneer, cascades 1 .. [22]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660ec
+new = "4508261e"
+new_asm = "fmul s5, s2, s6"
+reason = "cascade split veneer, cascades 1 .. [23]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660f0
+new = "0708231e"
+new_asm = "fmul s7, s0, s3"
+reason = "cascade split veneer, cascades 1 .. [24]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660f4
+new = "e778251e"
+new_asm = "fminnm s7, s7, s5"
+reason = "cascade split veneer, cascades 1 .. [25]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660f8
+new = "0068271e"
+new_asm = "fmaxnm s0, s0, s7"
+reason = "cascade split veneer, cascades 1 .. [26]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x46660fc
+new = "d9bb0e17"
+new_asm = "b #0xa15060"
+reason = "cascade split veneer, cascades 1 .. [27]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0xa220a8
+new = "1610f114"
+new_asm = "b #0x4666100"
+reason = "cascade: ldr s0, [x4, x27] (the receiver's copy of d[i]) -> b <veneer>"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666100
+copy_of = 0xa220a8
+new_asm = "(the word at main+0xa220a8)"
+reason = "cascade split veneer, the receiver copy [0]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666104
+new = "1c0000d0"
+new_asm = "adrp x28, #0x4668000"
+reason = "cascade split veneer, the receiver copy [1]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666108
+new = "9cdb40b9"
+new_asm = "ldr w28, [x28, #0xd8]"
+reason = "cascade split veneer, the receiver copy [2]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466610c
+new = "7c030034"
+new_asm = "cbz w28, #0x4666178"
+reason = "cascade split veneer, the receiver copy [3]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666110
+new = "9003271e"
+new_asm = "fmov s16, w28"
+reason = "cascade split veneer, the receiver copy [4]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666114
+new = "7c1300d1"
+new_asm = "sub x28, x27, #4"
+reason = "cascade split veneer, the receiver copy [5]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666118
+new = "5c0100b4"
+new_asm = "cbz x28, #0x4666140"
+reason = "cascade split veneer, the receiver copy [6]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466611c
+new = "7c2300d1"
+new_asm = "sub x28, x27, #8"
+reason = "cascade split veneer, the receiver copy [7]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666120
+new = "dc0200b5"
+new_asm = "cbnz x28, #0x4666178"
+reason = "cascade split veneer, the receiver copy [8]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666124
+new = "910c40bd"
+new_asm = "ldr s17, [x4, #0xc]"
+reason = "cascade split veneer, the receiver copy [9]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666128
+new = "06102d1e"
+new_asm = "fmov s6, #0.75000000"
+reason = "cascade split veneer, the receiver copy [10]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466612c
+new = "250a261e"
+new_asm = "fmul s5, s17, s6"
+reason = "cascade split veneer, the receiver copy [11]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666130
+new = "0708301e"
+new_asm = "fmul s7, s0, s16"
+reason = "cascade split veneer, the receiver copy [12]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666134
+new = "e778251e"
+new_asm = "fminnm s7, s7, s5"
+reason = "cascade split veneer, the receiver copy [13]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666138
+new = "0068271e"
+new_asm = "fmaxnm s0, s0, s7"
+reason = "cascade split veneer, the receiver copy [14]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466613c
+new = "0f000014"
+new_asm = "b #0x4666178"
+reason = "cascade split veneer, the receiver copy [15]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666140
+new = "910840bd"
+new_asm = "ldr s17, [x4, #8]"
+reason = "cascade split veneer, the receiver copy [16]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666144
+new = "bc0900d1"
+new_asm = "sub x28, x13, #2"
+reason = "cascade split veneer, the receiver copy [17]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666148
+new = "fc0000b4"
+new_asm = "cbz x28, #0x4666164"
+reason = "cascade split veneer, the receiver copy [18]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466614c
+new = "920c40bd"
+new_asm = "ldr s18, [x4, #0xc]"
+reason = "cascade split veneer, the receiver copy [19]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666150
+new = "06102d1e"
+new_asm = "fmov s6, #0.75000000"
+reason = "cascade split veneer, the receiver copy [20]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666154
+new = "450a261e"
+new_asm = "fmul s5, s18, s6"
+reason = "cascade split veneer, the receiver copy [21]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666158
+new = "270a301e"
+new_asm = "fmul s7, s17, s16"
+reason = "cascade split veneer, the receiver copy [22]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466615c
+new = "e778251e"
+new_asm = "fminnm s7, s7, s5"
+reason = "cascade split veneer, the receiver copy [23]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666160
+new = "316a271e"
+new_asm = "fmaxnm s17, s17, s7"
+reason = "cascade split veneer, the receiver copy [24]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666164
+new = "06102d1e"
+new_asm = "fmov s6, #0.75000000"
+reason = "cascade split veneer, the receiver copy [25]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666168
+new = "250a261e"
+new_asm = "fmul s5, s17, s6"
+reason = "cascade split veneer, the receiver copy [26]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x466616c
+new = "0708301e"
+new_asm = "fmul s7, s0, s16"
+reason = "cascade split veneer, the receiver copy [27]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666170
+new = "e778251e"
+new_asm = "fminnm s7, s7, s5"
+reason = "cascade split veneer, the receiver copy [28]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666174
+new = "0068271e"
+new_asm = "fmaxnm s0, s0, s7"
+reason = "cascade split veneer, the receiver copy [29]"
+
+[[patch]]
+feature = "cascade"
+module = "main"
+offset = 0x4666178
+new = "cdef0e17"
+new_asm = "b #0xa220ac"
+reason = "cascade split veneer, the receiver copy [30]"
+
+[[veneer]]
+feature = "havok_dt"
+module = "main"
+start = 0x4666180
+end = 0x4666198
+
+[[patch]]
+feature = "havok_dt"
+module = "main"
+offset = 0x274a70
+new = "c4c50f15"
+new_asm = "b #0x4666180"
+reason = "havok_dt: fcsel s8, s3, s0, mi (dt = min(dt, max dt)) -> b <veneer>"
+
+[[patch]]
+feature = "havok_dt"
+module = "main"
+offset = 0x4666180
+copy_of = 0x274a70
+new_asm = "(the word at main+0x274a70)"
+reason = "Havok step dt floor veneer [0]"
+
+[[patch]]
+feature = "havok_dt"
+module = "main"
+offset = 0x4666184
+new = "301191d2"
+new_asm = "mov x16, #0x8889"
+reason = "Havok step dt floor veneer [1]"
+
+[[patch]]
+feature = "havok_dt"
+module = "main"
+offset = 0x4666188
+new = "1071a7f2"
+new_asm = "movk x16, #0x3b88, lsl #16"
+reason = "Havok step dt floor veneer [2]"
+
+[[patch]]
+feature = "havok_dt"
+module = "main"
+offset = 0x466618c
+new = "1002271e"
+new_asm = "fmov s16, w16"
+reason = "Havok step dt floor veneer [3]"
+
+[[patch]]
+feature = "havok_dt"
+module = "main"
+offset = 0x4666190
+new = "0869301e"
+new_asm = "fmaxnm s8, s8, s16"
+reason = "Havok step dt floor veneer [4]"
+
+[[patch]]
+feature = "havok_dt"
+module = "main"
+offset = 0x4666194
+new = "383af016"
+new_asm = "b #0x274a74"
+reason = "Havok step dt floor veneer [5]"
+
+[[veneer]]
+feature = "havok_tau"
+module = "main"
+start = 0x46661a0
+end = 0x46661b0
+
+[[patch]]
+feature = "havok_tau"
+module = "main"
+offset = 0x274abc
+new = "b9c50f15"
+new_asm = "b #0x46661a0"
+reason = "havok_tau: fmul s5, s0, s0 (x^2 for tau = 0.6 / x^2) -> b <veneer>"
+
+[[patch]]
+feature = "havok_tau"
+module = "main"
+offset = 0x46661a0
+new = "1010201e"
+new_asm = "fmov s16, #2.00000000"
+reason = "Havok tau floor veneer [0]"
+
+[[patch]]
+feature = "havok_tau"
+module = "main"
+offset = 0x46661a4
+new = "0078301e"
+new_asm = "fminnm s0, s0, s16"
+reason = "Havok tau floor veneer [1]"
+
+[[patch]]
+feature = "havok_tau"
+module = "main"
+offset = 0x46661a8
+copy_of = 0x274abc
+new_asm = "(the word at main+0x274abc)"
+reason = "Havok tau floor veneer [2]"
+
+[[patch]]
+feature = "havok_tau"
+module = "main"
+offset = 0x46661ac
+new = "453af016"
+new_asm = "b #0x274ac0"
+reason = "Havok tau floor veneer [3]"
+
+[[veneer]]
+feature = "effectease"
+module = "main"
+start = 0x46661b0
+end = 0x46661e4
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0xb5b864
+new = "532aec14"
+new_asm = "b #0x46661b0"
+reason = "effectease: ldr s2, [x8, #0x940] (the altitude ease k = 0.01) -> b <veneer>"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661b0
+copy_of = 0xb5b864
+new_asm = "(the word at main+0xb5b864)"
+reason = "altitude effect ease k veneer [0]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661b4
+new = "080000d0"
+new_asm = "adrp x8, #0x4668000"
+reason = "altitude effect ease k veneer [1]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661b8
+new = "08dd40b9"
+new_asm = "ldr w8, [x8, #0xdc]"
+reason = "altitude effect ease k veneer [2]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661bc
+new = "48000034"
+new_asm = "cbz w8, #0x46661c4"
+reason = "altitude effect ease k veneer [3]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661c0
+new = "0201271e"
+new_asm = "fmov s2, w8"
+reason = "altitude effect ease k veneer [4]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661c4
+new = "a9d51317"
+new_asm = "b #0xb5b868"
+reason = "altitude effect ease k veneer [5]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0xb5ba64
+new = "d929ec14"
+new_asm = "b #0x46661c8"
+reason = "effectease: subs w8, w8, #1 (the 150-call burst count) -> b <veneer>"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661c8
+new = "1f050071"
+new_asm = "cmp w8, #1"
+reason = "altitude effect burst count veneer [0]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661cc
+new = "ab000054"
+new_asm = "b.lt #0x46661e0"
+reason = "altitude effect burst count veneer [1]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661d0
+new = "090000d0"
+new_asm = "adrp x9, #0x4668000"
+reason = "altitude effect burst count veneer [2]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661d4
+new = "29e140b9"
+new_asm = "ldr w9, [x9, #0xe0]"
+reason = "altitude effect burst count veneer [3]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661d8
+new = "0801094b"
+new_asm = "sub w8, w8, w9"
+reason = "altitude effect burst count veneer [4]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661dc
+new = "08050051"
+new_asm = "sub w8, w8, #1"
+reason = "altitude effect burst count veneer [5]"
+
+[[patch]]
+feature = "effectease"
+module = "main"
+offset = 0x46661e0
+new = "22d61317"
+new_asm = "b #0xb5ba68"
+reason = "altitude effect burst count veneer [6]"
 

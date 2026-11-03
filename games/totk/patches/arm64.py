@@ -158,6 +158,28 @@ def sub_w(rd, rn, rm):
     return 0x4b000000 | _reg(rm) << 16 | _reg(rn) << 5 | _reg(rd)
 
 
+def sub_w_imm(rd, rn, imm):
+    """sub w<rd>, w<rn>, #imm (no flags)."""
+    if not 0 <= imm < 4096:
+        raise ValueError(f'sub w, #{imm}')
+    return 0x51000000 | imm << 10 | _reg(rn) << 5 | _reg(rd)
+
+
+def sub_x_imm(rd, rn, imm):
+    """sub x<rd>, x<rn>, #imm (no flags)."""
+    if not 0 <= imm < 4096:
+        raise ValueError(f'sub x, #{imm}')
+    return 0xd1000000 | imm << 10 | _reg(rn) << 5 | _reg(rd)
+
+
+def cbz_x(rt, site, target):
+    return cbz_w(rt, site, target) | 0x80000000
+
+
+def cbnz_x(rt, site, target):
+    return cbz_x(rt, site, target) | 0x01000000
+
+
 def add_w(rd, rn, rm):
     return 0x0b000000 | _reg(rm) << 16 | _reg(rn) << 5 | _reg(rd)
 
@@ -246,3 +268,20 @@ def b_cond(cond, site, target):
     if delta & 3 or not -(1 << 20) <= delta < (1 << 20):
         raise ValueError('b.cond out of range')
     return 0x54000000 | ((delta >> 2) & 0x7ffff) << 5 | COND[cond]
+
+
+def fmaxnm_s(rd, rn, rm):
+    return 0x1e206800 | _reg(rm) << 16 | _reg(rn) << 5 | _reg(rd)
+
+
+def fminnm_s(rd, rn, rm):
+    return 0x1e207800 | _reg(rm) << 16 | _reg(rn) << 5 | _reg(rd)
+
+
+def fmov_s_imm(rd, value):
+    """fmov s<rd>, #value: +-(16 + n) / 16 * 2^e, n 0..15, e -3..4 (1.0, 2.0, 0.125, 0.5 ...)."""
+    for imm8 in range(256):
+        n, r, sign = imm8 & 15, (imm8 >> 4) & 7, -1.0 if imm8 & 0x80 else 1.0
+        if sign * (16 + n) / 16 * 2.0 ** ((r ^ 4) - 3) == value:
+            return 0x1e201000 | imm8 << 13 | _reg(rd)
+    raise ValueError(f'fmov #{value}: no 8-bit immediate')

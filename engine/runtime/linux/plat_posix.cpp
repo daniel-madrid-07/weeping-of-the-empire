@@ -28,11 +28,13 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/prctl.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
+#include <sys/eventfd.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <atomic>
@@ -48,6 +50,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <unistd.h>
 
 extern "C" char __ehdr_start;
@@ -291,7 +294,7 @@ int rt_posix_readable(unsigned long long a, unsigned long long n) {
 }  // extern "C"
 
 namespace {
-enum { K_THREAD = 1, K_TIMER = 2 };
+enum { K_THREAD = 1, K_TIMER = 2, K_EVENT = 3 };
 struct Obj { int kind; };
 struct ThreadObj : Obj {
     pthread_t th; std::atomic<pid_t> tid{0};
@@ -302,6 +305,7 @@ struct ThreadObj : Obj {
     ThreadObj() { kind = K_THREAD; }
 };
 struct TimerObj : Obj { int fd; TimerObj() { kind = K_TIMER; } };
+struct EventObj : Obj { int fd; bool manual; EventObj() { kind = K_EVENT; } };   // (eventfd: SetEvent writes, an auto-reset wait reads)
 void unref(ThreadObj* t) { if (t->refs.fetch_sub(1) == 1) { sem_destroy(&t->started); delete t; } }
 thread_local pid_t t_tid;
 pid_t my_tid() { if (!t_tid) t_tid = (pid_t)syscall(SYS_gettid); return t_tid; }
@@ -396,6 +400,7 @@ BOOL CloseHandle(HANDLE h) {
     Obj* o = (Obj*)h;
     if (o->kind == K_THREAD) unref((ThreadObj*)o);
     else if (o->kind == K_TIMER) { close(((TimerObj*)o)->fd); delete (TimerObj*)o; }
+    else if (o->kind == K_EVENT) { close(((EventObj*)o)->fd); delete (EventObj*)o; }
     return TRUE;
 }
 
@@ -408,16 +413,60 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
         if (ms == INFINITE) { t->cv.wait(l, [&] { return t->done; }); return WAIT_OBJECT_0; }
         return t->cv.wait_for(l, std::chrono::milliseconds(ms), [&] { return t->done; }) ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
     }
-    if (o->kind == K_TIMER) {
-        TimerObj* t = (TimerObj*)o;
-        struct pollfd pf = {t->fd, POLLIN, 0};
-        int rc;
-        while ((rc = poll(&pf, 1, ms == INFINITE ? -1 : (int)ms)) < 0 && errno == EINTR) {}
-        if (rc <= 0) return WAIT_TIMEOUT;
-        uint64_t exp; (void)!read(t->fd, &exp, sizeof exp);
-        return WAIT_OBJECT_0;
-    }
+    if (o->kind == K_TIMER || o->kind == K_EVENT) return WaitForMultipleObjects(1, &h, FALSE, ms);
     return WAIT_FAILED;
+}
+
+// Events and timers are fds: one poll over them. A fired timer and an auto-reset event are consumed by the wait that
+// returns them (the first ready one, in array order, as Windows); a manual-reset event stays set until ResetEvent.
+DWORD WaitForMultipleObjects(DWORD n, const HANDLE* hs, BOOL all, DWORD ms) {
+    if (all || n == 0 || n > 64) return WAIT_FAILED;
+    struct pollfd pf[64];
+    for (DWORD i = 0; i < n; i++) {
+        Obj* o = (Obj*)hs[i];
+        if (!o || hs[i] == INVALID_HANDLE_VALUE || hs[i] == kSelfThread || (o->kind != K_TIMER && o->kind != K_EVENT)) return WAIT_FAILED;
+        pf[i] = {o->kind == K_TIMER ? ((TimerObj*)o)->fd : ((EventObj*)o)->fd, POLLIN, 0};
+    }
+    struct timespec end; clock_gettime(CLOCK_MONOTONIC, &end);
+    end.tv_sec += ms / 1000; end.tv_nsec += (long)(ms % 1000) * 1000000l;
+    if (end.tv_nsec >= 1000000000l) { end.tv_sec++; end.tv_nsec -= 1000000000l; }
+    for (;;) {
+        int left = -1;
+        if (ms != INFINITE) {
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            long long d = (end.tv_sec - now.tv_sec) * 1000ll + (end.tv_nsec - now.tv_nsec + 999999) / 1000000;
+            left = d < 0 ? 0 : (int)d;
+        }
+        int rc = poll(pf, n, left);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc <= 0) return rc == 0 ? WAIT_TIMEOUT : WAIT_FAILED;
+        for (DWORD i = 0; i < n; i++) {
+            if (!(pf[i].revents & POLLIN)) continue;
+            Obj* o = (Obj*)hs[i];
+            if (o->kind == K_EVENT && ((EventObj*)o)->manual) return WAIT_OBJECT_0 + i;
+            uint64_t v;   // (non-blocking: another waiter may have consumed it between the poll and here)
+            if (read(pf[i].fd, &v, sizeof v) == (ssize_t)sizeof v) return WAIT_OBJECT_0 + i;
+        }
+    }
+}
+
+HANDLE CreateEventW(LPSECURITY_ATTRIBUTES, BOOL manual, BOOL initial, const wchar_t*) {
+    int fd = eventfd(initial ? 1 : 0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (fd < 0) return nullptr;
+    EventObj* e = new EventObj(); e->fd = fd; e->manual = manual != 0;
+    return e;
+}
+HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, const char*) { return CreateEventW(sa, manual, initial, nullptr); }
+BOOL SetEvent(HANDLE h) {
+    if (!h || ((Obj*)h)->kind != K_EVENT) return FALSE;
+    uint64_t one = 1;   // (a set event set again stays set: the count only grows, a wait or ResetEvent drains it)
+    return write(((EventObj*)h)->fd, &one, sizeof one) == (ssize_t)sizeof one;
+}
+BOOL ResetEvent(HANDLE h) {
+    if (!h || ((Obj*)h)->kind != K_EVENT) return FALSE;
+    uint64_t v;
+    (void)!read(((EventObj*)h)->fd, &v, sizeof v);
+    return TRUE;
 }
 
 BOOL SetThreadPriority(HANDLE h, int prio) {
@@ -439,10 +488,18 @@ HRESULT SetThreadDescription(HANDLE h, PCWSTR name) {
 }
 
 HANDLE CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES, const void*, DWORD, DWORD) {
-    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     if (fd < 0) return nullptr;
     TimerObj* t = new TimerObj(); t->fd = fd;
     return t;
+}
+
+BOOL CancelWaitableTimer(HANDLE h) {
+    if (!h || ((Obj*)h)->kind != K_TIMER) return FALSE;
+    struct itimerspec its = {};
+    uint64_t v;
+    (void)!read(((TimerObj*)h)->fd, &v, sizeof v);   // (a fire not waited for yet is dropped, as Windows' cancel)
+    return timerfd_settime(((TimerObj*)h)->fd, 0, &its, nullptr) == 0;
 }
 
 BOOL SetWaitableTimerEx(HANDLE h, const LARGE_INTEGER* due, LONG period, void*, LPVOID, void*, ULONG) {
@@ -458,10 +515,19 @@ BOOL SetWaitableTimerEx(HANDLE h, const LARGE_INTEGER* due, LONG period, void*, 
 // ------------------------------------------------------------------ signals, exe location
 }  // extern "C"
 
+__thread rt_try_frame* rt_try_top;   // (windows.h __try: the innermost guarded read of this thread)
 namespace {
 RtCrashFn g_crash_cb;
 void sig_handler(int sig, siginfo_t* si, void* uc) {
     if (sig == SIGSEGV && si->si_code == SEGV_ACCERR && ww_fault((uintptr_t)si->si_addr)) return;
+    if ((sig == SIGSEGV || sig == SIGBUS) && rt_try_top) {   // a guarded read (windows.h __try): back to its __except
+        rt_try_frame* f = rt_try_top;
+        rt_try_top = f->prev;
+        sigset_t s;   // (sigsetjmp saved no mask: unblock what the kernel blocked for this handler)
+        sigemptyset(&s); sigaddset(&s, SIGSEGV); sigaddset(&s, SIGBUS);
+        pthread_sigmask(SIG_UNBLOCK, &s, nullptr);
+        siglongjmp(f->jb, 1);
+    }
     alarm(10);                            // the dumper uses stdio: if the fault was inside it, die anyway after 10 s
     if (g_crash_cb) g_crash_cb(sig, si, uc);
     signal(sig, SIG_DFL);                 // no callback / it returned: the default action (core dump) on return or re-raise
@@ -822,5 +888,88 @@ void rt_threads_dump(int bt_tid) {
     fflush(stdout);
 }
 
+// ------------------------------------------------------------------ UTF-8 <-> wide (windows.h): wchar_t is UTF-32 here
+// Win32's contract: n = -1 counts the terminator; an out buffer of 0 asks for the size; returns the units written
+// (0 = the buffer is too small). Invalid UTF-8 becomes U+FFFD, as MultiByteToWideChar without MB_ERR_INVALID_CHARS.
+int MultiByteToWideChar(UINT, DWORD, const char* s, int n, wchar_t* w, int wn) {
+    const unsigned char* p = (const unsigned char*)s;
+    const unsigned char* e = n < 0 ? p + strlen(s) + 1 : p + n;
+    int k = 0;
+    while (p < e) {
+        unsigned c = *p++, need = c < 0x80 ? 0 : (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : (c & 0xF8) == 0xF0 ? 3 : 9;
+        unsigned v = need == 0 ? c : need == 1 ? c & 0x1F : need == 2 ? c & 0x0F : c & 0x07;
+        if (need == 9) v = 0xFFFD, need = 0;
+        for (unsigned i = 0; i < need; i++) {
+            if (p >= e || (*p & 0xC0) != 0x80) { v = 0xFFFD; break; }
+            v = v << 6 | (*p++ & 0x3F);
+        }
+        if (wn) { if (k >= wn) return 0; w[k] = (wchar_t)v; }
+        k++;
+    }
+    return k;
+}
+int WideCharToMultiByte(UINT, DWORD, const wchar_t* w, int n, char* s, int sn, const char*, BOOL* used) {
+    if (used) *used = FALSE;
+    const wchar_t* e = n < 0 ? w + wcslen(w) + 1 : w + n;
+    int k = 0;
+    for (; w < e; w++) {
+        unsigned v = (unsigned)*w;
+        if (v > 0x10FFFF || (v >= 0xD800 && v < 0xE000)) v = 0xFFFD;
+        char b[4]; int m;
+        if (v < 0x80) b[0] = (char)v, m = 1;
+        else if (v < 0x800) b[0] = (char)(0xC0 | v >> 6), b[1] = (char)(0x80 | (v & 0x3F)), m = 2;
+        else if (v < 0x10000) b[0] = (char)(0xE0 | v >> 12), b[1] = (char)(0x80 | (v >> 6 & 0x3F)), b[2] = (char)(0x80 | (v & 0x3F)), m = 3;
+        else b[0] = (char)(0xF0 | v >> 18), b[1] = (char)(0x80 | (v >> 12 & 0x3F)), b[2] = (char)(0x80 | (v >> 6 & 0x3F)), b[3] = (char)(0x80 | (v & 0x3F)), m = 4;
+        if (sn) { if (k + m > sn) return 0; memcpy(s + k, b, m); }
+        k += m;
+    }
+    return k;
+}
+static std::string utf8_of(const wchar_t* w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n : 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+    s.resize(n > 0 ? n - 1 : 0);
+    return s;
+}
+FILE* _wfopen(const wchar_t* path, const wchar_t* mode) {
+    std::string m = utf8_of(mode);
+    m.erase(std::remove_if(m.begin(), m.end(), [](char c) { return c == 't'; }), m.end());   // (text mode: no such thing here)
+    return fopen(utf8_of(path).c_str(), m.c_str());
+}
+const wchar_t* _wgetenv(const wchar_t* name) {
+    const char* v = getenv(utf8_of(name).c_str());
+    if (!v) return nullptr;
+    // one wide copy per (name, value) kept for the process's life, as the CRT's own wide environment is
+    static std::mutex m;
+    static std::map<std::string, std::wstring>* copies = new std::map<std::string, std::wstring>();
+    std::lock_guard<std::mutex> l(m);
+    std::string key = utf8_of(name) + '=' + v;
+    auto it = copies->find(key);
+    if (it == copies->end()) {
+        std::wstring w(strlen(v) + 1, L'\0');
+        int k = MultiByteToWideChar(CP_UTF8, 0, v, -1, &w[0], (int)w.size());
+        w.resize(k > 0 ? k - 1 : 0);
+        it = copies->emplace(key, w).first;
+    }
+    return it->second.c_str();
+}
+BOOL MoveFileExA(const char* from, const char* to, DWORD flags) {
+    if (flags & MOVEFILE_WRITE_THROUGH) {   // (the data on disk before the rename makes it visible)
+        int fd = open(from, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) { fsync(fd); close(fd); }
+    }
+    if (!(flags & MOVEFILE_REPLACE_EXISTING) && access(to, F_OK) == 0) { errno = EEXIST; return FALSE; }
+    return rename(from, to) == 0;
+}
+BOOL MoveFileExW(const wchar_t* from, const wchar_t* to, DWORD flags) { return MoveFileExA(utf8_of(from).c_str(), utf8_of(to).c_str(), flags); }
+DWORD GetFileAttributesA(const char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return INVALID_FILE_ATTRIBUTES;
+    return S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+}
+DWORD GetFileAttributesW(const wchar_t* path) { return GetFileAttributesA(utf8_of(path).c_str()); }
+
 }  // extern "C"
+
 #endif

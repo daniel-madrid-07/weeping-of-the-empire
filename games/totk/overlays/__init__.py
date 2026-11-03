@@ -148,10 +148,12 @@ def flvi_keys(data, base):
 # ------------------------------------------------------------------------------------------------------------ edits
 
 COMMON_ARCHIVE = 'UI/LayoutArchive/Common.Product.100.Nin_NX_NVN.blarc.zs'
-# The other layout archives: the title screen's own copies of the system menus and loading screen (43 layouts), the
-# boot cursors (2). An aspect set narrows them like Common's, or the title comes out stretched on a wide canvas.
-OTHER_ARCHIVES = ('UI/LayoutArchive/Title.Product.100.Nin_NX_NVN.blarc.zs',
-                  'UI/LayoutArchive/Boot.Product.100.Nin_NX_NVN.blarc.zs')
+# The other layout archive: the title screen's own copies of the system menus and loading screen (43 layouts). An aspect
+# set narrows them like Common's, or the title comes out stretched on a wide canvas. Not Boot's (BoxCursor_00 /
+# PaBoxedCursor_00, the gold focus box; narrowed from b76b9727, 2026-10-23, untested then): the box takes the focused
+# pane's size and place from its global matrix, which a narrowed root already holds, so a narrowed box root narrowed it
+# twice. Its root stays at 1, as the world markers' (ultrawide_layout.py MARKER_ROOT).
+OTHER_ARCHIVES = ('UI/LayoutArchive/Title.Product.100.Nin_NX_NVN.blarc.zs',)
 # The weapon / shield / material quick menus capture the game picture for their background when these panes become
 # visible at animation frame 1.0. UI animations advance 0.5 frames per game frame at 60 fps, so the capture lands after
 # the world stopped drawing and the background can be black: the visibility keys move to frame 0.0.
@@ -522,8 +524,8 @@ def build_shadow(romfs, zstd, out_root, distance):
     Edited in place (sizes and layout unchanged); a value slot another parameter shares is refused."""
     import struct as _struct
     from . import aamp
-    if not 0.5 <= distance <= 4:
-        raise ValueError(f'shadow distance {distance} out of range (0.5 .. 4)')
+    if not 0.25 <= distance <= 4:   # (0.25: integrated GPUs, splits 8 / 16 / 50 m, still above the 2 m start)
+        raise ValueError(f'shadow distance {distance} out of range (0.25 .. 4)')
     raw = romfs.read(SHADER_PACKAGE)
     pack, dict_id = zstd.decompress(raw)
     start, end = sarc_members(bytes(pack))[SHADOW_CONF]

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Weeping of the Empire's AppImage entry (linux-port, 2026-11-02): the bundled Python runs the Setup / Play window
+# (usr/app/setup_gui.py; --play and --setup work without a window). Nothing here touches the system.
+HERE="$(dirname "$(readlink -f "$0")")"
+export APPDIR="${APPDIR:-$HERE}"
+unset PYTHONHOME PYTHONPATH
+# (Tk's own scripts, next to the bundled Python: python-build-standalone finds them itself; this only keeps a
+# TCL_LIBRARY from the user's shell out of the way)
+unset TCL_LIBRARY TK_LIBRARY
+exec "$HERE/usr/python/bin/python3" -I "$HERE/usr/app/setup_gui.py" "$@"

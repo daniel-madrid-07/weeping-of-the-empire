@@ -14,6 +14,7 @@
 // without one imports recomp_settings.ini.
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -75,6 +76,8 @@ bool pc_settings_raw(const char *key, char *out, size_t n);
 void pc_settings_raw_set(const char *key, const char *value);
 // Any thread: saves a change still waiting for its 500 ms now (shim_win.c on WM_CLOSE: the game may exit before)
 void pc_settings_save_pending(void);
+// rt_main, once at the start after every row's variables are set: graphics.safe_mode's renderer switches (TOTK_SAFE_MODE=1)
+void pc_safe_mode_env(void);
 
 #ifdef __cplusplus
 }

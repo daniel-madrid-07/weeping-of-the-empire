@@ -98,8 +98,16 @@ static bool big_on(void) {
     if (on < 0) { const char *e = getenv("LARECOMP_VMA_BIG"); on = !(e && *e == '0'); }
     return on;
 }
-// spare[t][kind]: an empty block of memory type t made off the render thread (kinds 1 and 2, device-local types only)
-static struct { VkDeviceMemory mem; bool want; } spare[VK_MAX_MEMORY_TYPES][3];
+// spare[t][kind]: an empty block of memory type t made off the render thread (kinds 1 and 2, device-local types only), and
+// [t][SPARE_OWN] one OWN_SPARE allocation for a buffer's own allocation (below) The VRAM mirrors' 16 MB blocks (exec.c
+// mirror_block: a device-local buffer each, made when a draw first binds a range in it) are buffers over SUB_MAX: each was
+// its own vkAllocateMemory on the render thread, 10-12 ms ("[vma] slow device allocation: 16 MB of type 1... (own
+// allocation)": the world's first frame after a load in integration's gate runs f018 / v018c. The helper keeps one such
+// allocation ready per device-local type once one was asked for, so a device-local buffer of OWN_SPARE / 2.. OWN_SPARE takes
+// it (still its own allocation: the mirrors' release and residency see the same thing), and the helper makes the next.
+enum { SPARE_OWN = 3, OWN_SPARE = 16 << 20 };
+static struct { VkDeviceMemory mem; bool want; } spare[VK_MAX_MEMORY_TYPES][4];
+static VkDeviceSize spare_size(int kind) { return kind == SPARE_OWN ? OWN_SPARE : block_size((uint32_t)kind); }
 static pthread_cond_t spare_cv = PTHREAD_COND_INITIALIZER;
 static VmaAllocator spare_a;
 static bool spare_on(void) {
@@ -107,22 +115,48 @@ static bool spare_on(void) {
     if (on < 0) { const char *e = getenv("LARECOMP_VMA_SPARE"); on = !(e && *e == '0'); }
     return on;
 }
+// The first resource bound to a new block paid for the whole block on the render thread (camera-turn P0, no allocation
+// in those frames: a 2400x2400 x4 shadow map 126 ms, a 1856x1856 x4 one 52 ms, a 128x128 depth 31 ms; while
+// vkAllocateMemory itself was 0.3-0.5 ms where it showed): the driver's own work on new device memory looks deferred to
+// its first bind. So the helper binds a buffer over the whole spare once, off the render thread, and frees it; the first
+// lines say what that cost (evidence for the gate). LARECOMP_VMA_PREBIND=0: not.
+static void spare_prebind(VkDeviceMemory mem, uint32_t type, VkDeviceSize size) {
+    static int on = -1;
+    static uint32_t nlog;
+    if (on < 0) { const char *e = getenv("LARECOMP_VMA_PREBIND"); on = !(e && *e == '0'); }
+    if (!on) return;
+    const uint64_t t0 = SDL_GetTicksNS();
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (vkCreateBuffer(spare_a->dev, &bi, NULL, &buf) != VK_SUCCESS) return;
+    VkMemoryRequirements rq;
+    vkGetBufferMemoryRequirements(spare_a->dev, buf, &rq);
+    const bool fit = (rq.memoryTypeBits & (1u << type)) && rq.size <= size;
+    const VkResult r = fit ? vkBindBufferMemory(spare_a->dev, buf, mem, 0) : VK_ERROR_UNKNOWN;
+    vkDestroyBuffer(spare_a->dev, buf, NULL);
+    if (nlog++ < 8)
+        fprintf(stderr, "[vma] spare block %llu MB (type %u) bound once off the render thread: %s, %.1f ms\n",
+                (unsigned long long)(size >> 20), type, !fit ? "no buffer fits the type" : r == VK_SUCCESS ? "ok" : "bind failed",
+                (SDL_GetTicksNS() - t0) / 1e6);
+}
 static void *spare_main(void *arg) {
     (void)arg;
     pthread_mutex_lock(&sub_mu);
     for (;;) {
         int wt = -1, wk = 0;
         for (int t = 0; t < VK_MAX_MEMORY_TYPES && wt < 0; t++)
-            for (int k = 1; k < 3; k++)
+            for (int k = 1; k <= SPARE_OWN; k++)
                 if (spare[t][k].want && !spare[t][k].mem) { wt = t; wk = k; break; }
         if (wt < 0) { pthread_cond_wait(&spare_cv, &sub_mu); continue; }
         spare[wt][wk].want = false;
         if (vk_residency_tight()) continue;   // (short of memory: hold nothing spare)
         pthread_mutex_unlock(&sub_mu);
-        VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = block_size((uint32_t)wk),
+        VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = spare_size(wk),
                                    .memoryTypeIndex = (uint32_t)wt};
         VkDeviceMemory mem = VK_NULL_HANDLE;
         VkResult r = vkAllocateMemory(spare_a->dev, &mi, NULL, &mem);
+        if (r == VK_SUCCESS) spare_prebind(mem, (uint32_t)wt, mi.allocationSize);
         pthread_mutex_lock(&sub_mu);
         if (r != VK_SUCCESS) continue;
         // (became short meanwhile; or an emptied block took the slot meanwhile: sub_free)
@@ -137,7 +171,7 @@ static void *spare_main(void *arg) {
 void vma_shim_drop_spares(void) {
     pthread_mutex_lock(&sub_mu);
     for (int t = 0; t < VK_MAX_MEMORY_TYPES; t++)
-        for (int k = 1; k < 3; k++)
+        for (int k = 1; k <= SPARE_OWN; k++)
             if (spare[t][k].mem) {
                 vkFreeMemory(spare_a->dev, spare[t][k].mem, NULL);
                 spare[t][k].mem = VK_NULL_HANDLE;
@@ -182,8 +216,8 @@ void vma_shim_big(VmaAllocator a, uint32_t *n, uint64_t *bytes, uint64_t *live, 
     for (SubBlock *b = a->blocks; b; b = b->next)
         if (b->kind == 2) { ++*n; *bytes += BIG_BLOCK; *live += b->live_bytes; }
     for (int t = 0; t < VK_MAX_MEMORY_TYPES; t++)
-        for (int k = 1; k < 3; k++)
-            if (spare[t][k].mem) *spare_bytes += block_size((uint32_t)k);
+        for (int k = 1; k <= SPARE_OWN; k++)
+            if (spare[t][k].mem) *spare_bytes += spare_size(k);
     *dropped = spare_dropped;
     pthread_mutex_unlock(&sub_mu);
 }
@@ -216,8 +250,8 @@ static VkResult alloc_timed(VkDevice dev, const VkMemoryAllocateInfo *mi, VkDevi
     }
     return r;
 }
-static bool spare_type(VmaAllocator a, uint32_t t, uint32_t kind) {   // (device-local, not host-visible; kinds 1 and 2)
-    return kind >= 1 && kind < 3 && spare_on() && !(a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+static bool spare_type(VmaAllocator a, uint32_t t, uint32_t kind) {   // (device-local, not host-visible; kinds 1 and 2, SPARE_OWN)
+    return kind >= 1 && kind <= SPARE_OWN && spare_on() && !(a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
            (a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 }
 static void spare_ask(VmaAllocator a, uint32_t t, uint32_t kind) {   // (sub_mu held)
@@ -402,6 +436,7 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
     }
     VkResult r;
     VmaAllocation al = NULL;
+    VkDeviceSize own_size = 0;   // (the ready OWN_SPARE allocation taken: its real size, for the counts)
     int t;
     if (kind == 1 && req.size > SUB_MAX && req.size <= BIG_MAX && req.alignment <= (1u << 20) && big_on()) kind = 2;
     if (sub_on() && (req.size <= SUB_MAX || kind == 2) && !(ai->flags & VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT)) {
@@ -421,7 +456,24 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
         if (t < 0) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)t};
         al = calloc(1, sizeof *al);
-        r = alloc_timed(a->dev, &mi, &al->mem, req.size > BIG_MAX ? "own allocation, over 64 MB"
+        // (a device-local buffer of OWN_SPARE / 2.. OWN_SPARE: the helper's ready allocation, see spare[][SPARE_OWN]; not a
+        // smaller one, which would hold up to twice its size: a range's last, shorter mirror block makes its own)
+        bool took = false;
+        if (kind == 0 && !host && req.size > OWN_SPARE / 2 && req.size <= OWN_SPARE && req.alignment <= OWN_SPARE &&
+            spare_type(a, (uint32_t)t, SPARE_OWN)) {
+            pthread_mutex_lock(&sub_mu);
+            if (spare[t][SPARE_OWN].mem) {
+                al->mem = spare[t][SPARE_OWN].mem;
+                spare[t][SPARE_OWN].mem = VK_NULL_HANDLE;
+                live_count--;   // (counted as live while spare; counted again below)
+                spare_used++;
+                took = true;
+                own_size = OWN_SPARE;
+            }
+            spare_ask(a, (uint32_t)t, SPARE_OWN);
+            pthread_mutex_unlock(&sub_mu);
+        }
+        r = took ? VK_SUCCESS : alloc_timed(a->dev, &mi, &al->mem, req.size > BIG_MAX ? "own allocation, over 64 MB"
                                                 : kind == 2 && vk_residency_tight() ? "own allocation, VRAM short: no new big block"
                                                 : req.alignment > (1u << 20) ? "own allocation, alignment over 1 MB"
                                                 : "own allocation");
@@ -444,9 +496,11 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
     }
     live_count++;
 got:
-    al->type = (uint32_t)t; al->size = req.size; al->tag = (uint32_t)vma_shim_tag & 7;
-    tag_bytes[al->tag] += req.size; tag_count[al->tag]++;
-    heap_bytes[a->mp.memoryTypes[t].heapIndex] += req.size;
+    // (al->size: the memory it holds, a taken OWN_SPARE allocation's whole size, which the counts and its free use; the
+    // allocation info keeps the resource's size)
+    al->type = (uint32_t)t; al->size = own_size ? own_size : req.size; al->tag = (uint32_t)vma_shim_tag & 7;
+    tag_bytes[al->tag] += al->size; tag_count[al->tag]++;
+    heap_bytes[a->mp.memoryTypes[t].heapIndex] += al->size;
     heap_count[a->mp.memoryTypes[t].heapIndex]++;
     if (info) *info = (VmaAllocationInfo){.memoryType = al->type, .deviceMemory = al->mem, .offset = al->offset, .size = req.size,
                                           .pMappedData = al->mapped};

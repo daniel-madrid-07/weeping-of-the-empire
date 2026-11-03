@@ -42,7 +42,7 @@ PC_ROW(WORLD,    "holster",       'M', PCOP_NONE, MAC_HOLSTER,   B_B,        "Q"
 // MAC_ATTACK's bow mode, so on foot / in the air the draw is AIM (its rows, its glyphs)
 PC_ROW(WORLD,   "bow_toggle",    'T', PCOP_NONE, MAC_BOW_TOGGLE, 0,          "F")            // tap: the bow out / away (4.26)
 PC_ROW(WORLD,   "bow_toggle",    'M', PCOP_NONE, MAC_BOW_DRAW,  B_ZR,       "F")            // hold: the pad's ZR, the draw; release shoots
-PC_VROW(WORLD,    "throw",         PCVK(12), B_R, "G")            // hold, release throws
+PC_ROW(WORLD,    "throw",         'M', PCOP_NONE, MAC_THROW,     B_R,        "G")            // hold, release throws; carrying: the pad's R (#36)
 PC_ROW(WORLD,    "ability_wheel", 'H', PCOP_NONE, 0,             B_L,        "Tab")          // tap: the last ability; held: the wheel (4.13)
 // (Tab before 4-9: the prompts' L is Tab, the key for whichever ability is chosen, not 4 = Ultrahand only)
 PC_ROW(WORLD,    "ultrahand",     'M', PCOP_NONE, MAC_ABILITY_1, B_L,        "4")
@@ -95,6 +95,9 @@ PC_VROW(CLIMB,    "jump",          PCVK(0) | PCVK(10) | PCVK(19), B_X, "Space") 
                                                                 // in the 30 ms before a let-go's Fall reads AIR; nothing reads it
                                                                 // while climbing
 PC_VROW(CLIMB,    "let_go",        PCVK(5), B_B, "Shift")     // the "Let go [B]" prompt draws B as Shift (4.11 P2, G5)
+// E, the pad's A on a wall (public #36: a "Pick up" on a wall was dead, CLIMB had no A row): on foot's VK 4 | 16, so a
+// held E carries; no VK 7 (Ultrahand's grab toggle, no use on a wall)
+PC_VROW(CLIMB,    "interact",      PCVK(4) | PCVK(16), B_A, "E")
 // the strips and the wheel on a wall: no Sequence module that opens them tests a climb verb, so these send the pad's
 // own trigger and the game's gate decides, as for the pad. WORLD's action names, so a held key carries. No T rows: a
 // tap of 1 is the pad's d-right tap (no take-out on a wall); no 3: there is no aim on a wall, and its ZR + d-right

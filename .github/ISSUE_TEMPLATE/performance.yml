@@ -10,7 +10,7 @@ body:
     id: pc
     attributes:
       label: PC
-      description: CPU, GPU and driver version, RAM, Windows version.
+      description: In the game, F10 > **Copy system info** (bottom of the window) and paste it here, plus your RAM. Or write CPU, GPU and driver version, RAM, Windows version.
     validations:
       required: true
   - type: textarea
@@ -24,7 +24,8 @@ body:
     id: result
     attributes:
       label: Result
-      description: Place in the game, fps (average and lows if you have them), stutters, load times.
+      description: |
+        Place in the game, fps (average and lows if you have them: F3 shows the readout, F10's frame-rate readout set to Detailed adds the 1 % low, F9 the full overlay), stutters, load times. For how your PC runs the game in general, the Compatibility report form fits better.
     validations:
       required: true
   - type: input

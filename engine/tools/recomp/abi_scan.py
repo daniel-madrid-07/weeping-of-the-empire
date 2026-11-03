@@ -1,8 +1,10 @@
 """abi_scan.py: the call sites and functions that gen.py --lso-abi must leave alone.
 
 usage: python abi_scan.py <img_prefix> <funcs.json> <module> <out> [--findings FILE] [--jobs N]
+                           [--base <base img_prefix> <base keep>]
        (<img_prefix>.bin as gen.py reads it; <module> main | sdk names the out file's section; a FILE already holding
-       other sections keeps them; --jobs: processes for the first pass, default min(6, cores); 1 = this one only)
+       other sections keeps them; --jobs: processes for the first pass, default min(6, cores); 1 = this one only;
+       a full scan also writes <out>.state, from which --base starts a near image's scan: incremental())
 
 gen.py --lso-abi drops x9-x18 and NZCV ("D") from the registers an LSO stores to the real Ctx before a call or a
 return: AAPCS64 makes them dead there (not arguments, not results, not preserved). This binary was built with
@@ -31,6 +33,7 @@ its own code only: an import into another module's entry reader can't be keyed f
 in TotK 1.0.0). gen_ext.py's extension ranges are not scanned; gen.py keeps D everywhere in such functions."""
 import bisect
 import collections
+import hashlib
 import json
 import os
 import re
@@ -193,74 +196,126 @@ def plt_noreturn(img, info):
     return {a for a, i in plt.items() if NORET_NAMES.search(names[i])}
 
 
-def noreturn_functions(img, fde, noret_imports, stats):
-    """the functions with no way back to their caller (every path ends in a noreturn call, a trap or the end of the
-    FDE), to a fixpoint from none: a call to one has no fall-through. Sound: every edge the scan keeps elsewhere is
-    kept here, an unresolved br or a tail transfer to anything not known noreturn counts as a return"""
+def noret_flow(img, s, end, lite_cs, em):
+    """one function's flow for noreturn_functions: (succ lists, call targets by index, exits {index: (kind, target)},
+    instruction count)"""
+    lite = list(lite_cs.disasm_lite(img[s:end], s))
+    idx = {a: k for k, (a, sz, m, o) in enumerate(lite)}
+    adr_t = sorted({t for (a, sz, m, o) in lite if m == 'adr' for t in [gen.imm(gen.split_ops(o)[-1])] if s <= t < end})
+    succ, ct, ex = [[] for _ in lite], {}, {}
+    for k, (a, sz, m, o) in enumerate(lite):
+        nxt = [k + 1] if k + 1 < len(lite) else []
+        if m in ('ret', 'retaa', 'retab'):
+            ex[k] = ('ret', None)
+        elif m in CALLS:
+            succ[k] = nxt
+            if m == 'bl':
+                ct[k] = gen.imm(o)
+        elif m == 'br':   # (a resolved one still leaves through gen.py's `default: call_ind` arm: an exit too)
+            tab = em.jump_table(lite, k, s, end) or adr_t
+            succ[k] = [idx[t] for t in tab if t in idx]
+            ex[k] = ('br', None)
+        elif m in ('braa', 'braaz', 'brab', 'brabz'):
+            ex[k] = ('br', None)
+        elif m == 'b' or m.startswith('b.') or m in ('cbz', 'cbnz', 'tbz', 'tbnz'):
+            t = gen.imm(gen.split_ops(o)[-1])
+            succ[k] = ([idx[t]] if t in idx else []) + ([] if m == 'b' else nxt)
+            if t not in idx:
+                ex[k] = ('tail', t)
+        elif m in ('udf', 'brk', 'hlt', '.byte'):
+            pass
+        else:
+            succ[k] = nxt
+    return succ, ct, ex, len(lite)
+
+
+def flow_returns(flow, noret):
+    """a path from the function's entry back to its caller, given the noreturn functions known"""
+    succ, ct, ex, n = flow
+    seen, todo = set(), [0] if n else []
+    while todo:
+        k = todo.pop()
+        if k in seen:
+            continue
+        seen.add(k)
+        if k in ex:
+            kind, t = ex[k]
+            if kind != 'tail' or t not in noret:
+                return True
+        if k in ct and ct[k] in noret:
+            continue
+        todo.extend(succ[k])
+    return False
+
+
+def _flows_part(img, fde, part, noret_imports):
+    """noreturn_functions' first round over `part`: each function's flow, against the noreturn imports alone; returns
+    (the BL targets of these functions' code, {call target: callers among them}, the ones that do not return)"""
     lite_cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
     lite_cs.skipdata = True
     em = gen.Emitter.__new__(gen.Emitter)
     em.img, em.stats = img, collections.Counter()
-    info = {}   # start -> (succ lists, call targets by index, exits: [(kind, target)], n)
-    callers = collections.defaultdict(set)
-    for s in sorted(fde):
-        end = s + fde[s]
-        lite = list(lite_cs.disasm_lite(img[s:end], s))
-        idx = {a: k for k, (a, sz, m, o) in enumerate(lite)}
-        adr_t = sorted({t for (a, sz, m, o) in lite if m == 'adr' for t in [gen.imm(gen.split_ops(o)[-1])] if s <= t < end})
-        succ, ct, ex = [[] for _ in lite], {}, {}
-        for k, (a, sz, m, o) in enumerate(lite):
-            nxt = [k + 1] if k + 1 < len(lite) else []
-            if m in ('ret', 'retaa', 'retab'):
-                ex[k] = ('ret', None)
-            elif m in CALLS:
-                succ[k] = nxt
-                if m == 'bl':
-                    ct[k] = gen.imm(o)
-                    callers[ct[k]].add(s)
-            elif m == 'br':   # (a resolved one still leaves through gen.py's `default: call_ind` arm: an exit too)
-                tab = em.jump_table(lite, k, s, end) or adr_t
-                succ[k] = [idx[t] for t in tab if t in idx]
-                ex[k] = ('br', None)
-            elif m in ('braa', 'braaz', 'brab', 'brabz'):
-                ex[k] = ('br', None)
-            elif m == 'b' or m.startswith('b.') or m in ('cbz', 'cbnz', 'tbz', 'tbnz'):
-                t = gen.imm(gen.split_ops(o)[-1])
-                succ[k] = ([idx[t]] if t in idx else []) + ([] if m == 'b' else nxt)
-                if t not in idx:
-                    ex[k] = ('tail', t)
-            elif m in ('udf', 'brk', 'hlt', '.byte'):
-                pass
-            else:
-                succ[k] = nxt
-        info[s] = (succ, ct, ex, len(lite))
-    noret = set(noret_imports)
+    bl_t, callers, new = set(), collections.defaultdict(set), []
+    for s in part:
+        flow = noret_flow(img, s, s + fde[s], lite_cs, em)
+        for t in flow[1].values():
+            callers[t].add(s)
+        bl_t.update(flow[1].values())   # (noret_flow's call targets are every bl of the function: scan()'s bl_t)
+        if not flow_returns(flow, noret_imports):
+            new.append(s)
+    return bl_t, dict(callers), new
 
-    def returns(s):
-        succ, ct, ex, n = info[s]
-        seen, todo = set(), [0] if n else []
-        while todo:
-            k = todo.pop()
-            if k in seen:
-                continue
-            seen.add(k)
-            if k in ex:
-                kind, t = ex[k]
-                if kind != 'tail' or t not in noret:
-                    return True
-            if k in ct and ct[k] in noret:
-                continue
-            todo.extend(succ[k])
-        return False
-    todo = set(info)
-    while todo:
-        new = {s for s in todo if not returns(s)} - noret
+
+def _w_flows(part):
+    return _flows_part(_W['img'], _W['fde'], part, _W['noret_imports'])
+
+
+def _w_flows_init(bin_path, fde, noret_imports):
+    _W.update(img=open(bin_path, 'rb').read(), fde=fde, noret_imports=noret_imports)
+
+
+def noreturn_functions(img, fde, noret_imports, stats, jobs=1, bin_path=None):
+    """(the functions with no way back to their caller, scan()'s BL targets). No way back: every path ends in a noreturn
+    call, a trap or the end of the FDE, to a fixpoint from none: a call to one has no fall-through. Sound: every edge the
+    scan keeps elsewhere is kept here, an unresolved br or a tail transfer to anything not known noreturn counts as a
+    return. The first round (every function, against the imports alone: each one on its own) and the BL targets come
+    from one pass over the code, in `jobs` processes (bin_path: the image file they read); the later rounds see only
+    the callers of the functions the round before found, their flows built again here. Same rounds, same result as
+    one process (setup-fast 2026-11-03: these two passes were 43 s of main's 81 s scan, all in one process)."""
+    noret_imports = frozenset(noret_imports)
+    starts = sorted(fde)
+    bl_t, callers, new = set(), collections.defaultdict(set), set()
+    if jobs > 1 and bin_path:
+        import multiprocessing
+        n = 8 * jobs
+        parts = [starts[k * len(starts) // n:(k + 1) * len(starts) // n] for k in range(n)]
+        with multiprocessing.Pool(jobs, _w_flows_init, (bin_path, fde, noret_imports)) as pool:
+            for b, c, nw in pool.imap_unordered(_w_flows, parts):
+                bl_t |= b
+                for t, ss in c.items():
+                    callers[t] |= ss
+                new.update(nw)
+    else:
+        b, c, nw = _flows_part(img, fde, starts, noret_imports)
+        bl_t, new = b, set(nw)
+        callers.update(c)
+    noret = set(noret_imports)
+    new -= noret
+    stats['noret_rounds'] += 1
+    lite_cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+    lite_cs.skipdata = True
+    em = gen.Emitter.__new__(gen.Emitter)
+    em.img, em.stats = img, collections.Counter()
+    while new:
         noret |= new
-        todo = set().union(*(callers[s] for s in new)) if new else set()
+        todo = set().union(*(callers[s] for s in new))
+        if not todo:
+            break
+        new = {s for s in todo if not flow_returns(noret_flow(img, s, s + fde[s], lite_cs, em), noret)} - noret
         stats['noret_rounds'] += 1
-    stats['noreturn_functions'] = len(noret - set(noret_imports))
+    stats['noreturn_functions'] = len(noret - noret_imports)
     stats['noreturn_imports'] = len(noret_imports)
-    return noret
+    return noret, bl_t
 
 
 _W = {}   # a first-pass worker's inputs (_w_init)
@@ -277,10 +332,14 @@ def _w_part(part):
     return scan(_W['img'], _W['fde'], [] if _W.get('findings') else None, _part=(part, _W['mid'], _W['noret']))
 
 
-def scan(img, fde, findings_out=None, info=None, jobs=1, bin_path=None, _part=None):
+def scan(img, fde, findings_out=None, info=None, jobs=1, bin_path=None, _part=None, base=None, state_out=None):
     """jobs > 1 (with bin_path, the image file the workers read): the first pass, every function with nothing known
     about the others yet, runs in that many processes; it is order-free (callee_regs is empty then, and without
-    --entry-use nothing reads entry_readers), so the result is the same. The closure stays in this process."""
+    --entry-use nothing reads entry_readers), so the result is the same. The closure stays in this process.
+
+    base (incremental(): a full scan's result and the functions whose flow may differ from it): the first pass runs over
+    those only, from the base's keep sets, BL targets and noreturn functions, and the closure goes on from the base's
+    callees. state_out (a dict): a full scan leaves its BL targets and noreturn functions there (write_state)."""
     cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
     cs.detail = True
     cs.skipdata = True
@@ -293,26 +352,30 @@ def scan(img, fde, findings_out=None, info=None, jobs=1, bin_path=None, _part=No
     stats = collections.Counter()
     if _part is not None:
         _part, mid, noret = _part
+    elif base is not None:
+        mid, noret = base['mid'], base['noret']
     else:
-        # BL targets inside a function (an extra entry there), from the functions' own code
+        # the noreturn functions, and the BL targets of the functions' own code from the same pass over it; a BL target
+        # inside a function is an extra entry there
         t0 = time.time()
-        bl_t = set()
-        for s in starts:
-            for a, sz, m, o in lite_cs.disasm_lite(img[s:s + fde[s]], s):
-                if m == 'bl':
-                    bl_t.add(gen.imm(o))
+        noret, bl_t = noreturn_functions(img, fde, plt_noreturn(img, info), stats, jobs, bin_path)
+        t1 = time.time()
         mid = collections.defaultdict(set)
         for t in bl_t:
             if t not in fset:
                 j = bisect.bisect_right(starts, t) - 1
                 if j >= 0 and t < starts[j] + fde[starts[j]]:
                     mid[starts[j]].add(t)
-        t1 = time.time()
-        noret = noreturn_functions(img, fde, plt_noreturn(img, info), stats)
-        stats['s_bl_targets'], stats['s_noreturn'] = round(t1 - t0), round(time.time() - t1)
+        stats['s_noreturn'], stats['s_bl_targets'] = round(t1 - t0), round(time.time() - t1)
+        if state_out is not None:
+            state_out.update(bl_targets=sorted(bl_t), noret=sorted(noret))
     # per register: the D registers a keep site's caller reads after it / an entry reader reads at its entry / a callee's
     # exits must hand back (a call to an entry reader uses only the registers it reads)
     keep_sites, entry_readers, callee_regs, call_target = {}, {}, {}, {}
+    if base is not None:   # (sets that only grow: the base's are kept, a superset is sound)
+        keep_sites = {a: set(r) for a, r in base['sites'].items()}
+        entry_readers = {a: set(r) for a, r in base['entries'].items()}
+        callee_regs = {a: frozenset(r) for a, r in base['callees'].items()}
     callers_of = collections.defaultdict(set)   # a call / tail-transfer target -> the functions that reach it
     poison = lambda src: frozenset((r, src) for r in D_ALL)
     tail_target = {}
@@ -466,7 +529,10 @@ def scan(img, fde, findings_out=None, info=None, jobs=1, bin_path=None, _part=No
             analyze(s)
         return keep_sites, entry_readers, call_target, dict(callers_of), tail_target, stats, findings_out
     t0 = time.time()
-    if jobs > 1 and bin_path and not ENTRY_USE:
+    if base is not None:
+        for s in sorted(base['todo']):
+            analyze(s)
+    elif jobs > 1 and bin_path and not ENTRY_USE:
         import multiprocessing
         n = 8 * jobs   # (contiguous shares in address order: their findings join in the one-process order)
         parts = [starts[k * len(starts) // n:(k + 1) * len(starts) // n] for k in range(n)]
@@ -496,8 +562,12 @@ def scan(img, fde, findings_out=None, info=None, jobs=1, bin_path=None, _part=No
     # the call sites that poison those reads become keep sites, their targets callees; a function whose D at such a
     # read still comes from its entry becomes an entry reader itself
     seen_callee, seen_entry = {}, {}
+    if base is not None:   # (every function was analyzed with the base's callees: the first pass above too)
+        seen_callee = {f: set(r) for f, r in base['callees'].items()}
     while True:
         regs = collections.defaultdict(set)
+        for f, rr in (base['callees'].items() if base is not None else ()):   # (closed in the base already)
+            regs[f] |= rr
         for a, rr in keep_sites.items():
             if a in call_target:
                 regs[call_target[a]] |= rr
@@ -532,6 +602,135 @@ def scan(img, fde, findings_out=None, info=None, jobs=1, bin_path=None, _part=No
     return keep_sites, entry_readers, callees, stats
 
 
+STATE_VERSION = 1
+
+
+def tools_sha():
+    """this scan's code (abi_scan.py and the gen.py it reads jump tables with): a state is a base only for the same"""
+    return hashlib.sha256(b''.join(open(f, 'rb').read() for f in (__file__, gen.__file__))).hexdigest()
+
+
+def write_state(path, img, fde, state):
+    """<keep>.state beside a full scan's keep file: what incremental() starts from (the image's hash, the functions,
+    every BL target, the noreturn functions)"""
+    doc = dict(version=STATE_VERSION, flags=[ENTRY_USE, EXACT_JT], tools=tools_sha(),
+               bin_sha256=hashlib.sha256(img).hexdigest(),
+               fde={f'{a:x}': n for a, n in sorted(fde.items())}, bl_targets=state['bl_targets'], noret=state['noret'])
+    with open(path + '.tmp', 'w', newline='\n') as f:
+        json.dump(doc, f, separators=(',', ':'))
+    os.replace(path + '.tmp', path)
+
+
+def read_keep(path, module):
+    """a keep file's (sites, entries, callees) of `module`: {address: D registers}"""
+    out = {'site': {}, 'entry': {}, 'callee': {}}
+    cur = None
+    for line in open(path):
+        p = line.split()
+        if not p or line.startswith('#'):
+            continue
+        if p[0] == 'module':
+            cur = p[1]
+        elif cur == module and p[0] in out:
+            regs = p[2].split(',') if len(p) > 2 else ()
+            out[p[0]][int(p[1], 16)] = frozenset(NZCV if r == NZCV else int(r[1:]) for r in regs)
+    return out['site'], out['entry'], out['callee']
+
+
+def diff_runs(a, b, block=1 << 16):
+    """[start, end) runs where two images differ (a longer one's tail is a difference)"""
+    runs, n = [], max(len(a), len(b))
+    same = lambda k: k < len(a) and k < len(b) and a[k] == b[k]   # noqa: E731
+    for o in range(0, n, block):
+        if a[o:o + block] == b[o:o + block]:
+            continue
+        k, end = o, min(n, o + block)
+        while k < end:
+            if same(k):
+                k += 1
+                continue
+            j = k
+            while j < end and not same(j):
+                j += 1
+            if runs and runs[-1][1] == k:
+                runs[-1][1] = j
+            else:
+                runs.append([k, j])
+            k = j
+    return runs
+
+
+def incremental(img, fde, ext, base_prefix, base_keep, module):
+    """(the base mode's inputs for scan(), None) from a full scan of a near image (a code mod over the player's build:
+    tools/engine/build.py lso_abi_auto), or (None, why) when a full scan must run.
+
+    Sound because every result only grows and a superset is safe (gen.py keeps more stores): the base's keep sets stay
+    and the first pass runs again over every function whose flow may differ, the functions with other bytes or another
+    FDE size, new ones, and those a new BL now enters in the middle; the closure goes on from the base's callees. A full
+    scan instead when the base cannot bound the change: bytes changed outside every function and every extension range
+    (data: a jump table may read it), a base function gone, or a noreturn function that returns now (its callers' flow
+    was cut after the call)."""
+    try:
+        st = json.load(open(base_keep + '.state'))
+    except (OSError, ValueError):
+        return None, 'the base keep has no state'
+    if st.get('version') != STATE_VERSION or st.get('flags') != [ENTRY_USE, EXACT_JT] or st.get('tools') != tools_sha():
+        return None, 'the base state is of another scan'
+    try:
+        base_img = open(base_prefix + '.bin', 'rb').read()
+    except OSError:
+        return None, 'no base image'
+    if hashlib.sha256(base_img).hexdigest() != st['bin_sha256']:
+        return None, 'the base image changed'
+    base_fde = {int(k, 16): v for k, v in st['fde'].items()}
+    if not base_fde.keys() <= fde.keys():
+        return None, 'a function of the base is gone'
+    starts = sorted(fde)
+    ext_r = sorted((a, b) for rr in ext.values() for a, b in rr)
+    changed = {f for f in fde if base_fde.get(f) != fde[f]}
+    for a, b in diff_runs(img, base_img):
+        # a word that becomes 0 (udf #0) can lengthen another function's jump table (gen.py's udf_at skips such
+        # entries); every other change of bytes outside a function can only end one sooner: fewer edges, a subset
+        for w in range(a & ~3, b, 4):
+            if img[w:w + 4] == bytes(4) and base_img[w:w + 4] not in (bytes(4), b''):
+                return None, f'a word turned 0 at {w:#x}'
+        while a < b:
+            j = bisect.bisect_right(starts, a) - 1
+            if j >= 0 and a < starts[j] + fde[starts[j]]:
+                changed.add(starts[j])
+                a = starts[j] + fde[starts[j]]
+                continue
+            k = bisect.bisect_right(ext_r, (a, float('inf'))) - 1
+            if k >= 0 and ext_r[k][0] <= a < ext_r[k][1]:   # (extension code: gen.py keeps D everywhere there)
+                a = ext_r[k][1]
+                continue
+            return None, f'bytes changed outside every function at {a:#x}'
+    lite_cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+    lite_cs.skipdata = True
+    em = gen.Emitter.__new__(gen.Emitter)
+    em.img, em.stats = img, collections.Counter()
+    noret = set(st['noret'])
+    flows = {f: noret_flow(img, f, f + fde[f], lite_cs, em) for f in changed}
+    lost = sorted(f for f in changed if f in noret and flow_returns(flows[f], noret))
+    if lost:
+        return None, f'{len(lost)} noreturn function(s) return now ({lost[0]:#x})'
+    # (one that turned noreturn stays out of noret: its callers keep the flow after the call, over-approximate)
+    base_bl = set(st['bl_targets'])
+    new_bl = {t for f in changed for t in flows[f][1].values()} - base_bl
+    fset = set(starts)
+    todo = set(changed)
+    mid = collections.defaultdict(set)
+    for t in base_bl | new_bl:
+        if t not in fset:
+            j = bisect.bisect_right(starts, t) - 1
+            if j >= 0 and t < starts[j] + fde[starts[j]]:
+                mid[starts[j]].add(t)
+                if t in new_bl:
+                    todo.add(starts[j])
+    sites, entries, callees = read_keep(base_keep, module)
+    return dict(todo=todo, mid=mid, noret=noret, sites=sites, entries=entries, callees=callees), None
+
+
 def regs_txt(rr):
     return ','.join(sorted(f'x{r}' if r != NZCV else NZCV for r in rr))
 
@@ -543,7 +742,17 @@ def main():
     found = [] if '--findings' in sys.argv else None
     info = json.load(open(pre + '.json')) if os.path.exists(pre + '.json') else None
     jobs = int(sys.argv[sys.argv.index('--jobs') + 1]) if '--jobs' in sys.argv else min(6, os.cpu_count() or 1)
-    sites, entries, callees, stats = scan(img, fde, found, info, jobs, pre + '.bin')
+    base = None
+    if '--base' in sys.argv:   # --base <base img_prefix> <its keep file>: incremental() from that full scan
+        i = sys.argv.index('--base')
+        t0 = time.time()
+        ext = {int(k, 16): [(int(a, 16), int(b, 16)) for a, b in v]
+               for k, v in json.load(open(fj)).get('ext', {}).items()}
+        base, why = incremental(img, fde, ext, sys.argv[i + 1], sys.argv[i + 2], module)
+        print(f'abi_scan: from {sys.argv[i + 2]}: ' + (f"{len(base['todo'])} functions again ({time.time() - t0:.1f} s)"
+                                                        if base else f'a full scan ({why})'), file=sys.stderr)
+    state = {} if base is None else None   # (only a full scan is a base: an incremental keep is a superset)
+    sites, entries, callees, stats = scan(img, fde, found, info, jobs, pre + '.bin', base=base, state_out=state)
     keep = []
     if os.path.exists(out):   # other modules' sections stay
         cur = None
@@ -561,6 +770,8 @@ def main():
         f.write(''.join(f'entry {a:x} {regs_txt(entries[a])}\n' for a in sorted(entries)))
         f.write(''.join(f'callee {a:x} {regs_txt(callees[a])}\n' for a in sorted(callees)))
     os.replace(out + '.tmp', out)
+    if state:
+        write_state(out + '.state', img, fde, state)
     if found is not None:
         with open(sys.argv[sys.argv.index('--findings') + 1], 'w', newline='\n') as f:
             for s, a, txt, r, src in found:

@@ -11,9 +11,23 @@
 #include <string>
 #include <vector>
 
+// A link (symbolic link, junction, WSL link: a name-surrogate reparse point), which the save copies never follow. Other
+// reparse points are ordinary files and folders: OneDrive's cloud files above all (the rival port's #374 lost saves
+// skipping every reparse point), deduplicated ones.
+inline bool save_link(const WIN32_FIND_DATAW &e) {
+    return (e.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && IsReparseTagNameSurrogate(e.dwReserved0);
+}
+
 namespace save_tree_detail {
-inline bool skip(const WIN32_FIND_DATAW &e) {   // (reparse points: snap_tree skips them, so they never differ)
-    return !wcscmp(e.cFileName, L".") || !wcscmp(e.cFileName, L"..") || (e.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
+inline bool skip(const WIN32_FIND_DATAW &e) {   // (links: snap_tree skips them, so they never differ)
+    return !wcscmp(e.cFileName, L".") || !wcscmp(e.cFileName, L"..") || save_link(e);
+}
+inline bool link_at(const std::wstring &p) {   // p is a link (save_link), or cannot be read
+    WIN32_FIND_DATAW e;
+    HANDLE f = FindFirstFileW(p.c_str(), &e);
+    if (f == INVALID_HANDLE_VALUE) return true;
+    FindClose(f);
+    return save_link(e);
 }
 inline bool is_dir(DWORD a) { return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
 inline bool read_some(HANDLE h, std::vector<unsigned char> &buf, DWORD *got) {
@@ -62,7 +76,7 @@ inline bool covered(const std::wstring &a, const std::wstring &b, bool files) {
         if (skip(e)) continue;
         const std::wstring x = a + L"\\" + e.cFileName, y = b + L"\\" + e.cFileName;
         const DWORD ya = GetFileAttributesW(y.c_str());
-        if (ya == INVALID_FILE_ATTRIBUTES || (ya & FILE_ATTRIBUTE_REPARSE_POINT)) ok = false;
+        if (ya == INVALID_FILE_ATTRIBUTES || ((ya & FILE_ATTRIBUTE_REPARSE_POINT) && link_at(y))) ok = false;
         else if (e.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ok = is_dir(ya) && covered(x, y, files);
         else ok = !is_dir(ya) && (!files || same_file(x, y));
     } while (ok && FindNextFileW(f, &e));

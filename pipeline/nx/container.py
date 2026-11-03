@@ -1,4 +1,5 @@
-"""NSP (PFS0) / XCI (HFS0) containers, tickets, NCA3 headers and AES-CTR sections.
+"""NSP (PFS0) / XCI (HFS0) containers, tickets, NCA3 headers and AES-CTR sections; NSZ / XCZ (their NCAs as nsz's
+.ncz, nx/ncz.py) the same way.
 
 Port of the helpers in MacNativeGames `games/totk/scripts/extract_exefs.py` (MIT). Keys stay in memory and are never
 printed; error messages name keys, never their values.
@@ -10,6 +11,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers import modes
 
 from .common import decrypt, read_at, require
+from .ncz import NczBody, is_ncz
 
 TOTK_TITLE_ID = '0100F2C0115B6000'
 TOTK_UPDATE_TITLE_ID = '0100F2C0115B6800'
@@ -148,15 +150,25 @@ def nca_ctr_key(hdr, keys, tickets):
 
 
 def nca_inventory(f, entries, keys):
+    """[(record, decrypted header)] of the container's NCAs; an .ncz's record has its NCA size and `ncz` (its size in
+    the container)."""
     records = []
     for name, offset, length in entries:
-        if not name.lower().endswith('.nca'):
+        if not name.lower().endswith('.nca') and not is_ncz(name):
             continue
-        hdr = read_nca_header(f, offset, length, keys)
-        record = dict(name=name, nca_offset=offset, size=length, content_type=hdr[0x205],
+        size = NczBody(f, offset, length).nca_size if is_ncz(name) else length
+        hdr = read_nca_header(f, offset, size, keys)
+        record = dict(name=name, nca_offset=offset, size=size, content_type=hdr[0x205],
                       title_id=f'{struct.unpack_from("<Q", hdr, 0x210)[0]:016X}')
+        if is_ncz(name):
+            record['ncz'] = length
         records.append((record, hdr))
     return records
+
+
+def nca_body(f, record, spill=None):
+    """An .ncz's plaintext (NczBody) for NcaSection / BktrSection, None for an NCA (spill: NczBody's)."""
+    return NczBody(f, record['nca_offset'], record['ncz'], spill) if 'ncz' in record else None
 
 
 def program_nca(records, title_id=TOTK_TITLE_ID):
@@ -173,9 +185,10 @@ def program_nca(records, title_id=TOTK_TITLE_ID):
 
 
 class NcaSection:
-    """One AES-CTR section of an NCA inside an open container file; read() decrypts relative ranges."""
+    """One AES-CTR section of an NCA inside an open container file; read() decrypts relative ranges. With `body` (an
+    .ncz's NczBody: nca_body) the section reads from its plaintext instead."""
 
-    def __init__(self, f, nca_offset, hdr, index, ctr_key):
+    def __init__(self, f, nca_offset, hdr, index, ctr_key, body=None):
         start, end = struct.unpack_from('<II', hdr, 0x240 + 16 * index)
         require(start != 0, f'NCA section {index} is empty')
         self.fs = hdr[0x400 + 512 * index:0x600 + 512 * index]
@@ -189,9 +202,14 @@ class NcaSection:
         self.base = nca_offset
         self.key = ctr_key
         self.kind = (self.fs[2], self.fs[3])
+        self.body = body
 
     def read(self, relative, size):
         require(0 <= relative and relative + size <= self.size, 'Section read out of bounds')
+        if self.body is not None:   # (nsz stored it decrypted)
+            require(self.crypt in (CRYPT_NONE, CRYPT_CTR),
+                    f'NCA section {self.index}: only plain and AES-CTR sections are supported')
+            return self.body.read(self.start + relative, size)
         if self.crypt == CRYPT_NONE:
             return read_at(self.f, self.base + self.start + relative, size)
         require(self.crypt == CRYPT_CTR, f'NCA section {self.index}: only plain and AES-CTR sections are supported')
@@ -224,13 +242,14 @@ def update_program(f, keys, size, title_id=TOTK_UPDATE_TITLE_ID):
     return kind, [r for r, _ in records], record, hdr, nca_ctr_key(hdr, keys, tickets)
 
 
-def program_sections(f, keys, size, title_id=TOTK_TITLE_ID):
-    """Open a base game container and return (kind, records, program_record, [NcaSection])."""
+def program_sections(f, keys, size, title_id=TOTK_TITLE_ID, spill=None):
+    """Open a base game container and return (kind, records, program_record, [NcaSection]) (spill: an NSZ / XCZ's
+    NczBody's, for an update's merge reading the base out of order)."""
     kind, entries = container_entries(f, size)
     tickets = common_tickets(f, entries)
     records = nca_inventory(f, entries, keys)
     record, hdr = program_nca(records, title_id)
     key = nca_ctr_key(hdr, keys, tickets)
-    sections = [NcaSection(f, record['nca_offset'], hdr, i, key)
+    sections = [NcaSection(f, record['nca_offset'], hdr, i, key, nca_body(f, record, spill))
                 for i in range(4) if struct.unpack_from('<I', hdr, 0x240 + 16 * i)[0]]
     return kind, [r for r, _ in records], record, sections

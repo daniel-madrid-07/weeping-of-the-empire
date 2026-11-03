@@ -7,7 +7,9 @@ An update's RomFS section (FS header encryption type 4, AesCtrEx) holds only wha
   - the AES-CTR-Ex table: physical ranges of the patch data, each with its own counter generation (the IV's upper
     half is secure value | generation, the lower the absolute NCA offset / 16), or not encrypted at all.
 `BktrSection` has NcaSection's interface (`fs`, `size`, `kind`, `read`), so romfs.extract_image verifies every IVFC
-level of the merged RomFS exactly as for a base game: a wrong merge cannot produce an image.
+level of the merged RomFS exactly as for a base game: a wrong merge cannot produce an image. An update NSZ / XCZ (its
+NCA an .ncz, nx/ncz.py: `body`) holds the section decrypted, so the tables and the patch data are read from it as they
+are; the tables, then the merge reading the patch data in order, go through a solid stream twice at most.
 
 Layout as in LibHac / Atmosphere (fssystem BucketTree, IndirectStorage, AesCtrCounterExtendedStorage); written for
 this port from those definitions. Keys stay in memory; errors never print them.
@@ -64,7 +66,7 @@ def bucket_tree(meta: bytes, header: bytes, entry_size: int, total=None):
 class BktrSection:
     """The patched RomFS of an update: NcaSection's interface over base RomFS + update patch data."""
 
-    def __init__(self, f, nca_offset, hdr, index, ctr_key, base):
+    def __init__(self, f, nca_offset, hdr, index, ctr_key, base, body=None):
         start, end = struct.unpack_from('<II', hdr, 0x240 + 16 * index)
         require(start != 0, f'Update NCA section {index} is empty')
         self.fs = hdr[0x400 + 512 * index:0x600 + 512 * index]
@@ -75,7 +77,7 @@ class BktrSection:
                                              f'(encryption type {self.fs[4]})')
         require(self.fs[0x178:0x1A0] == bytes(0x28) and self.fs[0x148:0x178] == bytes(0x30),
                 'Update NCA section uses sparse or compressed storage (unsupported)')
-        self.f, self.index, self.key, self.base_section = f, index, ctr_key, base
+        self.f, self.index, self.key, self.base_section, self.body = f, index, ctr_key, base, body
         self.kind = (self.fs[2], self.fs[3])
         self.start, self.raw_size, self.nca = start * 512, (end - start) * 512, nca_offset
         self.upper = self.fs[0x140:0x148][::-1]                  # secure value (BE) | generation (BE)
@@ -102,6 +104,8 @@ class BktrSection:
 
     def _ctr(self, rel, size):
         """Plain section AES-CTR (the patch tables)."""
+        if self.body is not None:   # (an .ncz: stored decrypted)
+            return self.body.read(self.start + rel, size)
         absolute = self.start + rel
         aligned = absolute & ~15
         data = read_at(self.f, self.nca + aligned, size + absolute - aligned)
@@ -116,7 +120,9 @@ class BktrSection:
             off, enc, gen = self.ex[i]
             stop = self.ex_off[i + 1] if i + 1 < len(self.ex) else self.ex_end
             n = min(size, stop - rel)
-            if enc == 1:
+            if self.body is not None:   # (an .ncz: every range stored decrypted, nsz re-encrypts them only on -D)
+                out.append(self.body.read(self.start + rel, n))
+            elif enc == 1:
                 out.append(read_at(self.f, self.nca + self.start + rel, n))
             else:
                 absolute = self.start + rel

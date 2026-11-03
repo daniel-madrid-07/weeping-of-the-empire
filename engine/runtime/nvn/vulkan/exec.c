@@ -29,6 +29,13 @@
 #include "spvz.h"   // (the SPIR-V cache's compressed entries: the precompile's last worker compacts old ones)
 #include "index_max.h"   // (draw_'s index scan)
 #include "present_color.h"   // (display.color: the colour adjustment's factors)
+#include "shader_quar.h"   // (the shader quarantine's file lines and form ladder: pcq_load, dq_*)
+#ifdef _WIN32
+#include <fcntl.h>   // (_O_RDWR: pc_load_file cuts a torn precompile.bin tail)
+extern int shim_file_replace(const char *src, const char *dst);   // (shim_win.c: a one-step replace, MoveFileEx)
+#else
+static int shim_file_replace(const char *src, const char *dst) { return rename(src, dst); }   // (POSIX rename replaces)
+#endif
 #include "hostroom.h"   // (room on a host-visible heap: host_import's optional imports, ring_grow's chunk sizes)
 #include "vk.h"
 #include "../shim/las.h"  // TotK: was ../renderer.h
@@ -123,6 +130,11 @@ static uint32_t bar_epoch = 1;            // full barriers recorded in the main 
 static uint64_t stat_hazard_barriers;     // LARECOMP_BARRIERS=tracked: barriers for a texture / storage read after a write
 static uint64_t stat_pass_barriers, stat_pass_nobarrier, stat_game_barriers, stat_game_barrier_breaks;
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies, stat_feedback_live, stat_depth_war, stat_fb_selfw, stat_fb_alias;
+// glitch.c (TOTK_GLITCH_DETECT): cumulative counts, the stats windows' resets folded in (render thread, as the stats):
+// draws, skipped draws, passes, dispatches, occlusion reports, of them zero, kept visible (stat_oq_*: declared below)
+static uint64_t gl_acc[8];
+static void gl_fold(void), gl_fold_oq(void);
+void vk_glitch_counters(uint64_t c[8]);
 static uint64_t stat_fb_selfreuse;
 static uint64_t stat_snap_delta, stat_snap_delta_px, stat_snap_delta_full_px, stat_snap_tiles_n;   // (LARECOMP_SNAP_DELTA: copies, their pixels, the whole images' pixels)
 static uint64_t stat_fbl_moves;   // (g_vk.fbl_layout: attachments moved to the feedback-loop layout for a pass)
@@ -235,11 +247,10 @@ static bool chunk_ab_on = true;
 // submission. A submission holding a FenceSync always copies back. LARECOMP_CHUNK_NO_CARRY=1: copy back at every
 // chunk.
 static bool g_chunk_submit;
-// The transient ring under host-memory pressure (ring_tight: ring_grow saw a chunk refused): ring_open = the bytes the open
-// submission took from it. ring_grow can only reuse a chunk the GPU finished, so from then on begin_pass submits at the
-// next pass boundary once the open submission holds half the ring (ring_open_high), as chunked submission does.
+// The transient ring under host-memory pressure (ring_tight: a chunk was refused; ring_early_n: submissions ring_guard
+// sent early for it)
 static bool ring_tight;
-static uint64_t ring_open, ring_early_n;
+static uint64_t ring_early_n;
 static uint64_t g_fence_seq_mark;
 static bool gdev_carry_ok(void);
 static void gdev_carry(uint64_t from, uint64_t to);
@@ -284,6 +295,7 @@ static bool gdev_chk_on(void);
 static VkBuffer chk_buf[2];
 static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write);
 static uint64_t gdev_stat_in, gdev_stat_regions, gdev_stat_snap, gdev_stat_host, gdev_stat_grown;  // (stats line)
+static void gsf_stats(void);   // (LARECOMP_GDEV_SNAPFALL: its own line beside the stats line)
 static int gdev_n;
 
 uint64_t vk_completed_seq(void) {
@@ -349,7 +361,7 @@ void vk_wait_seq_at(uint64_t seq, const char *file, int line) {
         uint64_t h0 = SDL_GetTicksNS();
         // LARECOMP_HANG_IDLE=1 (diagnostic): wait with vkDeviceWaitIdle instead, so a layer that watches for device lost
         // there (LunarG crash diagnostic layer) writes its dump
-        if (getenv("LARECOMP_HANG_IDLE")) { vkq_drain(); r = vkDeviceWaitIdle(g_vk.dev); }
+        if (getenv("LARECOMP_HANG_IDLE")) { vkq_drain(); vk_queue_lock(); r = vkDeviceWaitIdle(g_vk.dev); vk_queue_unlock(); }
         else
             for (long i = 0; i < wait_s; i++) {
                 r = vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull);
@@ -589,7 +601,10 @@ void vk_devlost_dump(void) {
 // else, because the trace above is off in play): every draw / dispatch / pass / copy goes into a ring (a few stores)
 // with its submission number, and with VK_NV_device_diagnostic_checkpoints it is also a checkpoint whose marker is
 // its ring position, so after a hang the driver names the last operation each pipeline stage reached. hang_report
-// prints both. (With LARECOMP_VKQ=1 commands are recorded later on another thread: ring only, no checkpoints.)
+// prints both. With the recording thread (vkq, the default) the checkpoints are queued in order with the commands they
+// mark (q_checkpoint), at pass / dispatch / copy / submit granularity: a draw keeps its ring entry, and the hang report
+// names the draws between the last checkpoint each stage reached and the next (rival-parity 034: until then
+// VK_NV_device_diagnostic_checkpoints was enabled and never written in play). Without it every operation, as before.
 typedef struct { uint64_t seq, a, b; uint32_t kind, x, y, z; } HangOp;
 enum { HOP_DRAW = 1, HOP_DISPATCH, HOP_PASS, HOP_COPY, HOP_SUBMIT };
 // draw: a = fs hash, b = vs code, x = vertices/indices, y = instances; dispatch: a = cs code, b = threads, x y z = groups;
@@ -599,9 +614,13 @@ static HangOp hang_ops[HANG_OPS];
 static uint64_t hang_n;   // render thread
 static int hang_ready;
 static PFN_vkCmdSetCheckpointNV hang_cp;
-// AMD (g_vk.amd_marker): every operation writes its ring position + 1 at the top of the pipe (offset 0: the newest
-// operation started) and the bottom (offset 4: the newest that finished) into a host-visible buffer
+// AMD (g_vk.amd_marker): every pass / dispatch / copy writes its ring position + 1 at the top of the pipe (offset 0: the
+// newest operation started) and the bottom (offset 4: the newest that finished) into a host-visible buffer. Draws keep
+// their ring entry only, as with the NVIDIA checkpoints (rival-parity 034: two marker packets per draw, thousands a
+// frame, for a report the pass already narrows to its draws). Every draw marked too (both vendors) with
+// LARECOMP_CHECKPOINTS=draw, and for the start after one that lost this GPU (g_vk.draw_marks: device.c).
 static PFN_vkCmdWriteBufferMarkerAMD hang_mk;
+static bool hang_draw_marks;
 static VkBuffer hang_mbuf;
 static VmaAllocation hang_mmem;
 static volatile uint32_t *hang_mptr;
@@ -616,19 +635,22 @@ static void hang_marker_init(void) {
     hang_mptr = info.pMappedData;
     hang_mptr[0] = hang_mptr[1] = 0;
     hang_mk = fn;
-    LOG("[vk] GPU hang breadcrumbs: AMD buffer markers (top / bottom of pipe per operation)\n");
+    LOG("[vk] GPU hang breadcrumbs: AMD buffer markers (top / bottom of pipe per %s)\n",
+        hang_draw_marks ? "operation, draws too" : "pass / dispatch / copy");
 }
 static inline void hang_op(VkCommandBuffer cb, uint32_t kind, uint64_t a, uint64_t b, uint32_t x, uint32_t y, uint32_t z) {
     if (!hang_ready) {
         hang_ready = 1;
+        hang_draw_marks = g_vk.draw_marks;
         if (g_vk.checkpoints) hang_cp = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(g_vk.dev, "vkCmdSetCheckpointNV");
         if (g_vk.amd_marker) hang_marker_init();
     }
     HangOp *o = &hang_ops[hang_n & (HANG_OPS - 1)];
     o->seq = submit_seq + 1, o->a = a, o->b = b, o->kind = kind, o->x = x, o->y = y, o->z = z;
     hang_n++;
-    if (hang_cp && cb && !vkq_enabled()) hang_cp(cb, (void *)(uintptr_t)hang_n);   // (marker = ring position + 1)
-    if (hang_mk && cb) {   // (queued in order with the operation's own commands when the recording thread is on)
+    if (hang_cp && cb && (kind != HOP_DRAW || !vkq_enabled() || hang_draw_marks))
+        q_checkpoint(hang_cp, cb, (void *)(uintptr_t)hang_n);   // (marker = ring position + 1)
+    if (hang_mk && cb && (kind != HOP_DRAW || hang_draw_marks)) {   // (queued in order with the operation's own commands)
         q_mark(hang_mk, cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, hang_mbuf, 0, (uint32_t)hang_n);
         q_mark(hang_mk, cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, hang_mbuf, 4, (uint32_t)hang_n);
     }
@@ -745,9 +767,18 @@ static void hang_checkpoints(void) {
         LOG("[hang] AMD buffer markers: started #%llu, finished #%llu (of %llu)\n", (unsigned long long)t, (unsigned long long)b,
             (unsigned long long)hang_n);
         if (t) hang_op_log("last started", t - 1);
+        // (draws carry no marker unless LARECOMP_CHECKPOINTS=draw: the ones after the last started operation, up to the
+        // next marked one, may have started too, 64 at most)
+        for (uint64_t p = t; t && p < hang_n && p < t + 64 && hang_ops[p & (HANG_OPS - 1)].kind == HOP_DRAW; p++)
+            hang_op_log("  started after it?", p);
         if (b) hang_op_log("last finished", b - 1);
         if (b && t > b && t - b <= 512)
             for (uint64_t p = b; p < t; p++) hang_op_log("  in flight", p);
+        else if (b && t > b) {  // (one busy pass's draws: the first and last 32)
+            LOG("[hang]   %llu operations in flight; the first and last 32:\n", (unsigned long long)(t - b));
+            for (uint64_t p = b; p < b + 32; p++) hang_op_log("  in flight", p);
+            for (uint64_t p = t - 32; p < t; p++) hang_op_log("  in flight", p);
+        }
         fflush(stdout);
     }
     if (!hang_cp) return;
@@ -768,7 +799,9 @@ static void hang_checkpoints(void) {
         if (!m) { LOG("[hang] %s: none\n", tag); continue; }
         hang_op_log(tag, m - 1);
         for (uint64_t p = m - 1 > 3 ? m - 4 : 0; p < m - 1; p++) hang_op_log("  before", p);
-        for (uint64_t p = m; p < m + 3 && p < hang_n; p++) hang_op_log("  after", p);
+        // (draws carry no checkpoint with the recording thread: every draw up to the next checkpointed operation, 64 at most)
+        for (uint64_t p = m; p < hang_n && p < m + 64 && (p < m + 3 || hang_ops[p & (HANG_OPS - 1)].kind == HOP_DRAW); p++)
+            hang_op_log("  after", p);
         if (m - 1 < lo) lo = m - 1;
         if (m - 1 > hi) hi = m - 1;
     }
@@ -962,7 +995,9 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         if (!wait && !signal && vkq_submit_deferred(dcb, n, submit_seq + 1)) goto submitted;   // (the record thread submits)
         vkq_drain();   // (LARECOMP_VKQ: the record thread finishes both command buffers first)
         g_rt_op = "vkQueueSubmit2", g_rt_op_ns = SDL_GetTicksNS();
+        vk_queue_lock();   // (the FG present thread may present on this queue: device.c g_queue_shared)
         sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+        vk_queue_unlock();
         g_rt_op = NULL;
         if (sr == VK_ERROR_DEVICE_LOST) {   // (the hang path above can miss a reset: name the stuck operation here too)
             vk_devlost_dump();
@@ -980,7 +1015,6 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     if (carry) gdev_carry(this_seq, submit_seq + 1);
     cur_sub = (cur_sub + 1) % SUBS;
     chunk_draws = 0;
-    ring_open = 0;
     stat_flushes++;
     cum_submits++;
     ring_retire();
@@ -1240,12 +1274,32 @@ static void ring_retire(void) {
     nchunks--;
     if (active > pick) active--;
 }
-// begin_pass (ring_tight only): the open submission holds half the ring's bytes or more
-static bool ring_open_high(void) {
-    uint64_t held = 0;
-    for (int i = 0; i < nchunks; i++) held += chunks[i].size;
-    return ring_open >= held / 2;
+// A safe point for the ring (draw_, dispatch_compute and the copy handlers before they record anything, begin_pass
+// between passes). ring_grow
+// can only reuse a chunk the GPU finished: when the active chunk is past half full and every other chunk is the open
+// submission's, a chunk is made here, ahead of need; refused, the open submission goes to the GPU here, where nothing of
+// a draw is half recorded, and the next allocations wait for its chunks instead of FATAL. v0.1.8.2 gate travelb82low
+// (LARECOMP_VK_RING_REFUSE=1): the title's first upload burst filled both chunks inside one submission with no pass
+// boundary in between, so the first refusal was the FATAL. One compare while the active chunk is under half full.
+static void ring_guard(void) {
+    if (active < 0 || chunks[active].used < chunks[active].size / 2) return;
+    const uint64_t pend = vk_pending_seq();
+    for (int i = 0; i < nchunks; i++)
+        if (i != active && chunks[i].seq < pend) return;   // (submitted before: ring_grow waits for it or reuses it)
+    if (new_chunk(CHUNK_SIZE) >= 0) return;   // (free until vk_transient takes it)
+    if (!ring_tight) LOG("[vk] transient ring: a %llu MB chunk refused (at a safe point): the open submission goes to the GPU "
+                         "here, and again whenever it holds the whole ring\n", (unsigned long long)(CHUNK_SIZE >> 20));
+    ring_tight = true;
+    if (!ring_early_n++) LOG("[vk] transient ring: first early submission\n");
+    g_chunk_submit = chunk_limit() != 0;   // (as chunked submission's when it is on; else a plain one)
+    renderer_submit();
+    g_chunk_submit = false;
 }
+// preupload.c: the same safe point between the loading screen's pre-uploads. vk_preupload_frame runs at the present,
+// before the frame's submit, with no byte cap on the loading screen and no draw in between, so one call could fill every
+// chunk of the open submission (v0.1.9 gate g19_s1, LARECOMP_VK_RING_REFUSE=1: FATAL at the first load)
+void vk_ring_guard(void) { ring_guard(); }
+bool vk_ring_tight(void) { return ring_tight; }   // (preupload.c: a chunk was refused this session)
 // device.c "[vram] slack" line: the ring's chunks now, its peak, chunks made, what ring_retire gave back
 uint64_t vk_ring_bytes(int *n, uint64_t *peak, uint64_t *made, uint64_t *trim_n, uint64_t *trim_bytes) {
     uint64_t b = 0;
@@ -1269,8 +1323,7 @@ static int ring_grow(uint64_t size, bool keep_list) {
         for (int i = 0; i < n; i++) {
             const int k = new_chunk(sz[i]);
             if (k < 0) {
-                if (!ring_tight) LOG("[vk] transient ring: a %llu MB chunk refused: from now on a submission holding half the ring "
-                                     "goes to the GPU at the next pass boundary\n", (unsigned long long)(sz[i] >> 20));
+                if (!ring_tight) LOG("[vk] transient ring: a %llu MB chunk refused\n", (unsigned long long)(sz[i] >> 20));
                 ring_tight = true;
                 continue;
             }
@@ -1307,7 +1360,6 @@ static int ring_grow(uint64_t size, bool keep_list) {
 
 VkSpan vk_transient(uint64_t size, uint64_t align) {
     if (align < 16) align = 16;
-    ring_open += size;
     uint64_t pending = vk_pending_seq();
     if (active >= 0) {
         Chunk *c = &chunks[active];
@@ -1439,6 +1491,12 @@ static int rt_lookup(void) {
     if (on < 0) { const char *e = getenv("LARECOMP_RT_LOOKUP"); on = !e || *e != '0'; LOG("[vk] render-thread lookups: prefetch + region cache %s (LARECOMP_RT_LOOKUP)\n", on ? "on" : "off"); }
     return on;
 }
+// hle_os_mem.cpp, LARECOMP_SYNC_GUARD (objects.c's ticket lag): the guest memory the replay reads for a frame, the frame
+// fences it passes, the heap kept writable while it is imported
+void sync_guard_note(uint64_t addr, uint64_t len);
+void sync_guard_note_write(uint64_t addr, uint64_t len);
+void sync_guard_fence(const void *key, uint64_t ticket);
+void sync_guard_hold(int on);
 // With chunked submission the copies are shared by every chunk of one guest list (nothing writes guest memory within a
 // list, gcopy_gen otherwise): the key is the list, and a reuse in a later chunk keeps the ring chunk alive until then.
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
@@ -1471,6 +1529,7 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
         if (gcopy[slot].seq == seq) prof_gc_evict++, prof_gc_evict_b += size; else prof_gc_new++, prof_gc_new_b += size;
     }
     VkSpan s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
+    sync_guard_note(addr, size);   // (read now, for the frame being replayed: LARECOMP_SYNC_GUARD)
     gcopy[slot].addr = addr; gcopy[slot].size = size; gcopy[slot].seq = seq; gcopy[slot].span = s; gcopy[slot].used = pend;
     if (prof && vk_up_kind == 2) vx_page_stats(addr, size, pend);
     return s;
@@ -1576,10 +1635,29 @@ typedef struct {
     uint64_t t0, seen_t0, commit0, next_s;   // (t0 0 = idle)
     const char *what, *glsl;
     char name[24];
+    uint64_t qkey;   // the build's shader quarantine key (dq_enter; 0: none) and form; qhung: the form its hang recorded
+    int qlvl, qhung;
 } SlowSlot;
 static SlowSlot g_slow[64];
 static _Atomic int g_slow_n;
 static __thread int tl_slow = -1;
+// The shader quarantine (shader_quar.h; the pcq section below): the program / compute program this thread's driver builds
+// are for (dq_enter) and the build running (dq_in .. dq_out: build_begin / build_end, gpl_link), for on_crash and slow_watch
+static __thread uint64_t tl_dq_key;
+static __thread int tl_dq_lvl;
+static __thread bool tl_dq_in;
+static __thread const char *tl_dq_what;
+static __thread char tl_dq_name[24];
+static void dq_enter(uint64_t key, int lvl) { tl_dq_key = key; tl_dq_lvl = lvl; }
+static void dq_in(const char *what, const char *name) {
+    tl_dq_what = what;
+    snprintf(tl_dq_name, sizeof tl_dq_name, "%s", name ? name : "?");
+    tl_dq_in = true;
+}
+static void dq_out(void) { tl_dq_in = false; }
+static int dq_hung(uint64_t key, int lvl, const char *what, const char *name, double secs);
+static void dq_back(uint64_t key, int lvl, const char *what, const char *name, double secs);
+static uint64_t pc_stuck_ns(void);
 static double slow_thresh_s(void) {
     static double v = -1;
     if (v < 0) { const char *e = getenv("LARECOMP_SLOWBUILD_S"); v = e ? atof(e) : 5.0; if (v < 0) v = 0; }
@@ -1630,6 +1708,10 @@ static void *slow_watch(void *arg) {
                 }
                 s->next_s = s->next_s < 15 ? 15 : s->next_s * 2;
             }
+            // (a driver build past LARECOMP_PC_STUCK_S: its program takes the next form at later starts, unless it returns;
+            // our GLSL -> SPIR-V compiles are not the driver's, and only slow)
+            if (s->t0 && s->qkey && !s->qhung && pc_stuck_ns() && now - s->t0 >= pc_stuck_ns() && strncmp(s->what, "GLSL", 4))
+                s->qhung = dq_hung(s->qkey, s->qlvl, s->what, s->name, age);
             pthread_mutex_unlock(&s->mu);
         }
     }
@@ -1649,6 +1731,9 @@ static void slow_begin(const char *what, const char *name, const char *glsl) {
     s->what = what;
     s->glsl = glsl;
     snprintf(s->name, sizeof s->name, "%s", name ? name : "?");
+    s->qkey = tl_dq_in ? tl_dq_key : 0;
+    s->qlvl = tl_dq_lvl;
+    s->qhung = 0;
     s->t0 = SDL_GetTicksNS();
     pthread_mutex_unlock(&s->mu);
 }
@@ -1662,6 +1747,8 @@ static void slow_end(void) {
         LOG("[slowbuild] %s %s: done after %.1f s, process commit %.1f GB (%+.1f since it started)\n", s->what, s->name, age,
             c / 1073741824.0, s->seen_t0 == s->t0 ? ((double)c - (double)s->commit0) / 1073741824.0 : 0.0);
     }
+    if (s->qhung > 0) dq_back(s->qkey, s->qhung, s->what, s->name, age);   // (-1: seen, nothing recorded)
+    s->qhung = 0;
     s->t0 = 0;
     s->glsl = NULL;
     pthread_mutex_unlock(&s->mu);
@@ -1670,17 +1757,18 @@ static void slow_end(void) {
 // RAM full, 1 fps, and the next launch could not create a thread). The pool threads' compiles (GLSL -> SPIR-V and the
 // driver's) pass this gate: while the system is short of memory (commit headroom under max(2 GB, 1/20 of the limit), or
 // free RAM under max(1 GB, 1/25 of it)), the workers' builds run one at a time and the background ones (the precompile,
-// the archive warm-up) wait up to 2 s each, then go one at a time like the workers' (never an unbounded wait: the
-// precompile publishes a pipeline before it builds it, and a draw that finds it at state 0 holds frames until it is
-// built); the installer's prepare keeps one going too. The drawing thread and the translators (translations only) are
-// never gated. A compile already running is never stopped. "[vk] compile gate:..." lines on each change.
-// LARECOMP_COMPILE_GATE=0: off.
+// the archive warm-up) wait 2 s while the game's own builds are queued or running or free RAM is under 400 MB, then go
+// one at a time like the workers' (never an unbounded wait: the precompile publishes a pipeline before it builds it,
+// and a draw that finds it at state 0 holds frames until it is built); the installer's prepare keeps one going too. The
+// drawing thread and the translators (translations only) are never gated. A compile already running is never stopped.
+// "[vk] compile gate:..." lines on each change. LARECOMP_COMPILE_GATE=0: off.
 enum { GATE_NONE, GATE_GAME, GATE_BACKGROUND, GATE_PREPARE };
 static __thread int tl_gate;      // (set by each pool thread at its start)
 static __thread bool tl_in_gate;
 static _Atomic int g_gate_inflight;
 static _Atomic uint64_t g_gate_t;   // (last check, ns)
 static _Atomic int g_gate_low;
+static _Atomic uint64_t g_gate_ram;   // (free RAM at the last check, bytes; 0 = unknown)
 static bool gate_low(void) {
     static int off = -1;
     if (off < 0) { const char *e = getenv("LARECOMP_COMPILE_GATE"); off = e && *e == '0'; }
@@ -1694,6 +1782,7 @@ static bool gate_low(void) {
     shim_mem_room(&ca, &cl, &ra, &rt);
     const uint64_t cmin = cl / 20 > (2ull << 30) ? cl / 20 : 2ull << 30, rmin = rt / 25 > (1ull << 30) ? rt / 25 : 1ull << 30;
     const int low = cl && (ca < cmin || ra < rmin);
+    atomic_store_explicit(&g_gate_ram, ra, memory_order_relaxed);
 #else
     const int low = 0;
     uint64_t ca = 0, cl = 0, ra = 0, rt = 0;
@@ -1702,7 +1791,7 @@ static bool gate_low(void) {
         static _Atomic int nlog;
         if (atomic_fetch_add(&nlog, 1) < 200)
             LOG("[vk] compile gate: %s (commit headroom %.1f of %.1f GB, free RAM %.1f of %.1f GB, %d compiles running)\n",
-                low ? "memory short: one build at a time, background builds wait up to 2 s first" : "lifted", ca / 1073741824.0,
+                low ? "memory short: one build at a time, background ones wait 2 s while the game's are pending or under 400 MB free" : "lifted", ca / 1073741824.0,
                 cl / 1073741824.0, ra / 1073741824.0, rt / 1073741824.0, atomic_load(&g_gate_inflight));
     }
     return low;
@@ -1717,7 +1806,16 @@ static void gate_enter(void) {
             continue;
         }
         if (!wait0) wait0 = SDL_GetTicksNS();
-        const int cap = tl_gate == GATE_BACKGROUND && SDL_GetTicksNS() - wait0 < 2000000000ull ? 0 : 1;
+        // A background build waits 2 s while the game's own builds are queued or running, or while free RAM is under
+        // 400 MB (the old flat wait); otherwise it takes the one slot at once. A flat 2 s per build held the precompile
+        // under one item a second for a whole session on an 8 GB PC whose free RAM never passes 1 GB ("Loading shaders
+        // 9 %" for good; SadYungBoi 11-02, GTX 1660, 7,902 items left). The paging bound is unchanged: while memory is
+        // short one build runs at a time, game and background together (cap 1 on g_gate_inflight), so a background
+        // build only ever replaces an idle slot, never adds a second compile's peak. (No per-build peak is known to
+        // size it by: the driver's compile memory is not reported.)
+        const uint64_t ram = atomic_load_explicit(&g_gate_ram, memory_order_relaxed);
+        const bool bg_wait = tl_gate == GATE_BACKGROUND && (atomic_load(&g_jobs_pending) > 0 || (ram && ram < (400ull << 20)));
+        const int cap = bg_wait && SDL_GetTicksNS() - wait0 < 2000000000ull ? 0 : 1;
         if (cur < cap && atomic_compare_exchange_weak(&g_gate_inflight, &cur, cur + 1)) break;
         SDL_Delay(20);
     }
@@ -1731,10 +1829,12 @@ static void gate_exit(void) {
 // One compile on this thread: the gate, then the slow-build watch.
 static void build_begin(const char *what, const char *name, const char *glsl) {
     gate_enter();
+    dq_in(what, name);
     slow_begin(what, name, glsl);
 }
 static void build_end(void) {
     slow_end();
+    dq_out();
     gate_exit();
 }
 
@@ -1797,8 +1897,9 @@ static const char *const tc_env_vars[] = {
     "LARECOMP_GUARD_VIS", "LARECOMP_IPA_MUL_FOLD", "LARECOMP_KIL_DISCARD", "LARECOMP_LAYER_CLAMP", "LARECOMP_NATIVE_MINMAX",
     "LARECOMP_NO_DAG_GUARD", "LARECOMP_NO_DISCARD", "LARECOMP_NO_FLAT", "LARECOMP_NO_FS_STG", "LARECOMP_NO_IMAP", "LARECOMP_NO_MINPC",
     "LARECOMP_NO_RED", "LARECOMP_RSC_OWN", "LARECOMP_SAVE_MSL", "LARECOMP_TXD_HWGRAD", "LARECOMP_VP_EXACT", "LARECOMP_YDIR_POS",
-    "LARECOMP_BRX_C1_ALL", "TOTK_SOFT_SHADOWS", "TOTK_SOFT_SHADOWS_MAX", "LARECOMP_FLAT_NPC",
-};
+    "LARECOMP_BRX_C1_ALL", "TOTK_SOFT_SHADOWS", "TOTK_SOFT_SHADOWS_MAX", "LARECOMP_FLAT_NPC", "LARECOMP_QUAD_SWAP",
+    "LARECOMP_F2I_NAN",
+};   // (LARECOMP_TEX_PRED_HOIST is read by device.c: its result, maxwell_tex_hoist, is in the device part below)
 static uint64_t tc_env;   // (hash of the translator's configuration; 0 = cache off)
 static char tc_dir[48];   // cache/glsl/<tc_env>
 #ifdef _WIN32
@@ -1815,15 +1916,23 @@ static void tc_init_once(void) {
     const char *e = getenv("LARECOMP_GLSL_CACHE");
     if (e && *e == '0') { LOG("[shader] translator cache off (LARECOMP_GLSL_CACHE=0)\n"); return; }
     uint64_t h = hash_words(0x7c3a9e1d5b2f4c68ull, maxwell_build_stamp, strlen(maxwell_build_stamp));
+    char set[512];   // (the ones a player set: support logs show whether e.g. LARECOMP_D16_REF=0 took, public #35)
+    int nset = 0;
     for (size_t i = 0; i < sizeof tc_env_vars / sizeof *tc_env_vars; i++) {
         const char *v = getenv(tc_env_vars[i]);
         uint64_t one = hash_words(0x1d8e4e27c47d124full + i, v ? v : "\x01", v ? strlen(v) : 1);   // (unset != empty)
         h = hash_words(h, &one, sizeof one);
+        if (v && nset < (int)sizeof set - 1) {
+            const int n = snprintf(set + nset, sizeof set - nset, " %s=%.32s", tc_env_vars[i], v);
+            if (n > 0) nset += n;
+        }
     }
-    extern bool maxwell_wave_safe, maxwell_soft_f64, maxwell_vs_pointsize, maxwell_nvidia;
+    if (nset) LOG("[shader] translator variables set:%s\n", set);
+    extern bool maxwell_wave_safe, maxwell_soft_f64, maxwell_vs_pointsize, maxwell_nvidia, maxwell_tex_hoist;
     extern uint32_t maxwell_smem_bytes;
     extern uint64_t maxwell_gmem_window;
-    const uint64_t dev[6] = {maxwell_wave_safe, maxwell_soft_f64, maxwell_vs_pointsize, maxwell_nvidia, maxwell_smem_bytes, maxwell_gmem_window};
+    const uint64_t dev[7] = {maxwell_wave_safe, maxwell_soft_f64, maxwell_vs_pointsize, maxwell_nvidia, maxwell_smem_bytes,
+                             maxwell_gmem_window, maxwell_tex_hoist};
     h = hash_words(h, dev, sizeof dev);
     tc_env = h ? h : 1;
     mkdir("cache", 0755);
@@ -1884,8 +1993,7 @@ static void *tc_prune(void *arg) {
     if ((f = fopen("cache/glsl/configs.txt.tmp", "wb"))) {
         for (int i = 0; i < nl && i < 2; i++) fprintf(f, "%s\n", list[i]);
         fclose(f);
-        remove("cache/glsl/configs.txt");
-        rename("cache/glsl/configs.txt.tmp", "cache/glsl/configs.txt");
+        shim_file_replace("cache/glsl/configs.txt.tmp", "cache/glsl/configs.txt");   // (one step: never missing)
     }
     int n = 0;
     for (int i = 2; i < nl; i++) {
@@ -2271,9 +2379,11 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
         }
         // (stream-hitch: where the present's time went, device.c g_pr_ns; GPU-bound frames wait at the frame slot)
         LOG("[hitch] frame %llu present split: submit %.1f, FG pacing %.1f, frame slot (GPU) %.1f, acquire %.1f, swapchain "
-            "re-creation %.1f, pacer %.1f%s, present call %.1f ms\n", (unsigned long long)frame, g_pr_ns[PR_SUBMIT] / 1e6,
+            "re-creation %.1f, pacer %.1f%s, present call %.1f ms (queue drain %.1f, swapchain lock %.1f, vkQueuePresentKHR %.1f, "
+            "queued-frame / in-flight limits %.1f)\n", (unsigned long long)frame, g_pr_ns[PR_SUBMIT] / 1e6,
             g_pr_ns[PR_FG] / 1e6, g_pr_ns[PR_SLOT] / 1e6, g_pr_ns[PR_ACQ] / 1e6, g_pr_ns[PR_RECREATE] / 1e6, g_pr_ns[PR_PACE] / 1e6,
-            g_pr_paused ? " (a pause)" : "", g_pr_ns[PR_PRESENT] / 1e6);
+            g_pr_paused ? " (a pause)" : "", g_pr_ns[PR_PRESENT] / 1e6, g_pr_ns[PR_DRAIN] / 1e6, g_pr_ns[PR_LOCK] / 1e6,
+            g_pr_ns[PR_QPRESENT] / 1e6, g_pr_ns[PR_LIMITS] / 1e6);
         if (gr[2] != l_gr[2])   // (stream-hitch: the reads this frame waited for, on the thread that presents it)
             LOG("[hitch] frame %llu file reads on the game's presenting thread: %llu reads, %.1f MB in %.1f ms (longest %.1f ms)\n",
                 (unsigned long long)frame, gr[2] - l_gr[2], (gr[0] - l_gr[0]) / 1048576.0, (gr[1] - l_gr[1]) / 1e6, gr[3] / 1e6);
@@ -2402,6 +2512,7 @@ const char *renderer_stats(void) {
     stat_feedback_copies = stat_feedback_live = stat_depth_war = stat_fb_selfw = stat_fb_alias = stat_upload_bytes = 0;
     memset(stat_up_kind, 0, sizeof stat_up_kind);
     gdev_stat_in = gdev_stat_snap = gdev_stat_host = gdev_stat_grown = 0;
+    gsf_stats();
     {
         size_t n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, ", pass barriers %llu (skipped %llu; game barriers %llu, %llu mid-pass breaks; feedback elided %llu; hazard barriers %llu; elided small %llu, after a full one %llu)",
@@ -2451,6 +2562,7 @@ const char *renderer_stats(void) {
         snprintf(stats_text + n, sizeof stats_text - n, ", occlusion queries %llu (hidden %llu, kept visible %llu, count 1 %llu%s)",
                  (unsigned long long)stat_oq_reports, (unsigned long long)stat_oq_hidden, (unsigned long long)stat_oq_visible_fallback,
                  (unsigned long long)stat_oq_one, g_vk.oq_precise ? "" : ", not precise");
+        gl_fold_oq();   // (glitch.c's per-frame counts: the totals before this window's reset)
         stat_oq_reports = stat_oq_hidden = stat_oq_visible_fallback = stat_oq_one = 0;
     }
     if (stat_fbl_moves) {
@@ -2713,6 +2825,7 @@ const char *renderer_stats(void) {
             (unsigned long long)stat_skip_why[6]);
         memset(stat_skip_why, 0, sizeof stat_skip_why);
     }
+    gl_fold();
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
     return stats_text;
 }
@@ -2849,7 +2962,7 @@ static void blk_copy_back(VkCommandBuffer cb) {
 // LOD, particles, lights / flames). Until now every report said "visible" (+4096), so nothing the game culls by query was ever culled: a performance cut, whose only risk is popping. Now the scope's draws
 // run inside a Vulkan occlusion query (one per pass segment: a query cannot cross a render pass), the slot gets "visible" at record time as before, and the real count replaces it once the submission
 // completed (oq_poll, render thread). A late result therefore reads visible, never hidden; a scope with a skipped draw (pipeline not built yet) or more segments / queries than the ring holds stays visible.
-// LARECOMP_OCCLUSION=visible: the old stub; =zero: always 0.
+// LARECOMP_OCCLUSION=queries: the real queries (default off since 2026-11-03, below); =zero: always 0.
 #define OQ_MAX 4096
 #define OQ_SEG 8
 static VkQueryPool oq_pool;
@@ -2871,7 +2984,12 @@ static unsigned oq_ph, oq_pt;            // head (oldest), tail
 static int oq_on(void) {
     if (oq_mode < 0) {
         const char *e = getenv("LARECOMP_OCCLUSION");
-        oq_mode = e && !strcmp(e, "zero") ? 0 : e && !strcmp(e, "visible") ? 1 : 2;
+        // Default 'visible' again since 2026-11-03 (LEAD_BRIEF_1103 P0, zero visual glitches), and the game reads each slot
+        // 1-2 frames later with no availability check, so whether it saw 'visible' (the count not back yet) or 0 (back in
+        // time) changed from frame to frame: LOD / culling flips for single frames, the suspect of his one-frame see-through
+        // world (ground and rocks at a coarse level). LARECOMP_OCCLUSION=queries: the real queries (perf tests); =zero:
+        // always 0.
+        oq_mode = e && !strcmp(e, "zero") ? 0 : e && !strcmp(e, "queries") ? 2 : 1;
         if (oq_mode == 2 && !g_vk.host_qreset) { LOG("[vk] occlusion queries: no hostQueryReset, reports stay 'visible'\n"); oq_mode = 1; }
         if (oq_mode == 2) {
             VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = OQ_MAX};
@@ -2882,6 +3000,16 @@ static int oq_on(void) {
                                                                  : oq_mode == 1 ? "always visible" : "always zero");
     }
     return oq_mode;
+}
+static void gl_fold(void) {
+    gl_acc[0] += stat_draws, gl_acc[1] += stat_skipped, gl_acc[2] += stat_passes, gl_acc[3] += stat_dispatches;
+}
+void vk_glitch_counters(uint64_t c[8]) {
+    c[0] = gl_acc[0] + stat_draws, c[1] = gl_acc[1] + stat_skipped, c[2] = gl_acc[2] + stat_passes, c[3] = gl_acc[3] + stat_dispatches;
+    c[4] = gl_acc[4] + stat_oq_reports, c[5] = gl_acc[5] + stat_oq_hidden, c[6] = gl_acc[6] + stat_oq_visible_fallback, c[7] = 0;
+}
+static void gl_fold_oq(void) {
+    gl_acc[4] += stat_oq_reports, gl_acc[5] += stat_oq_hidden, gl_acc[6] += stat_oq_visible_fallback;
 }
 static void oq_end_open(VkCommandBuffer cb) {   // (before the pass ends, and at the report)
     if (oq_open < 0) return;
@@ -2927,7 +3055,7 @@ static void oq_poll(void) {
             }
             sum += ok ? v[i] : 0;
         }
-        if (ok && p->out) { p->out[0] = sum; stat_oq_hidden += sum == 0; }   // (not ready although completed: keep "visible")
+        if (ok && p->out) { p->out[0] = sum; stat_oq_hidden += sum == 0; sync_guard_note_write((uint64_t)(uintptr_t)p->out, 8); }   // (not ready although completed: keep "visible")
         oq_free(p->q, p->n);
         oq_ph++;
     }
@@ -3758,19 +3886,45 @@ static void contact_pass_hook(VkCommandBuffer cb) {
     if (contact_pass_begin(&p)) contact_run(cb);
 }
 
+// LARECOMP_GMEM_FLUSH=1 (a test arm, the v0.1.9 gate's one-frame foreign meshes / rain): a shader that writes global
+// memory (a compute dispatch, or a draw with STG / RED / ATOM) writes the device window, and its bytes reach host memory
+// only at the end of its submission (gdev_writeback; carried to the end of the chain with chunked submits). A later list
+// of the same submission that reads those bytes through host memory (a mirror snapshot, guest_copy, a straddling vertex
+// range, a constant-buffer copy) gets the old ones. With it on, the next pass or dispatch after such a writer first
+// submits what was recorded (a plain submission: no carry, the window copied back) and waits for it, so every later read
+// sees the shader's bytes in host memory, as on the Switch. Costs a GPU drain per writer.
+static bool g_gmem_flush_pend;
+static uint64_t g_gmem_flushes;
+static bool gmem_flush_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_GMEM_FLUSH");
+        on = e && *e == '1';
+        if (on) LOG("[vk] gmem flush: a submit + wait after every shader that writes global memory (LARECOMP_GMEM_FLUSH)\n");
+    }
+    return on;
+}
+static void gmem_flush_now(void) {
+    if (!g_gmem_flush_pend) return;
+    g_gmem_flush_pend = false;
+    const bool c0 = g_chunk_submit;
+    g_chunk_submit = false;   // (not a chunk: no carry, the window is copied back in this submission)
+    renderer_submit();
+    g_chunk_submit = c0;
+    vk_wait_seq(submit_seq);
+    if ((++g_gmem_flushes & 4095) == 1) LOG("[vk] gmem flush: %llu so far\n", (unsigned long long)g_gmem_flushes);
+}
+
 static void begin_pass(void) {
+    // (a draw that wrote global memory: the pass ends and is begun again after the flush, LARECOMP_GMEM_FLUSH)
+    if (g_gmem_flush_pend) { vk_end_pass_at(-1); gmem_flush_now(); }
     if (in_pass && !st.rt_dirty) return;
     uint64_t bp_t0 = prof ? prof_now() : 0, bp_tv = 0;
     vk_end_pass_at(-1);   // (-1: this pass change alone does not ask for a barrier)
     if (prof) { prof_bp_end += prof_now() - bp_t0; prof_bp_n++; }
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
     else if (chunk_limit() && chunk_draws >= (uint32_t)chunk_limit()) { prof_chunks++; g_chunk_submit = true; renderer_submit(); g_chunk_submit = false; }
-    else if (ring_tight && ring_open_high()) {   // (host memory short: the ring's chunks back sooner, ring_tight)
-        if (!ring_early_n++) LOG("[vk] transient ring: first early submission (the open one held half the ring)\n");
-        g_chunk_submit = chunk_limit() != 0;   // (as chunked submission's when it is on; else a plain one)
-        renderer_submit();
-        g_chunk_submit = false;
-    }
+    else ring_guard();
     st.rt_dirty = false;
     if (st.rt.ncolor >= 4 && st.rt.color[0] && st.rt.color[0]->width > g_drs_w) { g_drs_w = st.rt.color[0]->width; g_drs_h = st.rt.color[0]->height; }
     uint64_t z0 = prof ? prof_now() : 0;
@@ -4145,7 +4299,7 @@ static struct {
     VkCommandBuffer cb;
     uint64_t seq;
     bool valid, sten_valid;
-    bool dt, dw, sten, bias_on, restart;
+    bool dt, dw, sten, bias_on, bias_unorm, restart;
     VkCompareOp dop;
     VkCullModeFlags cull;
     VkFrontFace front;
@@ -4172,6 +4326,16 @@ static void dyn_end(void) {
     dyn.valid = on;
 }
 
+// The polygon offset (f: NVN's factor, units, clamp); unorm: the units in D24's 2^-24 on a D32F attachment (FORCE_UNORM)
+static void set_depth_bias(VkCommandBuffer cb, const float f[3], bool unorm) {
+    if (!unorm) { vkCmdSetDepthBias(cb, f[1], f[2], f[0]); return; }
+    const VkDepthBiasRepresentationInfoEXT rep = {.sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT,
+                                                  .depthBiasRepresentation = VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT,
+                                                  .depthBiasExact = g_vk.dbias_exact};
+    const VkDepthBiasInfoEXT bi = {.sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT, .pNext = &rep,
+                                   .depthBiasConstantFactor = f[1], .depthBiasClamp = f[2], .depthBiasSlopeFactor = f[0]};
+    g_vk.set_bias2(cb, &bi);
+}
 // Fixed-function state that isn't part of a pipeline is set explicitly on every bind (it persists across pipelines).
 static void dyn_defaults(VkCommandBuffer cb) {
     dyn_invalidate();
@@ -4331,6 +4495,8 @@ typedef struct Prog {
     _Atomic int lib_state;          // 0 none, 2 ready, 3 failed (g_vk.gpl)
     bool modules_dropped;           // vs / fs destroyed after the libraries: reload from the SPIR-V cache by spv_key
     uint64_t spv_key[2];
+    uint64_t qkey;                  // shader quarantine key (dq_prog / build_compute; 0: none) and this driver's form for it
+    int qlvl;
     _Atomic bool hurry;             // a held frame waits for it: its build queues ahead (job_hurry)
     bool build_now;                 // first seen by a fullscreen / tile draw (TOTK_HITCH_FULL_BUILD): built on the drawing thread
     uint64_t hurry_f;               // (drawing thread: the frame it was last hurried in)
@@ -4468,6 +4634,7 @@ static const void *sg_pin(const ShaderInfo *si, VkShaderStageFlags stage) {
 // TOTK_WARM_MAX_CASES) cases is built with the driver's optimizer off. The same code (no visual change); only those
 // stages may run slower, and every other stage of the pack is under 100 cases. 0: never.
 static VkPipelineCreateFlags noopt(const ShaderInfo *a, const ShaderInfo *b) {
+    if (tl_dq_lvl >= SQ_NOOPT) return VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;   // (quarantined: dq_prog / build_compute)
     static long max_cases = -1;
     if (max_cases < 0) { const char *e = getenv("LARECOMP_NOOPT_CASES"); max_cases = e ? atol(e) : 300; }
     extern bool maxwell_nvidia;
@@ -4562,8 +4729,31 @@ static void glsl_swap(char **msl, const char *fs, const char *stage) {
 }
 static void full_est_feed(uint64_t dt);
 static bool pa_full;   // (archive section below)
+static int dq_level(uint64_t key);
+// A program's shader quarantine key (its two stages' GLSL, what the driver compiles: the same for the game's build, the
+// precompile's and the archive warm-up's, with or without a precompile record) and its form on this GPU and driver
+static int dq_prog(Prog *p, const char *name) {
+    p->qkey = p->vi && p->vi->msl && p->fi && p->fi->msl
+              ? (vk_spirv_key(p->vi->msl, STAGE_VERTEX) * 0x9e3779b97f4a7c15ull ^ vk_spirv_key(p->fi->msl, STAGE_FRAGMENT) ^
+                 0x6a09e667f3bcc909ull) | 1
+              : 0;
+    p->qlvl = dq_level(p->qkey);
+    if (p->qlvl) {
+        static _Atomic int nlog;
+        if (atomic_fetch_add(&nlog, 1) < 50)
+            LOG("[vk] %s: a build of it crashed or hung this GPU's driver before (cache/precompile_stuck.txt): built %s\n", name,
+                sq_how(p->qlvl));
+    }
+    return p->qlvl;
+}
+static void compile_program_body(Prog *p);
 static void compile_program(void *arg) {
-    Prog *p = arg;
+    const uint64_t k0 = tl_dq_key;   // (dq_prog's key for this program's builds, then the caller's again)
+    const int l0 = tl_dq_lvl;
+    compile_program_body(arg);
+    dq_enter(k0, l0);
+}
+static void compile_program_body(Prog *p) {
     // Archive warm-up (pa_job: pa_tm_on) on a driver other than NVIDIA's: a program whose GLSL is a pc loop of more than
     // TOTK_WARM_MAX_CASES (300) cases is not compiled. Issue #9 probes on the RDNA2 iGPU: the pack's three 55 KB vertex
     // shaders (422 loop cases each) took AMD's driver over a minute and ~2.5 GB each, 8.8 GB for the three at once; every
@@ -4590,6 +4780,8 @@ static void compile_program(void *arg) {
     snprintf(nf_, sizeof nf_, "fs_%016llx", (unsigned long long)prog_code_hash(p, 1));
     glsl_swap(&p->vi->msl, nf_ + 3, "vs");
     glsl_swap(&p->fi->msl, nf_ + 3, "fs");
+    if (dq_prog(p, nf_) >= SQ_SKIP) { atomic_store(&p->state, 2); return; }
+    dq_enter(p->qkey, p->qlvl);
     build_begin("GLSL->SPIR-V vs", nf_, p->vi->msl);
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, nv_, &nv);
     build_end();
@@ -4606,7 +4798,8 @@ static void compile_program(void *arg) {
     free(sf);
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
     uint64_t t2 = SDL_GetTicksNS();
-    if (g_vk.gpl && p->vs && p->fs) gpl_program_libs(p);
+    if (g_vk.gpl && p->vs && p->fs && p->qlvl < SQ_WHOLE) gpl_program_libs(p);
+    else if (g_vk.gpl && p->qlvl >= SQ_WHOLE) atomic_store(&p->lib_state, 3);   // (whole pipelines only: build_pipeline_body)
     if (pa_tm_on) { uint64_t t3 = SDL_GetTicksNS(); pa_tm[2] += t1 - t0; pa_tm[3] += t2 - t1; pa_tm[4] += t3 - t2; }
     bool ok = p->vs && p->fs;
     // With libraries, the modules and the GLSL are only needed again for a monolithic pipeline (line fill, depth clamp,
@@ -5131,6 +5324,14 @@ static void translate_program(void *arg) {
 
 #define PROG_TAB 16384
 static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
+// Programs and pipelines made this session and kept (never freed: ~1.3 MB of driver memory per complete program, below):
+// the [hostmem] line (vk_prog_counts), with the commit it explains or not. game: get_program_base / draw's own; pre: the
+// shader precompile's (pc_worker, prepare) and the archive's in its keep mode, counted where kept (a duplicate is freed;
+// the archive's warm mode destroys its objects again)
+static _Atomic uint64_t g_progs_made, g_pipes_made, g_progs_pre, g_pipes_pre;
+void vk_prog_counts(uint64_t *progs, uint64_t *pipes, uint64_t *progs_pre, uint64_t *pipes_pre) {
+    *progs = g_progs_made; *pipes = g_pipes_made; *progs_pre = g_progs_pre; *pipes_pre = g_pipes_pre;
+}
 
 // shader precompile (below the pipeline code)
 static bool pc_on(void);
@@ -5242,6 +5443,7 @@ static Prog *get_program_base(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) 
     }
     prog_tab[slot].key = h;
     prog_tab[slot].prog = p;
+    g_progs_made++;
     if (g_prog_full_draw && !sync_shaders() && full_build_fits(false)) {
         uint64_t t0 = SDL_GetTicksNS();
         p->sync_try = p->build_now = true;
@@ -5692,9 +5894,14 @@ static bool gpl_link(Pipe *pp) {
                           frag, gpl_cached(hash_words(0x13198a2e03707344ull, &f, sizeof f), true, gpl_make_fo, k)};
     if (!libs[0] || !libs[3]) return false;
     VkPipelineLibraryCreateInfoKHR lci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, .libraryCount = 4, .pLibraries = libs};
-    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &lci, .layout = k->prog->layout};
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &lci, .layout = k->prog->layout,
+                                       .flags = noopt(NULL, NULL)};   // (a quarantined program: its form, build_pipeline_body)
+    char snm[24];
+    snprintf(snm, sizeof snm, "fs_%016llx", (unsigned long long)prog_code_hash(k->prog, 1));
     uint64_t t0 = SDL_GetTicksNS();
+    dq_in("pipeline link", snm);   // (some drivers compile at the link too: on_crash names it)
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, VK_NULL_HANDLE, 1, &pi, NULL, &pp->pipe);   // fast link (no LTO)
+    dq_out();
     atomic_fetch_add(&stat_gpl_links, 1);
     atomic_fetch_add(&stat_gpl_link_ns, SDL_GetTicksNS() - t0);
     if (r != VK_SUCCESS) {
@@ -5708,7 +5915,15 @@ static bool gpl_link(Pipe *pp) {
     return true;
 }
 
-static void build_pipeline_body(Pipe *pp) {
+static void build_pipeline_body_(Pipe *pp);
+static void build_pipeline_body(Pipe *pp) {   // (in its program's quarantine form, if any: dq_prog)
+    const uint64_t k0 = tl_dq_key;
+    const int l0 = tl_dq_lvl;
+    dq_enter(pp->k.prog->qkey, pp->k.prog->qlvl);
+    build_pipeline_body_(pp);
+    dq_enter(k0, l0);
+}
+static void build_pipeline_body_(Pipe *pp) {
     PipeKey *k = &pp->k;
     if (gpl_linkable(k) && gpl_link(pp)) return;
     VkShaderModule mod[2] = {k->prog->vs, k->prog->fs}, tmp[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -6337,8 +6552,8 @@ enum { PA_WARM_STAMP = 32 };
                                        // 4: 2026-10-20, one precise pf_, fmin/fmax/saturate as selects, integer attributes)
 static void pa_warm_stamp(char *s) {
     extern int vk_spirv_float_preserve(void);
-    snprintf(s, PA_WARM_STAMP, "%s%s%s%s", PA_WARM_EPOCH, vk_spirv_float_preserve() ? " fp" : "", gpl_shared() ? " gs" : "",
-             g_vk.feedback_loop ? " fl" : "");   // (gs: shared stage libraries)
+    snprintf(s, PA_WARM_STAMP, "%s%s%s%s%s", PA_WARM_EPOCH, vk_spirv_float_preserve() & 1 ? " fp" : "",
+             vk_spirv_float_preserve() & 2 ? " ftz" : "", gpl_shared() ? " gs" : "", g_vk.feedback_loop ? " fl" : "");   // (gs: shared stage libraries)
 }
 // The record also holds only for the engine build and driver that wrote it (cache/archive_warm.key = pc_cold_key, the
 // first-start pass's key): a new build's translator can change any program's GLSL, and a program the record calls warm
@@ -6409,7 +6624,7 @@ void vk_archive_warm_reset(void) {
     FILE *f = fopen("cache/archive_warm.bin.tmp", "wb");
     bool ok = f && fwrite(hdr, 1, sizeof hdr, f) == sizeof hdr && fwrite(&zero, 4, 1, f) == 1;
     if (f) fclose(f);
-    if (ok) { remove("cache/archive_warm.bin"); ok = rename("cache/archive_warm.bin.tmp", "cache/archive_warm.bin") == 0; }
+    if (ok) ok = shim_file_replace("cache/archive_warm.bin.tmp", "cache/archive_warm.bin") == 0;
     LOG("[precompile] archive warm-up record reset to the current shader generation%s\n", ok ? "" : " (write FAILED)");
 }
 static bool pa_is_warmed(uint64_t ck) { return pa_nwarmed && bsearch(&ck, pa_warmed, pa_nwarmed, sizeof ck, pa_cmp_u64); }
@@ -6455,7 +6670,7 @@ void vk_archive_warm_commit(uint32_t n) {
         bool ok = f && fwrite(hdr, 1, sizeof hdr, f) == sizeof hdr && fwrite(&total, 4, 1, f) == 1 &&
                   fwrite(all, 8, total, f) == total;
         if (f) fclose(f);
-        if (ok) { remove("cache/archive_warm.bin"); ok = rename("cache/archive_warm.bin.tmp", "cache/archive_warm.bin") == 0; }
+        if (ok) ok = shim_file_replace("cache/archive_warm.bin.tmp", "cache/archive_warm.bin") == 0;
         if (ok) pa_ncommitted = n;
         static bool key_written;   // (after the record: a crash in between leaves the old key = a warm-up again, not a gap)
         if (ok && !key_written && pc_cold_key[0]) {
@@ -6464,7 +6679,7 @@ void vk_archive_warm_commit(uint32_t n) {
             pa_warm_key(key, sizeof key);
             bool kw = k && fputs(key, k) >= 0;
             if (k) kw = fclose(k) == 0 && kw;
-            if (kw) { remove("cache/archive_warm.key"); key_written = rename("cache/archive_warm.key.tmp", "cache/archive_warm.key") == 0; }
+            if (kw) key_written = shim_file_replace("cache/archive_warm.key.tmp", "cache/archive_warm.key") == 0;
         }
         // (the form: warm in the driver's cache relies on its disk cache; a user who turned that off gets the
         // first-sight builds back, and this line says which form the record trusted)
@@ -6524,6 +6739,7 @@ static void pa_job(int i) {
         p->inline_compile = true;
         for (int s = 0; s < 2; s++) { p->code[s] = (uint64_t)(uintptr_t)code[s]; p->cmax[s] = cmax[s]; p->csize[s] = csize[s]; }   // (pa_file stays)
         if (pa_full && pc_claim_prog(ck, p) != p) { free(p); atomic_fetch_add(&pa_recorded, 1); pa_work_end(); return; }
+        if (pa_full) g_progs_pre++;
         uint64_t t0 = SDL_GetTicksNS();
         memset(pa_tm, 0, sizeof pa_tm);
         pa_tm_on = true;
@@ -6610,8 +6826,35 @@ void vk_precompile_play_now(void) {
     LOG("[precompile] play now: warm-up released at %u of %u archive programs, compiling on in the background\n",
         (unsigned)atomic_load(&pa_done), (unsigned)pa_nprogs);
 }
-static void pc_yield(void) {   // (pause while the game's own shader jobs are queued or running)
+// Free RAM under 400 MB: the precompile / warm-up claims nothing until it is back over 600 MB. Here, before an item is
+// claimed, not in the gate: a precompile pipeline is published before it is built and a draw that finds it holds frames
+// until it is. The game builds what it draws meanwhile. LARECOMP_COMPILE_GATE=0: off with the gate.
+static _Atomic int pc_mem_paused;   // (hle_osd.cpp: the banner says so, vk_precompile_mem_paused)
+int vk_precompile_mem_paused(void) { return atomic_load(&pc_mem_paused); }
+static void pc_mem_pause(void) {
+#ifdef _WIN32
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("LARECOMP_COMPILE_GATE"); off = e && *e == '0'; }
+    if (off) return;
+    extern void shim_mem_room(uint64_t *commit_avail, uint64_t *commit_limit, uint64_t *ram_avail, uint64_t *ram_total);
+    uint64_t ca = 0, cl = 0, ra = 0, rt = 0;
+    shim_mem_room(&ca, &cl, &ra, &rt);
+    if (!rt || ra >= (400ull << 20)) return;
+    static _Atomic int nlog;   // (one line per pause, whichever worker sees it first)
+    if (!atomic_exchange(&pc_mem_paused, 1) && atomic_fetch_add(&nlog, 1) < 20)
+        LOG("[precompile] free RAM %.0f MB: no new items until it is over 600 MB\n", ra / 1048576.0);
+    const uint64_t t0 = SDL_GetTicksNS();
+    while (ra < (600ull << 20)) {
+        SDL_Delay(500);
+        shim_mem_room(&ca, &cl, &ra, &rt);
+    }
+    if (atomic_exchange(&pc_mem_paused, 0) && atomic_load(&nlog) <= 20)
+        LOG("[precompile] free RAM %.0f MB: going on (paused %.1f s)\n", ra / 1048576.0, (SDL_GetTicksNS() - t0) / 1e9);
+#endif
+}
+static void pc_yield(void) {   // (pause while the game's own shader jobs are queued or running, and while RAM is short)
     while (atomic_load(&g_jobs_pending) > 0) SDL_Delay(3);
+    pc_mem_pause();
 }
 // "[precompile] stages": the recorded programs' thread time per stage (pa_tm, as the archive warm-up's line) and the
 // pipelines' build_pipeline_body time: what a start with a loaded pipeline cache still spends
@@ -6833,79 +7076,168 @@ static void pcw_begin(int kind, uint64_t key) {
     atomic_store(&pcw_t0[tl_pcw], SDL_GetTicksNS() | 2);
 }
 static void pcq_drop(uint64_t key);
+static uint64_t pa_qkey(uint64_t i);
 static bool pcw_end(void) {   // false: the watch gave this job up and counted it (the caller does not count it again)
     if (tl_pcw < 0) return true;
     if (atomic_exchange(&pcw_t0[tl_pcw], 0) != 1) return true;
     atomic_fetch_sub(&pcw_lost, 1);
-    if (pcw_kind[tl_pcw] < 3) pcq_drop(pcw_key[tl_pcw]);   // (it came back: slow, or behind a driver-wide lock; not stuck)
+    pcq_drop(pcw_kind[tl_pcw] < 3 ? pcw_key[tl_pcw] : pa_qkey(pcw_key[tl_pcw]));   // (it came back: slow, or behind a driver-wide lock; not stuck)
     return false;
 }
 static bool pcw_arrive(int slot) { return slot < 0 || !atomic_exchange(&pcw_arrived[slot], 1); }   // (once per slot)
-// the quarantine: keys of records that got stuck on this GPU / driver (vendor, device, driver version, cache UUID)
+// the quarantine: keys of records that got stuck on this GPU / driver (vendor, device, driver version, cache UUID), and
+// the programs whose driver builds crashed or hung (shader_quar.h: one form per level). Loaded once, at the first of
+// pc_cold_decide / dq_level (TOTK_PRECOMPILE=0 still reads it: the programs' lines matter without a precompile).
+#define PCQ_PATH "cache/precompile_stuck.txt"
 static uint64_t *pcq_keys;
+static int *pcq_lvl;
 static int pcq_n, pcq_cap;
 static char pcq_dev[96];
+static _Atomic int pcq_loaded;
 static pthread_mutex_t pcq_mu = PTHREAD_MUTEX_INITIALIZER;
 static void pcq_load(void) {
+    if (atomic_load(&pcq_loaded)) return;
+    pthread_mutex_lock(&pcq_mu);
+    if (atomic_load(&pcq_loaded)) { pthread_mutex_unlock(&pcq_mu); return; }
     int at = snprintf(pcq_dev, sizeof pcq_dev, "%04x %04x %08x ", g_vk.props.vendorID, g_vk.props.deviceID, g_vk.props.driverVersion);
     for (int i = 0; i < VK_UUID_SIZE; i++) at += snprintf(pcq_dev + at, sizeof pcq_dev - at, "%02x", g_vk.props.pipelineCacheUUID[i]);
-    FILE *f = fopen("cache/precompile_stuck.txt", "rb");
-    if (!f) return;
-    char line[128];
-    bool ours = fgets(line, sizeof line, f) && !strncmp(line, pcq_dev, strlen(pcq_dev));
-    while (ours && fgets(line, sizeof line, f)) {
-        uint64_t k = strtoull(line, NULL, 16);
-        if (!k) continue;
-        if (pcq_n == pcq_cap) { pcq_cap = pcq_cap ? pcq_cap * 2 : 16; pcq_keys = realloc(pcq_keys, pcq_cap * sizeof *pcq_keys); }
-        pcq_keys[pcq_n++] = k;
+    FILE *f = fopen(PCQ_PATH, "rb");
+    if (f) {
+        char line[256];
+        int nrec = 0, nlog = 0;
+        bool ours = fgets(line, sizeof line, f) && !strncmp(line, pcq_dev, strlen(pcq_dev));
+        while (ours && fgets(line, sizeof line, f)) {
+            int lv;
+            uint64_t k = sq_parse(line, &lv);
+            if (!k) continue;
+            if (pcq_n == pcq_cap) {
+                pcq_cap = pcq_cap ? pcq_cap * 2 : 16;
+                pcq_keys = realloc(pcq_keys, pcq_cap * sizeof *pcq_keys);
+                pcq_lvl = realloc(pcq_lvl, pcq_cap * sizeof *pcq_lvl);
+            }
+            pcq_keys[pcq_n] = k;
+            pcq_lvl[pcq_n++] = lv;
+            if (!lv) nrec++;
+            else if (nlog++ < 20) {   // (which shader: the line's "<shader>: <stage>")
+                line[strcspn(line, "\r\n")] = 0;
+                const char *nm = strchr(line + 17, ' ');
+                LOG("[vk] shader quarantine: %s crashed or hung this GPU's driver before: built %s\n", nm ? nm + 1 : line, sq_how(lv));
+            }
+        }
+        fclose(f);
+        if (!ours) remove(PCQ_PATH);   // (another GPU or driver: a new driver gets another try)
+        else if (nrec) LOG("[precompile] %d recorded builds skipped: they got stuck in this driver before (" PCQ_PATH ")\n", nrec);
     }
-    fclose(f);
-    if (!ours) remove("cache/precompile_stuck.txt");   // (another GPU or driver: a new driver gets another try)
-    else if (pcq_n) LOG("[precompile] %d recorded builds skipped: they got stuck in this driver before (cache/precompile_stuck.txt)\n", pcq_n);
+    atomic_store(&pcq_loaded, 1);
+    pthread_mutex_unlock(&pcq_mu);
 }
 static bool pc_quarantined(uint64_t key) {
-    for (int i = 0; i < pcq_n; i++) if (pcq_keys[i] == key) return true;
+    for (int i = 0; i < pcq_n; i++) if (pcq_keys[i] == key && !pcq_lvl[i]) return true;
     return false;
 }
-static void pcq_add(uint64_t key) {
-    if (!key) return;
+static int dq_level(uint64_t key) {   // (a program's form: 0 as usual)
+    if (!key) return 0;
+    pcq_load();
+    return sq_level(pcq_keys, pcq_lvl, pcq_n, key);
+}
+static void pcq_append(const char *line) {   // (the GPU / driver line first in a new file)
     pthread_mutex_lock(&pcq_mu);
     mkdir("cache", 0755);
-    FILE *f = fopen("cache/precompile_stuck.txt", "ab");
+    FILE *f = fopen(PCQ_PATH, "ab");
     if (f) {
         fseek(f, 0, SEEK_END);
         if (ftell(f) == 0) fprintf(f, "%s\n", pcq_dev);
-        fprintf(f, "%016llx\n", (unsigned long long)key);
+        fputs(line, f);
         fclose(f);
     }
     pthread_mutex_unlock(&pcq_mu);
 }
+static void pcq_add(uint64_t key) {
+    if (!key) return;
+    char line[24];
+    snprintf(line, sizeof line, "%016llx\n", (unsigned long long)key);
+    pcq_append(line);
+}
 static void pcq_drop(uint64_t key) {   // (rewrites the file without that key)
+    char pfx[24];
+    snprintf(pfx, sizeof pfx, "%016llx\n", (unsigned long long)key);
     pthread_mutex_lock(&pcq_mu);
-    FILE *f = fopen("cache/precompile_stuck.txt", "rb");
-    char line[128], *keep = NULL;
-    size_t nk = 0, cap = 0;
-    bool found = false;
-    for (int ln = 0; f && fgets(line, sizeof line, f); ln++) {
-        if (ln && strtoull(line, NULL, 16) == key) { found = true; continue; }
-        size_t l = strlen(line);
-        if (nk + l + 1 > cap) { cap = (nk + l + 1) * 2; keep = realloc(keep, cap); }
-        memcpy(keep + nk, line, l);
-        nk += l;
-    }
-    if (f) fclose(f);
-    if (found) {
-        f = fopen("cache/precompile_stuck.txt.tmp", "wb");
-        if (f) {
-            if (nk) fwrite(keep, 1, nk, f);
-            fclose(f);
-            remove("cache/precompile_stuck.txt");
-            rename("cache/precompile_stuck.txt.tmp", "cache/precompile_stuck.txt");
-        }
-        LOG("[precompile] %016llx came back from the driver after all: not skipped at later starts\n", (unsigned long long)key);
-    }
-    free(keep);
+    const int n = sq_drop(PCQ_PATH, pfx);
     pthread_mutex_unlock(&pcq_mu);
+    if (n > 0) LOG("[precompile] %016llx came back from the driver after all: not skipped at later starts\n", (unsigned long long)key);
+}
+// slow_watch: a driver build of a program (form lvl) still running after LARECOMP_PC_STUCK_S: its program takes the next
+// form at later starts (the build may never return: Windows ends a game whose driver thread hangs only at exit, if at all).
+// The form recorded, for dq_back.
+static int dq_hung(uint64_t key, int lvl, const char *what, const char *name, double secs) {
+    if (!pcq_dev[0]) return -1;
+    const int next = sq_next_hang(lvl, what, g_vk.gpl);
+    if (!next) {   // (only a crash may skip it: no record, once per build)
+        LOG("[vk] %s %s: in the driver for %.0f s, already in its last form short of skipping: not recorded\n", what, name, secs);
+        return -1;
+    }
+    char line[128];
+    sq_format(line, sizeof line, key, next, name, what);
+    pcq_append(line);
+    LOG("[vk] %s %s: in the driver for %.0f s: the next start on this GPU and driver builds it %s (" PCQ_PATH ")\n", what,
+        name, secs, sq_how(next));
+    return next;
+}
+static void dq_back(uint64_t key, int lvl, const char *what, const char *name, double secs) {   // (slow_end: it returned)
+    char pfx[24];
+    snprintf(pfx, sizeof pfx, "%016llx %d ", (unsigned long long)key, lvl);
+    pthread_mutex_lock(&pcq_mu);
+    sq_drop(PCQ_PATH, pfx);
+    pthread_mutex_unlock(&pcq_mu);
+    LOG("[vk] %s %s came back from the driver after %.0f s: built as before at later starts\n", what, name, secs);
+}
+// rt_main.cpp on_crash, on the crashing thread (Windows): when this thread was in a driver build (or our GLSL -> SPIR-V
+// compile) of a program as the process crashed (public #34: Intel's shader compiler, igc-default64.dll, read 0x28 in a
+// play-time build), the program takes the next form at later starts on this GPU and driver (shader_quar.h), so the game
+// does not crash on it again. Writes what to tell the player into msg; 0: no build of a program on this thread.
+int vk_shader_crashed(char *msg, int n) {
+    if (!tl_dq_in || !tl_dq_key || !pcq_dev[0]) return 0;
+    const int next = sq_next(tl_dq_lvl, tl_dq_what, g_vk.gpl);
+    char line[128];
+    sq_format(line, sizeof line, tl_dq_key, next, tl_dq_name, tl_dq_what);
+    // (an append without pcq_mu: a crash handler must never wait on a lock another thread may hold; as vk_precompile_crashed)
+    mkdir("cache", 0755);
+    FILE *f = fopen(PCQ_PATH, "ab");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    if (ftell(f) == 0) fprintf(f, "%s\n", pcq_dev);
+    fputs(line, f);
+    fclose(f);
+    snprintf(msg, n, "in the GPU driver's build of shader %s (%s, %016llx): the next start on this GPU and driver builds it %s "
+             "(" PCQ_PATH ")", tl_dq_name, tl_dq_what ? tl_dq_what : "?", (unsigned long long)tl_dq_key, sq_how(next));
+    return 1;
+}
+// An archive program's quarantine key: its index in this archive (the archive's size in it, so another release's archive
+// does not skip a different program at the same index)
+static uint64_t pa_qkey(uint64_t i) { return (i | (uint64_t)pa_nprogs << 32) ^ 0xa5c4e3d2b1f09687ull; }
+// rt_main.cpp on_crash, on the crashing thread (Windows): when this thread's precompile / prepare / archive build was in
+// the driver as the process crashed (public #34: Intel's shader compiler, igc-default64.dll, read 0x28 at the title in a
+// pre-build), its record is quarantined as a stuck one is (cache/precompile_stuck.txt, this GPU and driver only), so the
+// next start does not crash on it again; a draw that needs it still builds it. Returns its kind (0 compute program,
+// 1 program, 2 pipeline, 3 archive program; *key = the quarantined key) or -1: no build of ours on this thread.
+int vk_precompile_crashed(uint64_t *key) {
+    if (tl_pcw < 0 || !pcq_dev[0]) return -1;
+    const uint64_t t = atomic_load(&pcw_t0[tl_pcw]);
+    if (t <= 1) return -1;   // (idle, or given up already: quarantined then)
+    const int kind = pcw_kind[tl_pcw];
+    const uint64_t k = kind < 3 ? pcw_key[tl_pcw] : pa_qkey(pcw_key[tl_pcw]);
+    if (!k) return -1;
+    // (pcq_add's append without its lock: a crash handler must never wait on a lock another thread may hold; a line
+    // interleaved with a concurrent stuck-build append is the worst case, and pcq_load skips what does not parse)
+    mkdir("cache", 0755);
+    FILE *f = fopen(PCQ_PATH, "ab");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    if (ftell(f) == 0) fprintf(f, "%s\n", pcq_dev);
+    fprintf(f, "%016llx\n", (unsigned long long)k);
+    fclose(f);
+    *key = k;
+    return kind;
 }
 // Gives up the jobs past the limit (once a second: pc_watch, vk_prepare's loop); counted(slot, kind) counts each.
 static void pcw_sweep(void (*counted)(int slot, int kind)) {
@@ -6922,8 +7254,8 @@ static void pcw_sweep(void (*counted)(int slot, int kind)) {
         static _Atomic int nlog;
         if (atomic_fetch_add(&nlog, 1) < 50)
             LOG("[precompile] %s %016llx still building after %.0f s: given up (counted done%s); the worker stays in the driver\n",
-                kn[kind & 3], (unsigned long long)key, (now - t) / 1e9, kind < 3 ? ", skipped at later starts" : "");
-        if (kind < 3) pcq_add(key);
+                kn[kind & 3], (unsigned long long)key, (now - t) / 1e9, ", skipped at later starts");
+        pcq_add(kind < 3 ? key : pa_qkey(key));  // (an archive program too: the warm-up loop skips it)
         counted(i, kind);
     }
 }
@@ -6984,6 +7316,7 @@ static void *pc_worker(void *arg) {
             p->csize[s] = cs;
         }
         if (ok && pc_claim_prog(r->ckey, p) == p) {
+            g_progs_pre++;
             memset(pa_tm, 0, sizeof pa_tm);
             pa_tm_on = true;
             translate_unlocked = pc_unlocked;   // (TOTK_PRECOMPILE_UNLOCKED=0: under translate_lock)
@@ -7016,6 +7349,7 @@ static void *pc_worker(void *arg) {
             if (pc_take_pipe(ph)) free(pp);
             else {
                 pc_put_pipe(ph, pp);
+                g_pipes_pre++;
                 uint64_t tb = SDL_GetTicksNS();
                 pcw_begin(2, hash_words(r->ckey, &r->k, sizeof(PipeKey)) ^ 0x5bd1e995ull);
                 build_pipeline_body(pp);
@@ -7051,6 +7385,7 @@ extra_out:;
             }
             int i = atomic_fetch_add(&pa_next, 1);
             if (i >= (int)pa_nprogs) break;
+            if (pcq_n && pc_quarantined(pa_qkey((uint64_t)i))) { atomic_fetch_add(&pa_done, 1); continue; }   // (crashed the driver before)
             uint64_t t0 = SDL_GetTicksNS();
             pcw_begin(3, (uint64_t)i);
             pa_job(i);
@@ -7119,13 +7454,13 @@ static int pc_load_file(const char *path);
 
 // The first start on this PC: a pipeline cache the driver did not accept is not the test (some drivers keep their own):
 // another GPU, driver or engine build than the ones that last finished this pass is (cache/precompile_cold.key: vendor,
-// device, driver version, pipeline cache UUID, the exe's size and time); then the driver has none of this build's
-// pipelines and every recorded program and pipeline (the package's seed and this PC's own) builds from nothing. They
-// build on every logical CPU but one instead of the usual 1..6 threads (1 on <= 8 CPUs: a whole seed took minutes
-// there, and play met its pipelines unbuilt: held frames), at the workers' usual below-normal priority, so the game's
-// threads still come first; done long before the title is left on any core count. The archive warm-up after it and
-// every later start: as before. TOTK_PRECOMPILE_COLD=0 never (boot.py: harness boots share the host's cores), =1 always
-// (a measurement).
+// device, driver version, pipeline cache UUID, the exe's size and time, or the translator's identity NXR_XLATE_ID when
+// the build gives it); then the driver has none of this build's pipelines and every recorded program and pipeline (the
+// package's seed and this PC's own) builds from nothing. They build on every logical CPU but one instead of the usual
+// 1..6 threads (1 on <= 8 CPUs: a whole seed took minutes there, and play met its pipelines unbuilt: held frames), at
+// the workers' usual below-normal priority, so the game's threads still come first; done long before the title is left
+// on any core count. The archive warm-up after it and every later start: as before. TOTK_PRECOMPILE_COLD=0 never
+// (boot.py: harness boots share the host's cores), =1 always (a measurement).
 #ifndef _WIN32
 #include <unistd.h>   // (readlink)
 #endif
@@ -7139,6 +7474,12 @@ static void pc_cold_decide(void) {   // (pc_cold_key: declared with the archive 
     // (heap windows from an earlier refusal translate every program differently: the start after the switch is a first
     // start; keys without them are as before)
     if (g_gwin_kept) at += snprintf(pc_cold_key + at, sizeof pc_cold_key - at, " gw%llu", (unsigned long long)(g_gwin_kept >> 20));
+#ifdef NXR_XLATE_ID
+    // (the translator's identity, tools/engine/xlate_id.py: a relink whose renderer sources did not change - a game-code
+    // or runtime fix - keeps the warm record and the first-start pass off; the exe's size and time re-warmed the whole
+    // archive on every update, setup-fast 2026-11-03)
+    snprintf(pc_cold_key + at, sizeof pc_cold_key - at, " x%016llx\n", (unsigned long long)NXR_XLATE_ID);
+#else
     char exe[600] = "";
 #ifdef _WIN32
     GetModuleFileNameA(NULL, exe, sizeof exe);
@@ -7150,6 +7491,7 @@ static void pc_cold_decide(void) {   // (pc_cold_key: declared with the archive 
     if (exe[0] && !stat(exe, &st))
         snprintf(pc_cold_key + at, sizeof pc_cold_key - at, " %llx-%llx\n", (unsigned long long)st.st_size,
                  (unsigned long long)st.st_mtime);
+#endif
     pcq_load();
     char have[160] = "";
     FILE *f = fopen("cache/precompile_cold.key", "rb");
@@ -7310,8 +7652,10 @@ static int pc_load_file(const char *path) {
     PcInfo want = {pc_info_heap(), gdev_window_size(), sizeof(PcProg), sizeof(PipeKey)};
     static int cap_p, cap_l, cap_c;
     bool good = false;
-    for (int pass = 0; pass < 2; pass++)   // PC_PROG2 records + pipelines first; then PC_PROG ones no PC_PROG2 replaced
-    for (long o = 0; o + (long)sizeof(PcHdr) <= n;) {
+    long end0 = n;   // (pass 0: where the records end; short of n = a torn tail)
+    for (int pass = 0; pass < 2; pass++) {   // PC_PROG2 records + pipelines first; then PC_PROG ones no PC_PROG2 replaced
+    long o = 0;
+    for (; o + (long)sizeof(PcHdr) <= n;) {
         PcHdr h;
         memcpy(&h, d + o, sizeof h);
         if (h.magic != PC_MAGIC || o + (long)sizeof h + (long)h.size > n) break;   // (torn tail)
@@ -7337,7 +7681,25 @@ static int pc_load_file(const char *path) {
         }
         o += sizeof h + h.size;
     }
+    if (pass == 0) end0 = o;
+    }
     free(d);
+    // A torn tail (a write cut short: the process ended in the middle of a record, e.g. the close's deadline) is cut off
+    // our own file: else every record appended after it sat behind it, unread at every later start (the loop above stops
+    // at the first torn record). The seed's file is never touched. Nothing of this process has it open then: the writer
+    // (pc_write_now) opens it at its first record, and every record path (programs, pipelines, compute programs) calls
+    // pc_start, which runs this load, first; vk_prepare (Setup) loads it before its workers start too.
+    if (end0 < n && !strcmp(path, "cache/precompile.bin")) {
+#ifdef _WIN32
+        int fd = _open(path, _O_RDWR | _O_BINARY);
+        const bool cut = fd >= 0 && _chsize_s(fd, end0) == 0;
+        if (fd >= 0) _close(fd);
+#else
+        const bool cut = truncate(path, end0) == 0;
+#endif
+        LOG("[precompile] cache/precompile.bin: a torn record at byte %ld of %ld %s\n", end0, n,
+            cut ? "cut off (later records are read again)" : "could not be cut off");
+    }
     return good;
 }
 static void pc_start_workers(void) {
@@ -7690,6 +8052,87 @@ uint64_t vk_scene_idle_frames(void) { return pk_scene_frame == ~0ull ? 0 : rende
 static inline bool is_upscale_fs(uint64_t h) { return h == 0x32845c90c668fdbbull || h == 0x6dc5011326ac42a2ull; }
 static uint64_t pk_upscale_frame = ~0ull;
 uint64_t vk_upscale_idle_frames(void) { return pk_upscale_frame == ~0ull ? ~0ull : renderer_present_count() - pk_upscale_frame; }
+
+// TOTK_DLSS_HDR=1 (ngx.c vk_ngx_sr_hdr): SR on the game's linear HDR scene right before its tonemap draw. TotK's chain
+// ends tonemap -> FXAA (a copy into a scratch target, then fs 6dc5011326ac42a2 drawing the result back into the first
+// target) -> EASU into the canvas. The tonemap is not known by hash: it is learned at the FXAA, as the frame's last
+// full-screen draw into the target FXAA draws back into, and the scene as that draw's texture of the target's size in a
+// float format (the HDR scene, with the bloom composited in or not). From then on SR runs before that draw (the scene
+// at the canvas's size only: DLAA) and the upscale pass draws as the game's own. Kept per frame: the full-screen
+// single-target draws without depth (the bloom chain, composites, copies), 32 at most.
+typedef struct { uint64_t frame, hash; TexBackend *rt, *tex[4]; uint32_t tw[4], th[4], bw[4], bh[4]; VkFormat fmt[4]; } HdrDraw;
+static HdrDraw hdr_ring[32];
+static uint32_t hdr_n;
+static struct { uint64_t hash; int k; } hdr_tm[4];   // the tonemap draws learned (several shaders may alternate), newest first
+static uint32_t hdr_cw, hdr_ch;                      // the canvas the upscale pass last drew into (backend size)
+
+static void hdr_learn(NvnTexture *fxaa_rt, uint64_t now) {   // the FXAA draw (1:1, fs 6dc5) into fxaa_rt
+    TexBackend *tb = vk_render_backend(fxaa_rt);
+    for (uint32_t j = 0; j < 32 && j < hdr_n; j++) {
+        const HdrDraw *d = &hdr_ring[(hdr_n - 1 - j) % 32];
+        if (d->frame != now) return;
+        if (d->rt != tb) continue;   // (the FXAA's copy into its scratch target came after the tonemap)
+        for (int k = 0; k < 4; k++) {
+            if (!d->tex[k] || d->tex[k] == tb || d->tw[k] != fxaa_rt->width || d->th[k] != fxaa_rt->height) continue;
+            VkFormat f = d->fmt[k];
+            if (f != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && f != VK_FORMAT_R16G16B16A16_SFLOAT && f != VK_FORMAT_R32G32B32A32_SFLOAT) continue;
+            if (hdr_tm[0].hash == d->hash && hdr_tm[0].k == k) return;
+            int i = 0;
+            while (i < 3 && !(hdr_tm[i].hash == d->hash && hdr_tm[i].k == k)) i++;
+            memmove(&hdr_tm[1], &hdr_tm[0], (size_t)i * sizeof hdr_tm[0]);
+            hdr_tm[0].hash = d->hash, hdr_tm[0].k = k;
+            static int nlog;
+            if (nlog++ < 16)
+                LOG("[dlss] HDR scene: the tonemap is fs %016llx (learned at the FXAA, frame %llu), its texture %d = the scene "
+                    "%ux%u format %d\n", (unsigned long long)d->hash, (unsigned long long)now, k, d->bw[k], d->bh[k],
+                    (int)f);
+            return;
+        }
+        static int nmiss;
+        if (nmiss++ < 4) LOG("[dlss] HDR scene: the draw before the FXAA (fs %016llx) samples no float texture of its size\n",
+                             (unsigned long long)d->hash);
+        return;
+    }
+}
+
+// A full-screen draw into one colour target without depth: SR first when it is a learned tonemap (once a frame), then kept.
+static void hdr_fs_draw(ShaderTexture *tex, int ntex, uint64_t hash, uint64_t now) {
+    for (int i = 0; i < 4 && hdr_tm[i].hash && vk_ngx_sr_hdr_frame() != now; i++) {
+        if (hdr_tm[i].hash != hash || hdr_tm[i].k >= ntex) continue;
+        NvnTexture *x = shader_texture_object(1, &tex[hdr_tm[i].k]);
+        TexBackend *xb = x ? vk_render_backend(x) : NULL;
+        if (!xb || !hdr_cw) break;
+        if (xb->width != hdr_cw || xb->height != hdr_ch) {   // (not DLAA: SR stays on the upscale pass)
+            static uint32_t told_s, told_c;
+            if (told_s != xb->width || told_c != hdr_cw) {
+                told_s = xb->width, told_c = hdr_cw;
+                LOG("[dlss] HDR scene %ux%u is not the canvas's size (%ux%u): SR upscales on the upscale pass\n", xb->width,
+                    xb->height, hdr_cw, hdr_ch);
+            }
+            break;
+        }
+        int bi = -1;   // (the G-buffer depth of the scene's size, latest first: as the upscale pass picks it)
+        for (int c = 0; c < 4; c++)
+            if (g_dlss_cand[c] && g_dlss_cand[c]->width == x->width && g_dlss_cand[c]->height == x->height &&
+                (bi < 0 || g_dlss_cand_at[c] > g_dlss_cand_at[bi]))
+                bi = c;
+        if (bi < 0) break;
+        g_dlss_depth = g_dlss_cand[bi];
+        vk_end_pass();
+        vk_feedback_epoch_bump();   // (SR writes the scene outside a draw)
+        vk_ngx_sr_hdr(vk_cmd(), xb, vk_render_backend(g_dlss_depth), now, nvn_window_origin() == 0, nvn_depth_mode() == 0);
+        dyn_invalidate();
+        break;
+    }
+    HdrDraw *d = &hdr_ring[hdr_n++ % 32];
+    memset(d, 0, sizeof *d);
+    d->frame = now, d->hash = hash, d->rt = vk_render_backend(st.rt.color[0]);
+    for (int k = 0; k < 4 && k < ntex; k++) {
+        NvnTexture *t = shader_texture_object(1, &tex[k]);
+        TexBackend *b = t ? vk_render_backend(t) : NULL;
+        if (b) d->tex[k] = b, d->tw[k] = t->width, d->th[k] = t->height, d->bw[k] = b->width, d->bh[k] = b->height, d->fmt[k] = b->format;
+    }
+}
 
 static void pk_draw(Prog *pr) {   // (draw_, before the fragment textures resolve)
     pk_subst_tex = NULL;
@@ -8707,9 +9150,21 @@ static bool host_import(uint64_t base, uint64_t size, uint64_t *got, VkBuffer *p
         vkDestroyBuffer(g_vk.dev, buf, NULL);
         return false;
     }
+    // A HOST_COHERENT one first (rival-parity 034, their #452: an Intel device loss on non-coherent per-draw memory): the
+    // game writes the heap from the CPU and nothing flushes it (the pointer is never vkMapMemory'd), so only a coherent
+    // type promises the GPU sees those writes. The lowest coherent type; none: the lowest, with a warning.
     VkPhysicalDeviceMemoryProperties mprops;
     vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mprops);
-    const uint32_t type = (uint32_t)__builtin_ctz(types), heap = mprops.memoryTypes[type].heapIndex;
+    uint32_t coherent = 0;
+    for (uint32_t i = 0; i < mprops.memoryTypeCount && i < 32; i++)
+        if ((types >> i & 1) && (mprops.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) coherent |= 1u << i;
+    if (!coherent) {
+        static int nw;
+        if (nw++ < 2)
+            LOG("[vk] WARNING: host import: no coherent memory type among %#x: the GPU may not see the game's CPU writes "
+                "(expect wrong pictures or a device loss)\n", types);
+    }
+    const uint32_t type = (uint32_t)__builtin_ctz(coherent ? coherent : types), heap = mprops.memoryTypes[type].heapIndex;
     uint64_t ours, keep;
     uint64_t room = host_room(heap, &ours, &keep);
     if (spare) {
@@ -8764,8 +9219,8 @@ static bool host_import(uint64_t base, uint64_t size, uint64_t *got, VkBuffer *p
     static _Atomic int nlog;
     if (atomic_fetch_add(&nlog, 1) < 1) {
         const VkMemoryPropertyFlags f = mprops.memoryTypes[ai.memoryTypeIndex].propertyFlags;
-        LOG("[vk] host import memory: type %u of the pointer's %#x / the buffer's %#x (%s%s%s%s)\n", ai.memoryTypeIndex,
-            mp.memoryTypeBits, req.memoryTypeBits, f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local " : "",
+        LOG("[vk] host import memory: type %u of the pointer's %#x / the buffer's %#x, coherent ones %#x (%s%s%s%s)\n",
+            ai.memoryTypeIndex, mp.memoryTypeBits, req.memoryTypeBits, coherent, f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local " : "",
             f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? "host-visible " : "", f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? "coherent " : "",
             f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? "cached" : "uncached");
     }
@@ -8815,7 +9270,14 @@ static void gmem_retire(VkBuffer buf, VkDeviceMemory mem) {   // (the heap grew:
 }
 // The heap [HEAP_BASE, + size) imported: one buffer, or (g_gwin) windows of g_gwin bytes; a window that already covers
 // its part is kept. False = the first window failed (no global memory at all).
-static bool gmem_import(uint64_t size) {
+static bool gmem_import_(uint64_t size);
+static bool gmem_import(uint64_t size) {   // (no guarded read-only heap page meets the driver's import: sync_guard_hold)
+    sync_guard_hold(1);
+    const bool ok = gmem_import_(size);
+    sync_guard_hold(0);
+    return ok;
+}
+static bool gmem_import_(uint64_t size) {
     gmem_asked = size;
     uint64_t win = g_gwin && size > g_gwin ? g_gwin : size;
     int nw = (int)((size + win - 1) / win);
@@ -8919,20 +9381,6 @@ static VkDescriptorBufferInfo gmem_win_info(int k) {
     VkSpan s = vk_transient_copy(zero, sizeof zero, 256);
     return (VkDescriptorBufferInfo){s.buf, s.off, sizeof zero};
 }
-// The imported buffer and offset holding guest [addr, addr + size) (window 0 or a later window; false: not imported,
-// LARECOMP_VK_NO_GMEM, or the range crosses a window's end). textures.c's CPU-read targets copy into it.
-bool vk_gmem_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
-    if (!gmem_buf) gmem_info();
-    if (!gmem_buf || addr < HEAP_BASE) return false;
-    uint64_t o = addr - HEAP_BASE;
-    if (o + size <= gmem_size) { *buf = gmem_buf; *off = o; return true; }
-    if (!g_gwin) return false;
-    uint64_t k = o / g_gwin, ko = o - k * g_gwin;
-    if (!k || k >= GMEM_WIN_MAX || !gmem_wbuf[k] || ko + size > gmem_wsize[k]) return false;
-    *buf = gmem_wbuf[k]; *off = ko;
-    return true;
-}
-
 // ---- Device window. The driver cbuf's storage buffer table points such a buffer at HEAP_BASE + HEAP_MAX + offset,
 // which translated shaders route to gdev_ (maxwell_gdev_size). Host memory stays the truth between submissions: a
 // region's first use in a submission copies host -> VRAM in the upload command buffer (runs before the main one),
@@ -8941,8 +9389,24 @@ bool vk_gmem_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *of
 #define GDEV_REGION_MAX (16ull << 20)
 typedef struct { uint64_t addr, size, off, seq, up, cap; } GdevRegion;  // seq: the submission it was copied in for (or
 // carried into, chunked submission); up: the submission whose upload buffer copied it in; cap: the bytes from addr its
-// window slot reserves (size <= cap: a later binding of the same start may grow into it, gdev_map)
-static GdevRegion gdev_reg[256];
+// window slot reserves (size <= cap: a later binding of the same start may grow into it, gdev_map) The device window's
+// region table. Up to 256 regions by default: a submission that binds more storage buffers than that left the rest in
+// host memory: ~5000 '(256 regions, half 0)' host fallbacks per 2 s LEAD 10:57, the gate's one-frame foreign-mesh
+// glitches). LARECOMP_GDEV_REGIONS=<n> (16.. 2048): a larger table (an A/B arm: the 'host fallbacks' figure of the [vk]
+// line should drop; every lookup scans the table, so the CPU cost grows with it).
+#define GDEV_REGS 2048
+static GdevRegion gdev_reg[GDEV_REGS];
+static int gdev_lim(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("LARECOMP_GDEV_REGIONS");
+        n = e && *e ? atoi(e) : 256;
+        if (n < 16) n = 16;
+        if (n > GDEV_REGS) n = GDEV_REGS;
+        if (n != 256) LOG("[vk] device window: up to %d regions (LARECOMP_GDEV_REGIONS)\n", n);
+    }
+    return n;
+}
 static int gdev_n;
 static uint64_t gdev_top, gdev_upload_seq, gdev_stat_in, gdev_stat_regions, gdev_stat_snap, gdev_stat_host, gdev_stat_grown;
 static int gdev_half;               // the window half new regions go into
@@ -9071,7 +9535,7 @@ static bool wb_set_ready(void) {
 static void gdev_shadow_sync(VkCommandBuffer up) {
     if (wb_mode != 1) return;
     uint64_t cur = submit_seq + 1;
-    VkBufferCopy bc[256];
+    static VkBufferCopy bc[GDEV_REGS];   // (static: the render thread only)
     uint32_t n = 0;
     for (int i = 0; i < gdev_n; i++)  // (carried regions keep the shadow of their first upload: the final diff covers every chunk)
         if (gdev_reg[i].seq == cur && gdev_reg[i].up == cur) bc[n++] = (VkBufferCopy){gdev_reg[i].off, gdev_reg[i].off, gdev_reg[i].size};
@@ -9082,7 +9546,7 @@ static void gdev_shadow_sync(VkCommandBuffer up) {
 
 // Regions used by the open submission (copies of their placement), for guest_direct's per-draw lookups: the region
 // table keeps up to 256 stale regions, and scanning it for every index / vertex binding cost ~1 us per draw.
-static struct { uint64_t addr, size, off; } gdev_lv[256];
+static struct { uint64_t addr, size, off; } gdev_lv[GDEV_REGS];
 static int gdev_lv_n;
 static uint64_t gdev_lv_seq;
 static uint32_t gdev_gen;   // bumped wherever gdev_reg gains, loses or moves a region (gdev_find's cache)
@@ -9229,6 +9693,76 @@ static void gdev_upload(GdevRegion *r, uint64_t lo, uint64_t hi, bool write, uin
     if (gdev_chk_on()) vkCmdCopyBuffer(up, gmem_buf, chk_buf[0], 1, &bc);  // (LARECOMP_GDEV_CHECK: host at the upload)
     gdev_stat_in += n;
 }
+// LARECOMP_GDEV_SNAPFALL=1: a read-only storage buffer the window has no room for (table full, both halves taken: the
+// '(N regions, half h)' host fallbacks, on the GPU timeline, after the game may have rewritten it. With it on it is
+// snapshotted now (CPU copy into the upload ring) into a slot of an 8 MB snapshot area at the window's top (the halves
+// share the rest): the shaders address it like any window region, nothing copies it back (read-only), and the slot is
+// reused only once its submission completed (else in place, as before: counted 'busy'). Not snapshotted: ranges over 1
+// MB, or with pages a shader wrote in a submission not complete (their bytes are not in host memory yet: in place as
+// before). One copy per (address, size) per submission, as a region's.
+enum { GSF_BYTES = 8 << 20, GSF_Q = 4, GSF_MAX = 1 << 20 };
+static int gsf_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_GDEV_SNAPFALL");
+        on = e && *e == '1';
+        if (on) LOG("[vk] device window: read-only storage buffers it has no room for are snapshotted into an %d MB area at its top (LARECOMP_GDEV_SNAPFALL)\n", GSF_BYTES >> 20);
+    }
+    return on;
+}
+static uint64_t gdev_half_size(void) { return (GDEV_SIZE - (gsf_on() ? GSF_BYTES : 0)) / 2; }
+static uint64_t gsf_pos, gsf_qseq[GSF_Q], gsf_n, gsf_bytes, gsf_busy, gsf_inflight;
+static struct { uint64_t addr, size, seq, off; } gsf_memo[512];
+// Mirror pages written by the game after their chunk's first sync in a submission and found at a later list's sync of it
+// (heap, alias): without LARECOMP_MIRROR_VOL their new bytes were copied before the earlier lists' draws. Counted with
+// the switch on or off, so a gate log's hits can be set against it ('[vk] mirror late rewrites').
+static uint64_t stat_mlate[2];
+static bool mirror_vol_on(void);
+static void gsf_stats(void) {
+    extern void vk_tex_alias_miss_stats(void);
+    vk_tex_alias_miss_stats();
+    if (stat_mlate[0] || stat_mlate[1])
+        LOG("[vk] mirror late rewrites: heap %llu, alias %llu pages (%s)\n", (unsigned long long)stat_mlate[0], (unsigned long long)stat_mlate[1],
+            mirror_vol_on() ? "volatile, LARECOMP_MIRROR_VOL" : "copied before the submission's earlier lists' draws");
+    stat_mlate[0] = stat_mlate[1] = 0;
+    if (!gsf_on()) return;
+    LOG("[vk] device window snapshots: %llu (%.1f MB), left in place: %llu slot busy, %llu shader-written in flight\n", (unsigned long long)gsf_n,
+        gsf_bytes / 1048576.0, (unsigned long long)gsf_busy, (unsigned long long)gsf_inflight);
+    gsf_n = gsf_bytes = gsf_busy = gsf_inflight = 0;
+}
+// the window address of a snapshot of [addr, addr + size) for submission cur, or addr (in place, as before)
+static uint64_t gdev_snapfall(uint64_t addr, uint64_t size, uint64_t cur) {
+    if (!gsf_on() || !size || size > GSF_MAX || addr < HEAP_BASE) return addr;
+    typeof(gsf_memo[0]) *m = &gsf_memo[((addr >> 8) ^ (size * 0x9E3779B1u)) & 511];
+    if (m->seq == cur && m->addr == addr && m->size == size) return HEAP_BASE + HEAP_MAX + m->off;
+    const uint64_t done = vk_completed_seq();
+    for (uint64_t b = (addr - HEAP_BASE) >> GDEV_SH, be = (addr + size - 1 - HEAP_BASE) >> GDEV_SH; b <= be && b < GDEV_BLKS; b++)
+        if (gdev_blk[b] > done) { gsf_inflight++; return addr; }
+    const uint64_t qlen = GSF_BYTES / GSF_Q;
+    uint64_t pos = (gsf_pos + 255) & ~255ull;
+    if (pos / qlen != (pos + size - 1) / qlen || pos + size > GSF_BYTES) {   // (into the next quarter, from its start)
+        const uint64_t q = (pos / qlen + 1) % GSF_Q;
+        if (gsf_qseq[q] > done) { gsf_busy++; return addr; }   // (still read by a submission in flight)
+        pos = q * qlen;
+    }
+    // (within a quarter the position only moves forward: fresh bytes; a quarter is only checked when entered)
+    gsf_qseq[pos / qlen] = cur;
+    gsf_pos = pos + size;
+    const uint64_t off = 2 * gdev_half_size() + pos;
+    VkCommandBuffer up = vk_upload_cmd();
+    if (gdev_upload_seq != cur) { vk_full_barrier(up); gdev_upload_seq = cur; }
+    const int k0 = vk_up_kind;
+    vk_up_kind = 2;
+    VkSpan sp = vk_transient(size, 256);
+    vk_up_kind = k0;
+    memcpy(sp.ptr, (const void *)(uintptr_t)addr, size);
+    const VkBufferCopy bc = {sp.off, off, size};
+    vkCmdCopyBuffer(up, sp.buf, gdev_buf, 1, &bc);
+    *m = (typeof(*m)){addr, size, cur, off};
+    gsf_n++;
+    gsf_bytes += size;
+    return HEAP_BASE + HEAP_MAX + off;
+}
 static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
     if (write && addr >= HEAP_BASE && size) {
         static uint64_t la, ls, lseq;
@@ -9242,7 +9776,7 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
     if (!addr || !size || addr < HEAP_BASE || addr + size > HEAP_BASE + gmem_size || !gdev_ready()) return addr;
     if (gdev_host_rule(addr, size)) return addr;
     GdevRegion *r = gdev_find(addr, size);
-    const uint64_t half = GDEV_SIZE / 2;
+    const uint64_t half = gdev_half_size();   // (GDEV_SIZE / 2 unless LARECOMP_GDEV_SNAPFALL takes the top)
     // A new region's window slot reserves the bytes up to the next 256 of the guest address (cap): slots start 256-aligned,
     // so they cost no window space. The region itself stays exact (size): only a binding of the SAME start grows it, its
     // new bytes uploaded now from fresh host data. Any other address in the reserved tail is not contained and takes the
@@ -9317,12 +9851,12 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
         // Two halves used in turn. The old "full: reset" needed no region of the current submission in use, which mid-frame
         // never held: from the first fill on every new region silently stayed in host memory, read on the GPU timeline after
         // the game had rewritten it (UI ring slices: minimap text flicker with SyncWait lag).
-        if (gdev_n == 256 && !oldfull) {   // table full: older regions are only a lookup cache (their window space is guarded per half)
+        if (gdev_n >= gdev_lim() && !oldfull) {   // table full: older regions are only a lookup cache (their window space is guarded per half)
             for (int i = 0; i < gdev_n; i++) if (gdev_reg[i].seq != cur) gdev_reg[i--] = gdev_reg[--gdev_n];
             gdev_gen++;
         }
         uint64_t off = (gdev_top + 255) & ~255ull;
-        if (oldfull && (off + rsize > GDEV_SIZE || gdev_n == 256)) {
+        if (oldfull && (off + rsize > GDEV_SIZE || gdev_n >= gdev_lim())) {
             for (int i = 0; i < gdev_n; i++) if (gdev_reg[i].seq == cur) { gdev_stat_host++; return addr; }
             vk_wait_seq(submit_seq);
             gdev_n = 0;
@@ -9339,8 +9873,12 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
                 off = (uint64_t)h * half;
             }
         }
-        if (off == ~0ull || gdev_n == 256 || rsize > half) {   // (rare: counted in the stats line)
+        if (off == ~0ull || gdev_n >= gdev_lim() || rsize > half) {   // (rare: counted in the stats line)
             static int nlog;
+            if (!write) {   // (LARECOMP_GDEV_SNAPFALL: a snapshot slot instead of in place)
+                const uint64_t w = gdev_snapfall(addr, size, cur);
+                if (w != addr) return w;
+            }
             if (nlog++ < 8) LOG("[vk] device window: %llx +%llx left in host memory (%d regions, half %d)\n", (unsigned long long)addr,
                                 (unsigned long long)size, gdev_n, gdev_half);
             gdev_stat_host++;
@@ -9357,9 +9895,9 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
         wb_init();  // (first use: the copy-back pipeline + shadow; gdev_shadow_sync fills the shadow at the end of the upload buffer)
         r->seq = cur;
         r->up = cur;
-        gdev_half_seq[r->off >= GDEV_SIZE / 2] = cur;
+        gdev_half_seq[r->off >= gdev_half_size()] = cur;
         if (gdev_lv_seq != cur) { gdev_lv_seq = cur; gdev_lv_n = 0; }
-        if (gdev_lv_n < 256) { gdev_lv[gdev_lv_n].addr = r->addr; gdev_lv[gdev_lv_n].size = r->size; gdev_lv[gdev_lv_n].off = r->off; gdev_lv_n++; }
+        if (gdev_lv_n < GDEV_REGS) { gdev_lv[gdev_lv_n].addr = r->addr; gdev_lv[gdev_lv_n].size = r->size; gdev_lv[gdev_lv_n].off = r->off; gdev_lv_n++; }
     }
     return HEAP_BASE + HEAP_MAX + r->off + (addr - r->addr);
 }
@@ -9372,7 +9910,7 @@ static int gdev_chk = -1;
 static VkBuffer chk_buf[2];
 static VmaAllocation chk_mem[2];
 static uint8_t *chk_ptr[2];
-static struct { uint64_t addr, size, off; } chk_pend[256];
+static struct { uint64_t addr, size, off; } chk_pend[GDEV_REGS];
 static int chk_n;
 static uint64_t chk_seq, chk_words, chk_clob;
 static bool gdev_chk_on(void) {
@@ -9427,14 +9965,14 @@ static void gdev_carry(uint64_t from, uint64_t to) {
 
 static void gdev_writeback(VkCommandBuffer cb) {
     uint64_t cur = submit_seq + 1;
-    VkBufferCopy bc[256];
+    static VkBufferCopy bc[GDEV_REGS];   // (static: the render thread only)
     uint32_t n = 0;
     for (int i = 0; i < gdev_n; i++)
         if (gdev_reg[i].seq == cur) bc[n++] = (VkBufferCopy){gdev_reg[i].off, gdev_reg[i].addr - HEAP_BASE, gdev_reg[i].size};
     if (!n) return;
     vk_full_barrier(cb);
     if (gdev_chk_on()) {  // host as it is right before the copy-back
-        VkBufferCopy hc[256];
+        static VkBufferCopy hc[GDEV_REGS];
         for (uint32_t i = 0; i < n; i++) {
             hc[i] = (VkBufferCopy){bc[i].dstOffset, bc[i].srcOffset, bc[i].size};
             chk_pend[i].addr = bc[i].dstOffset + HEAP_BASE; chk_pend[i].size = bc[i].size; chk_pend[i].off = bc[i].srcOffset;
@@ -9445,7 +9983,7 @@ static void gdev_writeback(VkCommandBuffer cb) {
         chk_seq = cur;
     }
     if (wb_mode == 1 && wb_set_ready()) {  // diff copy-back: one dispatch per region; unaligned regions copied whole
-        VkBufferCopy whole[256];
+        static VkBufferCopy whole[GDEV_REGS];
         uint32_t nw = 0;
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, wb_pipe);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, wb_layout, 0, 1, &wb_set, 0, NULL);
@@ -9683,7 +10221,15 @@ static uint64_t al_nblk;
 static uint64_t *al_blk_use;   // per block: the last submission that bound or wrote it (mirror_release_tick)
 static uint8_t *al_blk_rel;    // released (counted when re-made)
 static uint64_t alias_sync_seq;
-static uint64_t *alias_chunk_key, alias_chunk_n;  // lazy sync: per 1 MB chunk, the list / submission key it was last synced for
+static uint64_t *alias_chunk_key, alias_chunk_n;
+// LARECOMP_MIRRORFIX=0: every part of the 2026-11-03 mirror fixes off at once (the gate's same-build baseline): a re-made
+// heap chunk synced whatever its key, the memo generation bumped at a release, a released alias block's chunk keys reset,
+// and an alias block's record-time fill (that last one also alone: LARECOMP_ALIAS_FILL_RECORD=0)
+static bool mirrorfix_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_MIRRORFIX"); on = !(e && *e == '0'); if (!on) LOG("[vram] mirror fixes off (LARECOMP_MIRRORFIX=0)\n"); }
+    return on;
+}  // lazy sync: per 1 MB chunk, the list / submission key it was last synced for
 // Lazy sync snapshots the dirty pages at the sync (CPU copy into upload staging), as the heap mirror does: copied from the
 // import when the GPU ran the upload, they could already hold the game's next frame (SyncWait lets the game run a fence
 // ahead of the GPU): the minimap's coordinate text was drawn with another string's glyph vertices for single frames. Pages
@@ -9691,6 +10237,23 @@ static uint64_t *alias_chunk_key, alias_chunk_n;  // lazy sync: per 1 MB chunk, 
 // catch up at the next submission (al_pg_*: as hm_pg_* in heap_mirror).
 static uint64_t *al_pg_sub, *al_pg_vol, *al_chunk_vol;
 static uint8_t *al_pg_stale;
+// LARECOMP_MIRROR_VOL=1: a page clean at its chunk's first sync of a submission and written by the game before a later
+// list's sync of that chunk was copied into the mirror in that later list's upload, and the uploads run before the WHOLE
+// submission: the earlier lists' draws, which bound the chunk when the mirror still held the older (right) bytes, read the
+// game's newer bytes (for a ring slot, another object's vertices). Only pages the mirror had already taken in this
+// submission went volatile. With it on, any page written since an earlier sync of its chunk in the same submission goes
+// volatile (draws binding it copy for the rest of the submission, the mirror catches up at the next one), as the volatile
+// rule meant. al_chunk_sub / hm_chunk_sub: per chunk, the submission of its last sync.
+static uint64_t *al_chunk_sub;
+static bool mirror_vol_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_MIRROR_VOL");
+        on = e && *e == '1';
+        if (on) LOG("[vk] mirrors: pages rewritten after their chunk's first sync in a submission go volatile (LARECOMP_MIRROR_VOL)\n");
+    }
+    return on;
+}
 uint64_t prof_alias_syncs, prof_alias_bytes, prof_alias_ranges, prof_alias_ns;
 static int alias_state;  // 0 untried, 2 importing on its thread (alias_import_kick), 1 imported, -1 failed / off
 // The window's import pins all of it in the driver (vkAllocateMemory of a host pointer, 2 GB): 323 ms on the render
@@ -9830,9 +10393,26 @@ static bool alias_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
                 return false;
             VkCommandBuffer up = vk_upload_cmd();   // the block's whole span once (pages written since: the syncs below, after it)
             vk_full_barrier(up);
-            const int sl = al_slice(kbase);
-            VkBufferCopy bc = {kbase - al_slice_start(sl), 0, blen};
-            vkCmdCopyBuffer(up, al_sl_buf[sl], al_blk[k], 1, &bc);
+            // (LARECOMP_ALIAS_FILL_RECORD, default on: the span as guest memory holds it NOW, copied on the CPU into the ring;
+            // the copy from the imported window ran when the GPU got to it, by then possibly the game's next frame: a block
+            // made again under 32:9's VRAM pressure drew one frame with those bytes, a wall / rock out of place for one frame
+            // with a mirror release just before (the v0.1.9 gate's async10 hits). =0: the GPU-time copy (old).)
+            static int fill_rec = -1;
+            if (fill_rec < 0) { const char *e = getenv("LARECOMP_ALIAS_FILL_RECORD"); fill_rec = !(e && *e == '0') && mirrorfix_on(); }
+            const uint64_t clen = kbase + blen <= al_imported ? blen : al_imported > kbase ? al_imported - kbase : 0;
+            if (fill_rec && clen) {
+                const int k0 = vk_up_kind;
+                vk_up_kind = 2;
+                VkSpan sp = vk_transient(clen, 256);
+                vk_up_kind = k0;
+                memcpy(sp.ptr, (const void *)(uintptr_t)(base + kbase), clen);
+                VkBufferCopy bc = {sp.off, 0, clen};
+                vkCmdCopyBuffer(up, sp.buf, al_blk[k], 1, &bc);
+            } else {
+                const int sl = al_slice(kbase);
+                VkBufferCopy bc = {kbase - al_slice_start(sl), 0, blen};
+                vkCmdCopyBuffer(up, al_sl_buf[sl], al_blk[k], 1, &bc);
+            }
             vk_full_barrier(up);
             mirror_writes++;
         }
@@ -9844,10 +10424,11 @@ static bool alias_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
         if (!chunk_key) {
             chunk_key = alias_chunk_key = calloc(alias_chunk_n = (wsize + (1u << 20) - 1) >> 20, sizeof *chunk_key);
             al_chunk_vol = calloc(alias_chunk_n, 8);
+            al_chunk_sub = calloc(alias_chunk_n, 8);
             al_pg_sub = calloc(alias_chunk_n << 8, 8);
             al_pg_vol = calloc(alias_chunk_n << 8, 8);
             al_pg_stale = calloc(alias_chunk_n << 8, 1);
-            if (!chunk_key || !al_chunk_vol || !al_pg_sub || !al_pg_vol || !al_pg_stale) { alias_chunk_key = NULL; return false; }
+            if (!chunk_key || !al_chunk_vol || !al_chunk_sub || !al_pg_sub || !al_pg_vol || !al_pg_stale) { alias_chunk_key = NULL; return false; }
         }
         uint64_t cur = submit_seq + 1, key = in_execute ? alias_epoch : cur | (1ull << 62);
         for (uint64_t ch = (addr - base) >> 20, ce = (addr - base + (size ? size - 1 : 0)) >> 20; ch <= ce; ch++) {
@@ -9862,10 +10443,13 @@ static bool alias_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
                     for (uint64_t o = offs[i]; o < offs[i] + lens[i]; o += 4096) pg[(o - cb) >> 12] = 1;
             }
             uint64_t snap = 0, np = (clen + 4095) >> 12;
+            const bool seen = al_chunk_sub[ch] == cur, again = seen && mirror_vol_on();   // (synced before in this submission: LARECOMP_MIRROR_VOL)
+            al_chunk_sub[ch] = cur;
             for (uint64_t i = 0; i < np; i++) {
                 uint64_t q = (cb >> 12) + i;
                 if (!pg[i] && al_pg_stale[q] && al_pg_sub[q] != cur) pg[i] = 1;  // left out last submission: catch up
-                if (pg[i] && al_pg_sub[q] == cur) { pg[i] = 0; al_pg_stale[q] = 1; al_pg_vol[q] = cur; al_chunk_vol[ch] = cur; continue; }
+                if (seen && pg[i] && al_pg_sub[q] != cur) stat_mlate[1]++;
+                if (pg[i] && (al_pg_sub[q] == cur || again)) { pg[i] = 0; al_pg_stale[q] = 1; al_pg_vol[q] = cur; al_chunk_vol[ch] = cur; continue; }
                 if (pg[i]) { al_pg_sub[q] = cur; al_pg_stale[q] = 0; snap += 4096; }
             }
             int nr = 0;
@@ -9885,6 +10469,7 @@ static bool alias_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
                     else bc[nr++] = (VkBufferCopy){sp.off + so, o - cbase, l};
                     so += l;
                 }
+                for (int i = 0; i < nr; i++) sync_guard_note(base + cbase + bc[i].dstOffset, bc[i].size);   // (snapshotted now)
                 VkCommandBuffer up = vk_upload_cmd();
                 if (barrier_seq != cur) {  // once per submission: after the earlier submissions' reads of the mirror
                     vk_full_barrier(up);
@@ -9980,7 +10565,7 @@ static uint64_t hm_size, *hm_chunk_key, hm_blk_seq[GDEV_BLKS];
 // command lists of one submission. The later version then stays out of the mirror (the earlier lists' draws read the
 // mirror), the page is volatile for the rest of the submission (draws binding it copy, as before the mirror) and stale
 // (snapshotted at its chunk's first sync of a later submission).
-static uint64_t *hm_pg_sub, *hm_pg_vol, *hm_chunk_vol;  // per page: submission that last wrote it into the mirror / made it volatile
+static uint64_t *hm_pg_sub, *hm_pg_vol, *hm_chunk_vol, *hm_chunk_sub;  // per page: submission that last wrote it into the mirror / made it volatile
 static uint64_t *hm_pg_gpu;   // (LARECOMP_RACECHECK) per page: submission whose upload copied all of it on the GPU timeline
 static uint8_t *hm_pg_stale;
 uint64_t prof_hm_vol;
@@ -9999,11 +10584,11 @@ static bool heap_mirror(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSiz
             if (hm_blk && hm_blk_mem && hm_blk_use && hm_blk_rel) {
                 hm_size = gmem_size;
                 uint64_t nch = (hm_size + (1u << 20) - 1) >> 20, npg = nch << 8;
-                hm_chunk_key = calloc(nch, 8); hm_chunk_vol = calloc(nch, 8); hm_chunk_full = calloc(nch, 1);
+                hm_chunk_key = calloc(nch, 8); hm_chunk_vol = calloc(nch, 8); hm_chunk_sub = calloc(nch, 8); hm_chunk_full = calloc(nch, 1);
                 hm_pg_sub = calloc(npg, 8); hm_pg_vol = calloc(npg, 8); hm_pg_stale = calloc(npg, 1);
                 if (getenv("LARECOMP_RACECHECK")) hm_pg_gpu = calloc(npg, 8);
                 if (getenv("LARECOMP_VK_PROF")) hm_pg_snapkey = calloc(npg, 8);
-                hm_state = hm_chunk_key && hm_chunk_vol && hm_chunk_full && hm_pg_sub && hm_pg_vol && hm_pg_stale ? 1 : -1;
+                hm_state = hm_chunk_key && hm_chunk_vol && hm_chunk_sub && hm_chunk_full && hm_pg_sub && hm_pg_vol && hm_pg_stale ? 1 : -1;
             }
         }
         LOG("[vk] heap VRAM mirror (%llu MB): %s\n", (unsigned long long)(gmem_size >> 20), hm_state > 0 ? "on" : "off, per-draw copies");
@@ -10032,7 +10617,9 @@ static bool heap_mirror(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSiz
     uint64_t cur = submit_seq + 1, key = in_execute ? alias_epoch : cur | (1ull << 62);
     static uint64_t barrier_seq;
     for (uint64_t ch = (addr - HEAP_BASE) >> 20, ce = (addr - HEAP_BASE + (size ? size - 1 : 0)) >> 20; ch <= ce; ch++) {
-        if (hm_chunk_key[ch] == key) continue;
+        // (a chunk whose block was made again is synced whatever its key: a release and a re-bind in one list epoch drew
+        // from the new block's uninitialised memory, another block's old bytes; candidate for the v0.1.9 see glitches)
+        if (hm_chunk_key[ch] == key && !(hm_chunk_full[ch] && mirrorfix_on())) continue;
         hm_chunk_key[ch] = key;
         uint64_t t0 = prof ? prof_now() : 0, bytes = 0, base = ch << 20, len = hm_size - base < (1u << 20) ? hm_size - base : (1u << 20);
         uint64_t cbase = base >> MBLK_SH << MBLK_SH;   // (the chunk's block: another one than the range's first when it straddles)
@@ -10071,10 +10658,13 @@ static bool heap_mirror(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSiz
         VkBufferCopy bc[512], sc[128];
         int nb = 0, ns = 0, n3 = 0;
         uint64_t snap = 0, np = (len + 4095) >> 12;
+        const bool seen = hm_chunk_sub[ch] == cur, again = seen && mirror_vol_on();   // (synced before in this submission: LARECOMP_MIRROR_VOL)
+        hm_chunk_sub[ch] = cur;
         for (uint64_t i = 0; i < np; i++) {
             uint64_t q = (base >> 12) + i;
             if (!pg[i] && hm_pg_stale[q] && hm_pg_sub[q] != cur) pg[i] = 1;  // left out last submission: catch up
-            if (pg[i] & 1 && hm_pg_sub[q] == cur) { pg[i] = 0; hm_pg_stale[q] = 1; hm_pg_vol[q] = cur; hm_chunk_vol[ch] = cur; prof_hm_vol++; continue; }
+            if (seen && pg[i] & 1 && hm_pg_sub[q] != cur) stat_mlate[0]++;
+            if (pg[i] & 1 && (hm_pg_sub[q] == cur || again)) { pg[i] = 0; hm_pg_stale[q] = 1; hm_pg_vol[q] = cur; hm_chunk_vol[ch] = cur; prof_hm_vol++; continue; }
             if (pg[i]) { hm_pg_sub[q] = cur; hm_pg_stale[q] = 0; }
             if (pg[i] == 2 && hm_pg_gpu) hm_pg_gpu[q] = cur;
         }
@@ -10118,6 +10708,7 @@ static bool heap_mirror(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSiz
             for (int j = 0; j < ni; j++) bc[nb++] = (VkBufferCopy){iv[j][0], iv[j][0] - cbase, iv[j][1] - iv[j][0]};
             n3 += ni;
         }
+        for (int i = 0; i < ns; i++) sync_guard_note(HEAP_BASE + cbase + sc[i].dstOffset, sc[i].size);   // (snapshotted now)
         if (nb || ns) {
             VkCommandBuffer up = vk_upload_cmd();
             if (barrier_seq != cur) { vk_full_barrier(up); barrier_seq = cur; }  // after the earlier submissions' reads of the mirror
@@ -10228,14 +10819,19 @@ void vk_mirror_release_tick(void) {
             if (bw < 0) break;
             uint64_t kbase = bk << MBLK_SH, len = span[bw] - kbase < (1ull << MBLK_SH) ? span[bw] - kbase : (1ull << MBLK_SH);
             vmaDestroyBuffer(g_vk.vma, bl[bw][bk], bm[bw][bk]);
+            if (mirrorfix_on()) g_gd_gen++;   // (no guest_direct / straddle memo may hand out a binding of the released block)
             bl[bw][bk] = VK_NULL_HANDLE;
             bm[bw][bk] = NULL;
             g_mirror_blk_bytes[bw] -= len;
             if (bw == 0) {
                 hm_blk_rel[bk] = 1;
                 for (uint64_t ch = kbase >> 20; ch < (kbase + len + (1u << 20) - 1) >> 20; ch++) hm_chunk_full[ch] = 1;
-            } else
+            } else {
                 al_blk_rel[bk] = 1;
+                // (its chunks sync again at their next bind, whatever their key: the re-make's fill is the bytes of that moment)
+                if (alias_chunk_key && mirrorfix_on())
+                    for (uint64_t ch = kbase >> 20; ch < (kbase + len + (1u << 20) - 1) >> 20 && ch < alias_chunk_n; ch++) alias_chunk_key[ch] = 0;
+            }
             nfree[bw]++;
             n_rel[bw]++;
             b_rel[bw] += len;
@@ -10430,6 +11026,8 @@ void vk_exec_reset(void) {
     gmem_size = gmem_tried = gmem_asked = 0;
     extern void alias_soft_pause(void);   // hle_os_mem.cpp (TOTK_ALIAS_SOFT_WW): the window writable again before a re-import
     alias_soft_pause();
+    sync_guard_hold(1);   // (and the sync guard's pages: lifted)
+    sync_guard_hold(0);
     if (alias_state == 2 || al_grow == 1) {   // (an import still running on its thread: wait for it, then free what it made)
         pthread_join(alias_imp_thr, NULL);
         if (atomic_load(&alias_imp_done) > 0) { vkDestroyBuffer(g_vk.dev, alias_imp_buf, NULL); imp_free(alias_imp_mem); }
@@ -10486,6 +11084,17 @@ static int dref_dummy_on(void) {
     if (on < 0) { const char *e = getenv("LARECOMP_DREF_DUMMY"); on = !e || *e != '0'; }
     return on;
 }
+// fx_draw(): the current draw blends into colour target 0 without writing depth (fire, smoke, sparks, glows) while the PC LOD
+// bias is raised (textures.c vk_sampler_noplus, public #50); its fragment textures keep the game's own bias. Never with a
+// bias at or below 0, so the default path and its caches are as before. LARECOMP_FX_BIAS=1: the raised bias on them too (v0.1.8).
+static bool fx_draw(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_FX_BIAS"); on = !(e && *e == '1'); }
+    if (!on || !st.rt.color[0] || !(st.color_state[0] & 1) || (st.ds[0] && st.ds[1])) return false;
+    extern bool vk_pc_lod_bias_plus(void);
+    return vk_pc_lod_bias_plus();
+}
+static bool g_fs_fx;   // (fx_draw() of the draw whose fragment textures resolve: draw_ sets it once per draw, before them)
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[3], uint32_t wh[2]) {
     static int mode = -1;
     if (mode < 0) { const char *e = getenv("LARECOMP_TEXINFO_CACHE"); mode = e ? atoi(e) : 1; if (mode != 1) LOG("[vk] texture_info cache %d\n", mode); }
@@ -10500,13 +11109,15 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     // re-checked against it when vk_alias_gen moved. No list epoch: texture_info_'s view memo and upload check are per frame.)
     extern uint32_t vk_view_gen, vk_alias_gen;
     extern NvnTexture *renderer_texture_alias_writer(NvnTexture *t);
-    // (shadow is in the key: a shadow binding gets the depth twin view and the compare sampler, a plain one neither)
+    // (shadow is in the key: a shadow binding gets the depth twin view and the compare sampler, a plain one neither; bit 1:
+    // a fragment texture of an effect draw, fx_draw, which may get another sampler)
     static struct { uint64_t h, frame; void *tp, *sp; NvnTexture *tex, *w; uint32_t gen, agen, pool_gen; uint8_t type, shadow, valid; VkDescriptorImageInfo ii; float sc[3]; uint32_t wh[2]; } c[4096];
     uint64_t frame = vk_frame_counter();
     uint32_t gen = vk_view_gen, pg = __atomic_load_n(&g_pool_gen, __ATOMIC_RELAXED), tic = (uint32_t)(h & 0xFFFFF);
-    uint64_t k = (h * 0x9E3779B97F4A7C15ull) ^ ((uintptr_t)st.tpool >> 4) ^ ((uintptr_t)st.spool << 7) ^ st_->type ^ (uint64_t)st_->shadow << 8;
+    const uint8_t shk = (uint8_t)(st_->shadow | (stage == 1 && g_fs_fx) << 1);
+    uint64_t k = (h * 0x9E3779B97F4A7C15ull) ^ ((uintptr_t)st.tpool >> 4) ^ ((uintptr_t)st.spool << 7) ^ st_->type ^ (uint64_t)shk << 8;
     typeof(c[0]) *e = &c[(k ^ k >> 29) & 4095];
-    bool hit = e->valid && e->h == h && e->type == st_->type && e->shadow == st_->shadow && e->tp == (void *)st.tpool && e->sp == (void *)st.spool &&
+    bool hit = e->valid && e->h == h && e->type == st_->type && e->shadow == shk && e->tp == (void *)st.tpool && e->sp == (void *)st.spool &&
                e->frame == frame && e->gen == gen && e->pool_gen == pg;
     if (hit && e->agen != vk_alias_gen) {   // an alias writer changed somewhere: still this texture's?
         NvnTexture *tex = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
@@ -10532,7 +11143,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     // (a resolve can itself destroy a view or change the pool's generation: stored only when the key still holds)
     if (vk_view_gen != gen || __atomic_load_n(&g_pool_gen, __ATOMIC_RELAXED) != pg) { e->valid = 0; return; }
     NvnTexture *tex = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
-    e->h = h; e->type = (uint8_t)st_->type; e->shadow = st_->shadow; e->tp = (void *)st.tpool; e->sp = (void *)st.spool; e->frame = frame;
+    e->h = h; e->type = (uint8_t)st_->type; e->shadow = shk; e->tp = (void *)st.tpool; e->sp = (void *)st.spool; e->frame = frame;
     e->tex = tex; e->w = tex ? renderer_texture_alias_writer(tex) : NULL; e->agen = vk_alias_gen;
     e->gen = gen; e->pool_gen = pg; e->ii = *out; e->sc[0] = sc[0]; e->sc[1] = sc[1]; e->sc[2] = sc[2]; e->wh[0] = wh[0]; e->wh[1] = wh[1]; e->valid = 1;
 }
@@ -10566,8 +11177,9 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
             NvnTexture *w = renderer_texture_alias_writer(tex);
             {
                 const TexBackend *tb = (w ? w : tex)->backend;
+                extern int vk_aniso_mips_rules(void);   // (one level: a lookup / ramp, the game's own filter; textures.c, #48)
                 pc_bias_ok = !w && tb && !tb->gpu_owned && !tb->blk && !(tb->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) &&
-                             (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY);
+                             (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY) && (tb->levels > 1 || !(vk_aniso_mips_rules() & 2));
                 // (Those are gpu_owned and get no PC / DLSS bias. Counted once per image, the gate reads it: non-zero =
                 // treat an image whose levels all came by copy as data. Bit 31 of b2t_levels: counted.)
                 extern bool vk_pc_lod_bias_on(void);
@@ -10658,7 +11270,9 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
         static int scope = -1;
         if (scope < 0) { const char *ev = getenv("LARECOMP_SAMPLER_SCOPE"); scope = !(ev && *ev == '0'); }
         if (!scope) pc_bias_ok = true;
+        extern VkSampler vk_sampler_noplus(NvnSamplerDesc *d, bool plain);
         if (!pc_bias_ok && vk_pc_sampler_override_on()) smp = vk_sampler_nobias(sd, plain && !st_->shadow);
+        else if (stage == 1 && g_fs_fx) smp = vk_sampler_noplus(sd, plain && !st_->shadow);   // (#50)
         else smp = plain && !st_->shadow ? vk_sampler_plain(sd) : vk_sampler(sd);
     }
     if (!view) view = vk_dummy_view(st_->type), vb = NULL;
@@ -11159,8 +11773,27 @@ static void build_compute_timed(void *arg) {   // (TOTK_HITCH_FULL_BUILD: a work
     build_compute(arg);
     if (atomic_load(&((CsProg *)arg)->p.state) != 2) full_est_feed_(&g_full_est_cs, SDL_GetTicksNS() - t0);
 }
-static void build_compute(void *arg) {
+static void build_compute_(CsProg *cp);
+static void build_compute(void *arg) {   // (in its quarantine form, if any: dq_prog)
     CsProg *cp = arg;
+    const uint64_t k0 = tl_dq_key;
+    const int l0 = tl_dq_lvl;
+    if (cp->si && cp->si->msl) {
+        cp->p.qkey = hash_words(vk_spirv_key(cp->si->msl, STAGE_COMPUTE) ^ 0xbb67ae8584caa73bull, cp->local, sizeof cp->local) | 1;
+        cp->p.qlvl = dq_level(cp->p.qkey);
+    }
+    if (cp->p.qlvl) {
+        static _Atomic int nlog;
+        if (atomic_fetch_add(&nlog, 1) < 50)
+            LOG("[vk] cs_%llx: a build of it crashed or hung this GPU's driver before (cache/precompile_stuck.txt): built %s\n",
+                (unsigned long long)cp->p.code[0], sq_how(cp->p.qlvl >= SQ_WHOLE ? SQ_SKIP : cp->p.qlvl));
+        if (cp->p.qlvl >= SQ_WHOLE) { atomic_store(&cp->p.state, 2); return; }   // (no library path to try: skipped)
+    }
+    dq_enter(cp->p.qkey, cp->p.qlvl);
+    build_compute_(cp);
+    dq_enter(k0, l0);
+}
+static void build_compute_(CsProg *cp) {
     size_t n = 0;
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
     if (!spv) { atomic_store(&cp->p.state, 2); return; }
@@ -11327,7 +11960,10 @@ static CsProg *compute_program(NvnProgram *np) {
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate_(NULL, false);
     if (!st.program || !gx || !gy || !gz) return;
+    gmem_flush_now();   // (an earlier writer's bytes in host memory before this dispatch reads: LARECOMP_GMEM_FLUSH)
+    ring_guard();
     CsProg *cp = compute_program(st.program);
+    if (cp && cp->si && cp->si->writes_gmem && gmem_flush_on()) g_gmem_flush_pend = true;
     if (ind_log() && cp && cp->si && cp->si->writes_gmem) { ind_wdisp++; ind_note_writes(5); }
     if (g_hold_force && cp && atomic_load(&cp->p.state) == 0 && !bake_is_dead(cp)) {   // (held 30 frames: wait for it, like a bake)
         uint64_t t0 = SDL_GetTicksNS();
@@ -11452,6 +12088,7 @@ void vk_late_latch_present(void) { if (ll_canvas) late_latch_fire(true); }
 static void draw_(CmdRec *r, bool indexed) {
     if (PROFD) { prof_tp_ = prof_now(); memset(gps_ns, 0, sizeof gps_ns); }
     if (!st.program) { stat_skipped++; stat_skip_why[0]++; return; }
+    ring_guard();   // (before anything of this draw is recorded: a submission here is one between two draws)
     if (!g_debug_frame && e1_armed && e1_n) e1_report();
     if (st.program->stage_mask & 0x1C) {
         static uint64_t seen[32]; static int nseen;
@@ -11527,6 +12164,7 @@ static void draw_(CmdRec *r, bool indexed) {
         else smark_variant = true;
     }
     if (ind_log() && pr && pr->vi && pr->fi && (pr->vi->writes_gmem || pr->fi->writes_gmem)) { ind_wdraw++; ind_note_writes(0); ind_note_writes(1); }
+    if (pr && ((pr->vi && pr->vi->writes_gmem) || (pr->fi && pr->fi->writes_gmem)) && gmem_flush_on()) g_gmem_flush_pend = true;   // (flushed at the next pass / dispatch)
     g_prog_full_draw = false;
     g_bake_sync = false;
     if (PROFD && pr) {   // ("[hitch] ... first use": precompiled programs count from their first draw too)
@@ -11611,6 +12249,19 @@ static void draw_(CmdRec *r, bool indexed) {
         // at its present (vk_late_latch_present). Either upscale pass arms it (EASU, or 6dc5 at the dynamic resolution's
         // 1280x720 tier), 6dc5 only into a wider target: at 1600x900 the game runs it 1:1 into an intermediate before EASU
         bool upscale_pass = is_upscale_fs(last_hash);
+        {   // SR / FG on (vk_ngx_sr_on: SR ready, or FG, which takes the pass over for its inputs) and neither upscale
+            // pass seen in 5 minutes of presents (at 60): neither ever runs, as at the 1280x720 tier before 6dc5 was
+            // known. Once; a mod's or another version's upscale shader shows here
+            static bool up_seen, up_said;
+            if (upscale_pass) up_seen = true;
+            else if (!up_seen && !up_said && renderer_present_count() >= 18000) {
+                up_said = true;
+                if (vk_ngx_sr_on())
+                    LOG("[dlss] SR / FG on, but the game's upscale pass (fs 32845c90c668fdbb or 6dc5011326ac42a2) has not drawn "
+                        "in %llu presents: SR / FG never take it over (still in the title menu, or a mod's / another version's "
+                        "upscale shader: TOTK_DLSS_HUNT=1 lists the candidates)\n", (unsigned long long)renderer_present_count());
+            }
+        }
         if (ll_canvas && !upscale_pass && st.rt.color[0] == ll_canvas) late_latch_fire(false);
         if (upscale_pass && st.rt.color[0] && vk_late_latch_on()) {
             NvnTexture *src = last_hash == 0x6dc5011326ac42a2ull && pr->fi->ntex >= 1 ? shader_texture_object(1, &pr->fi->tex[0]) : NULL;
@@ -11628,6 +12279,10 @@ static void draw_(CmdRec *r, bool indexed) {
             dyn_invalidate();
             hl_canvas = NULL;
         }
+        // TOTK_DLSS_HDR=1: SR on the HDR scene before the game's tonemap draw (hdr_fs_draw; learned at the FXAA below)
+        if (!upscale_pass && st.rt.color[0] && st.rt.ncolor == 1 && !st.rt.depth && r->x[2] <= 6 && pr->fi->ntex >= 1 &&
+            vk_ngx_sr_hdr_on())
+            hdr_fs_draw(pr->fi->tex, pr->fi->ntex, last_hash, renderer_present_count());
         // (Any other draw that samples a texture of the latest G-buffer depth's size into a larger target is named once
         // per shader, 40 at most, to find the pass the game uses there. TOTK_DLSS_HUNT=1 only.)
         static int dlss_hunt = -1;
@@ -11659,12 +12314,22 @@ static void draw_(CmdRec *r, bool indexed) {
             // 1:1 into a 1600x900 target before EASU: SR took that one, as DLAA, and refused EASU after it)
             if (src && last_hash == 0x6dc5011326ac42a2ull && st.rt.color[0]->width <= src->width) {
                 // (that 1:1 draw is the game's FXAA: while SR runs it becomes a copy of its input, ngx.c)
+                if (vk_ngx_sr_hdr_on()) hdr_learn(st.rt.color[0], renderer_present_count());
                 vk_end_pass();
                 vk_feedback_epoch_bump();
                 bool copied = vk_ngx_sr_fxaa_bypass(vk_cmd(), vk_render_backend(src), vk_render_backend(st.rt.color[0]));
                 dyn_invalidate();
                 if (copied) return;
                 src = NULL;
+            }
+            if (src) {   // (the canvas: TOTK_DLSS_HDR's DLAA test; a frame SR ran on the HDR scene is the game's to draw)
+                TexBackend *cb_ = vk_render_backend(st.rt.color[0]);
+                if (cb_) hdr_cw = cb_->width, hdr_ch = cb_->height;
+                if (vk_ngx_sr_hdr_frame() == renderer_present_count()) {
+                    hl_canvas = st.rt.color[0];   // (FG's HUD-less image: the canvas after this draw, as when SR is off)
+                    hl_frame = renderer_present_count();
+                    src = NULL;
+                }
             }
             if (src) {
                 // the depth of the scene's size, latest first (the size changes with dynamic resolution; a later
@@ -12016,7 +12681,7 @@ smark_reselect:;
     if (!pp) {
         pp = pc_take_pipe(ph);   // built (or being built) by the shader precompile
         bool fresh = !pp;
-        if (fresh) { pp = calloc(1, sizeof *pp); pp->k = k; }
+        if (fresh) { pp = calloc(1, sizeof *pp); pp->k = k; g_pipes_made++; }
         pipe_tab[pslot].key = ph;
         pipe_tab[pslot].pipe = pp;
         if (fresh && gpl_linkable(&k) && hitch_fits(g_link_est)) {   // fast link here: no skip
@@ -12227,7 +12892,49 @@ pipe_known:;
         if (on) memcpy(f, st.poly_offset, sizeof f);
         if (equal_tol) { f[1] -= 8; on = true; }  // (see the EQUAL comment above: a few depth ulps nearer)
         DYN_SET(dyn.bias_on != on, dyn.bias_on = on, vkCmdSetDepthBiasEnable(cb, on));
-        DYN_SET(memcmp(dyn.bias, f, sizeof f), memcpy(dyn.bias, f, sizeof f), vkCmdSetDepthBias(cb, f[1], f[2], f[0]));
+        // (a DEPTH24 guest target is D32_SFLOAT here: its constant factor in D24's unit 2^-24, device.c depth bias control)
+        const TexBackend *dbk = st.rt.depth ? st.rt.depth->backend : NULL;
+        const bool unorm = g_vk.dbias_unorm && dbk && (st.rt.depth->format == 0x33 || st.rt.depth->format == 0x35) &&
+                           (dbk->format == VK_FORMAT_D32_SFLOAT || dbk->format == VK_FORMAT_D32_SFLOAT_S8_UINT);
+        DYN_SET(memcmp(dyn.bias, f, sizeof f) || dyn.bias_unorm != unorm, (memcpy(dyn.bias, f, sizeof f), dyn.bias_unorm = unorm),
+                set_depth_bias(cb, f, unorm));
+        // '[d24bias]' (LEAD 04:45): once per distinct depth target kind (NVN format, size, layers) drawn with the game's polygon
+        // offset, and its bias draws every 30 s (10 lines at most): whether the sun cascades are DEPTH24 (the D24 unit reaches
+        // them) or DEPTH32F (not: the game picks the format through agl, no literal at the shadow sites)
+        static struct { uint32_t fmt, w, h, d; uint64_t n; } kinds[24];
+        static int nk, cur = -1, nsum;
+        static const NvnTexture *seen_t;
+        static uint64_t sum_t;
+        if ((st.poly[3] & 4) && st.rt.depth) {
+            const NvnTexture *t = st.rt.depth;
+            if (t != seen_t) {
+                seen_t = t;
+                int i = 0;
+                while (i < nk && !(kinds[i].fmt == t->format && kinds[i].w == t->width && kinds[i].h == t->height && kinds[i].d == t->depth)) i++;
+                if (i == nk && nk < 24) {
+                    kinds[nk++] = (__typeof__(kinds[0])){t->format, t->width, t->height, t->depth, 0};
+                    LOG("[d24bias] target %ux%u x%u guest fmt %#x (vk %d): polygon offset units %g, factor %g, clamp %g, %s\n",
+                        t->width, t->height, t->depth, t->format, dbk ? (int)dbk->format : 0, f[1], f[0], f[2],
+                        unorm ? "in D24's unit (FORCE_UNORM)" : t->format == 0x33 || t->format == 0x35 ? "DEPTH24 in the float unit (no extension / =0)"
+                                                              : "its own unit");
+                }
+                cur = i < nk ? i : -1;
+            }
+            static uint32_t tick;
+            if (cur >= 0) kinds[cur].n++;
+            const uint64_t now = nsum < 10 && !(tick++ & 255) ? SDL_GetTicksNS() : 0;   // (the clock every 256 bias draws)
+            if (now && !sum_t) sum_t = now;
+            if (now && now - sum_t >= 30000000000ull) {
+                char line[1024];
+                int o = 0;
+                for (int i = 0; i < nk && o < (int)sizeof line - 64; i++)
+                    o += snprintf(line + o, sizeof line - o, "%s%ux%u x%u fmt %#x bias draws %llu", i ? "; " : "", kinds[i].w, kinds[i].h,
+                                  kinds[i].d, kinds[i].fmt, (unsigned long long)kinds[i].n);
+                LOG("[d24bias] last %.0f s: %s\n", (now - sum_t) / 1e9, line);
+                for (int i = 0; i < nk; i++) kinds[i].n = 0;
+                sum_t = now, nsum++;
+            }
+        }
     }
 #undef DYN_SET
     dyn_end();
@@ -12286,13 +12993,14 @@ pipe_known:;
     // mismatches.
     static int fs_tc = -1;
     if (fs_tc < 0) { const char *e = getenv("LARECOMP_FS_TEXCACHE"); fs_tc = e ? atoi(e) : 1; if (fs_tc) LOG("[vk] fragment-texture cache %d\n", fs_tc); }
-    static struct { ShaderInfo *fi; uint64_t bgen, frame, epoch; uint32_t view_gen, pool_gen; int n; bool valid;
+    static struct { ShaderInfo *fi; uint64_t bgen, frame, epoch; uint32_t view_gen, pool_gen; int n; bool valid, fx;
                     VkDescriptorImageInfo ii[64]; float sc[64][3]; uint32_t wh[64][2]; } fstc;
     static uint64_t fstc_hits, fstc_bad, fstc_ver = 1;   // (ver: bumped at every refill of fstc.ii, never 0)
     extern uint32_t vk_view_gen, g_pool_gen;
     extern uint64_t vk_frame_counter(void);
     int fs_n = pr->fi->ntex < 64 ? pr->fi->ntex : 64;
-    bool fs_same = fs_tc && fstc.valid && !nfeedback && !pk_subst_tex && fstc.fi == pr->fi && fstc.n == fs_n && fstc.bgen == g_bind_gen[1] &&
+    const bool fs_fx = g_fs_fx = fx_draw();   // (an effect draw's samplers differ while the PC bias is raised, #50)
+    bool fs_same = fs_tc && fstc.valid && !nfeedback && !pk_subst_tex && fstc.fi == pr->fi && fstc.n == fs_n && fstc.bgen == g_bind_gen[1] && fstc.fx == fs_fx &&
                    fstc.frame == vk_frame_counter() && fstc.view_gen == memo_gen() && fstc.pool_gen == __atomic_load_n(&g_pool_gen, __ATOMIC_RELAXED) &&
                    fstc.epoch == (in_execute ? alias_epoch : 0);
     if (fs_same && fs_tc == 1) {
@@ -12315,7 +13023,7 @@ pipe_known:;
                 if (bad && fstc_bad++ < 16) LOG("[vk] fragment-texture cache would have been wrong (%llu so far)\n", (unsigned long long)fstc_bad);
             }
             fstc.valid = !nfeedback && !pk_subst_tex;
-            fstc.fi = pr->fi; fstc.n = fs_n; fstc.bgen = g_bind_gen[1]; fstc.frame = vk_frame_counter(); fstc.view_gen = memo_gen();
+            fstc.fi = pr->fi; fstc.n = fs_n; fstc.bgen = g_bind_gen[1]; fstc.fx = fs_fx; fstc.frame = vk_frame_counter(); fstc.view_gen = memo_gen();
             fstc.pool_gen = __atomic_load_n(&g_pool_gen, __ATOMIC_RELAXED); fstc.epoch = in_execute ? alias_epoch : 0;
             memcpy(fstc.ii, fii, (size_t)fs_n * sizeof *fii);
             fstc_ver++;
@@ -13216,6 +13924,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     snap_reason = "buf2tex"; snapshots_invalidate(NULL);
     NvnTexture *t = (NvnTexture *)(uintptr_t)dst->tex;
     if (!t || !src) return;
+    ring_guard();   // (a top-level op, before it records: its upload is the ring's)
     vk_end_pass(); if (contact_strength()) contact_run(vk_cmd());
     const FormatInfo *fi;
     int32_t rg[6];
@@ -13294,10 +14003,20 @@ static void mirror_guest_written(uint64_t addr, uint64_t size) {
         }
     }
 }
+static VkFormatFeatureFlags fmt_features(VkFormat f) {   // (optimal tiling; memoised: the render thread's copies)
+    static struct { VkFormat f; VkFormatFeatureFlags v; } memo[64];
+    static int n;
+    for (int i = 0; i < n; i++) if (memo[i].f == f) return memo[i].v;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g_vk.phys, f, &fp);
+    if (n < 64) { memo[n].f = f; memo[n].v = fp.optimalTilingFeatures; n++; }
+    return fp.optimalTilingFeatures;
+}
 static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     NvnTexture *t = (NvnTexture *)(uintptr_t)src->tex;
     if (!t || !dst || dst < HEAP_BASE) return;
     if (g_debug_frame) LOG("[readback] tex %ux%u f%#x -> %llx\n", t->width, t->height, t->format, (unsigned long long)dst);
+    ring_guard();
     vk_end_pass(); if (contact_strength()) contact_run(vk_cmd());
     const FormatInfo *fi;
     int32_t rg[6];
@@ -13337,8 +14056,10 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
         vk_image_init_layout(cb, srcimg, VK_IMAGE_ASPECT_COLOR_BIT);
         VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)level, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)hw, (int32_t)hh, 1}},
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)gw, (int32_t)gh, 1}}};
-        // (integer formats cannot be filtered: nearest, as copy_texture)
-        vkCmdBlitImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, srcimg, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, rt_kind(t->format) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+        // (integer formats cannot be filtered: nearest, as copy_texture) (a source the device cannot
+        // filter: nearest, as copy_texture)
+        const bool lin = !rt_kind(t->format) && (fmt_features(b->format) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+        vkCmdBlitImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, srcimg, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, lin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
         vk_full_barrier(cb);
         rlevel = 0;
     } else if ((tsx != 1 || tsy != 1) && !renderer_format_is_depth(t->format) && (b->layers > 1 || b->depth > 1)) {
@@ -13367,6 +14088,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     snap_reason = "tex2tex"; snapshots_invalidate(NULL);
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
     if (!st_ || !dt) return;
+    ring_guard();
     extern bool tex_watched(uint64_t addr);
     if (tex_watched(dt->addr) || tex_watched(st_->addr))
         LOG("[texw] copy texture %llx %ux%ux%u -> %llx %ux%ux%u (src lv %d, dst lv %d, region z %d+%d)\n", (unsigned long long)st_->addr,
@@ -13444,6 +14166,20 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
         if (dx0 + dw > dlw) dw = dlw - dx0;
         if (dy0 + dh > dlh) dh = dlh - dy0;
         if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+        // compact textures (textures.c astc_bc3_on: decoded ASTC kept as BC3): into one only a BC3 -> BC3 copy of whole
+        // 4x4 blocks (or up to a level's edge) is valid; a blit cannot write BC, nor a copy start inside a block (a 5x5
+        // or 10x10 ASTC copy's offsets): skipped, logged. Before, these images were RGBA8.
+        if (d->astc_bc3) {
+            bool whole = s->format == d->format && sw == dw && sh == dh && !((sx0 | sy0 | dx0 | dy0) & 3) &&
+                         (!(sw & 3) || (sx0 + sw == slw && dx0 + dw == dlw)) && (!(sh & 3) || (sy0 + sh == slh && dy0 + dh == dlh));
+            if (!whole) {
+                static int nlog;
+                if (nlog++ < 8)
+                    LOG("[vk] copy into a compact (BC3) texture skipped: f%#x (vk %d) %d,%d %dx%d -> f%#x %d,%d %dx%d (not whole blocks)\n",
+                        st_->format, s->format, sx0, sy0, sw, sh, dt->format, dx0, dy0, dw, dh);
+                return;
+            }
+        }
     }
     if (g_debug_frame)
         LOG("[copytex] %p %ux%u f%#x lv%u (%d,%d %dx%d) [%ux%u] -> %p %ux%u f%#x lv%u (%d,%d %dx%d) [%ux%u] phys (%d,%d %dx%d) -> (%d,%d %dx%d) flags %llx\n",
@@ -13474,6 +14210,31 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
                       .dstSubresource = {depth ? (da & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : da) : da, dlv, dly, 1},
                       .dstOffsets = {{dx0, dy0, 0}, {dx0 + dw, dy0 + dh, 1}}};
     bool linear = (flags & 1) && !depth && !rt_kind(st_->format);
+    {   // A blit is valid only where the device lists BLIT_SRC / BLIT_DST for the two formats, and a linear one only where
+        // it can filter the source (public #39, Arc B580: white patches on water and in caves that move with the view;
+        // NVIDIA lists every format the game copies, other GPUs not all): a linear blit the source cannot filter is made
+        // nearest (valid). Each format pair / filter is logged once, with what the device lacks for it, if anything (a
+        // field log then names the game's scaled copies: its depth pyramid, reflection probe and colour downsamples).
+        const VkFormatFeatureFlags sf = fmt_features(s->format), df = fmt_features(d->format);
+        const bool nofilter = linear && !(sf & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+        if (nofilter) linear = false;
+        const bool noblit = !(sf & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(df & VK_FORMAT_FEATURE_BLIT_DST_BIT);
+        static uint64_t seen[48];
+        static int nseen;
+        const uint64_t k = (uint64_t)s->format << 33 | (uint64_t)d->format << 1 | (linear || nofilter);
+        bool found = false;
+        for (int i = 0; i < nseen; i++) found |= seen[i] == k;
+        if (!found && nseen < 48) {
+            seen[nseen++] = k;
+            LOG("[vk] copy blit f%#x -> f%#x (vk format %d -> %d, %ux%u -> %ux%u, %s)%s\n", st_->format, dt->format, s->format,
+                d->format, (unsigned)sw, (unsigned)sh, (unsigned)dw, (unsigned)dh, linear ? "linear" : "nearest",
+                !noblit ? (nofilter ? ": the source cannot be filtered here: nearest" : "")
+                : !(sf & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && !(df & VK_FORMAT_FEATURE_BLIT_DST_BIT)
+                    ? ": this GPU cannot blit from the source format nor to the destination format: undefined here"
+                : !(sf & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ? ": this GPU cannot blit from the source format: undefined here"
+                                                          : ": this GPU cannot blit to the destination format: undefined here");
+        }
+    }
     dl_note("  blit %p lv%u/%u %ux%u (%d,%d %dx%d) -> %p lv%u/%u %ux%u (%d,%d %dx%d) %s", (void *)s->image, slv, s->levels, s->width,
             s->height, sx0, sy0, sw, sh, (void *)d->image, dlv, d->levels, d->width, d->height, dx0, dy0, dw, dh, linear ? "linear" : "nearest");
     vkCmdBlitImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
@@ -14038,6 +14799,22 @@ static void ind_note_indirect(int kind, uint64_t addr) {   // (0 DrawElementsInd
     ind_n[kind]++;
     for (int i = 0; i < ind_nw; i++) if (addr >= ind_w[i].lo && addr < ind_w[i].hi) { ind_hit[kind]++; break; }
 }
+// TOTK_GLITCH_DETECT: the addresses SAMPLES_PASSED (type 1) reports are written to, so '[condflip]' can say whether its
+// pair is occlusion reports or something else; the first 64 logged '[oqaddr]'. Render thread.
+static uint64_t oqa_tab[1024];
+static unsigned oqa_n;
+static void oqa_note(uint64_t a) {
+    extern bool vk_glitch_on(void);
+    if (!a || !vk_glitch_on()) return;
+    for (unsigned i = 0; i < oqa_n; i++) if (oqa_tab[i] == a) return;
+    if (oqa_n >= 1024) return;
+    oqa_tab[oqa_n++] = a;
+    if (oqa_n <= 64) LOG("[oqaddr] occlusion (type 1) report #%u at %llx (mode %d)\n", oqa_n, (unsigned long long)a, oq_on());
+}
+static bool oqa_has(uint64_t a) {
+    for (unsigned i = 0; i < oqa_n; i++) if (oqa_tab[i] == a) return true;
+    return false;
+}
 static void exec_list(uint64_t handle, int depth) {
     if (!depth && ind_log()) {
         if (ind_lists && ind_lists % 60 == 0) {
@@ -14312,6 +15089,7 @@ static void exec_list(uint64_t handle, int depth) {
             if (apply < 0) apply = getenv("LARECOMP_COND_RENDER") ? atoi(getenv("LARECOMP_COND_RENDER")) : 1;
             if (r->x[0] < 2) { g_render_off = false; break; }
             const uint64_t *ctr = (const uint64_t *)(uintptr_t)r->x[1];
+            if (ctr) sync_guard_note(r->x[1], 24);   // (read now, for the frame being replayed: LARECOMP_SYNC_GUARD)
             bool equal = ctr && ctr[0] == ctr[2];
             bool render = r->x[0] == 2 ? equal : !equal;
             g_cond_evals++;
@@ -14331,10 +15109,12 @@ static void exec_list(uint64_t handle, int depth) {
                             g_cond_flips++;
                             uint64_t bk = r->x[1] >= HEAP_BASE && ((r->x[1] - HEAP_BASE) >> GDEV_SH) < GDEV_BLKS ? (r->x[1] - HEAP_BASE) >> GDEV_SH : 0;
                             if (nlog++ < 300)
-                                LOG("[condflip] addr %llx frame %llu: %u evals pattern %#x (prev frame %u evals %#x) | now %llx vs %llx mode %llu | shader-written blk seq %llu (submit %llu)\n",
+                                LOG("[condflip] addr %llx frame %llu: %u evals pattern %#x (prev frame %u evals %#x) | now %llx vs %llx mode %llu | shader-written blk seq %llu (submit %llu)%s\n",
                                     (unsigned long long)r->x[1], (unsigned long long)ct[i].frame, ct[i].n, ct[i].pat, ct[i].pn, ct[i].ppat,
                                     ctr ? (unsigned long long)ctr[0] : 0ull, ctr ? (unsigned long long)ctr[2] : 0ull,
-                                    (unsigned long long)(r->x[0] - 2), (unsigned long long)gdev_blk[bk], (unsigned long long)submit_seq);
+                                    (unsigned long long)(r->x[0] - 2), (unsigned long long)gdev_blk[bk], (unsigned long long)submit_seq,
+                                    !oqa_n ? "" : oqa_has(r->x[1]) && oqa_has(r->x[1] + 16) ? " | both occlusion reports"
+                                               : oqa_has(r->x[1]) || oqa_has(r->x[1] + 16) ? " | one occlusion report" : " | no occlusion report");
                         }
                         ct[i].ppat = ct[i].pat, ct[i].pn = ct[i].n, ct[i].prev = true;
                         ct[i].pat = 0, ct[i].n = 0, ct[i].frame = fr;
@@ -14362,6 +15142,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_DRAW_ELEMENTS: draw(r, true); break;
         case CMD_UPDATE_UNIFORM_BUFFER:
             memcpy((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3]);
+            sync_guard_note_write(r->x[0] + r->x[2], r->x[3]);   // (LARECOMP_SYNC_GUARD: not guarded, the replay writes it)
             // (uniform buffers reach the heap mirror only with LARECOMP_UBO_ZEROCOPY=2; otherwise they are the snapshots
             // flushed below, and ~280 inline updates a frame (d55) would each re-sync a mirror chunk for nothing)
             if (ubo_zc == 2) mirror_guest_written(r->x[0] + r->x[2], r->x[3]);
@@ -14509,8 +15290,9 @@ static void exec_list(uint64_t handle, int depth) {
             }
             if (type == 0 || type == 16) dsub_live = !hold;
             const bool owned = (type == 0 || type == 16) && !hold && dts_claim(type, out, host_v, k);
-            if (out) { out[0] = v; if (!owned) out[1] = host_v; }
+            if (out) { out[0] = v; if (!owned) out[1] = host_v; sync_guard_note_write(r->x[1], 16); }
             if (type == 1 && oq_mode == 2) oq_report(out);
+            if (type == 1) oqa_note(r->x[1]);
             if (g_debug_frame) LOG("[counter] type %u -> %llx value %llu\n", type, (unsigned long long)r->x[1], (unsigned long long)v);
             break;
         }
@@ -14534,6 +15316,7 @@ static void exec_list(uint64_t handle, int depth) {
             renderer_flush();
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
             mirror_guest_written(r->x[1], r->x[2]);
+            sync_guard_note_write(r->x[1], r->x[2]);
             break;
         default: {   // (not executed: logged once per op, and every time in a debug frame)
             static uint64_t seen[CMD_COUNT];
@@ -14549,8 +15332,10 @@ static void exec_list(uint64_t handle, int depth) {
 }
 
 static pthread_mutex_t exec_mu = PTHREAD_MUTEX_INITIALIZER;
-void backend_exec_lock(void) { pthread_mutex_lock(&exec_mu); }
-void backend_exec_unlock(void) { pthread_mutex_unlock(&exec_mu); }
+static _Thread_local int tl_exec_held;   // (LARECOMP_SYNC_GUARD: a game thread holding it must not wait for the render thread)
+void backend_exec_lock(void) { pthread_mutex_lock(&exec_mu); tl_exec_held++; }
+void backend_exec_unlock(void) { tl_exec_held--; pthread_mutex_unlock(&exec_mu); }
+bool backend_exec_lock_held(void) { return tl_exec_held > 0; }
 
 static void deferred_frees(void);
 static void backend_execute_now(uint64_t handle) {
@@ -14665,6 +15450,7 @@ static void *async_main(void *arg) {
             s->ring_seq[op.a & 3] = q;   // (op.a: the sync's fence number, backend_async_fence)
             s->seq = q;
             s->signaled = 1;
+            sync_guard_fence(s, aq_head + 1);   // (this op's ticket; before aq_done moves past it: LARECOMP_SYNC_GUARD)
             break;
         }
         case AOP_PRESENT: vk_present_set_frame(op.a); backend_present((NvnTexture *)op.p); break;   // (op.a: low latency's frame)
@@ -14811,7 +15597,7 @@ static void *bench_worker(void *arg) {
         uint64_t before[8];
         memcpy(before, pa_tm, sizeof before);
         uint64_t t0 = SDL_GetTicksNS();
-        if (ok && pc_claim_prog(r->ckey, p) == p) translate_program(p);
+        if (ok && pc_claim_prog(r->ckey, p) == p) { g_progs_pre++; translate_program(p); }
         else { free(p); p = NULL; }
         o->ms[5] = (SDL_GetTicksNS() - t0) / 1e6;
         for (int k = 0; k < 5; k++) o->ms[k] = (pa_tm[k] - before[k]) / 1e6;
@@ -14835,6 +15621,7 @@ static void *bench_worker(void *arg) {
         pp->claimed = 1;
         if (pc_take_pipe(ph)) { free(pp); continue; }
         pc_put_pipe(ph, pp);
+        g_pipes_pre++;
         o->fast = gpl_linkable(&pp->k);
         uint64_t t0 = SDL_GetTicksNS();
         build_pipeline_body(pp);
@@ -15039,6 +15826,7 @@ static void *prep_worker(void *arg) {
             free((void *)(uintptr_t)p->code[0]);
             free(p);
         } else if (pc_claim_prog(r->ckey, p) == p) {
+            g_progs_pre++;
             translate_unlocked = !(u && !strcmp(u, "0"));
             translate_program(p);
             translate_unlocked = false;
@@ -15063,6 +15851,7 @@ static void *prep_worker(void *arg) {
             if (pc_take_pipe(ph)) free(pp);
             else {
                 pc_put_pipe(ph, pp);
+                g_pipes_pre++;
                 pcw_begin(2, hash_words(r->ckey, &r->k, sizeof(PipeKey)) ^ 0x5bd1e995ull);
                 build_pipeline_body(pp);
                 if (!pcw_end()) continue;   // (given up and counted: vk_prepare's loop)

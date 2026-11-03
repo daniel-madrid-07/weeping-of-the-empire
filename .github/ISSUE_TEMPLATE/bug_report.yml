@@ -1,5 +1,5 @@
 name: Bug report
-description: Something is wrong in the game or in the build.
+description: Something is wrong in the game, in Setup or in the launcher.
 labels: [bug]
 body:
   - type: markdown
@@ -11,10 +11,11 @@ body:
     attributes:
       label: Where does it happen?
       options:
-        - Build (Setup / Builder)
+        - Setup (install or update)
         - Start-up (before the title screen)
         - In game
         - Settings (F10) / controls
+        - Launcher (before the game starts)
     validations:
       required: true
   - type: textarea
@@ -24,24 +25,23 @@ body:
       description: Steps to see it, where in the game, and how often. A screenshot helps.
     validations:
       required: true
-  - type: input
-    id: version
-    attributes:
-      label: Version
-      description: The release or commit you built (the launcher's README.txt and `git log -1` show it).
-    validations:
-      required: true
   - type: textarea
-    id: pc
+    id: sysinfo
     attributes:
-      label: PC
-      description: CPU, GPU and driver version, RAM, Windows version, display resolution.
-      placeholder: "Ryzen 7 5800X, RTX 3070 (driver 566.36), 32 GB, Windows 11 24H2, 2560x1440"
+      label: System info
+      description: In the game, press F10 and then **Copy system info** at the bottom of the window, and paste it here. It holds the version, Windows, CPU, GPU and driver, display and the settings you changed (no user name, no paths). If the game does not get that far, write your CPU, GPU and driver version, RAM and Windows version instead.
+      render: text
+      placeholder: "Release v0.1.x, commit ...\nWindows 11 ...\nCPU: ...\nGPU: ... (driver ...)\n..."
     validations:
       required: true
   - type: textarea
     id: log
     attributes:
       label: Log
-      description: Attach the log file from the game folder (it has no keys in it). For a build problem, the last 50 lines of the Builder's output.
-      render: text
+      description: |
+        Attach the game's log: open `%LOCALAPPDATA%\nxrecomp\TotK-engine\logs` (paste it in Explorer's address bar) and drag the newest `totk-*.log` here. After a crash, also attach the newest `crash-*.txt` from the `crashes` folder next to it. Never attach the `.dmp` file next to it: it holds the game's memory; the `.txt` is enough. When an error box offers to open the log, that is the same file. For Setup: `setup.log` in your install folder. The logs hold no keys; the paths in them can show your Windows user name.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Only if the system info above is missing (the first lines of README.txt in the game's folder show it).

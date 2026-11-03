@@ -21,7 +21,8 @@ static class PreflightTest
             foreach (var line in File.ReadAllLines(args[1]))
             {
                 var f = line.Split('\t');
-                Console.WriteLine("INPUTS\t" + (Inputs.Check(f[0] == "-" ? null : f[0], f[1], f[2] == "-" ? null : f[2]) ?? ""));
+                Console.WriteLine("INPUTS\t" + (Inputs.Check(f[0] == "-" ? null : f[0], f[1] == "-" ? null : f[1], f[2] == "-" ? null : f[2]) ?? ""));
+                Console.WriteLine("PACKED\t" + (Inputs.Compressed(f[0] == "-" ? null : f[0]) ? "1" : "0"));   // (CopyDefault's)
             }
             return 0;
         }

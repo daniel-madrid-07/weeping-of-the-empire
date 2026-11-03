@@ -144,46 +144,69 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
 }
 
 // LARECOMP_FLOAT_PRESERVE=1: every module declares OpExecutionMode SignedZeroInfNanPreserve 32 (SPIR-V 1.4+ core,
-// capability 4466 / mode 4461). Without it the driver may assume a shader never sees inf / NaN, while Maxwell code
-// relies on them (MUFU.LG2 of 0 = -inf). ScarletNX (github.com/scarletnx/ScarletNX, its notes): TotK's lighting came
-// out as NaN blocks until its SPIR-V declared it. Candidate for the black cave lighting. Applied after the disk cache
-// (cached SPIR-V stays unpatched), so the switch costs pipeline builds, not GLSL compiles.
+// capability 4466 / mode 4461). Without it the driver may assume a shader never sees inf / NaN, while Maxwell code relies
+// on them (MUFU.LG2 of 0 = -inf). ScarletNX (github.com/scarletnx/ScarletNX, its notes): TotK's lighting came out as NaN
+// blocks until its SPIR-V declared it. Candidate for the black cave lighting. Applied after the disk cache (cached SPIR-V
+// stays unpatched), so the switch costs pipeline builds, not GLSL compiles. Default on for Intel GPUs. The translator's
+// NaN rules (FMNMX's NaN-select,.SAT's NaN -> 0, the prelude's fmin / fmax / saturate) are isnan() tests, and without the
+// mode a driver may fold them to false (the no-NaN licence), so a NaN from the game's lighting (0 * inf, LG2 of 0) could
+// reach the render target. NVIDIA keeps them either way (default off there: no rebuild of its pipelines). Found while
+// chasing public #39 (Arc B580, white patches on water and in caves), which it did not fix (the reporter's run with it
+// on, 2026-11-02): kept for the rules' sake. LARECOMP_FLOAT_PRESERVE=1 on every GPU, =0 never. LARECOMP_FLOAT_FTZ=1 (a
+// test, default off; public #39's white blow-outs on Arc): also DenormFlushToZero 32 (capability 4465 / mode 4460).
+// Maxwell's float ops mostly run.FTZ and NVIDIA's driver flushes 32-bit denormals, so a game value in the denormal range
+// is 0 there; a driver that keeps denormals hands 1 / x or rsqrt(x) a tiny non-zero instead: a huge finite result where
+// the game's maths expected 0 -> inf, which its clamps handle. The returned mask: 1 preserve, 2 FTZ.
 static int float_preserve(void) {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("LARECOMP_FLOAT_PRESERVE");
+        const char *e = getenv("LARECOMP_FLOAT_PRESERVE"), *z = getenv("LARECOMP_FLOAT_FTZ");
         on = 0;
-        if (e && *e == '1') {
+        const bool want_p = e && *e ? *e == '1' : g_vk.props.vendorID == 0x8086, want_z = z && *z == '1';
+        if (want_p || want_z) {
             VkPhysicalDeviceFloatControlsProperties fc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
             VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &fc};
             vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
-            on = fc.shaderSignedZeroInfNanPreserveFloat32 ? 1 : 0;
-            LOG("[shader] float controls: SignedZeroInfNanPreserve 32 %s\n", on ? "on" : "NOT supported by the device: off");
+            if (want_p) {
+                on |= fc.shaderSignedZeroInfNanPreserveFloat32 ? 1 : 0;
+                LOG("[shader] float controls: SignedZeroInfNanPreserve 32 %s%s\n", on & 1 ? "on" : "NOT supported by the device: off",
+                    e && *e ? " (LARECOMP_FLOAT_PRESERVE)" : " (Intel default)");
+            }
+            if (want_z) {
+                on |= fc.shaderDenormFlushToZeroFloat32 ? 2 : 0;
+                // (denormBehaviorIndependence NONE: one denormal mode for every width, so a 16 / 64-bit float in a module
+                // would make it invalid there (VUID 06290); translate.c emits none)
+                LOG("[shader] float controls: DenormFlushToZero 32 %s (LARECOMP_FLOAT_FTZ; denorm behaviour independence %d)\n",
+                    on & 2 ? "on" : "NOT supported by the device: off", (int)fc.denormBehaviorIndependence);
+            }
         }
     }
     return on;
 }
 int vk_spirv_float_preserve(void) { return float_preserve(); }   // (exec.c: part of the archive warm-up stamp)
 static uint32_t *add_float_preserve(uint32_t *spv, size_t *nwords) {
-    enum { OP_CAPABILITY = 17, OP_ENTRY_POINT = 15, CAP_PRESERVE = 4466, MODE_PRESERVE = 4461 };
-    if (!spv || !float_preserve()) return spv;
+    enum { OP_CAPABILITY = 17, OP_ENTRY_POINT = 15, CAP_PRESERVE = 4466, MODE_PRESERVE = 4461, CAP_FTZ = 4465, MODE_FTZ = 4460 };
+    const int fm = spv ? float_preserve() : 0;
+    if (!fm) return spv;
     size_t n = *nwords, caps_end = 5, ep_end = 0;
     uint32_t entry = 0;
     for (size_t i = 5; i < n;) {
         uint32_t wc = spv[i] >> 16, op = spv[i] & 0xFFFF;
         if (!wc) return spv;
-        if (op == OP_CAPABILITY) { if (spv[i + 1] == CAP_PRESERVE) return spv; caps_end = i + wc; }
+        if (op == OP_CAPABILITY) { if (spv[i + 1] == CAP_PRESERVE || spv[i + 1] == CAP_FTZ) return spv; caps_end = i + wc; }
         if (op == OP_ENTRY_POINT && !ep_end) { entry = spv[i + 2]; ep_end = i + wc; }
         if (ep_end && op != OP_ENTRY_POINT) break;
         i += wc;
     }
     if (!ep_end) return spv;
-    uint32_t *out = malloc((n + 6) * 4);
+    uint32_t *out = malloc((n + 12) * 4);
     size_t o = 0;
     memcpy(out, spv, caps_end * 4); o = caps_end;
-    out[o++] = 2u << 16 | OP_CAPABILITY; out[o++] = CAP_PRESERVE;
+    if (fm & 1) { out[o++] = 2u << 16 | OP_CAPABILITY; out[o++] = CAP_PRESERVE; }
+    if (fm & 2) { out[o++] = 2u << 16 | OP_CAPABILITY; out[o++] = CAP_FTZ; }
     memcpy(out + o, spv + caps_end, (ep_end - caps_end) * 4); o += ep_end - caps_end;
-    out[o++] = 4u << 16 | 16; out[o++] = entry; out[o++] = MODE_PRESERVE; out[o++] = 32;   // OpExecutionMode
+    if (fm & 1) { out[o++] = 4u << 16 | 16; out[o++] = entry; out[o++] = MODE_PRESERVE; out[o++] = 32; }   // OpExecutionMode
+    if (fm & 2) { out[o++] = 4u << 16 | 16; out[o++] = entry; out[o++] = MODE_FTZ; out[o++] = 32; }
     memcpy(out + o, spv + ep_end, (n - ep_end) * 4); o += n - ep_end;
     free(spv);
     *nwords = o;

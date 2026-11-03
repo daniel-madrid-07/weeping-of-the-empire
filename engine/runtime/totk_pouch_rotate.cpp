@@ -19,7 +19,6 @@
 #include <cstring>
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 constexpr u64 kRight = 0x20, kLeft = 0x28, kUserName = 0x38;
 
 void stf(u64 a, float v) { u32 w; memcpy(&w, &v, 4); st32(a, w); }
@@ -51,9 +50,9 @@ void hook_f_1f61d6c(Ctx *__restrict c) {   // QueryControllerGetStick's worker (
         printf("[pouch-rotate] UI stick in AI programs %s\n", v ? "per 30 Hz of game time" : "per frame, as the game (TOTK_POUCH_ROTATE=0)");
         return v;
     }();
-    const u64 fd = totk_global(kFrameDelta);
+    const u64 fd = totk_frame_delta();
     if (!on || !totk_ptr_ok(q) || !totk_ptr_ok(fd)) return;
-    const float r = ldf32(fd + 8);
+    const float r = totk_frame_ratio(fd);
     if (!(r > 0.01f && r < 1.0f) || !is_ui(q)) return;
     for (u64 o : {kRight, kLeft, kRight + 4, kLeft + 4}) stf(q + o, ldf32(q + o) * r);
 }

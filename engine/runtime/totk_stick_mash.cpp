@@ -16,6 +16,9 @@
 // bits and the leave-the-dead-zone edge are the original's (events, frame-rate independent). At 30 fps and below
 // (r >= 1) the original exactly. One tracker (Link: the only Player). gen.py --hook 16e4610 in GEN_MAIN;
 // TOTK_STICK_MASH=0: the original alone. tools/oracle/test_stick_mash.py.
+// 1.4.3's isStickMash (main+0x1cfbc70) scales the angle change by the frame-delta object's 1 / ratio before the pi/16
+// test, so its threshold is in rad/s, but it still mashes on every frame of a spin: the hook's answer (one angle mash
+// per 30 Hz tick, from the same Player fields) is the same there; the actor's component pointer moved (Actor +0x228).
 #include "rt.h"
 #include "totk_globals.h"
 
@@ -27,7 +30,6 @@
 extern "C" void *totk_data_page_current(void);   // games/totk/runtime/totk_patches.c: the data page, or NULL
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 constexpr u64 kPresents = 88;            // data_page.h TOTK_DP_PRESENTS (u32, one per game present)
 // the original's constants, bit-exact: 0.05 (main+0x3776494), pi (0x3775b84), 2 pi (0x3775f60), pi/16 (0x37761d4)
 constexpr u32 kDeadBits = 0x3d4ccccd, kPiBits = 0x40490fdb, kTwoPiBits = 0x40c90fdb, kMashBits = 0x3e490fdb;
@@ -82,11 +84,11 @@ void hook_f_16e4610(Ctx *__restrict c) {   // GameActor::isStickMash(this)
         return v;
     }();
     const u8 *page = (const u8 *)totk_data_page_current();
-    const u64 fd = totk_global(kFrameDelta);
-    if (!on || !page || !totk_ptr_ok(fd) || !totk_ptr_ok(actor)) return;
-    const float r = ldf32(fd + 8);
+    const u64 fd = totk_frame_delta();
+    if (!on || !page || !totk_ptr_ok(fd) || !totk_ptr_ok(actor) || !totk_field_known(Actor, 0x220)) return;
+    const float r = totk_frame_ratio(fd);
     if (!(r > 0.01f) || !(r < 1.0f)) return;   // 30 fps and below: the original
-    const u64 comp = ld64(actor + 0x220), p = totk_ptr_ok(comp) ? ld64(comp + 0x3a8) : 0;
+    const u64 comp = ld64(actor + totk_field(Actor, 0x220)), p = totk_ptr_ok(comp) ? ld64(comp + 0x3a8) : 0;
     if (!totk_ptr_ok(p)) return;
     const u64 key_p = ld64(p + 0x38), len_p = ld64(p + 0x98), pre_len_p = ld64(p + 0xa8), pre_p = ld64(p + 0x68),
               cur_p = ld64(p + 0x78);

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Weeping of the Empire
+Comment=Native PC build of your own Tears of the Kingdom dump: Setup and Play
+Exec=AppRun
+Icon=weeping-of-the-empire
+Categories=Game;
+Terminal=false

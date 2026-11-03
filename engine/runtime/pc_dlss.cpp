@@ -20,9 +20,28 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <stdio.h>
+
+#include "pc_text.h"
+
 extern "C" void vk_ngx_request(int sr, int fg);   // nvn/vulkan/ngx.c (-1: unchanged)
+extern "C" void vk_set_fg_max(bool on);           // nvn/vulkan/device.c: frame generation 'Maximum fps'
+extern "C" void osd_toast(const char *text, int ms);   // hle_osd.cpp
 
 namespace {
+
+// graphics.safe_mode (pc_settings.cpp pc_safe_mode_env: their variables are gone from the start): DLSS, DLAA, FSR and
+// frame generation stay off for the whole run, also when a row is changed in F10; the change is still saved and
+// applies at a start without safe mode
+bool safe_mode() {
+    const char *e = getenv("TOTK_SAFE_MODE");
+    return e && !strcmp(e, "1");
+}
+void safe_mode_refuse() {
+    vk_ngx_request(0, 0);   // (ngx.c apply_request: off whatever is on, not just this change ignored)
+    osd_toast(pc_tr("Safe mode is on: DLSS, FSR and frame generation stay off"), 5000);
+    printf("[settings] safe mode: an upscaler / frame generation change in F10 left off (saved for later starts)\n");
+}
 
 constexpr int FG_FSR = 16;   // (vk.h VK_NGX_FG_FSR)
 
@@ -42,8 +61,22 @@ void fg_to_env(const char *v) {   // (v: one of V_FG; Off removes them all, so a
     _putenv_s("TOTK_DLSS_FG_FRAMES", fsr ? "" : v);
     _putenv_s("TOTK_FSR_FG", fsr ? "1" : "");
 }
-void sr_apply(const char *v) { vk_ngx_request(!*v ? 0 : !strcmp(v, "fsr") ? 2 : !strcmp(v, "dlaa") ? 3 : 1, -1); }
-void fg_apply(const char *v) { vk_ngx_request(-1, !*v ? 0 : !strcmp(v, "fsr") ? FG_FSR : atoi(v)); }
+void sr_apply(const char *v) {
+    if (*v && safe_mode()) return safe_mode_refuse();   // (Off goes through: nothing to refuse)
+    vk_ngx_request(!*v ? 0 : !strcmp(v, "fsr") ? 2 : !strcmp(v, "dlaa") ? 3 : 1, -1);
+}
+void fg_apply(const char *v) {
+    if (*v && strcmp(v, "0") && safe_mode()) return safe_mode_refuse();
+    vk_ngx_request(-1, !*v ? 0 : !strcmp(v, "fsr") ? FG_FSR : atoi(v));
+}
+// graphics.frame_gen_pace: "" Smooth, the frames shown matched to the refresh (the real ones at the cap / (n + 1), on
+// whole refreshes: hle_vi.cpp); "max" Maximum fps, the real frames as without FG and n generated after each, past the
+// refresh (MAILBOX in place of FIFO while FG is on; tearing only with V-sync off, the player's pick). Live: hle_vi reads
+// it every frame, device.c makes the swapchain again when the present mode changes.
+const char *const V_FGPACE[] = {"", "max", nullptr};
+const char *const N_FGPACE[] = {"Smooth (matched to the refresh)", "Maximum fps", nullptr};
+void fgpace_to_env(const char *v) { _putenv_s("TOTK_FG_PACE", !strcmp(v, "max") ? "max" : ""); }
+void fgpace_apply(const char *v) { vk_set_fg_max(!strcmp(v, "max")); }
 
 const pc_setting k_dlss[] = {
     {"graphics.dlss", "Graphics", "Rendering", "Upscaler", "TOTK_DLSS_SR / TOTK_FSR_SR. DLSS (NVIDIA "
@@ -54,6 +87,11 @@ const pc_setting k_dlss[] = {
      "frames between real ones: DLSS x2 on NVIDIA RTX 40 series and newer, x3 and x4 on RTX 50; FSR x2 on any GPU. The "
      "frame cap counts the frames shown (at a 30 cap: x2, 60 shown). Adds some input latency.",
      "", V_FG, N_FG, 0, 0, 0, 0, nullptr, fg_to_env, fg_apply, nullptr},
+    {"graphics.frame_gen_pace", "Graphics", "Rendering", "Frame generation mode", "TOTK_FG_PACE. Smooth: the frames shown "
+     "match the monitor (real ones at the cap divided by the multiplier). Maximum fps: the real frames as without frame "
+     "generation and the multiplier's generated ones after each, past the refresh rate, with VRR too (mailbox, else "
+     "immediate, which can tear; the panel may leave VRR; TOTK_FG_MAX_VRR_FIFO=1 keeps VRR's FIFO).", "", V_FGPACE, N_FGPACE, 0, 0, 0, 0, nullptr, fgpace_to_env,
+     fgpace_apply, nullptr},
 };
 
 struct AddDlssRows {

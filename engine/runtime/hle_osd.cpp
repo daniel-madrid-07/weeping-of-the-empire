@@ -270,6 +270,7 @@ extern "C" const uint32_t* osd_fps(const char* text, int target_h, int* w, int* 
 // first start spends its precompile) hid it. Render thread only. TOTK_OSD=0 hides it with the rest.
 extern "C" size_t g_vk_pcache_loaded;
 extern "C" int vk_precompile_cold_active(void);   // exec.c: the first-start pass (every core but one)
+extern "C" int vk_precompile_mem_paused(void);    // exec.c pc_mem_pause: no new items while free RAM is short
 static OsdBlock g_pc;
 extern "C" const uint32_t* osd_precompile(int target_h, int* w, int* h) {
     static const bool off = getenv("TOTK_OSD") && getenv("TOTK_OSD")[0] == '0';
@@ -286,6 +287,10 @@ extern "C" const uint32_t* osd_precompile(int target_h, int* w, int* h) {
     char b[160];
     snprintf(b, sizeof b, vk_precompile_cold_active() ? pc_tr("Preparing the shaders for this PC (first start): %d %%")
                           : compiling ? pc_tr("Compiling shaders %d %%") : pc_tr("Loading shaders %d %%"), pct);
+    if (vk_precompile_mem_paused()) {
+        const size_t l = strlen(b);
+        snprintf(b + l, sizeof b - l, " %s", pc_tr("(paused: low memory)"));
+    }
     int fh = target_h / 48 < 12 ? 12 : target_h / 48;
     if (g_pc.text != b || fh != g_pc.font_h) {
         OsdBlock t;

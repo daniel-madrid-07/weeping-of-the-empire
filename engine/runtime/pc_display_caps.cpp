@@ -293,4 +293,25 @@ void pcd_caps_text(const pcd_caps &c, char *buf, size_t n) {
     add("%s", ".");
 }
 
+#else
+// Linux: the display's name, desktop mode and fastest refresh at that size, as linux/shim_sdl3.c keeps them: read from
+// SDL on the thread that pumps its events (SDL's display calls are main-thread only; a display plugged in or out frees
+// the modes), at the start and at every display event, and copied out here from any thread (the F10 drawing side). The
+// monitor handle is an SDL_DisplayID (shim MonitorFromWindow), nullptr the primary. HDR and VRR are the compositor's
+// and SDL 3.2 reports neither per display, so they stay 'not known' (no HDR or VRR suggestion on Linux). F10's
+// uneven-rate hint (fps_uneven), the footer's Display line and the first start's defaults read this.
+#include "pc_display_caps.h"
+#include <stdio.h>
+#include <string.h>
+extern "C" int shim_display_info(void *monitor, char *name, size_t name_n, int *w, int *h, int *hz, int *top_hz);
+int pcd_caps_of(void *monitor, pcd_caps *out) {
+    memset(out, 0, sizeof *out);
+    out->nv_bits = -1;
+    return shim_display_info(monitor, out->name, sizeof out->name, &out->w, &out->h, &out->hz, &out->top_hz) && out->hz > 0;
+}
+int pcd_caps_cached(void *monitor, pcd_caps *out) { return pcd_caps_of(monitor, out); }   // (the shim's copy: no SDL call)
+void pcd_caps_display_changed() {}
+void pcd_caps_text(const pcd_caps &c, char *buf, size_t n) {
+    snprintf(buf, n, "%s, %d x %d at %d Hz%s", c.name, c.w, c.h, c.hz, c.top_hz > c.hz + 1 ? " (it offers more)" : "");
+}
 #endif  // _WIN32

@@ -47,7 +47,7 @@ constexpr u64 kMain = 0x7100000000ull;           // main's base in the engine (g
 constexpr u64 kEventMgrSlot = 0x4557b30;   // GOT slot of EventMgr*; +0x58 mpMainEvent != 0 while an event runs (D1)
 constexpr u64 kEmMainEvent = totk_field(EventMgr, 0x58);
 // GameDataMgr (its GOT slot), its setBool, and the bool the bow strip sets to take the bow out (totk_player_game_calls)
-constexpr u64 kGameDataMgrSlot = 0x4557b20, kGameDataSetBool = 0xa02aec;
+constexpr u64 kGameDataMgrSlot = 0x4557b20;   // (its setBool: f_a02aec, below)
 constexpr u32 kGdBowTakeOut = 0x2f03cd3e;
 // the actor's component array and the components read here
 constexpr u64 kActorComponents = totk_field(Actor, 0x220), kCompAttention = totk_field(ActorComps, 0x128),
@@ -56,6 +56,15 @@ constexpr u64 kActorComponents = totk_field(Actor, 0x220), kCompAttention = totk
 constexpr u64 kASSlots = totk_field(BSA, 0x1f0), kSlotVerb = totk_field(BsaSlot, 0x28),   // BSA: 5 slots, each one's
               kSlotVerbAlt = totk_field(BsaSlot, 0x4c);                                     // verb
 constexpr u64 kPlStateBytes = totk_field(Player, 0x1424);                                   // Player
+// The state bits read there (two bytes, the state query's own tests: swimming, climbing). 1.4.3 keeps them as one u16
+// at +0x145c with the high byte's bits one place up, so the field moves and the climb bit is per version; swimming
+// stays bit 4 of the first byte
+constexpr int kPlSwimBit = 4;
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION == 143
+constexpr int kPlClimbBit = 2;   // (+0x145d bit 2 = the u16's bit 10)
+#else
+constexpr int kPlClimbBit = 1;   // (1.0.0 +0x1425 bit 1)
+#endif
 // The Player's move rate as the game reads it for the running attack (main+0x1076b40: +0xf24, a float, clamped to
 // 0..0.5; when it is ~0, 0.5 if +0xad8 bit 0 else 0); the walk scheduler's DashAttack test (main+0x16e9130) wants
 // >= 0.25 with slot-0 verb Walk (1), the weapon sheathed and a VK 9 trigger: the draw-slash
@@ -106,29 +115,63 @@ constexpr int kParryBit = 57;
 constexpr u64 kCompRideLink = totk_field(ActorComps, 0x410);
 constexpr u64 kLinkId = totk_field(RideLink, 0x30), kLinkLive = totk_field(RideLink, 0x38),
               kLinkSlot = totk_field(RideLink, 0x3c);
-constexpr u64 kQueryPlayerState = 0x12af610;   // FUN_10012af610(actor, EventQueryPlayerState) -> bool
+// FUN_10012af610(actor, EventQueryPlayerState) -> bool: f_12af610, below
 constexpr u32 kQueryRideControlStick = 23;
 constexpr int kVerbManipulate = 48;
 constexpr u64 kRootPlayerLink = totk_field(PlayerRoot, 0x20);   // (logged only: totk_globals.h's walk)
 
-// The fields are 1.0.0 offsets through totk_field (totk_version.h): another version's build maps each one or does not
-// compile; a diagnostic one leaves an unplaced field at TOTK_FIELD_UNKNOWN, and then the walks read nothing (no
-// player). 1.0.0: always true.
-constexpr bool kFieldsKnown = [] {
-#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
-    // (the verb numbers this file compares, kVerbWalk, kVerbInvalid and the sprint / climb / ride sets, are 1.0.0's:
-    // totk_version.h TOTK_VERBS_KNOWN)
-    if (!TOTK_VERBS_KNOWN) return false;
-#endif
-    for (const u64 f : {kEmMainEvent, kActorComponents, kCompAttention, kCompAS, kCompPlayer, kCompSpecialPower,
-                        kASSlots, kSlotVerb, kSlotVerbAlt, kPlStateBytes, kPlMoveRate, kPlMoveFlags, kAttState,
-                        kSpRequested, kSpCurrent, kSpUltraHand, kUhState, kCompEquipmentUser, kCompDynamicEquipment,
-                        kEuLinks, kEuSlotForce, kLinkData, kLinkProcId, kLinkDataProc, kLinkDataId, kProcState,
-                        kDeStateFlags, kDeState, kEuDrawnType, kEuReadySlot, kParryWord, kSpStepType, kCompRideLink,
-                        kLinkId, kLinkLive, kLinkSlot, kRootPlayerLink})
+// The fields are 1.0.0 offsets through totk_field (totk_version.h): another version's table maps each one or leaves it
+// at TOTK_FIELD_UNKNOWN. Each group of reads below runs only when all of its own fields are placed, so on 1.4.3 a group
+// turns on as soon as decomp maps it (games/totk/patches/fields_v143.json) instead of the whole file waiting for the
+// last field; a group off only takes its flags away (the router then sees fewer states, as with no player). 1.0.0:
+// all true, the same code as before.
+constexpr bool all_known(std::initializer_list<u64> fields) {
+    for (const u64 f : fields)
         if (f == TOTK_FIELD_UNKNOWN) return false;
     return true;
-}();
+}
+// the core every player group needs: the actor's component array, the proc links the player and equipment walks
+// follow, the player root, the Player's +0x28 word
+constexpr bool kCoreKnown = all_known({kActorComponents, kLinkData, kLinkProcId, kLinkDataProc, kLinkDataId, kProcState,
+                                       kRootPlayerLink, kParryWord});
+// the verbs: the 5 action slots (the verb numbers this file compares, kVerbWalk, kVerbInvalid and the sprint / climb /
+// ride sets, are 1.0.0's: totk_version.h TOTK_VERBS_KNOWN), on the core; every other player group is on the verbs
+constexpr bool kVerbsKnown =
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    TOTK_VERBS_KNOWN &&
+#endif
+    kCoreKnown && all_known({kCompAS, kASSlots, kSlotVerb, kSlotVerbAlt});
+constexpr bool kEventKnown = all_known({kEmMainEvent});   // an event running (no player and no chain needed)
+constexpr bool kPlayerKnown = kVerbsKnown &&
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100 && TOTK_GAME_VERSION != 143
+                              false &&   // (another version: its state bits are not known)
+#endif
+                              all_known({kCompPlayer, kPlStateBytes, kPlMoveRate, kPlMoveFlags});
+constexpr bool kPlayerLogKnown = kPlayerKnown && all_known({kSpStepType});   // (tests' readouts only)
+constexpr bool kLockOnKnown = kVerbsKnown && all_known({kCompAttention, kAttState});
+constexpr bool kPowerKnown = kVerbsKnown && all_known({kCompSpecialPower, kSpCurrent});   // the selected ability
+// the requested-ability write (+0x68): only TOTK_CTL "ability <n>" (totk_player_request_ability) asks for it, and no
+// 1.0.0 reader shows it yet, so it is its own gate and off where unplaced
+constexpr bool kRequestKnown = kPowerKnown && all_known({kSpRequested});
+constexpr bool kUltraHandKnown = kPowerKnown && all_known({kSpUltraHand, kUhState});
+constexpr bool kHandsKnown = kVerbsKnown && all_known({kCompEquipmentUser, kCompDynamicEquipment, kEuLinks, kEuSlotForce,
+                                                       kDeStateFlags, kDeState});
+// (the drawn type and ready slot feed the hands log only, a lead for the bow class: read where placed, never a gate)
+constexpr bool kHandsLogKnown = kHandsKnown && all_known({kEuDrawnType, kEuReadySlot});
+constexpr bool kRideKnown = kVerbsKnown && all_known({kCompRideLink, kLinkId, kLinkLive, kLinkSlot});
+constexpr bool kRootLogKnown = kCoreKnown;
+// every group (the start line says which are off)
+constexpr bool kFieldsKnown = kVerbsKnown && kEventKnown && kPlayerKnown && kPlayerLogKnown && kLockOnKnown &&
+                              kPowerKnown && kRequestKnown && kUltraHandKnown && kHandsKnown && kHandsLogKnown &&
+                              kRideKnown && kRootLogKnown;
+// The switch for a table that places only some groups (1.4.3 until decomp maps the rest): TOTK_PLAYER_STATE=1 runs the
+// placed groups, otherwise the file stands down as before (all or nothing). It turns on by default once a 1.4.3 boot
+// passes GATE_v0.1.9.md's player-state lines. 1.0.0 and a full table: always on.
+bool groups_on() {
+    if (kFieldsKnown) return true;
+    static const bool on = [] { const char* e = getenv("TOTK_PLAYER_STATE"); return e && !strcmp(e, "1"); }();
+    return on;
+}
 
 template <class T> T rd(u64 a) {
     T v;
@@ -216,17 +259,20 @@ u8 hand_state(u64 eu, int slot) {
     return kHandRaw | (u8)(st >= 0 && st < 0x7f ? st : 0x7e);
 }
 bool sample_walk(Sample* s, int req) {
-    if (!kFieldsKnown) return true;
+    if ((!kVerbsKnown && !kEventKnown) || !groups_on()) return true;
     __try {
         // an event (talk, cutscene): ExecutePlayerCalcKey's own test for cutting the player's input, read with or
         // without a player
-        const u64 em = totk_global(kEventMgrSlot);
-        s->event = ptr_ok(em) && rd<u64>(em + kEmMainEvent) != 0;
+        if (kEventKnown) {
+            const u64 em = totk_global(kEventMgrSlot);
+            s->event = ptr_ok(em) && rd<u64>(em + kEmMainEvent) != 0;
+        }
+        if (!kVerbsKnown) return true;
         const u64 actor = player_actor();
         const u64 comps = actor ? rd<u64>(actor + kActorComponents) : 0;
         const u64 as = ptr_ok(comps) ? rd<u64>(comps + kCompAS) : 0;
         if (!game_object(as)) {   // (no player: ok stays false, the event test stands)
-            if (verbose()) {   // tests: where the walk stops, every 2 s
+            if (kRootLogKnown && verbose()) {   // tests: where the walk stops, every 2 s
                 static unsigned long long last;
                 const unsigned long long now = GetTickCount64();
                 if (now - last > 2000) {
@@ -256,32 +302,34 @@ bool sample_walk(Sample* s, int req) {
         }
         // the Player component's state bytes the game's own test reads too (+0x1424 bit 4 swimming, +0x1425 bit 1
         // climbing), for the states no verb shows
-        const u64 pl = rd<u64>(comps + kCompPlayer);
+        const u64 pl = kPlayerKnown ? rd<u64>(comps + kCompPlayer) : 0;
         if (game_object(pl)) { s->pl[0] = rd<u8>(pl + kPlStateBytes); s->pl[1] = rd<u8>(pl + kPlStateBytes + 1); }
         if (game_object(pl)) {   // the move rate, main+0x1076b40's arithmetic
             const float r = rd<float>(pl + kPlMoveRate);
             s->move_rate = r > 1.1920929e-07f ? (r < 0.5f ? r : 0.5f) : ((rd<u8>(pl + kPlMoveFlags) & 1) ? 0.5f : 0.f);
         }
-        if (verbose() && game_object(pl)) {   // (tests only)
+        if (kPlayerLogKnown && verbose() && game_object(pl)) {   // (tests only)
             s->parry_word = rd<u64>(pl + kParryWord);
             s->slowmo = rd<u32>(pl + kSpStepType);
         }
         // locked on: the attention client's state 2 or 3
-        const u64 att = rd<u64>(comps + kCompAttention);
+        const u64 att = kLockOnKnown ? rd<u64>(comps + kCompAttention) : 0;
         if (game_object(att)) { const s32 st = rd<s32>(att + kAttState); s->locked = st == 2 || st == 3; }
-        const u64 sp = rd<u64>(comps + kCompSpecialPower);
+        const u64 sp = kPowerKnown ? rd<u64>(comps + kCompSpecialPower) : 0;
         s->power = game_object(sp) ? rd<u32>(sp + kSpCurrent) : 0;
-        const u64 eu = rd<u64>(comps + kCompEquipmentUser);
+        const u64 eu = kHandsKnown ? rd<u64>(comps + kCompEquipmentUser) : 0;
         if (game_object(eu)) {
             s->hand[0] = hand_state(eu, kSlotWeapon);
             s->hand[1] = hand_state(eu, kSlotBow);
             s->hand[2] = hand_state(eu, kSlotShield);
-            s->eu_type = rd<s32>(eu + kEuDrawnType);
-            s->eu_ready = rd<s32>(eu + kEuReadySlot);
+            if (kHandsLogKnown) {
+                s->eu_type = rd<s32>(eu + kEuDrawnType);
+                s->eu_ready = rd<s32>(eu + kEuReadySlot);
+            }
         }
-        if (req && game_object(sp)) { wr<u32>(sp + kSpRequested, (u32)req); s->wrote = true; }
+        if (kRequestKnown && req && game_object(sp)) { wr<u32>(sp + kSpRequested, (u32)req); s->wrote = true; }
         // Ultrahand holding something: its mState 4 Grabbing / 5 Grabbed
-        if (s->power == TPA_ULTRAHAND) {
+        if (kUltraHandKnown && s->power == TPA_ULTRAHAND) {
             const u64 uh = rd<u64>(sp + kSpUltraHand);
             if (game_object(uh)) { const s32 st = rd<s32>(uh + kUhState); s->holding = st == 4 || st == 5; }
         }
@@ -315,7 +363,7 @@ bool sample(Sample* s, int req) {
 // The ride link's identity, plain loads under SEH (the walk's rules): false without a live link.
 struct RideLink { u64 actor; s32 id; u32 slot; };
 bool ride_link_walk(RideLink* r) {
-    if (!kFieldsKnown) return false;
+    if (!kRideKnown || !groups_on()) return false;
     __try {
         const u64 actor = player_actor();
         const u64 comps = actor ? rd<u64>(actor + kActorComponents) : 0;
@@ -347,14 +395,11 @@ constexpr u64 kRideLinkData = totk_field(RideLink, 0x28), kRecvState = totk_fiel
               kRecvClients = totk_field(AttentionReceiver, 0x58), kRecvBest = totk_field(AttentionReceiver, 0x60),
               kClientEntryFlags = totk_field(AttentionClientEntry, 0x20),
               kClientEntryActor = totk_field(AttentionClientEntry, 0x8), kActorAffordance = totk_field(Actor, 0x5a0);
-constexpr bool kReachFieldsKnown = [] {   // (kFieldsKnown's rule)
-    for (const u64 f : {kRideLinkData, kRecvState, kRecvClients, kRecvBest, kClientEntryFlags, kClientEntryActor,
-                        kActorAffordance})
-        if (f == TOTK_FIELD_UNKNOWN) return false;
-    return kFieldsKnown;
-}();
+constexpr bool kReachFieldsKnown = kRideKnown && kHandsKnown && kLockOnKnown &&   // (its link, proc and receiver reads)
+                                   all_known({kRideLinkData, kRecvState, kRecvClients, kRecvBest, kClientEntryFlags,
+                                              kClientEntryActor, kActorAffordance});
 int construct_reach_walk() {
-    if (!kReachFieldsKnown) return -1;
+    if (!kReachFieldsKnown || !groups_on()) return -1;
     __try {
         const u64 actor = player_actor();
         const u64 comps = actor ? rd<u64>(actor + kActorComponents) : 0;
@@ -384,6 +429,20 @@ int construct_reach_walk() {
 }
 
 void read_player() {
+    if (!kFieldsKnown) {   // (another version's table: which groups wait for their fields, once; the 1.4.3 gate reads it)
+        static const bool said = [] {
+            printf("[player] player-state groups placed:%s%s%s%s%s%s%s%s; not:%s%s%s%s%s%s%s%s (%s)\n",
+                   kVerbsKnown ? " verbs" : "",
+                   kEventKnown ? " event" : "", kPlayerKnown ? " player" : "", kLockOnKnown ? " lock-on" : "",
+                   kPowerKnown ? " ability" : "", kUltraHandKnown ? " ultrahand" : "", kHandsKnown ? " hands" : "",
+                   kRideKnown ? " ride" : "", kVerbsKnown ? "" : " verbs", kEventKnown ? "" : " event",
+                   kPlayerKnown ? "" : " player", kLockOnKnown ? "" : " lock-on", kPowerKnown ? "" : " ability",
+                   kUltraHandKnown ? "" : " ultrahand", kHandsKnown ? "" : " hands", kRideKnown ? "" : " ride",
+                   groups_on() ? "TOTK_PLAYER_STATE=1: the placed ones run" : "all off; TOTK_PLAYER_STATE=1 runs the placed ones");
+            return true;
+        }();
+        (void)said;
+    }
     Sample s = {{-1, -1, -1, -1, -1}, 0, {0, 0}, false, false, false, false, false, 0, kSpStepNone, {0, 0, 0}, -1, -1, 0.f};
     uint32_t f = 0;
     const int req = g_request.exchange(0);
@@ -393,8 +452,8 @@ void read_player() {
     const int (&v)[5] = s.v;
     if (s.ok) {
         f |= flags_of(s.v);
-        if (s.pl[0] >> 4 & 1) f |= TPS_SWIM;
-        if (s.pl[1] >> 1 & 1) f |= TPS_CLIMB;
+        if (s.pl[0] >> kPlSwimBit & 1) f |= TPS_SWIM;
+        if (s.pl[1] >> kPlClimbBit & 1) f |= TPS_CLIMB;
         if (s.locked) f |= TPS_LOCKON;
         if (s.holding) f |= TPS_HOLDING;
         // holding a steering stick: the game's state test 23 (only verb 48 shows otherwise, which other held devices
@@ -611,6 +670,11 @@ extern "C" void totk_player_hand_note(int hand) {
 // SelectorPlayerSubSchedulerSheathed (+0x130 / +0x140 / +0x148), not by SelectorPlayerSchedulerRide or
 // ExecutePlayerRide, which never call the test. preCalc clears bit 21 every frame, so a request the gate refuses is
 // gone, not kept for after the dismount. A request the hook has not taken within 250 ms (a menu, a load) is dropped.
+// The game's GameDataMgr::setBool (main+0xa02aec) and its player-state query (main+0x12af610), named as functions so
+// another version's engine map aliases them (both pinned for 1.4.3) and places their addresses too:
+// totk_main_known(off) says whether this build has them
+void f_a02aec(Ctx* __restrict c);
+void f_12af610(Ctx* __restrict c);
 static bool bow_request_ok(uint32_t st) {
     const uint32_t no = TPS_BOW_OUT | TPS_EVENT | TPS_VEHICLE | TPS_ABILITY;
     return (st & TPS_VALID) && (st & TPS_BOW_EQUIPPED) && !(st & no);
@@ -634,12 +698,12 @@ extern "C" void totk_player_game_calls(Ctx* c) {
     const uint32_t st = totk_player_state();
     const u64 gdm = totk_global(kGameDataMgrSlot);
     const bool stale = GetTickCount64() - asked > 250;
-    const bool ok = !stale && bow_request_ok(st) && ptr_ok(gdm) && totk_main_known(kGameDataSetBool);
+    const bool ok = !stale && bow_request_ok(st) && ptr_ok(gdm) && totk_main_known(0xa02aec);
     if (ok) {   // (after this the hook reads no guest register but sets x0 itself: totk_pc_vk.cpp)
         c->x[0] = gdm;
         c->x[1] = 1;
         c->x[2] = kGdBowTakeOut;
-        call_ind(c, totk_main(kGameDataSetBool));
+        f_a02aec(c);
     }
     static int logs;
     if (logs++ < 200)
@@ -682,13 +746,13 @@ extern "C" void totk_player_stick_frame(Ctx* c) {
     static int logs;
     bool now = false;
     RideLink r;
-    if (g_verb[0].load(std::memory_order_relaxed) == kVerbManipulate && totk_main_known(kQueryPlayerState) &&
+    if (g_verb[0].load(std::memory_order_relaxed) == kVerbManipulate && totk_main_known(0x12af610) &&
         ride_link(&r)) {
         if (r.actor != asked.actor || r.id != asked.id || r.slot != asked.slot) {
             asked = r;
             c->x[0] = r.actor;
             c->x[1] = kQueryRideControlStick;
-            call_ind(c, totk_main(kQueryPlayerState));
+            f_12af610(c);
             on = (c->x[0] & 1) != 0;
             if (logs++ < 200)
                 printf("[player] verb 48 on ride link %d (entry %u): %s\n", r.id, r.slot,

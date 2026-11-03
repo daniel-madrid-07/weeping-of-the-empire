@@ -19,6 +19,8 @@ nxrecomp has no draw-time UI squeeze (MacNativeGames nvn_mtl.m has one): these l
 """
 import struct
 
+from .ultrawide_layout import MARKER_ROOT, scale_markers   # world-marker layouts: the root stays at 1 (see there)
+
 PANE_MAGICS = (b'pan1', b'pic1', b'txt1', b'wnd1', b'bnd1', b'prt1', b'ali1', b'scr1')
 FIELD = {'x': 44, 'y': 48, 'sx': 68, 'sy': 72, 'h': 80}   # offsets in a pane section: name at +12 (24 bytes), translate x / y, scale x / y, height
 # Layouts whose root stays as tall as the canvas: full-screen backgrounds and fades.
@@ -130,7 +132,7 @@ def panes(blarc, lo, hi):
 def apply(blarc, members, width, height, hud_corner=True, common=True):
     """Edits blarc (bytearray) in place for a width x height canvas. Returns the members it changed. hud_corner False leaves the
     layouts that hang from an edge, and the panes placed at one, where the squeeze puts them (the middle 16:9).
-    common=False: another layout archive (Title, Boot): edits apply to the layouts and animations it has."""
+    common=False: another layout archive (Title): edits apply to the layouts and animations it has."""
     k = (width / height) / (16 / 9)
     assert k < 1, 'only for canvases taller than 16:9'
     changed, found = set(), {}
@@ -141,11 +143,14 @@ def apply(blarc, members, width, height, hud_corner=True, common=True):
         changed.add(member)
         if pane not in found[member]: raise SystemExit(f'{layout}: no pane {pane}')
         return found[member][pane]
-    unknown = sorted(n for n in (*KEEP_ROOT, *ROOT_UP, *ROOT_DOWN) if f'blyt/{n}.bflyt' not in members)
+    unknown = sorted(n for n in (*KEEP_ROOT, *ROOT_UP, *ROOT_DOWN, *MARKER_ROOT) if f'blyt/{n}.bflyt' not in members)
     if unknown and common: raise SystemExit(f'layouts not in the archive: {unknown}')
     for member in sorted(m for m in members if m.startswith('blyt/') and m.endswith('.bflyt')):
         layout = member[5:-6]
         if layout in KEEP_ROOT: continue
+        if layout in MARKER_ROOT:   # world markers: the root spans the canvas, the scale goes one level down
+            scale_markers(blarc, layout, pane_offset, FIELD['sy'], k)
+            continue
         at = pane_offset(layout, 'RootPane')
         struct.pack_into('<f', blarc, at + FIELD['sy'], k)
         if hud_corner and (layout in ROOT_UP or layout in ROOT_DOWN) and layout not in CENTERED:

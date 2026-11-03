@@ -12,15 +12,18 @@
 #include <cctype>
 extern "C" u64 g_rt_heap_base;
 extern "C" void alias_soft_io(const void* ptr, size_t len, int begin);   // hle_os_mem.cpp
+extern "C" void sync_guard_io(const void* ptr, size_t len, int begin);   // hle_os_mem.cpp
 namespace cheatvm {
 static bool mem(u64 a, void* b, size_t n, bool wr) {   // a failed access is silent, as in dmnt
     if (!a || !n) return false;
 #ifdef _WIN32
     SIZE_T got = 0;
     if (!wr) return ReadProcessMemory(GetCurrentProcess(), (const void*)a, b, n, &got) && got == n;
+    sync_guard_io((const void*)a, n, 1);   // (the same for LARECOMP_SYNC_GUARD's read-only pages)
     alias_soft_io((const void*)a, n, 1);   // (a kernel write: a soft-watched, read-only alias page would refuse it)
     bool ok = WriteProcessMemory(GetCurrentProcess(), (void*)a, b, n, &got) && got == n;
     alias_soft_io((const void*)a, n, 0);
+    sync_guard_io((const void*)a, n, 0);
     return ok;
 #else
     struct iovec l = {b, n}, r = {(void*)a, n};

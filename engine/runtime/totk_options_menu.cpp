@@ -83,7 +83,6 @@ const char *const kVsync[] = {"", "off", nullptr};            // On (default), O
 const char *const kVrr[] = {"", "on", nullptr};               // Off (default), On
 const char *const kShaderWait[] = {"", "always", nullptr};   // Limit to 0.1 s (default), Always wait
 const char *const kOffYes[] = {"", "1", nullptr};             // Off (default), On
-const char *const kOnDef[] = {"", "0", nullptr};              // On (default), Off
 const char *const kFrameGen[] = {"", "1", "2", "3", "fsr", nullptr};   // Off (default), DLSS x2 / x3 / x4, FSR x2
 const char *const kUpscaler[] = {"", "1", "dlaa", "fsr", nullptr};    // Off (default), DLSS, DLAA, FSR
 const char *const kHdr[] = {"", "hdr10", "scrgb", nullptr};   // Off (default), HDR10, scRGB
@@ -94,8 +93,8 @@ const char *const kHdrPaper[] = {"80", "100", "120", "140", "160", "180", "200",
 const char *const kGameplay[] = {"console", "pc", nullptr};  // Console layout, PC
 const char *const kGyro[] = {"0.25", "0.5", "0.75", "1", "1.25", "1.5", "1.75", "2", "2.5", "3", nullptr};
 const char *const kFov[] = {"0.8", "0.9", "1", "1.1", "1.2", "1.3", "1.4", "1.5", nullptr};  // of a 0.5 .. 2 slider
-const char *const kWide[] = {"16:9", "window", "16:10", "21:9", "32:9", nullptr};   // the game's (default), the window's shape
-const char *const kHud[] = {"corner", "center", nullptr};    // the ultrawide HUD at the screen's edges (default), middle 16:9
+const char *const kWide[] = {"16:9", "window", "16:10", "21:9", "32:9", "48:9", nullptr};   // the game's, the window's shape (default)
+const char *const kHud[] = {"auto", "corner", "center", nullptr};   // the ultrawide HUD: by shape (default), edges, middle 16:9
 const char *const kCut[] = {"wide", "16:9", nullptr};        // ultrawide cutscenes: wide (default), the original 16:9
 const char *const kWindowMode[] = {"windowed", "borderless", "exclusive", nullptr};  // borderless: the default
 // The volumes: 0 .. 100 % in 5 % steps of a 0 .. 1 slider (audio.volume / music / effects; the default 1)
@@ -134,7 +133,7 @@ const PcRow kRows[] = {
     {68, "graphics.aspect_ratio", kWide},  // restart (totk_engine.c, the ultrawide; patched main only)
     {128, "graphics.hud_layout", kHud},         // restart (totk_engine.c: the ultrawide HUD at the edges / middle 16:9)
     {130, "graphics.cutscene_aspect", kCut},    // live (totk_engine.c, totk_hooks.c: ultrawide cutscenes wide / 16:9)
-    {117, "graphics.native_ui", kOnDef},  // live
+    {117, "graphics.native_ui", kOffYes},  // live
     {53, "controls.mouse_sensitivity", kSens},  // live (hle_hid.cpp), a slider of 0.1 .. 20
     {116, "controls.mouse_aim_scale", kAimScale},  // live: the mouse while the bow is drawn
     {119, "controls.key_min_hold_ms", kKeyHold},  // live: the W / A / D tap slide

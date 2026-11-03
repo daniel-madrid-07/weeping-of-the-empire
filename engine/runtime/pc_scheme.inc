@@ -130,9 +130,15 @@ PC_ROW(TITLE,    "confirm",     'O', PCOP_CONFIRM,     0, B_A,         "Enter")
 // event flag, the producer): advance, the game's skip prompt, every other key dead the loading screen: its "A Next
 // tip"; every other key stays dead there
 PC_ROW(LOADING,  "next_tip",    'P', PCOP_NONE,        0, B_A,         "E, Enter, Mouse Left")
-PC_ROW(CUTSCENE, "confirm",     'P', PCOP_NONE,        0, B_A,         "E, Enter")
-PC_ROW(CUTSCENE, "skip",        'P', PCOP_NONE,        0, B_PLUS,      "Esc")
-PC_ROW(CUTSCENE, "skip_x",      'P', PCOP_NONE,        0, B_X,         "Space")              // a short scene's "Skip X" (its hint "Skip SPACE", i2c_dye3)
+// (held, as the pad's A, and named as on foot's E: an event that a press starts and a hold carries on, the Temple of
+// Time door's heart drain, public #58, saw E die at the change into the event (a key keeps its hold across a context
+// change only onto the same action's held row) and, pressed again, one 70 ms pulse; now on foot's held E carries in
+// and a fresh press holds A as long as the key is down)
+PC_ROW(CUTSCENE, "interact",    'H', PCOP_NONE,        0, B_A,         "E, Enter")
+// (the skips held too, the pad's + / X as long as the key is down: as 2-present pulses no skip took, public #64, while
+// the Console scheme's held Space skipped "like normal"; a 2-present pulse is under one 30 Hz game tick at high fps)
+PC_ROW(CUTSCENE, "skip",        'H', PCOP_NONE,        0, B_PLUS,      "Esc")
+PC_ROW(CUTSCENE, "skip_x",      'H', PCOP_NONE,        0, B_X,         "Space")              // a short scene's "Skip X" (its hint "Skip SPACE", i2c_dye3)
 PC_NOLAYOUT(CUTSCENE)
 
 // ---- a quickmenu: the L ability wheel, the D-pad strips (4.13; on foot's rows otherwise, the mouse as the R stick:

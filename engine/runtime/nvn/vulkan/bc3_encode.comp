@@ -1,0 +1,141 @@
+#version 450
+// RGBA8 -> BC3 on the GPU (ram-diet, RIVAL-034: graphics.compact_textures, the low-VRAM texture mode). A line-by-line
+// port of engine/runtime/nvn/bc3enc.h (bc3_block: principal axis, extreme projections, 565 fit, one least-squares refit;
+// alpha in the eight-value mode). One invocation per 4x4 block of a band of rows: src holds the decoded level (RGBA8,
+// pc.row texels a row, from word pc.src_off), dst gets the band's blocks row by row from word pc.dst_off. Texels past
+// the level's edge repeat the last row / column. engine/tools/astcgpu checks it against bc3enc.h (PSNR).
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint dst[]; };
+
+layout(push_constant) uniform PC {
+    uint src_off, dst_off;   // words
+    uint row;                // texels a source row
+    uint w, h;               // the level
+    uint y0;                 // the band's first texel row (a multiple of 4)
+    uint bx, nblk;           // blocks a row, blocks in the band
+} pc;
+
+uint q565(vec3 e) {
+    vec3 c = clamp(e, vec3(0.0), vec3(255.0));
+    uint r = uint(c.x * (31.0 / 255.0) + 0.5), g = uint(c.y * (63.0 / 255.0) + 0.5), b = uint(c.z * (31.0 / 255.0) + 0.5);
+    return r << 11 | g << 5 | b;
+}
+
+vec3 x565(uint c) {
+    uint r = c >> 11 & 31u, g = c >> 5 & 63u, b = c & 31u;
+    return vec3(float(r << 3 | r >> 2), float(g << 2 | g >> 4), float(b << 3 | b >> 2));
+}
+
+vec3 px[16];
+
+float fit(uint q0, uint q1, inout uint pos[16]) {
+    vec3 a = x565(q0), b = x565(q1), d = b - a;
+    float dd = dot(d, d), err = 0.0;
+    for (int i = 0; i < 16; i++) {
+        float t = 0.0;
+        if (dd > 0.0) t = dot(px[i] - a, d) / dd;
+        float s = t * 3.0 + 0.5;
+        uint p = s < 0.0 ? 0u : s >= 3.0 ? 3u : uint(s);
+        pos[i] = p;
+        vec3 v = (a * float(3u - p) + b * float(p)) / 3.0 - px[i];
+        err += dot(v, v);
+    }
+    return err;
+}
+
+void main() {
+    uint blk = gl_GlobalInvocationID.x;
+    if (blk >= pc.nblk) return;
+    uint bxi = blk % pc.bx, byi = blk / pc.bx;
+    uint al[16];
+    for (uint i = 0u; i < 16u; i++) {
+        uint x = min(bxi * 4u + (i & 3u), pc.w - 1u), y = min(pc.y0 + byi * 4u + (i >> 2), pc.h - 1u);
+        uint t = src[pc.src_off + y * pc.row + x];
+        px[i] = vec3(float(t & 255u), float(t >> 8 & 255u), float(t >> 16 & 255u));
+        al[i] = t >> 24;
+    }
+    // alpha
+    uint amin = 255u, amax = 0u;
+    for (int i = 0; i < 16; i++) { amin = min(amin, al[i]); amax = max(amax, al[i]); }
+    uint alo = 0u, ahi = 0u;
+    if (amax > amin) {
+        uint r = amax - amin;
+        for (uint i = 0u; i < 16u; i++) {
+            uint t = ((al[i] - amin) * 14u + r) / (2u * r);
+            uint idx = t == 7u ? 0u : t == 0u ? 1u : 8u - t;
+            uint bit = 3u * i;
+            if (bit < 32u) alo |= idx << bit;
+            if (bit + 3u > 32u) ahi |= bit >= 32u ? idx << (bit - 32u) : idx >> (32u - bit);
+        }
+    }
+    // colour: mean, covariance, principal axis
+    vec3 mean = vec3(0.0);
+    for (int i = 0; i < 16; i++) mean += px[i];
+    mean /= 16.0;
+    float cv0 = 0.0, cv1 = 0.0, cv2 = 0.0, cv3 = 0.0, cv4 = 0.0, cv5 = 0.0;   // xx xy xz yy yz zz
+    for (int i = 0; i < 16; i++) {
+        vec3 c = px[i] - mean;
+        cv0 += c.x * c.x; cv1 += c.x * c.y; cv2 += c.x * c.z; cv3 += c.y * c.y; cv4 += c.y * c.z; cv5 += c.z * c.z;
+    }
+    int k0 = cv0 >= cv3 && cv0 >= cv5 ? 0 : cv3 >= cv5 ? 1 : 2;
+    vec3 v = k0 == 0 ? vec3(cv0, cv1, cv2) : k0 == 1 ? vec3(cv1, cv3, cv4) : vec3(cv2, cv4, cv5);
+    for (int it = 0; it < 6; it++) {
+        float m = dot(v, v);
+        if (m < 1e-12) break;
+        vec3 n = v * (1.0 / sqrt(m));
+        v = vec3(cv0 * n.x + cv1 * n.y + cv2 * n.z, cv1 * n.x + cv3 * n.y + cv4 * n.z, cv2 * n.x + cv4 * n.y + cv5 * n.z);
+    }
+    float m = dot(v, v);
+    vec3 e0, e1;
+    if (m < 1e-12) {
+        e0 = e1 = mean;
+    } else {
+        v *= 1.0 / sqrt(m);
+        float tmin = 1e30, tmax = -1e30;
+        for (int i = 0; i < 16; i++) {
+            float t = dot(px[i] - mean, v);
+            tmin = min(tmin, t);
+            tmax = max(tmax, t);
+        }
+        e0 = mean + v * tmax;
+        e1 = mean + v * tmin;
+    }
+    uint q0 = q565(e0), q1 = q565(e1), pos[16], pos2[16];
+    float err = fit(q0, q1, pos);
+    // least-squares refit for these positions
+    float aa = 0.0, ab = 0.0, bb = 0.0;
+    vec3 ax = vec3(0.0), bxs = vec3(0.0);
+    for (int i = 0; i < 16; i++) {
+        float w = float(pos[i]) / 3.0, u = 1.0 - w;
+        aa += u * u; ab += u * w; bb += w * w;
+        ax += u * px[i]; bxs += w * px[i];
+    }
+    float det = aa * bb - ab * ab;
+    if (det > 1e-6) {
+        vec3 r0 = (ax * bb - bxs * ab) / det, r1 = (bxs * aa - ax * ab) / det;
+        uint p0 = q565(r0), p1 = q565(r1);
+        float err2 = fit(p0, p1, pos2);
+        if (err2 < err) { q0 = p0; q1 = p1; pos = pos2; }
+    }
+    // four-colour order: c0 > c1 (equal: every texel is c0)
+    const uint idx_of[4] = uint[4](0u, 2u, 3u, 1u);
+    uint ci = 0u;
+    if (q0 < q1) {
+        uint t = q0; q0 = q1; q1 = t;
+        for (int i = 0; i < 16; i++) pos[i] = 3u - pos[i];
+    }
+    if (q0 != q1)
+        for (int i = 0; i < 16; i++) ci |= idx_of[pos[i]] << (2 * i);
+    uint o = pc.dst_off + blk * 4u;
+    if (amax == amin) {
+        dst[o] = amax | amax << 8;
+        dst[o + 1u] = 0u;
+    } else {
+        dst[o] = amax | amin << 8 | (alo & 0xffffu) << 16;
+        dst[o + 1u] = alo >> 16 | ahi << 16;
+    }
+    dst[o + 2u] = q0 | q1 << 16;
+    dst[o + 3u] = ci;
+}

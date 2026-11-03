@@ -44,6 +44,7 @@ static const char *pcache_file(void) {
     return e && !strcmp(e, "0") ? "cache/vk_pipelines.bin" : "cache/vk_pipelines_dynubo.bin";
 }
 static size_t pcache_saved;  // size of the last file written / loaded (an unchanged 1.8 GB cache was rewritten every boot)
+static _Atomic size_t pcache_known;   // its size in memory at the last query (the saver's, every 10 s at most): [hostmem]
 // Two boots of one exe share cache/ (boot.py --cache shared) and used to write one cache/<file>.tmp: a body spliced from
 // both under a valid driver header could be published. Now each process writes its own.<pid>.tmp, replaces the file in
 // one step, and the file ends with our trailer (size + hash of the driver's data), checked at load before the driver
@@ -514,10 +515,39 @@ static void save_log_copy(void) {
     if (fp) { fclose(fp); LOG("[vk] log copied to %s\n", name); }
 #endif
 }
+// Per-draw hang marks (exec.c hang_op) cost two packets a draw on AMD, unmeasured there: off by default, on for the
+// start after one that lost this GPU (lead, rival-parity 034). A loss / hang writes cache/gpu_lost.txt with the
+// GPU and driver; the next start with the same ones turns the per-draw marks on and removes the file (one start: a
+// second loss writes it again). LARECOMP_CHECKPOINTS=draw: always on.
+#define GPU_LOST_FILE "cache/gpu_lost.txt"
+static void draw_marks_decide(void) {
+    const char *e = getenv("LARECOMP_CHECKPOINTS");
+    if (e && !strcmp(e, "draw")) { g_vk.draw_marks = true; return; }
+    FILE *f = fopen(GPU_LOST_FILE, "r");
+    if (!f) return;
+    unsigned v = 0, d = 0, drv = 0;
+    const bool same = fscanf(f, "%x %x %x", &v, &d, &drv) == 3 && v == g_vk.props.vendorID && d == g_vk.props.deviceID &&
+                      drv == g_vk.props.driverVersion;
+    fclose(f);
+    remove(GPU_LOST_FILE);
+    g_vk.draw_marks = same;
+    if (same) LOG("[vk] the last start lost this GPU (%s): hang marks on every draw for this start\n", GPU_LOST_FILE);
+    else LOG("[vk] the last start lost a GPU (%s), but the GPU or driver changed since: no per-draw hang marks\n", GPU_LOST_FILE);
+}
+static void gpu_lost_note(void) {
+    mkdir("cache", 0755);
+    FILE *f = fopen(GPU_LOST_FILE, "w");
+    if (!f) return;
+    fprintf(f, "%x %x %x\n", g_vk.props.vendorID, g_vk.props.deviceID, g_vk.props.driverVersion);
+    fclose(f);
+    if (!g_vk.draw_marks && (g_vk.checkpoints || g_vk.amd_marker))
+        LOG("[vk] the next start marks every draw for the hang report (%s)\n", GPU_LOST_FILE);
+}
 // After VK_ERROR_DEVICE_LOST: what the driver says faulted (VK_EXT_device_fault), into the log; then the log copy.
 void vk_device_fault_report(void) {
     static int once;
     if (once++) return;
+    gpu_lost_note();
     if (g_fault_ext) fault_info();
     save_log_copy();
 }
@@ -555,6 +585,13 @@ static void fault_info(void) {
 }
 
 bool vk_dyn_clamp;   // depth clamp is dynamic state in the GPL pre-rasterization libraries (create_device; exec.c)
+// The FG present thread on g_vk.queue itself (create_device: no second queue in the family): its presents, the render
+// thread's submits and presents and the record thread's submits (vkq) hold this. Set once before any thread uses the
+// queue; false: no lock taken. Order: vk_swapchain_lock, then this.
+static bool g_queue_shared;
+static pthread_mutex_t g_queue_mu = PTHREAD_MUTEX_INITIALIZER;
+void vk_queue_lock(void) { if (g_queue_shared) pthread_mutex_lock(&g_queue_mu); }
+void vk_queue_unlock(void) { if (g_queue_shared) pthread_mutex_unlock(&g_queue_mu); }
 static void create_device(void) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
@@ -597,12 +634,13 @@ static void create_device(void) {
                        !(getenv("LARECOMP_CHECKPOINTS") && !strcmp(getenv("LARECOMP_CHECKPOINTS"), "0"));
     if (g_vk.checkpoints) ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
     // AMD's equivalent: VK_AMD_buffer_marker writes the same marks at the top and bottom of the pipe into a host buffer
-    // read after the loss; it also works with the command-recording thread (queued in order). LARECOMP_CHECKPOINTS=0:
-    // off.
+    // read after the loss; it also works with the command-recording thread (queued in order). Passes / dispatches /
+    // copies; every draw too after a loss or with =draw (draw_marks_decide). LARECOMP_CHECKPOINTS=0: off.
     g_vk.amd_marker = !g_vk.checkpoints && has_ext(ep, ne, VK_AMD_BUFFER_MARKER_EXTENSION_NAME) &&
                       !(getenv("LARECOMP_CHECKPOINTS") && !strcmp(getenv("LARECOMP_CHECKPOINTS"), "0"));
     if (g_vk.amd_marker) ext[n_ext++] = VK_AMD_BUFFER_MARKER_EXTENSION_NAME;
     LOG("[vk] GPU checkpoints (hang reports): %s\n", g_vk.checkpoints ? "on" : g_vk.amd_marker ? "AMD buffer markers" : "off");
+    if (g_vk.checkpoints || g_vk.amd_marker) draw_marks_decide();
     // shader libraries + fast link (DXVK's stutter fix): each program's shaders compile once into libraries, a new draw
     // state only links them (exec.c). LARECOMP_NO_GPL=1: monolithic pipelines only (old).
     VkPhysicalDeviceVulkan13Properties p13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
@@ -616,10 +654,18 @@ static void create_device(void) {
     // NVIDIA's compiler miscompiles some programs in one shader form: those take the other (translate.c nv_pcloop)
     extern bool maxwell_nvidia;
     maxwell_nvidia = drv.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+    {  // (translate.c tex_hoist: public #39's Arc water; default off until the reporter's =1 / =0 runs)
+        extern bool maxwell_tex_hoist;
+        const char *e = getenv("LARECOMP_TEX_PRED_HOIST");
+        maxwell_tex_hoist = e && *e == '1';
+        if (maxwell_tex_hoist) LOG("[vk] predicated implicit-LOD samples taken outside their branch (LARECOMP_TEX_PRED_HOIST)\n");
+    }
     LOG("[vk] driver %s %s%s\n", drv.driverName, drv.driverInfo, maxwell_nvidia ? " (NVIDIA shader-form list on)" : "");
-    {   // translate.c requires GL_KHR_shader_subgroup_{basic,vote,ballot,shuffle,shuffle_relative} (Maxwell VOTE / SHFL)
+    {   // translate.c requires GL_KHR_shader_subgroup_{basic,vote,ballot,shuffle,shuffle_relative} (Maxwell VOTE / SHFL), and
+        // _quad in fragment shaders where wave-safe (a quad butterfly)
         const VkSubgroupFeatureFlags ops = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
-                                           VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT;
+                                           VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
+                                           VK_SUBGROUP_FEATURE_QUAD_BIT;
         const VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
         if ((sgp.supportedOperations & ops) != ops || (sgp.supportedStages & stages) != stages)
             LOG("[vk] warning: subgroup operations 0x%x in stages 0x%x (size %u): shaders using vote / ballot / shuffle outside "
@@ -714,6 +760,17 @@ static void create_device(void) {
     const char *v23 = getenv("LARECOMP_2D_OF_3D");
     g_vk.view2d_of_3d = has_ext(ep, ne, VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME) && !getenv("LARECOMP_NO_2D_OF_3D") && !(v23 && !strcmp(v23, "copy"));
     if (g_vk.view2d_of_3d) ext[n_ext++] = VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME;
+    // VK_EXT_depth_bias_control (LEAD 2026-11-03): NVN's DEPTH24 / DEPTH24_STENCIL8 are D32_SFLOAT / D32_SFLOAT_S8 here
+    // (textures.c fmt_of), where Vulkan's constant depth bias unit r follows each primitive's largest depth exponent, 2^(e -
+    // 23), instead of D24's fixed 2^-24: the game's polygon offset shrank with depth, 64x at z 0.01 (decals and other
+    // coplanar draws on the scene's D24 targets). Not the sun: its cascades are DEPTH16 (0x32), native D16 with D16's unit,
+    // so this is no fix for the 32:9 grey (the wide shadow cap, textures.c shadow_wide_cap, stays its guard). FORCE_UNORM
+    // takes r = 2^-24 on a D32F attachment = D24's; exec.c uses it for draws into such targets only (a DEPTH32F guest target
+    // keeps the float unit). Without the extension or its feature, the bias stays in the float unit (said once below): no
+    // bound scale exists for a per-primitive r. LARECOMP_DEPTH_BIAS_UNORM=0: off.
+    const char *dbu = getenv("LARECOMP_DEPTH_BIAS_UNORM");
+    g_vk.dbias_unorm = has_ext(ep, ne, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME) && !(dbu && *dbu == '0');
+    if (g_vk.dbias_unorm) ext[n_ext++] = VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME;
     vk_present_device_exts(ep, ne, ext, &n_ext);   // present.c: present id / wait, HDR metadata (when used)
     vk_ngx_device_exts(ep, ne, ext, &n_ext, 40);   // ngx.c: what DLSS asks for on this GPU (TOTK_DLSS only)
     free(ep);
@@ -740,7 +797,18 @@ static void create_device(void) {
     if (g_vk.maint8) { have_m8.pNext = have13.pNext; have13.pNext = &have_m8; }
     VkPhysicalDeviceImage2DViewOf3DFeaturesEXT have_v23 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT};
     if (g_vk.view2d_of_3d) { have_v23.pNext = have13.pNext; have13.pNext = &have_v23; }
+    VkPhysicalDeviceDepthBiasControlFeaturesEXT have_dbc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT};
+    if (g_vk.dbias_unorm) { have_dbc.pNext = have13.pNext; have13.pNext = &have_dbc; }
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    if (g_vk.dbias_unorm && !(have_dbc.depthBiasControl && have_dbc.leastRepresentableValueForceUnormRepresentation)) {
+        g_vk.dbias_unorm = false;
+        drop_ext(ext, &n_ext, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
+    }
+    g_vk.dbias_exact = g_vk.dbias_unorm && have_dbc.depthBiasExact;
+    LOG("[vk] depth bias on DEPTH24 targets (D32_SFLOAT here): %s\n",
+        g_vk.dbias_unorm ? (g_vk.dbias_exact ? "D24's unit 2^-24, exact (VK_EXT_depth_bias_control)" : "D24's unit (VK_EXT_depth_bias_control)")
+        : dbu && *dbu == '0' ? "the float unit (LARECOMP_DEPTH_BIAS_UNORM=0)"
+        : "the float unit: no VK_EXT_depth_bias_control with FORCE_UNORM on this driver (polygon offsets smaller near depth 0)");
     if (g_vk.view2d_of_3d && !(have_v23.image2DViewOf3D && have_v23.sampler2DViewOf3D)) {
         g_vk.view2d_of_3d = false;
         drop_ext(ext, &n_ext, VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME);
@@ -839,6 +907,10 @@ static void create_device(void) {
     VkPhysicalDeviceImage2DViewOf3DFeaturesEXT v23f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT,
                                                        .image2DViewOf3D = VK_TRUE, .sampler2DViewOf3D = VK_TRUE};
     if (g_vk.view2d_of_3d) { v23f.pNext = f13.pNext; f13.pNext = &v23f; }
+    VkPhysicalDeviceDepthBiasControlFeaturesEXT dbcf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT,
+                                                        .depthBiasControl = VK_TRUE, .leastRepresentableValueForceUnormRepresentation = VK_TRUE,
+                                                        .depthBiasExact = g_vk.dbias_exact};
+    if (g_vk.dbias_unorm) { dbcf.pNext = f13.pNext; f13.pNext = &dbcf; }
     f13.pNext = vk_present_features(f13.pNext);
     // vendor binary = the driver's own GPU crash dump (NVIDIA 617: supported), saved by vk_device_fault_report
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
@@ -898,10 +970,13 @@ static void create_device(void) {
         LOG("[vk] compute shared memory: %u KiB on this GPU (Maxwell: 48): programs declare that much\n", maxwell_smem_bytes >> 10);
     }
     float prio[2] = {1.0f, 1.0f};
-    // with the FG present thread asked for (present.c, TOTK_FG_PRESENT_THREAD=1, with DLSS), a second queue of the
-    // family: its presents never share the render thread's queue
+    // for the FG present thread (present.c, default on; TOTK_FG_PRESENT_THREAD=0 off), a second queue of the family:
+    // its presents never share the render thread's queue. Asked for whether FG is on at the start or not: the Frame
+    // generation row turns it on live
+    // (no second queue: AMD's graphics family usually has one. The thread then presents on g_vk.queue itself, in 'Maximum fps' only (present.c vk_present_queue_on), and every submit
+    // and present on it holds g_queue_mu: host access to a queue is externally synchronized)
     uint32_t nqueue = 1;
-    if ((getenv("TOTK_DLSS") || getenv("TOTK_DLSS_FG")) && vk_present_queue_wanted()) {
+    if (vk_present_queue_wanted()) {
         VkQueueFamilyProperties fp[16];
         uint32_t nf = 16;
         vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nf, fp);
@@ -923,10 +998,13 @@ static void create_device(void) {
         gpu_unsupported(g_vk.props.deviceName, why);
     }
     log_memory_layout();
+    g_vk.set_bias2 = g_vk.dbias_unorm ? (PFN_vkCmdSetDepthBias2EXT)vkGetDeviceProcAddr(g_vk.dev, "vkCmdSetDepthBias2EXT") : NULL;
+    if (!g_vk.set_bias2) g_vk.dbias_unorm = false;
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
     VkQueue pq = VK_NULL_HANDLE;
     if (nqueue == 2) vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 1, &pq);
-    vk_present_queue_init(pq);
+    else if (vk_present_queue_wanted()) pq = g_vk.queue, g_queue_shared = true;   // (one queue in the family: vk_queue_lock)
+    vk_present_queue_init(pq, g_queue_shared);
     vk_present_device_ready();
     vk_ngx_device_ready();   // ngx.c: NGX on our device, capability map logged (TOTK_DLSS only)
 
@@ -1016,7 +1094,9 @@ void vk_pipeline_cache_save(void) {
     pthread_mutex_lock(&pcache_save_lock);
     size_t sz = 0;
     uint32_t warm_n = vk_archive_warm_snapshot();   // archive programs warmed so far: inside the data read below
-    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz || sz == pcache_saved) {
+    const bool sized = vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) == VK_SUCCESS;
+    if (sized) pcache_known = sz;
+    if (!sized || !sz || sz == pcache_saved) {
         if (sz && sz == pcache_saved && pcache_saved) vk_archive_warm_commit(warm_n);   // unchanged since the file
         pthread_mutex_unlock(&pcache_save_lock);
         return;
@@ -1104,6 +1184,7 @@ static void *pcache_saver(void *arg) {
         if (since < (early ? 15 : 60) || since % 5) continue;   // (the size query every 10 s at most)
         size_t sz = 0;
         if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS) continue;
+        pcache_known = sz;
         size_t step = early ? (pcache_saved / 16 > ((size_t)2 << 20) ? pcache_saved / 16 : (size_t)2 << 20) : (size_t)16 << 20;
         if (sz >= pcache_saved + step || (sz != pcache_saved && since >= 300)) { vk_pipeline_cache_save(); since = 0; }
     }
@@ -1115,6 +1196,30 @@ static void *pcache_saver(void *arg) {
 // never edits the environment while the game runs
 static atomic_int g_present_override = -1;
 void vk_set_present_mode(int mode) { atomic_store(&g_present_override, mode); }
+// Frame generation 'Maximum fps' (the F10 row graphics.frame_gen_pace, TOTK_FG_PACE=max: "as many fps as possible, 600 on
+// a 240 Hz monitor if the PC allows it"): the real frames pace as with FG off and every one gets the multiplier's
+// generated frames, whatever the refresh (hle_vi.cpp vi_pace_wait). The rows already give MAILBOX (V-sync on) or IMMEDIATE
+// (off: the player's tearing); FIFO comes with the VRR row, which keeps it (every frame shown up to the panel's maximum;
+// mailbox can turn G-SYNC off on some drivers). A FIFO asked for by hand (LARECOMP_VK_PRESENT=fifo, no VRR row) would free
+// a window image only at a vblank and hold the frames shown to the refresh again: MAILBOX instead while FG is on in this
+// mode. vk_frame_begin makes the swapchain again when FG turns on or off in it.
+static atomic_int g_fg_max = -1;   // (-1: TOTK_FG_PACE not read yet)
+bool vk_fg_max(void) {
+    int v = atomic_load(&g_fg_max);
+    if (v < 0) { const char *e = getenv("TOTK_FG_PACE"); v = e && !strcmp(e, "max"); atomic_store(&g_fg_max, v); }
+    return v;
+}
+void vk_set_fg_max(bool on) { atomic_store(&g_fg_max, on); }   // (pc_dlss.cpp, the row live)
+static bool fg_max_now(void) { return vk_fg_max() && vk_ngx_fg_on(); }
+static bool g_sc_fg_max;   // (fg_max_now() when the swapchain was last made: create_swapchain)
+static bool g_sc_vrr;      // (the VRR row then: its change makes the swapchain again, pc_window.cpp present_apply)
+static bool g_sc_free;     // (the swapchain's mode never waits for a vblank: MAILBOX / IMMEDIATE, not FIFO / FIFO_RELAXED)
+// 'Maximum fps' on a present mode that never waits for a vblank: the FG present thread may then share the render queue
+// (present.c vk_present_queue_on), holding its lock across presents that return at once. Not with the VRR row (FIFO) nor
+// where mailbox is missing and the mode fell back to FIFO (a present there can wait for a vblank and would stall every
+// submit behind the lock)
+bool vk_fg_max_free(void) { return vk_fg_max() && g_sc_free; }
+bool vk_sc_vrr_row(void) { return g_sc_vrr; }   // (present.c's composition check line)
 
 static VkPresentModeKHR present_mode(void) {
     // MAILBOX by default: the game paces itself (vi.c's emulated 60 Hz vsync), and with FIFO every submission queued
@@ -1127,18 +1232,51 @@ static VkPresentModeKHR present_mode(void) {
                           : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR
                           : !strcmp(e, "fifo_relaxed") ? VK_PRESENT_MODE_FIFO_RELAXED_KHR : VK_PRESENT_MODE_FIFO_KHR;
     if (atomic_load(&g_present_override) >= 0) want = (VkPresentModeKHR)atomic_load(&g_present_override);
+    // 'Maximum fps' takes MAILBOX (IMMEDIATE where the window has no mailbox) with the VRR row on too: with VRR's
+    // FIFO the frames above the refresh held up the render thread's acquire, so the real ones fell back to ~refresh /
+    // (n + 1). TOTK_FG_MAX_VRR_FIFO=1: FIFO with the VRR row on (before; mailbox can turn G-SYNC off on some
+    // drivers).
+    static int keep_fifo = -1;
+    if (keep_fifo < 0) { const char *e = getenv("TOTK_FG_MAX_VRR_FIFO"); keep_fifo = e && *e == '1'; }
+    const bool fg_free = g_sc_fg_max && !(g_sc_vrr && keep_fifo);
+    if (fg_free && (want == VK_PRESENT_MODE_FIFO_KHR || want == VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
+        want = VK_PRESENT_MODE_MAILBOX_KHR;
+        static int said;
+        if (!said++) LOG("[present] frame generation 'Maximum fps': mailbox instead of FIFO while it is on (frames shown past the refresh%s)\n",
+                         g_sc_vrr ? "; the VRR row's FIFO too: TOTK_FG_MAX_VRR_FIFO=1 keeps it" : "");
+    }
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, NULL);
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
     for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
+    if (fg_free && want == VK_PRESENT_MODE_MAILBOX_KHR) {   // (no mailbox: IMMEDIATE, which tears, else FIFO)
+        for (uint32_t i = 0; i < n; i++)
+            if (m[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                static int said;
+                if (!said++) LOG("[present] frame generation 'Maximum fps': this window offers no mailbox: IMMEDIATE (no refresh limit; it can tear)\n");
+                return VK_PRESENT_MODE_IMMEDIATE_KHR;
+            }
+        static int said;
+        if (!said++) LOG("[present] frame generation 'Maximum fps': this window offers no mailbox nor immediate: FIFO, the frames shown held to the refresh\n");
+    }
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
 static VkImageUsageFlags g_sc_usage;   // what the window images allow (create_swapchain: the surface's supported bits)
+// Whether the FG present thread presented when the swapchain was made (its image count: present.c
+// vk_present_image_count, +2 for the frames the thread holds). The Frame generation row turns it on or off live:
+// vk_frame_begin makes the swapchain again on each change. That gives the thread its images when FG comes on, and
+// after FG goes off (recreate_swapchain drains the thread first) the render thread is the only one presenting again.
+static bool g_sc_pq;
 static void create_swapchain(void) {
     vk_present_queue_drain();   // (FG present thread: nothing of the old swapchain left to present)
+    g_sc_fg_max = fg_max_now();   // (present_mode's; set before any return, so vk_frame_begin does not retry every frame)
+    {
+        const char *v = pc_settings_get("display.vrr");
+        g_sc_vrr = v && !strcmp(v, "on");   // (present_mode's)
+    }
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps));
     int w, h;
@@ -1158,9 +1296,15 @@ static void create_swapchain(void) {
     for (uint32_t i = 0; i < nf; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; break; }
     vk_present_pick_format(fmts, nf, &sf);   // present.c: HDR10 / scRGB when asked and offered
+    VkPresentModeKHR mode = present_mode();   // (before the image count: vk_present_queue_on reads g_sc_free)
+    g_sc_free = mode != VK_PRESENT_MODE_FIFO_KHR && mode != VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    if (g_queue_shared && g_sc_fg_max && !g_sc_free) {
+        static int said;
+        if (!said++) LOG("[present] frame generation 'Maximum fps' on FIFO: the FG present thread stays off the shared render queue (presents inline)\n");
+    }
+    g_sc_pq = vk_present_queue_on();
     uint32_t count = vk_present_image_count(&caps);   // (TOTK_SWAPCHAIN_IMAGES; default minImageCount + 1, at most 8)
     VkSwapchainKHR old = g_vk.swapchain;
-    VkPresentModeKHR mode = present_mode();
     // (what the surface allows: every Windows driver has these, but say so where one does not instead of failing
     // vkCreateSwapchainKHR; the screenshot / window-shot paths copy from the images, the present pass may blit into them)
     VkImageUsageFlags use = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -1248,7 +1392,9 @@ static void recreate_swapchain(void) {
     const uint64_t t = SDL_GetTicksNS();
     vk_present_queue_drain();   // (vkDeviceWaitIdle: every queue to itself)
     vkq_drain();
+    vk_queue_lock();   // (a shared render queue: the FG present thread's next present waits; vkDeviceWaitIdle needs it to itself)
     vkDeviceWaitIdle(g_vk.dev);
+    vk_queue_unlock();
     create_swapchain();
     g_pr_ns[PR_RECREATE] += SDL_GetTicksNS() - t;
 }
@@ -1258,6 +1404,7 @@ static void recreate_swapchain(void) {
 #define FRAMES 3
 static VkSemaphore acquire_sem[FRAMES], done_sem[8];
 static uint64_t slot_seq[FRAMES];
+static uint64_t slot_end_seq[FRAMES];   // (each slot's frame: its LAST submission, the present's: vk_frame_end; LARECOMP_GPU_FRAMES)
 static int slot;
 
 static VkSemaphore binary_semaphore(void) {
@@ -1293,8 +1440,13 @@ bool vk_frame_begin(const float clear[4]) {
     int w, h;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     if (!w || !h) { atomic_store(&g_last_frame_ns, SDL_GetTicksNS()); return false; }  // minimised (not a hang)
+    if (g_vk.swapchain && vk_present_queue_on() != g_sc_pq) {   // (FG present thread on / off since: g_sc_pq)
+        static int nlog;
+        if (nlog++ < 20) LOG("[present] FG present thread %s: the swapchain is made again\n", g_sc_pq ? "off" : "on");
+        atomic_store(&g_sc_recreate, 1);
+    }
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height ||
-        atomic_exchange(&g_sc_recreate, 0)) recreate_swapchain();
+        atomic_exchange(&g_sc_recreate, 0) || fg_max_now() != g_sc_fg_max) recreate_swapchain();
     if (!g_vk.swapchain) return false;
     static int trace = -1;
     if (trace < 0) trace = getenv("LARECOMP_VK_TRACE") != NULL;
@@ -1303,7 +1455,21 @@ bool vk_frame_begin(const float clear[4]) {
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
     {
         const uint64_t t = SDL_GetTicksNS();
-        vk_wait_seq(slot_seq[slot]);
+        // LARECOMP_GPU_FRAMES=<1..3> (default 3 = FRAMES, as before): at most that many presented frames on the GPU at once;
+        // this frame starts once frame f - n's submission completed (slot_seq holds the last FRAMES frames' seqs). The v0.1.9
+        // gate's one-frame foreign meshes / rain streaks come with GPU overlap (arm A: none), as if the game rewrote per-frame
+        // data its own frame counting took as consumed while our GPU, up to 3 frames behind, still read it in place (the
+        // Switch's GPU is about one frame behind). 1 or 2 = closer to that, at some fps.
+        static int gpu_frames = -1;
+        if (gpu_frames < 0) {
+            const char *e = getenv("LARECOMP_GPU_FRAMES");
+            gpu_frames = e && *e ? atoi(e) : FRAMES;
+            if (gpu_frames < 1 || gpu_frames > FRAMES) gpu_frames = FRAMES;
+            if (gpu_frames != FRAMES) LOG("[vk] at most %d presented frame(s) on the GPU at once (LARECOMP_GPU_FRAMES)\n", gpu_frames);
+        }
+        // (n < FRAMES: frame f - n wholly done, its present submission, not only its first: a frame spans several submissions
+        // with chunked submits / gdev carries / FG passes)
+        vk_wait_seq(gpu_frames == FRAMES ? slot_seq[slot] : slot_end_seq[(slot + FRAMES - gpu_frames) % FRAMES]);
         g_pr_ns[PR_SLOT] += SDL_GetTicksNS() - t;
     }
     VkResult r;
@@ -1543,6 +1709,16 @@ void vk_frame_end(const char *shot_path) {
     }
     VkSpan shot = {0};
     if (shot_path) save_window_image(cb, &shot);
+    if (g_game_present) {   // (TOTK_GLITCH_DETECT: glitch.c)
+        extern bool vk_glitch_on(void);
+        extern void vk_glitch_frame(VkCommandBuffer cb, VkImage sc, VkFormat sc_fmt, uint32_t w, uint32_t h, uint64_t frame);
+        if (g_sc_usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+            vk_glitch_frame(cb, g_vk.sc_images[cur_frame.image], g_vk.sc_format, g_vk.sc_extent.width, g_vk.sc_extent.height, total_frames);
+        else if (vk_glitch_on()) {
+            static int told;
+            if (!told++) LOG("[glitch] the window images cannot be copied from (no TRANSFER_SRC): the detector sees nothing\n");
+        }
+    }
     // HDR probe (present.c, TOTK_HDR_PROBE=<frame>,...): the encode on this frame into offscreen HDR targets, saved below
     extern bool vk_present_hdr_probe(VkCommandBuffer cb, VkImage src, VkFormat src_fmt, uint64_t frame, bool busy);
     extern void vk_present_hdr_probe_save(void);
@@ -1555,6 +1731,7 @@ void vk_frame_end(const char *shot_path) {
     uint64_t seq = vk_pending_seq();
     uint64_t t_submit = SDL_GetTicksNS();
     vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE);
+    slot_end_seq[slot] = seq;   // (this frame's last submission: LARECOMP_GPU_FRAMES waits on it)
     g_pr_ns[PR_SUBMIT] += SDL_GetTicksNS() - t_submit;
     extern void vk_present_latency_present(int stage);   // (present.c: low latency markers of a game frame)
     if (g_game_present) vk_present_latency_present(0);
@@ -1565,21 +1742,34 @@ void vk_frame_end(const char *shot_path) {
     uint64_t pid = vk_present_chain(&pi, g_note_gen);
     vk_present_note(pid, g_note_game_ns, g_note_gen);
     VkResult r;
+    // (the present call's parts for the hitch lines' present split, camera-turn P0)
+    uint64_t t_pc = SDL_GetTicksNS();
     if (vk_present_queue_on()) {   // DLSS-G: the FG present thread presents it at its due time (present.c)
         vkq_drain();   // (the submit that signals done_sem is in the queue before the present waits on it)
+        g_pr_ns[PR_DRAIN] += SDL_GetTicksNS() - t_pc;
         vk_present_queue_push(img, done_sem[img], pid, total_frames, seq, t_submit, g_game_present ? 1 : g_note_gen ? 2 : 0,
                               g_fg_k, g_fg_n);
         r = vk_present_queue_result();   // (what its earlier presents returned: out of date, suboptimal, lost)
     } else {
         g_rt_op = "vkQueuePresentKHR", g_rt_op_ns = SDL_GetTicksNS();
         if (g_game_present) vk_present_latency_present(1);
+        t_pc = SDL_GetTicksNS();
         vkq_drain();   // (LARECOMP_VKQ_SUBMIT: no deferred submit may race this queue call; returns at once when the ring is empty)
+        const uint64_t t_dr = SDL_GetTicksNS();
         vk_swapchain_lock();  // (the present-wait thread polls the same swapchain: present.c)
+        vk_queue_lock();
+        const uint64_t t_lk = SDL_GetTicksNS();   // (the lock wait: swapchain and queue locks)
         r = vkQueuePresentKHR(g_vk.queue, &pi);
+        vk_queue_unlock();
         vk_swapchain_unlock();
+        const uint64_t t_qp = SDL_GetTicksNS();
+        g_pr_ns[PR_DRAIN] += t_dr - t_pc;
+        g_pr_ns[PR_LOCK] += t_lk - t_dr;
+        g_pr_ns[PR_QPRESENT] += t_qp - t_lk;
         if (g_game_present) vk_present_latency_present(2);
         g_rt_op = NULL;
         vk_present_done(total_frames, pid, seq, r, t_submit, t_paced);   // timing; queued-frame and frames-in-flight limits
+        g_pr_ns[PR_LIMITS] += SDL_GetTicksNS() - t_qp;
     }
     g_pr_ns[PR_PRESENT] += SDL_GetTicksNS() - t_paced;
     if (r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) vk_present_lost();
@@ -1618,6 +1808,15 @@ void renderer_save_texture_tex(TexBackend *b, const char *path);
 
 static uint64_t frames, total_frames, g_frame_counter;
 uint64_t renderer_present_count(void) { return total_frames; }
+// Frames handed to the window since the start (any thread may read; the F3 readout's 'shown' rate takes their
+// difference over its interval): real ones (the game's own images; held frames, which are not shown, not counted) and
+// generated ones (DLSS-G or FSR FG, both through the passes below; TOTK_FG_PRESENT_THREAD's thread presents the same
+// frames later, at their due time). Shown = real + generated.
+static uint64_t g_shown_real, g_shown_gen;
+uint64_t vk_frames_shown(uint64_t *generated) {
+    if (generated) *generated = __atomic_load_n(&g_shown_gen, __ATOMIC_RELAXED);
+    return __atomic_load_n(&g_shown_real, __ATOMIC_RELAXED);
+}
 uint64_t vk_frame_counter(void) { return g_frame_counter; }
 static float g_shot_crop[4] = {0, 0, 1, 1};
 static uint64_t g_held_window;            // frames not shown in this stats window (backend_present hold)
@@ -1747,6 +1946,41 @@ void backend_present(NvnTexture *t) {
     b->presented = true;
     vk_late_latch_present();   // (latch.c: the frame's canvas, when no HUD draw came after its upscale)
     vk_end_pass();
+    // The presented image's writes before anything here reads it. vk_end_pass issues no memory barrier by default (the
+    // next game pass's barrier comes later), and vk_frame_begin's barrier names only the swapchain image. So the game's
+    // final colour writes into this window texture, and ours (late latch, upscale), had no formal dependency before
+    // DLSS-G / post_process / vk_present_draw sample or copy it. A read racing them takes the texture's previous contents
+    // (frame N-2: TotK has 2 window textures) wherever the write had not reached. Now a barrier here, once a frame.
+    // LARECOMP_PRESENT_BARRIER: 1 (default) a full barrier, the form the gate's presentbar arm tested; 2 only an image
+    // barrier on this texture (colour / storage / transfer writes -> sampled / storage / transfer reads; narrower, needs
+    // its own arm); 0 none (old).
+    {
+        static int mode = -1;
+        if (mode < 0) {
+            const char *e = getenv("LARECOMP_PRESENT_BARRIER");
+            mode = e && (*e == '0' || *e == '2') ? *e - '0' : 1;
+            if (mode != 1)
+                LOG("[present] %s before the presented image is read (LARECOMP_PRESENT_BARRIER=%d)\n",
+                    mode ? "only an image barrier on it" : "no barrier", mode);
+        }
+        if (mode == 1) vk_full_barrier(vk_cmd());
+        else if (mode == 2 && b->image) {
+            const VkImageMemoryBarrier2 ib = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT |
+                                 VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = b->image, .subresourceRange = {b->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+            const VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
+            vkCmdPipelineBarrier2(vk_cmd(), &di);
+        }
+    }
     // ngx.c DLSS-G: TOTK_DLSS=fgtest replaces b's contents with the generated frame; TOTK_DLSS=fg presents the ngen
     // generated frames first, generated frame k at k / (ngen + 1) of a real-frame interval after the last real present,
     // then this frame as usual
@@ -1879,7 +2113,8 @@ void backend_present(NvnTexture *t) {
     bool real = pass == npass;
     if (npass) vk_ngx_fg_show(vk_cmd(), b, real ? 0 : pass + 1);
     g_fg_k = real ? 0 : pass + 1, g_fg_n = npass;
-    if (!real && !pq && fg_last_real && fg_interval) {
+    // ('Maximum fps' without the thread: no wait, the generated frames go out with the real one; hdr's review)
+    if (!real && !pq && fg_last_real && fg_interval && !vk_fg_max()) {
         uint64_t due = fg_last_real + fg_interval * (uint64_t)(pass + 1) / (uint64_t)(npass + 1), now = SDL_GetTicksNS();
         if (due > now && due - now < 100000000ull) {   // (sleep to 2 ms before, then spin: our earlier Rust renderer's presenter)
             while (SDL_GetTicksNS() + 2000000ull < due) SDL_Delay(1);
@@ -1973,6 +2208,7 @@ void backend_present(NvnTexture *t) {
         vk_frame_end(shot_to);
         g_game_present = false;
         g_note_game_ns = 0;
+        __atomic_add_fetch(real ? &g_shown_real : &g_shown_gen, 1, __ATOMIC_RELAXED);   // (vk_frames_shown)
         if (!real) { fg_n_gen++; fg_gen_t = SDL_GetTicksNS(); }
         if (real && gen) {
             uint64_t now = SDL_GetTicksNS();
@@ -2439,9 +2675,19 @@ void backend_present(NvnTexture *t) {
             // (ram-diet: the guest's own parts, both imported = pinned; with the [host] commit / working set they show what
             // is the game's and what is ours or the driver's)
             extern uint64_t kernel_heap_size(void), g_alias_import_size, g_alias_import_committed;
-            LOG("[hostmem] %s; %s; guest heap %llu MB, alias import window %llu of %llu MB committed\n", db, ph,
+            // (+ what else of ours only grows: the command shadows' committed pages (cmdbuf.c) and the programs /
+            // pipelines made, each with its driver objects (exec.c))
+            extern uint64_t nvn_cmd_shadow_held(void);
+            extern void vk_prog_counts(uint64_t *progs, uint64_t *pipes, uint64_t *progs_pre, uint64_t *pipes_pre);
+            uint64_t npr, npi, npr2, npi2;
+            vk_prog_counts(&npr, &npi, &npr2, &npi2);
+            LOG("[hostmem] %s; %s; guest heap %llu MB, alias import window %llu of %llu MB committed; command shadows %llu MB "
+                "committed; programs kept: game %llu + precompile %llu, pipelines: game %llu + precompile %llu; pipeline cache "
+                "%llu MB\n", db, ph,
                 (unsigned long long)(kernel_heap_size() >> 20), (unsigned long long)(g_alias_import_committed >> 20),
-                (unsigned long long)(g_alias_import_size >> 20));
+                (unsigned long long)(g_alias_import_size >> 20), (unsigned long long)(nvn_cmd_shadow_held() >> 20),
+                (unsigned long long)npr, (unsigned long long)npr2, (unsigned long long)npi, (unsigned long long)npi2,
+                (unsigned long long)(pcache_known >> 20));
         }
 #endif
         if (last_fps_time > 0) {  // "[vram]": the OS
@@ -2536,11 +2782,18 @@ void backend_present(NvnTexture *t) {
                 l_dm = vk_dac_moves;
             }
             extern uint64_t cum_img_n, cum_img_reused, cum_img_unpooled;   // (textures.c)
-            static uint64_t l_n, l_r, l_u;
+            extern uint64_t cum_img_slow_n, cum_img_slow_ns, img_slow_worst_ns;
+            extern char img_slow_worst[];
+            static uint64_t l_n, l_r, l_u, l_sn, l_sns;
+            char slow[160] = "";
+            if (cum_img_slow_n != l_sn)   // (creations of 8 ms or more: under the hitch lines' 50 ms too; camera-turn P0)
+                snprintf(slow, sizeof slow, "; %llu of them took 8 ms or more, %.0f ms in all, worst %.0f ms (%s)",
+                         (unsigned long long)(cum_img_slow_n - l_sn), (cum_img_slow_ns - l_sns) / 1e6, img_slow_worst_ns / 1e6, img_slow_worst);
             LOG("[vram] images since the last line: created %llu, from the recycle pool %llu, finalized but freed (soft limit, "
-                "LARECOMP_VK_SOFT_EVICT=0) %llu\n",(unsigned long long)(cum_img_n - l_n), (unsigned long long)(cum_img_reused - l_r),
-                (unsigned long long)(cum_img_unpooled - l_u));
-            l_n = cum_img_n; l_r = cum_img_reused; l_u = cum_img_unpooled;
+                "LARECOMP_VK_SOFT_EVICT=0) %llu%s\n",(unsigned long long)(cum_img_n - l_n), (unsigned long long)(cum_img_reused - l_r),
+                (unsigned long long)(cum_img_unpooled - l_u), slow);
+            l_n = cum_img_n; l_r = cum_img_reused; l_u = cum_img_unpooled; l_sn = cum_img_slow_n; l_sns = cum_img_slow_ns;
+            img_slow_worst_ns = 0;
         }
         max_gap = 0;
         g_held_window = 0;
@@ -2648,7 +2901,9 @@ static void quick_exit_handler(void) {
         t = exit_step("present queue drained", "command recording drain", t);
         vkq_drain();
         t = exit_step("command recording drained", "GPU idle wait", t);
+        vk_queue_lock();   // (as recreate_swapchain)
         vkDeviceWaitIdle(g_vk.dev);
+        vk_queue_unlock();
         t = exit_step("GPU idle", "pipeline cache save", t);
         vk_pipeline_cache_save();   // (tmp file + one-step replace: an exit cut short leaves the previous cache)
         t = exit_step("pipeline cache save", "exit hook", t);
@@ -2745,7 +3000,9 @@ void backend_reset(void) {
     if (!g_vk.dev) return;
     vk_present_queue_drain();
     vkq_drain();
+    vk_queue_lock();   // (as recreate_swapchain)
     vkDeviceWaitIdle(g_vk.dev);
+    vk_queue_unlock();
     extern void vk_textures_reset(void);
     extern void vk_exec_reset(void);
     vk_textures_reset();

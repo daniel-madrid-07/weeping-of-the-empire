@@ -108,6 +108,7 @@ extern bool maxwell_vs_pointsize;  // no maintenance5 (device.c): every VS write
 extern bool maxwell_soft_f64;  // no shaderFloat64 on the device (device.c; LARECOMP_SOFT_F64=1 forces it): F64 ops as soft_f64.h calls
 extern uint32_t maxwell_smem_bytes;  // compute shared memory declared (device.c: the Maxwell 48 KiB, or less where the device has less)
 extern bool maxwell_nvidia;  // NVIDIA's proprietary driver (device.c): per-program form choices (translate.c nv_pcloop)
+extern bool maxwell_tex_hoist;   // predicated implicit-LOD samples outside their `if` (device.c; translate.c tex_hoist)
 // Device window (Vulkan, 0 = off): addresses [gmem_base + gmem_size, + maxwell_gdev_size) index the buffer at
 // GDEV_BUFFER_INDEX, VRAM copies of the storage buffers shaders write (exec.c gdev_*: RED atomics into the
 // host-imported heap cost 77 of a 113 ms GPU frame).

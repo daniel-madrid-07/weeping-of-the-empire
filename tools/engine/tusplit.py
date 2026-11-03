@@ -13,7 +13,7 @@ c_<addr>.cpp, which build.py compiles at -O1; without one every TU is t_<addr>.c
 The text of every function is gen.py's, byte for byte: each input TU is checked to parse back to itself, and every
 input function lands in exactly one output TU. Only the TU boundaries and the forward declarations change.
 """
-import hashlib, os, re, shutil
+import hashlib, json, os, re, shutil
 
 ANCHOR_INSNS = 160        # assumed mean function size: anchors every ~N/2 instructions (a constant, never measured,
                           # so the anchors depend on N alone)
@@ -168,6 +168,20 @@ def chunks(names, w, target):
         yield cur
 
 
+INDEX = 'split-index.json'   # beside the TUs: what genpart.py grafts a near key's regenerated functions with
+INDEX_VERSION = 1
+
+
+def write_index(d, m, decl, w, files):
+    """d/INDEX: the functions in address order with their weights and TU file, the header, the declarations (gen.py's
+    and those made from definitions)"""
+    doc = dict(version=INDEX_VERSION, pre=m.pre, eol=m.eol, decl=decl,
+               funcs=[[n, w[n], files[n]] for n in sorted(files, key=addr)])
+    with open(os.path.join(d, INDEX + '.tmp'), 'w', newline='\n') as f:
+        json.dump(doc, f, separators=(',', ':'), sort_keys=True)   # (sorted: a graft's equals a split's)
+    os.replace(os.path.join(d, INDEX + '.tmp'), os.path.join(d, INDEX))
+
+
 def split(src, dst, target, hot=None):
     """src: gen.py's output for one module -> dst: the same functions in stable TUs. Returns a summary dict."""
     m = Module(src)
@@ -188,9 +202,12 @@ def split(src, dst, target, hot=None):
                 decl[d.group(1)] = line[:line.index(') {') + 1] + ';'
     found = refs_of(m.funcs, ref_pattern(decl).pattern)
     summary = {'functions': len(order), 'tus': {}}
+    files = {}
     for cls, names in classes.items():
         count = 0
         for group in chunks(names, w, target):
+            for n in group:
+                files[n] = f'{cls}_{addr(group[0]):010x}.cpp'
             refs = set()
             for n in group:
                 refs.update(t for t in found[n] if t in decl)
@@ -202,4 +219,5 @@ def split(src, dst, target, hot=None):
                 f.write(text)
             count += 1
         summary['tus'][cls] = count
+    write_index(dst, m, decl, w, files)
     return summary

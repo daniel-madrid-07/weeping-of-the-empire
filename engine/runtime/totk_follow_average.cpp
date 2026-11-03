@@ -21,7 +21,6 @@
 #include <cstring>
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 constexpr u64 kData = 0x20, kCap = 0x28, kHead = 0x2c, kCount = 0x30;
 
 struct Node { u64 node; float acc; };
@@ -47,8 +46,8 @@ void hook_f_1b7ba58(Ctx *__restrict c) {   // ExecuteCalculateAverageVec3f::upda
         printf("[follow-average] follower smoothing %s\n", v ? "sampled at 30 Hz of game time" : "sampled per frame, as the game (TOTK_FOLLOW_AVERAGE=0)");
         return v;
     }();
-    const u64 n = c->x[0], fd = totk_global(kFrameDelta);
-    const float r = on && totk_ptr_ok(n) && totk_ptr_ok(fd) ? ldf32(fd + 8) : 1.0f;
+    const u64 n = c->x[0], fd = totk_frame_delta();
+    const float r = on && totk_ptr_ok(n) && totk_ptr_ok(fd) ? totk_frame_ratio(fd) : 1.0f;
     const s32 cap = r > 0.01f && r < 1.0f ? (s32)ld32(n + kCap) : 0;
     const u64 data = cap > 0 ? ld64(n + kData) : 0;
     if (!cap || !totk_ptr_ok(data)) { f_1b7ba58_orig(c); return; }

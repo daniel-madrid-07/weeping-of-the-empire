@@ -61,7 +61,9 @@ DECOMP_MAIN = 0x1000000000
 DATA_KINDS = ('data', 'data1', 'vtable', 'bound', 'string', 'blob')   # tools/version_port.py map() answers
 MIN_OFFSET = 0x10000             # below this a hex constant is a size, a mask or an encoding, not a main address
 HEX = re.compile(r'\b0x([0-9a-fA-F]+)(?:ull|ULL|u|U|ll|LL)?\b')
-GUEST_FN = re.compile(r'DECOMP_GUEST_FN\(\s*\w+\s*,\s*([0-9a-fA-F]+)\s*,')  # bare hex
+# bare hex GUEST_FN in the public tree (tools/release/export_public.py CODE_RENAMES: a player's 1.4.3 Setup maps the
+# exported sources, and without this every such address was left out and step 5 failed to compile)
+GUEST_FN = re.compile(r'\b(?:DECOMP_)?GUEST_FN\(\s*\w+\s*,\s*([0-9a-fA-F]+)\s*,')
 FNAME = re.compile(r'\b(?:hook_)?f_([0-9a-f]{5,8})(?:_orig)?\b')
 FIELD = re.compile(r'\btotk_field(?:_known)?\(\s*([A-Za-z_]\w*)\s*,\s*(0x[0-9a-f]+)\s*\)')   # totk_version.h
 FIELD_UNKNOWN = 0x7FFFFFF0   # totk_version.h TOTK_FIELD_UNKNOWN
@@ -105,12 +107,44 @@ HOOK_CAP30 = {
     0x1aa6a94: 'horse gauge tween', 0x1b7ba58: "followers' ring", 0x212b740: "inventory Link's tab debounce",
     0x1f61d6c: "inventory Link's rotation", 0x2833b60: 'AI-program integrators', 0x200f61c: 'ChaseF32 easer',
     0x200f8b0: 'ChaseVec3f easer', 0x20147f4: 'LerpF32 easer', 0x27dcb98: 'AddF32 adder',
+    0x171fafc: 'Recall velocity step where the helper is inlined',
 }
+# A cap30 hook another version does without: its job is done there by that version's own patch sites, so its drop
+# does not cap the build (the hook stays dropped; dropped_hooks says why). Each entry is (needs, why): needs is the
+# patch feature that must be built for the cover to hold ('realtime'), '!<feature>' one that must not be ('!fps60'),
+# or None (the cover is another hook, itself cap30). engine.json lists the covers' needs (covered_needs) and build.py
+# refuses a patch set that does not meet them.
+HOOK_COVERED = {
+    '1.4.3': {
+        0x7a83e4: ('realtime', "sites_v143 realtime: 1.4.3's frame-step producer (STEP_SITE) and global ratio "
+                               '(RATIO_SITE) take the measured step from the data page, so its VFRMgr::update '
+                               '(main+0x3e67f0) stores real time itself'),
+        0x120ec94: (None, "inlined into 1.4.3's getNextVelocity (main+0x1d4ac34): the 0x171fafc hook there scales both "
+                          'steps (a cap30 hook too: its drop still caps)'),
+        0x8f689c: ('!fps60', 'no fps60 for 1.4.3: the hook only writes the controller minimum that fps60 reads, and '
+                             "leaves the field alone on an image without it (fps60_reads_min); the runtime's own pacing "
+                             'sets the rate'),
+    },
+}
+
+
+def covers_unmet(needs, features):
+    """The covers' needs ({hex: need}, engine.json covered_needs) a patch set with these features does not meet."""
+    out = {}
+    for off, need in (needs or {}).items():
+        if need and (need[1:] in features if need.startswith('!') else need not in features):
+            out[off] = need
+    return out
+
+
 HOOK_GROUPS = (
     ('PouchActorInfoTable::getRow memo and its mutators',
      (0xb6afc8, 0x75718c, 0x18fb7d0, 0x18fbf18, 0x18fbf68, 0x18fc0ac, 0x279a77c, 0x2798a1c)),
 )
 HOOK_FREE = {0x704b7c: 'submesh cull (speed)', 0x27b6e64: 'load lap labels (diagnostic)',
+             0x9a7130: "foot IK ground-height ease in game time: without it the game's own per-frame ease runs (feet settle faster above 30 fps)",
+             0x16e4f90: "swim velocity ease in game time: without it the game's own per-frame ease runs (swimming settles faster above 30 fps)",
+             0x274a3c: 'Havok step log (diagnostic, TOTK_HAVOK_STEP_LOG)',
              0x11276cc: 'loader thread count (A/B)',
              0x9c2ef0: 'aal flush hold: without it the runtime keeps its 180 fps hold (hle_vi audio_fps_max), under the '
                        '200 where the jam watchdog cuts audio',
@@ -119,12 +153,20 @@ HOOK_FREE = {0x704b7c: 'submesh cull (speed)', 0x27b6e64: 'load lap labels (diag
              0xabb518: 'ambient one-shot settle in game time: without it the game plays, short ambient one-shots just '
                        'come closer together above 30 fps',
              0x91a290: "map temperature sign: without it the sign follows the game's language (the number still "
-                       'follows the setting where the tempunit patch is placed)'}
+                       'follows the setting where the tempunit patch is placed)',
+             0xa6fd14: "placement timers in game time (CPU): without it the game's own frame counts run, 8x the "
+                       'placement requests and rescans at 240 fps',
+             0xcc2c2c: "the 'Basic2' effect sway spring in game time (cosmetic): without it the game's per-call "
+                       'constants run, the sway is stiffer above 30 fps',
+             0x15eca7c: "Ultrahand read guard (#51): without it the game reads its bound target unchecked, as before",
+             0x7cba8c: "query result entries kept apart (#51): without it new requests may share a live request's entry, as "
+                       'before (the Ultrahand read guard still stops a dead target)'}
 
 
-def hook_policy(kept, hooks):
+def hook_policy(kept, hooks, version=None):
     """kept: {1.0.0 hook offset: why it cannot stay (absent: it stays)} for every GEN_MAIN hook. Returns (hooked
-    1.0.0 offsets, status 'pass' | 'fail', safe_mode list, reasons {hex: text})."""
+    1.0.0 offsets, status 'pass' | 'fail', safe_mode list, reasons {hex: text}). version: the build's game version
+    ('1.4.3'), whose HOOK_COVERED cap30 hooks drop without the 30 fps cap."""
     drop, reasons = dict(kept), {}
     for name, members in HOOK_GROUPS:
         lost = [m for m in members if m in drop]
@@ -136,6 +178,8 @@ def hook_policy(kept, hooks):
         if off in HOOK_FAIL:
             status = 'fail'
             reasons[hex(off)] = f'REQUIRED ({HOOK_FAIL[off]}): {why}'
+        elif off in HOOK_CAP30 and off in HOOK_COVERED.get(version, {}):
+            reasons[hex(off)] = f'covered on {version} ({HOOK_CAP30[off]}: {HOOK_COVERED[version][off][1]}): {why}'
         elif off in HOOK_CAP30:
             safe = ['cap30']
             reasons[hex(off)] = f'cap30 ({HOOK_CAP30[off]}): {why}'
@@ -292,10 +336,12 @@ def check_fields(d, structs=None):
         for k, v in offs.items():
             if not isinstance(k, str) or not HEX_RE.match(k):
                 out.append(f'{st} {k!r}: key is not 0x<hex>')
-            elif (not isinstance(v, dict) or set(v) != {'new', 'for'} or not isinstance(v['new'], str)
+            elif (not isinstance(v, dict) or set(v) - {'ro'} != {'new', 'for'} or v.get('ro', True) is not True
+                  or not isinstance(v['new'], str)
                   or not HEX_RE.match(v['new']) or not isinstance(v['for'], list) or not v['for']
                   or not all(isinstance(x, str) and HEX_RE.match(x) for x in v['for'])):
-                out.append(f'{st} {k}: needs {{"new": "0x<hex>", "for": ["0x<hex>", ...]}}')
+                out.append(f'{st} {k}: needs {{"new": "0x<hex>", "for": ["0x<hex>", ...]}} (+ "ro": true: the runtime '
+                           f'only reads it, so the renamed form may prove it)')
     return out
 
 
@@ -411,9 +457,65 @@ def _rebased(porter, fo, at, fn, at1, m0, m1, new):
     return None
 
 
-def field_evidence(porter, at, off, new, pinned, kinds=None):
+RENAMED_MIN = 0x10  # the renamed form never proves an offset below this
+
+
+def _op_class(kind):
+    """an immediate access's opcode and size class: mem_imm's masked word with its registers masked too (rt, rn, and
+    a pair's rt2)"""
+    k = kind & ~0x3ff
+    return k & ~(31 << 10) if k & 0x3a000000 == 0x28000000 else k
+
+
+def _renamed(porter, at, off, new, pinned):
+    """the renamed form: in a pinned or confirmed pair, the 1.0.0 access at `at` is the only load / store of its opcode
+    and size class at off in the whole function, and the 1.4.3 function has exactly one of that class at new (any
+    registers: an update that rewrote the function and renamed its registers). Offsets below RENAMED_MIN never
+    qualify; ADD is not an access. Only for a field the runtime only reads ('ro', gated_fields), and only with a
+    second agreeing piece from another function or an aligned one. None when it holds, else why not."""
+    fo = porter.func_of(0, at)
+    if fo is None or fo not in porter.fwd or not (fo in pinned or porter.confirmed(fo)):
+        return 'no confirmed pair or passing pin'
+    if off < RENAMED_MIN or new < RENAMED_MIN:
+        return f'offsets below {RENAMED_MIN:#x} never qualify'
+    m0 = mem_imm(_word(porter.old, at))
+    if m0 is None or m0[1] != off or m0[0] & 0x7f800000 == 0x11000000:
+        return f'{at:#x} is not an immediate load / store at {off:#x}'
+    cls = _op_class(m0[0])
+
+    def same(img, fs, size, o):
+        out = []
+        for a in range(fs, fs + size, 4):
+            m = mem_imm(_word(img, a))
+            if m is not None and m[1] == o and m[0] & 0x7f800000 != 0x11000000 and _op_class(m[0]) == cls:
+                out.append(a)
+        return out
+    olds = same(porter.old, fo, porter.size_o[fo], off)
+    if olds != [at]:
+        return f'{len(olds)} accesses of its class at {off:#x} in {fo:#x} (exactly one needed)'
+    fn = porter.fwd[fo]
+    news = same(porter.new, fn, porter.size_n[fn], new)
+    if len(news) != 1:
+        return f'{len(news)} accesses of its class at {new:#x} in {fn:#x} (exactly one needed)'
+    return None
+
+
+def field_evidence(porter, at, off, new, pinned, kinds=None, renamed_ok=False):
     """None when the 1.0.0 access at `at` (of a field at off) is matched on this image by the same access at offset new
-    (its function a confirmed pair or a passing pin, the instruction aligned); else why not"""
+    (its function a confirmed pair or a passing pin, the instruction aligned); else why not. renamed_ok (a read-only
+    field): the renamed form (_renamed) may hold where the others do not."""
+    why = _field_evidence(porter, at, off, new, pinned, kinds)
+    if why is None or not renamed_ok:
+        return why
+    r = _renamed(porter, at, off, new, pinned)
+    if r is None:
+        if kinds is not None:
+            kinds.append('renamed')
+        return None
+    return f'{why}; renamed: {r}'
+
+
+def _field_evidence(porter, at, off, new, pinned, kinds=None):
     import difflib
     fo = porter.func_of(0, at)
     if fo is None:
@@ -492,24 +594,27 @@ def field_evidence(porter, at, off, new, pinned, kinds=None):
 def gated_fields(shipped, porter, pinned, report=None):
     """(the flat field map fields_inc takes, refusals) from a checked shipped map: an entry when all its evidence holds.
     A piece matched only inside a rewritten stretch ('stretch', weaker than an aligned one: a lone same-shape access
-    there can be the next member) needs a second agreeing piece, aligned or in another function. report:
-    {'Struct+off': [[address, 'aligned' | 'stretch'],...]} for the audit."""
+    there can be the next member) needs a second agreeing piece, aligned or in another function. So does a 'renamed'
+    piece (field_evidence's renamed form, only for an entry marked "ro": the runtime never writes it). report:
+    {'Struct+off': [[address, 'aligned' | 'stretch' | 'renamed' |...],...]} for the audit."""
     out, refused = {}, []
     for st, offs in shipped.items():
         for k, v in offs.items():
             bad, kinds = [], []
             for x in v['for']:
-                why = field_evidence(porter, int(x, 16), int(k, 16), int(v['new'], 16), pinned, kinds)
+                why = field_evidence(porter, int(x, 16), int(k, 16), int(v['new'], 16), pinned, kinds,
+                                     renamed_ok=v.get('ro') is True)
                 if why:
                     bad.append(why)
             pieces = list(zip([int(x, 16) for x in v['for']], kinds)) if not bad else []
             if report is not None and pieces:
                 report[f'{st}+{k}'] = [[hex(a), kd] for a, kd in pieces]
-            if not bad and 'stretch' in kinds:
+            weak = [kd for kd in ('stretch', 'renamed') if kd in kinds]
+            if not bad and weak:
                 fns = {porter.func_of(0, a) for a, _ in pieces}
                 if not ('aligned' in kinds or len(fns) > 1):
-                    bad.append('matched only inside a rewritten stretch: a second agreeing piece (aligned, or in '
-                               'another function) is needed')
+                    bad.append(f'matched only by the {weak[0]} form in one function: a second agreeing piece (aligned, '
+                               f'or in another function) is needed')
             if bad:
                 refused.append(f'{st}+{k}: {bad[0]}')
             else:
@@ -654,7 +759,7 @@ def generate(old_nso, new_nso, version, diagnostic=False, beta=False, pins=None,
             report['functions'][hex(off)].update(why=pinned[fo]['why'], checked=pinned[fo].get('checked'))
         if off in gen_hooks and not exact and fo not in pinned:
             cannot[off] = 'the function changed (the hook may assume its 1.0.0 layout)'
-    kept, status, safe, reasons = hook_policy(cannot, gen_hooks)
+    kept, status, safe, reasons = hook_policy(cannot, gen_hooks, version)
     report['hooks'] = {hex(o): reasons.get(hex(o), 'hooked') for o in gen_hooks}
     vlocal = [porter.fwd[o] for o in lists.get('vlocal', []) if o in porter.fwd]
     # the cold giants gen.py splits into chunks (build.py SPLIT_FUNCS: compile time and memory, not behaviour)
@@ -667,6 +772,8 @@ def generate(old_nso, new_nso, version, diagnostic=False, beta=False, pins=None,
                   vlocal=[hex(v) for v in sorted(vlocal)], split=[hex(v) for v in sorted(split)],
                   giant_hot=sorted(giant_hot),
                   unplaced_hooks=[hex(o) for o in sorted(cannot) if o not in porter.fwd],
+                  covered_needs={hex(o): HOOK_COVERED[version][o][0] for o in sorted(cannot)
+                                 if o in HOOK_COVERED.get(version, {}) and HOOK_COVERED[version][o][0]},
                   dropped_hooks=reasons)
     if pinned:   # (absent without --pins: the file as before)
         engine['pinned'] = {hex(o): hex(porter.fwd[o]) for o in sorted(pinned)}

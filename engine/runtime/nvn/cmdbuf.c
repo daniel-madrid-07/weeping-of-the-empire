@@ -64,6 +64,11 @@ static void cmap_put(CmdMap *m, uint64_t k, CmdChunk *v) {
 typedef struct { uint64_t win; uint8_t *host; uint64_t *committed; } CmdSlab;   // win: the window's first slab
 static CmdSlab g_slabs[64];
 static int g_nslabs;
+// Host bytes the shadows hold committed (never decommitted: 8 x every guest address ever used as command memory) and
+// the calloc'd fallback shadows: the [hostmem] line (nvn_cmd_shadow_held). sadyungboi 2026-11-02: our commit grew
+// 7.4 -> 11.0 GB in an hour on an 8 GB PC, ~3 GB of it in nothing any log line counted.
+static volatile uint64_t g_shadow_held;
+uint64_t nvn_cmd_shadow_held(void) { return __atomic_load_n(&g_shadow_held, __ATOMIC_RELAXED); }
 // One CmdChunk per region for cmd_chunk_for, covering the window it owns: every mirrored chunk of it maps guest ->
 // host the same way (host = region host + (guest - window base) * K), so a handle or JUMP target only needs its window
 // - no lock, no hash lookup. Published
@@ -101,7 +106,13 @@ static uint8_t *cmd_mirror(uint64_t base, uint64_t size, CmdChunk **region) {
     if (!done) {
         if (!VirtualAlloc(s->host + (g0 << COMMIT_SHIFT), (SIZE_T)((g1 - g0 + 1) << COMMIT_SHIFT), MEM_COMMIT, PAGE_READWRITE))
             return NULL;
-        if (s->committed) for (uint64_t g = g0; g <= g1; g++) s->committed[g >> 6] |= 1ull << (g & 63);
+        uint64_t fresh = 0;   // (granules committed for the first time; no bitmap: not counted)
+        if (s->committed)
+            for (uint64_t g = g0; g <= g1; g++) {
+                fresh += !((s->committed[g >> 6] >> (g & 63)) & 1);
+                s->committed[g >> 6] |= 1ull << (g & 63);
+            }
+        __atomic_add_fetch(&g_shadow_held, fresh << COMMIT_SHIFT, __ATOMIC_RELAXED);
     }
     if (region) *region = &g_slab_chunk[r];
     return p;
@@ -122,8 +133,9 @@ static void shadow_note(uint64_t base, uint64_t size) {   // (under cmd_lock)
         const uint64_t now = plat_now_ns();
         if (now >= next_ns) {
             next_ns = now + 60000000000ull;
-            LOG("[nvn] command shadows: %llu, %llu MiB made in total (latest %llx +%llx); map %zu bases, %zu handles\n",
-                (unsigned long long)g_shadow_count, (unsigned long long)(g_shadow_total >> 20), (unsigned long long)base,
+            LOG("[nvn] command shadows: %llu, %llu MiB made in total, %llu MiB held (latest %llx +%llx); map %zu bases, %zu handles\n",
+                (unsigned long long)g_shadow_count, (unsigned long long)(g_shadow_total >> 20),
+                (unsigned long long)(nvn_cmd_shadow_held() >> 20), (unsigned long long)base,
                 (unsigned long long)size, g_chunk_by_base.n, g_chunk_by_handle.n);
         }
     }
@@ -163,7 +175,7 @@ static CmdChunk *cmd_chunk_add(uint64_t base, uint64_t size) {
     if (!k || k->size < size) {     // a replaced chunk record is kept: lists recorded in it stay valid until overwritten
         k = malloc(sizeof *k);
         k->base = base; k->size = size; k->host = host;
-        if (!k->host) { InterlockedExchange(&g_mirror_fallback, 1); k->host = calloc(size, CMD_SHADOW_K); LOG("[nvn] command shadow %llx +%llx: no mirror, calloc\n",
+        if (!k->host) { InterlockedExchange(&g_mirror_fallback, 1); k->host = calloc(size, CMD_SHADOW_K); if (k->host) __atomic_add_fetch(&g_shadow_held, size * CMD_SHADOW_K, __ATOMIC_RELAXED); LOG("[nvn] command shadow %llx +%llx: no mirror, calloc\n",
                                                                    (unsigned long long)base, (unsigned long long)size); }
         if (!k->host) FATAL("nvn: no host memory for a %llu-byte command shadow (%llu shadows, %llu MiB so far)\n",
                             (unsigned long long)size * CMD_SHADOW_K, (unsigned long long)g_shadow_count,

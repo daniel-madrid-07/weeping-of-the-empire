@@ -121,8 +121,24 @@ def op2(ops, n):
 
 # --lso-abi: AAPCS64's dead state at a call or a return: x9-x18 (bits 9-18) and NZCV (bit 32 of an LSO mask)
 ABI_DEAD = sum(1 << r for r in range(9, 19)) | (1 << 32)
-# lsi_abi: lsi without them (rt.h lsi: x0-x18, x30, NZCV), one line in each TU's header (rt.h, so every key, unchanged)
-LSI_ABI_DEF = '#define lsi_abi(r, l) do { LANES(0, 9, (l).x[i] = (r)->x[i]); (l).x[30] = (r)->x[30]; } while (0)\n'
+# lsi_abi: lsi without them (rt.h lsi: x0-x18, x30, NZCV), one line in each TU's header (rt.h, so every key, unchanged).
+# Its lanes and lso's are written out here, not through rt.h's LANES / lso<M>: each LANES site is a lambda of its own
+# (12 template instances: rt_unroll, rt_unroll_, one per lane) and each mask an lso<M> (33), ~16k instances in a median
+# TU, half its compile. setup-fast, 2026-11-02 (Setup's fresh v0.1.7 key, 12-20 TU samples, same flags): 23-29% less
+# compile time a TU (lsi_abi 23%, lso 6% more); the same code but for the registers in ~3% of the functions (the same
+# instructions, -0.02% of them; lso written out changes no function), the same profile data (entry counts, weights).
+LSI_ABI_DEF = ('#define lsi_abi(r, l) do { ' + ' '.join(f'(l).x[{i}] = (r)->x[{i}];' for i in range(9))
+               + ' (l).x[30] = (r)->x[30]; } while (0)\n')
+
+
+def lso_text(m):
+    """rt.h's lso<m>(cx, lc_) written out: the registers of mask m (bits 0-30 x0-x30, 31 sp, 32 NZCV) back to the Ctx"""
+    s = [f'cx->x[{i}] = lc_.x[{i}];' for i in range(31) if m >> i & 1]
+    if m >> 31 & 1:
+        s.append('cx->sp = lc_.sp;')
+    if m >> 32 & 1:
+        s.append('cx->n = lc_.n; cx->z = lc_.z; cx->c = lc_.c; cx->vf = lc_.vf;')
+    return '{ ' + ' '.join(s) + ' }'
 COND = {'eq': 'C_EQ', 'ne': 'C_NE', 'hs': 'C_HS', 'cs': 'C_HS', 'lo': 'C_LO', 'cc': 'C_LO', 'mi': 'C_MI', 'pl': 'C_PL',
         'vs': 'C_VS', 'vc': 'C_VC', 'hi': 'C_HI', 'ls': 'C_LS', 'ge': 'C_GE', 'lt': 'C_LT', 'gt': 'C_GT', 'le': 'C_LE', 'al': 'C_AL'}
 # --fcfuse: each condition after fcmp a, b (gt 0010, lt 1000, eq 0110, unordered 0011) as one C compare; C's compares
@@ -606,7 +622,7 @@ class Emitter:
                         self.stats['lso_abi_syncs'] += 1
                     self.stats['lctx_syncs'] += 1
                     self.stats['lctx_sync_regs'] += bin(m).count('1')
-                    o += f'lso<{m:#x}ull>(cx, lc_);' + part
+                    o += lso_text(m) + part
                 cd = o
             res.append(cd.replace('LSI;', 'lsi(cx, lc_);').replace('LSI_ABI;', 'lsi_abi(cx, lc_);'))
         self.stats['lctx_funcs'] += 1

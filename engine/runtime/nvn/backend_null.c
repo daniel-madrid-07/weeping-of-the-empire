@@ -7,6 +7,7 @@ void backend_init(void) { LOG("[nvn] null backend (no rendering yet)\n"); }
 void backend_execute(uint64_t handle) { (void)handle; g_execs++; }
 void backend_exec_lock(void) {}
 void backend_exec_unlock(void) {}
+bool backend_exec_lock_held(void) { return false; }   // (hle_os_mem.cpp sync guard: no exec lock here)
 void backend_present(NvnTexture *tex) {
     if (g_presents++ < 5 || g_presents % 300 == 0)
         LOG("[nvn] present #%llu tex %ux%u fmt %#x (command lists executed: %llu)\n", (unsigned long long)g_presents,

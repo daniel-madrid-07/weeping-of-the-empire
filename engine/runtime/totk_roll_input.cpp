@@ -27,7 +27,6 @@
 #include <cstring>
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 // the original's constants, bit-exact (main+0x3776234 / 0x37762f0 / 0x3776360 / 0x3776274 / 0x37761b4, 0x3775b84 /
 // 0x3775f60)
 constexpr u32 kMinBits = 0x3e2b92a7, kCapBits = 0x40c25c20, kFlickBits = 0x40060a92, kFullBits = 0x3f733333,
@@ -85,10 +84,10 @@ void hook_f_1cd0260(Ctx *__restrict c) {   // ExecutePlayerCalcStick's calc (thi
     if (!ok) return;
     const u32 cur = ld32(self + 0xe0);
     if (cur == prev) return;   // the roll was not evaluated (no stick this frame) or did not move
-    const u64 fd = totk_global(kFrameDelta), len_p = ld64(self + 0x58);
+    const u64 fd = totk_frame_delta(), len_p = ld64(self + 0x58);
     float d;
     if (!totk_ptr_ok(fd) || !addr_ok(len_p) ||
-        !totk_roll_input_redo(bits(prev), bits(cur), ldf32(len_p), ldf32(fd + 8), &d))
+        !totk_roll_input_redo(bits(prev), bits(cur), ldf32(len_p), totk_frame_ratio(fd), &d))
         return;
     const float acc = totk_roll_input_sum(acc0, d);
     stf(self + 0xe8, acc);
@@ -98,5 +97,5 @@ void hook_f_1cd0260(Ctx *__restrict c) {   // ExecutePlayerCalcStick's calc (thi
     if (addr_ok(turn_p)) st8(turn_p, fabsf(acc) >= bits(kCapBits));
     if (addr_ok(flick_p) && fabsf(acc) >= bits(kFlickBits)) st8(flick_p, 0);
     static int logs;
-    if (logs < 3 && ++logs) printf("[roll-input] counted a %.3f rad change at ratio %.3f (sum %.2f)\n", d, ldf32(fd + 8), acc);
+    if (logs < 3 && ++logs) printf("[roll-input] counted a %.3f rad change at ratio %.3f (sum %.2f)\n", d, totk_frame_ratio(fd), acc);
 }

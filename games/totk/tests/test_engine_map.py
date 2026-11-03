@@ -41,6 +41,39 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(status, 'pass')
         self.assertIn('its group', why[hex(0xb6afc8)])
 
+    def test_covered_hooks(self):
+        # a version's covered cap30 hook drops without the cap; on 1.0.0 (no version) the same drop still caps
+        hooks = em.gen_main_lists()['hook']
+        for version, covered in em.HOOK_COVERED.items():
+            self.assertTrue(set(covered) <= set(em.HOOK_CAP30), version)
+            for off in covered:
+                kept, status, safe, why = em.hook_policy({off: 'no confirmed place'}, hooks, version)
+                self.assertEqual((status, safe, off in kept), ('pass', [], False))
+                self.assertIn('covered on', why[hex(off)])
+                self.assertEqual(em.hook_policy({off: 'no confirmed place'}, hooks)[2], ['cap30'])
+        from games.totk.patches import sites_v143
+        # each cover names what it needs; a patch set without it is refused by build.py (covers_unmet)
+        needs = {hex(o): n for o, (n, _) in em.HOOK_COVERED['1.4.3'].items() if n}
+        self.assertEqual(needs, {hex(0x7a83e4): 'realtime', hex(0x8f689c): '!fps60'})
+        self.assertEqual(em.covers_unmet(needs, {'realtime', 'cloth'}), {})
+        self.assertEqual(em.covers_unmet(needs, {'cloth'}), {hex(0x7a83e4): 'realtime'})
+        self.assertEqual(em.covers_unmet(needs, {'realtime', 'fps60'}), {hex(0x8f689c): '!fps60'})
+        # the patch set's 'features' are the resolved names (patches engine: resolve_features(engine_spec(...))), never
+        # the literal 'default': a default 1.4.3 export meets every cover
+        from games.totk.patches import engine as pe, resolve_features
+        table = {'feature': [dict(name=n, default=d, needs=list(nd)) for n, (_, d, nd) in sites_v143.FEATURES.items()]}
+        feats = resolve_features(pe.engine_spec('default', {f['name'] for f in table['feature']}, set(), set()), table)
+        self.assertNotIn('default', feats)
+        self.assertIn('realtime', feats)
+        self.assertEqual(em.covers_unmet(needs, set(feats)), {})
+        self.assertEqual(em.covers_unmet(needs, set(resolve_features('default,-realtime,-cloth', table))),
+                         {hex(0x7a83e4): 'realtime'})
+        # the cover holds only while 1.4.3's sites are what the entries say: realtime on by default, no fps60
+        from games.totk.patches import sites_v143
+        self.assertEqual(sites_v143.FEATURES['realtime'][1], True)
+        if 0x8f689c in em.HOOK_COVERED['1.4.3']:
+            self.assertNotIn('fps60', sites_v143.FEATURES, 'fps60 came to 1.4.3: 0x8f689c needs its pin, not a cover')
+
 
 class BetaTest(unittest.TestCase):
     def test_beta_groups_cover_known_required_hooks_and_have_env(self):
@@ -276,6 +309,70 @@ def _mains():
     work = os.environ.get('NXRECOMP_WORK') or r'C:\nxrecomp-work'
     old, new = (os.path.join(work, 'extracted', v, 'exefs', 'main') for v in ('v100', 'v143'))
     return (old, new) if os.path.isfile(old) and os.path.isfile(new) else None
+
+
+class RenamedFormTest(unittest.TestCase):
+    """the renamed form: a read-only ("ro") field whose 1.4.3 function was rewritten with its registers renamed; exactly
+    one access of the class at the offset in each whole function, offsets >= 0x10, a second piece from another
+    function"""
+    LDR40, NOP, RET = 0xb9404001, 0xd503201f, 0xd65f03c0          # ldr w1, [x0, #0x40]
+    LDR48_W9_X3 = 0xb9404869                                       # ldr w9, [x3, #0x48]
+
+    def porter(self, new_words, confirmed=True):
+        p = FieldEvidenceTest.P(confirmed=confirmed)
+        n = len(new_words)
+        p.new.words[0x1100 // 4: 0x1100 // 4 + n] = new_words
+        p.size_n = {0x1100: 4 * n}
+        p._norm = lambda side, s: (p.old if side == 0 else p.new).words[s // 4: s // 4 + (4 if side == 0 else n)]
+        p.fwd[0x200] = 0x1100          # a second 1.0.0 function paired with it: the other piece's function
+        return p
+
+    def rewritten(self, *extra):
+        return [0x52800020, 0x52800041, self.LDR48_W9_X3, *extra, self.NOP, self.RET]
+
+    def test_holds_with_a_piece_in_another_function(self):
+        f = {'OptionSelect': {'0x40': {'new': '0x48', 'for': ['0x104', '0x204'], 'ro': True}}}
+        rep = {}
+        self.assertEqual(em.gated_fields(f, self.porter(self.rewritten()), {}, rep),
+                         ({'OptionSelect': {'0x40': '0x48'}}, []))
+        self.assertEqual(rep['OptionSelect+0x40'], [['0x104', 'renamed'], ['0x204', 'renamed']])
+
+    def test_refusals(self):
+        one = {'OptionSelect': {'0x40': {'new': '0x48', 'for': ['0x104'], 'ro': True}}}
+        self.assertIn('second agreeing piece', em.gated_fields(one, self.porter(self.rewritten()), {})[1][0])
+        written = {'OptionSelect': {'0x40': {'new': '0x48', 'for': ['0x104', '0x204']}}}   # no "ro": strict forms only
+        self.assertIn('ambiguous', em.gated_fields(written, self.porter(self.rewritten()), {})[1][0])
+        two = self.rewritten(0xb9404862)                                                   # + ldr w2, [x3, #0x48]
+        self.assertIn('2 accesses', em.field_evidence(self.porter(two), 0x104, 0x40, 0x48, {}, renamed_ok=True))
+        wide = [0x52800020, 0x52800041, 0xf9402469, self.NOP, self.RET]                   # ldr x9, [x3, #0x48]
+        self.assertIn('0 accesses', em.field_evidence(self.porter(wide), 0x104, 0x40, 0x48, {}, renamed_ok=True))
+        unpinned = self.porter(self.rewritten(), confirmed=False)
+        self.assertIn('no confirmed pair', em.field_evidence(unpinned, 0x104, 0x40, 0x48, {}, renamed_ok=True))
+        low = self.porter([0x52800020, 0x52800041, 0xb9400869, self.NOP, self.RET])        # ldr w9, [x3, #8]
+        low.old.words[0x104 // 4] = 0xb9400801                                             # ldr w1, [x0, #8]
+        self.assertIn('below 0x10', em.field_evidence(low, 0x104, 0x8, 0x8, {}, renamed_ok=True))
+
+    def test_schema(self):
+        ok = {'OptionSelect': {'0x40': {'new': '0x48', 'for': ['0x104'], 'ro': True}}}
+        self.assertEqual(em.check_fields(ok, structs={'OptionSelect'}), [])
+        for bad in ({'new': '0x48', 'for': ['0x104'], 'ro': False}, {'new': '0x48', 'for': ['0x104'], 'rw': True}):
+            self.assertTrue(em.check_fields({'OptionSelect': {'0x40': bad}}, structs={'OptionSelect'}))
+
+    @unittest.skipUnless(_mains(), 'no 1.0.0 / 1.4.3 mains in the work folder')
+    def test_move_box_cursor_on_mains(self):
+        """1.0.0's moveBoxCursor 0x2230100 and 1.4.3's 0x28f8d0c (rewritten, registers renamed): the control's active
+        node load [x22, #0x58] is [x8, #0x58] there; the strict forms refuse it, the renamed form takes it"""
+        import sys
+        sys.path.insert(0, str(em.ROOT / 'tools'))
+        import version_port as vp
+        porter = vp.Porter(*(vp.load_image(p) for p in _mains()))
+        porter._pair(0x2230100, 0x28f8d0c, 'pinned')
+        pinned = {0x2230100}
+        self.assertIsNotNone(em.field_evidence(porter, 0x2230154, 0x58, 0x58, pinned))
+        kinds = []
+        self.assertIsNone(em.field_evidence(porter, 0x2230154, 0x58, 0x58, pinned, kinds, renamed_ok=True))
+        self.assertEqual(kinds, ['renamed'])
+        self.assertIsNotNone(em.field_evidence(porter, 0x2230154, 0x58, 0x60, pinned, renamed_ok=True))   # near miss
 
 
 @unittest.skipUnless(_mains(), 'no 1.0.0 / 1.4.3 mains in the work folder')

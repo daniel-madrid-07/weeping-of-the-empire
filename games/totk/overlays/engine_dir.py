@@ -26,6 +26,9 @@ from . import RomFS, Zstd
 
 RSTB = 'System/Resource/ResourceSizeTable.Product.100.rsizetable.zs'
 ENGINE_FIXES = ('UI/LayoutArchive/Common.Product.100.Nin_NX_NVN.blarc.zs', 'Event/EventFlow/DmF_SY_GameOver.bfevfl.zs')
+# Files 1.0.0 does not have, which the runtime serves in place of one it does (hle_fs.cpp): checked against that
+# original, and the RSTB entry of that original made big enough for either
+SERVED_AS = {'Mals/USpt.Product.100.sarc.zs': 'Mals/USen.Product.100.sarc.zs'}   # (mals.py: Brazilian Portuguese)
 
 
 def rstb_entries(d):
@@ -71,7 +74,7 @@ def build(romfs_root, sets, sets_root, engine_dir, out):
             data = src.read_bytes()
             if hashlib.sha256(data).hexdigest() != digest or len(data) != int(size):
                 raise ValueError(f'{src}: does not match {man}')
-            if hashlib.sha256(romfs.read(path)).hexdigest() != orig:
+            if hashlib.sha256(romfs.read(SERVED_AS.get(path, path))).hexdigest() != orig:
                 raise ValueError(f'{path}: set {s} was made from another original')
             if path in files:
                 prev, origin = files[path]
@@ -84,16 +87,18 @@ def build(romfs_root, sets, sets_root, engine_dir, out):
     rpath = files[RSTB][0] if RSTB in files else None
     rstb, dict_id = zs.decompress((rpath.read_bytes() if rpath else romfs.read(RSTB)))
     entries = rstb_entries(rstb)
-    raised = []
+    raised, growth = [], {}
     for path, (src, origin) in sorted(files.items()):
         if origin == 'engine' or not path.endswith('.zs'):
             continue
         ours, _ = zs.decompress(src.read_bytes())
-        base, _ = zs.decompress(romfs.read(path))
+        game = SERVED_AS.get(path, path)
+        base, _ = zs.decompress(romfs.read(game))
         grow = len(ours) - len(base)
-        if grow <= 0:
-            continue
-        key = rstb_key(path)
+        if grow > 0:   # (a served-as file and its original's own replacement share one entry: the bigger growth)
+            growth[game] = max(growth.get(game, 0), grow)
+    for game, grow in sorted(growth.items()):
+        key = rstb_key(game)
         at = entries.get(zlib.crc32(key.encode()), entries.get(key))
         if at is None:
             continue                                   # not sized by the table

@@ -60,6 +60,7 @@ struct CheatRow {
     std::string mod, name, file;
     exefs::Cheat c;
     std::string id;   // FNV-1a 32 of "<mod>/<name>"
+    std::string key;  // "c" + FNV-1a 32 of "<name>\n<words>": the same cheat in a renamed mod folder (cheats.on keeps both)
     bool on = false;
     int slot = -1;    // a code cheat's switch (nxr_code_switch), -1 none
 };
@@ -85,6 +86,7 @@ std::set<std::string> g_cheats_on;    // cheats.on
 // what the exe was built with (exefs-set.txt)
 std::string g_built;                  // its set hash ("" none)
 std::set<std::string> g_built_ids;
+std::set<std::string> g_built_content;   // the same without the mods' names (exefs::content_id)
 fs::path g_exe_dir;
 bool g_can_build = false;             // TOTK_EXEFS_BUILD is set
 std::string g_failed;                 // the set whose build failed last ("" none)
@@ -241,7 +243,8 @@ void scan_mod(nxr_mod &m) {
                 r.mod = m.name; r.name = c.name; r.file = fname; r.c = c;
                 if (g_image) exefs::classify_cheat(r.c, im);
                 r.id = fnv32(m.name + "/" + c.name);
-                r.on = g_cheats_on.count(r.id) > 0;
+                r.key = "c" + fnv32(c.name + "\n" + std::string((const char *)c.words.data(), c.words.size() * 4));
+                r.on = g_cheats_on.count(r.id) || g_cheats_on.count(r.key);
                 if (!c.master) m.cheats_count++;
                 // a code cheat joins the code patches, on or off: its switch site is built in, switched live
                 if (md.on && r.c.kind == exefs::Cheat::CODE && g_slots < MAX_SWITCHES) {
@@ -272,8 +275,9 @@ void note_mod(nxr_mod &m, const Mod &md) {
     for (int i = md.first; i < md.first + md.files; i++) {
         const exefs::File &f = g_files[i];
         if (f.kind == exefs::File::DATA) data_only++;
-        else if (f.kind == exefs::File::CODE && !g_built_ids.count(g_file_ids[i])) waiting++;
-        else if (f.kind == exefs::File::CODE && f.slot < 0) in_use++;   // (a code cheat built in: its F10 switch says)
+        else if (f.kind == exefs::File::CODE && !g_live && !g_built_content.count(exefs::content_id(g_file_ids[i])))
+            waiting++;   // (by content: a renamed mod folder's code is still the exe's)
+        else if (f.kind == exefs::File::CODE) in_use += f.slot < 0;   // (a code cheat built in: its F10 switch says, not left out)
         else if (f.kind != exefs::File::EMPTY && left_out.empty()) left_out = file_note(f);
     }
     if (in_use + data_only) parts.push_back(fmt_n(PC_T("%d ExeFS patches in use"), in_use + data_only));
@@ -375,7 +379,10 @@ void load_built() {
         return;
     }
     g_built = built;
+    std::set<std::string> content;
+    for (auto &id : ids) content.insert(exefs::content_id(id));
     g_built_ids = ids;
+    g_built_content = content;
 }
 
 // the program the cheat VM runs: per mod on, its masters and its data cheats switched on (none on: the mod adds nothing)
@@ -465,9 +472,9 @@ void mods_exefs_start(const char *img_dir) {
         load_port_sites(img_dir);
         const char *cmd = getenv("TOTK_EXEFS_BUILD");
         g_can_build = cmd && *cmd;
-        char on[8192];
-        if (pc_settings_raw("cheats.on", on, sizeof on))
-            for (auto &id : split(on, '|')) g_cheats_on.insert(id);
+        std::vector<char> on(64 * 1024);   // (two ids per cheat on: ~3600 cheats)
+        if (pc_settings_raw("cheats.on", on.data(), on.size()))
+            for (auto &id : split(on.data(), '|')) g_cheats_on.insert(id);
         g_image = true;
     }
     mods_list();   // the scan: the hook
@@ -526,7 +533,7 @@ void mods_cheat_set(int i, bool on) {
         if (r.c.master || ++n != i) continue;
         if (r.on == on || r.c.kind == exefs::Cheat::BAD) return;
         r.on = on;
-        if (on) g_cheats_on.insert(r.id); else g_cheats_on.erase(r.id);
+        if (on) g_cheats_on.insert({r.id, r.key}); else g_cheats_on.erase(r.id), g_cheats_on.erase(r.key);
         std::string v;
         for (auto &id : g_cheats_on) v += (v.empty() ? "" : "|") + id;
         pc_settings_raw_set("cheats.on", v.empty() ? nullptr : v.c_str());

@@ -108,5 +108,5 @@ as "left to the port's own files".
 - Switch a mod off in F10 (or rename its folder to start with `_`) and start again to see if it is the cause.
 - The game's log (the newest `totk-*.log` in `%LOCALAPPDATA%\nxrecomp\TotK-engine\logs`) has a `[mods]` line per mod: on, off,
   or why it is not used, and which RomFS folder it serves.
-- A mod made for another version of the game can crash it or show wrong text even when its files load: use mods made
-  for 1.0.0.
+- A mod made for another version of the game can crash it or show wrong text even when its files load: use mods made for
+  1.0.0.

@@ -260,6 +260,13 @@ inline std::string set_hash(const Writes& code) {
     return s;
 }
 
+// an exefs-set.txt id ("file <name id> <content>" / "cheat <name id> <content>") without its name part: what the exe
+// holds whatever the mod's folder is called now (the name id hashes the mod's name; RIVAL-034)
+inline std::string content_id(const std::string& id) {
+    const size_t a = id.find(' '), b = a == std::string::npos ? a : id.find(' ', a + 1);
+    return b == std::string::npos ? id : id.substr(0, a) + id.substr(b);
+}
+
 // runs of consecutive bytes: [(offset, new bytes)]
 inline std::vector<std::pair<uint32_t, std::string>> runs(const Writes& w) {
     std::vector<std::pair<uint32_t, std::string>> out;

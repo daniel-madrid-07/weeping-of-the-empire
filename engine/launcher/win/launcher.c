@@ -54,6 +54,8 @@
 
 #include "saves.h"
 #include "autoupdate.h"
+#include "preplay.h"
+#include "text_pt.h"
 #include "../../runtime/mods_install.h"
 #include <bcrypt.h>
 
@@ -67,7 +69,8 @@ static wchar_t g_base[MAX_PATH];   /* %APPDATA%\nxrecomp\TotK-engine: userdata, 
 static wchar_t g_local[MAX_PATH];  /* %LOCALAPPDATA%\nxrecomp\TotK-engine: run, logs, crashes, launcher.log */
 static FILE *g_log;
 static int g_es = 1;   /* the player's texts in Spanish (else English): lang_init (Spanish until then: test_launcher.c) */
-#define ES_EN(es, en) (g_es ? (es) : (en))
+static int g_pt;       /* ... or in Brazilian Portuguese (text_pt.inc, looked up by the English: English where it lacks one) */
+#define ES_EN(es, en) (g_es ? (es) : g_pt ? pt_of(en) : (en))
 
 static void say(const wchar_t *fmt, ...) {
     if (!g_log) return;
@@ -83,6 +86,41 @@ static void message(UINT icon, const wchar_t *fmt, ...) {
     say(L"message: %ls", text);
     if (g_messages_logged_only) return;
     MessageBoxW(NULL, text, TITLE, MB_OK | MB_SETFOREGROUND | icon);
+}
+/* message() for an error with a file that tells why (a crash report, a log): the box asks to open it, Yes opens it with
+ * its usual program (rival parity, RIVAL-034: a player finds the log without knowing %LOCALAPPDATA%). A missing file:
+ * the plain box. */
+static wchar_t g_game_log[MAX_PATH];   /* the newest game log run_package made (the error boxes offer it) */
+static int exists(const wchar_t *p);
+static void open_file(const wchar_t *file);
+static void message_open(UINT icon, const wchar_t *file, const wchar_t *fmt, ...) {
+    wchar_t text[2048];
+    va_list a; va_start(a, fmt); vswprintf(text, 2048, fmt, a); va_end(a);
+    int can = file && file[0] && exists(file);
+    if (can) {
+        size_t n = wcslen(text);
+        swprintf(text + n, 2048 - n, ES_EN(L"\n\n¿Abrir %ls ahora?", L"\n\nOpen %ls now?"), wcsrchr(file, L'\\') ? wcsrchr(file, L'\\') + 1 : file);
+    }
+    say(L"message: %ls", text);
+    if (g_messages_logged_only) return;
+    if (!can) { MessageBoxW(NULL, text, TITLE, MB_OK | MB_SETFOREGROUND | icon); return; }
+    if (MessageBoxW(NULL, text, TITLE, MB_YESNO | MB_SETFOREGROUND | icon) != IDYES) return;
+    open_file(file);
+}
+/* a log or report opened with its usual program */
+static void open_file(const wchar_t *file) {
+    INT_PTR r = (INT_PTR)ShellExecuteW(NULL, L"open", file, NULL, NULL, SW_SHOWNORMAL);
+    if (r <= 32) {   /* no program for.log /.txt: Notepad reads both*/
+        wchar_t q[MAX_PATH + 2], np[MAX_PATH];   /* (System32's Notepad by its path: a bare name is searched in the
+                                                    game folder first)*/
+        swprintf(q, MAX_PATH + 2, L"\"%ls\"", file);
+        UINT n = GetSystemDirectoryW(np, MAX_PATH - 16);
+        if (n && n < MAX_PATH - 16) {
+            wcscat(np, L"\\notepad.exe");
+            r = (INT_PTR)ShellExecuteW(NULL, L"open", np, q, NULL, SW_SHOWNORMAL);
+        }
+    }
+    say(L"opened %ls (%ls)", file, r > 32 ? L"ok" : L"failed");
 }
 static int exists(const wchar_t *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
 /* a folder holding anything besides . and .. */
@@ -120,12 +158,17 @@ static int init_paths(void) {
     wchar_t p[MAX_PATH]; swprintf(p, MAX_PATH, L"%ls\\launcher.log", g_local);
     WIN32_FILE_ATTRIBUTE_DATA a;
     int big = GetFileAttributesExW(p, GetFileExInfoStandard, &a) && (a.nFileSizeHigh || a.nFileSizeLow > LOG_MAX);
+    if (big) {   /* the full log becomes launcher-previous.log (the one before it goes), the new one starts empty */
+        wchar_t prev[MAX_PATH]; swprintf(prev, MAX_PATH, L"%ls\\launcher-previous.log", g_local);
+        if (MoveFileExW(p, prev, MOVEFILE_REPLACE_EXISTING)) big = 0;
+    }
     g_log = _wfopen(p, big ? L"w, ccs=UTF-8" : L"a, ccs=UTF-8");
     return 1;
 }
 
 /* The player's language, as the game decides it (pc_lang.cpp): game.language in <g_base>\settings.ini when set (Spanish
- * for "es" and "es-419", English for any other), else Windows' display language. The launcher only speaks those two.
+ * for "es" and "es-419", Brazilian Portuguese for "pt-BR", English for any other), else Windows' display language. The
+ * launcher speaks those three.
  * Before the first start there is no settings.ini yet (run_package copies the build's defaults later), so Windows
  * decides, as it does for the game whose default is "automatic". */
 static void lang_init(void) {
@@ -153,11 +196,14 @@ static void lang_init(void) {
     }
     if (value[0]) {
         g_es = !wcscmp(value, L"es") || !wcscmp(value, L"es-419");
-        say(L"language: %ls (game.language = %ls)", g_es ? L"Spanish" : L"English", value);
+        g_pt = !wcscmp(value, L"pt-BR");
+        say(L"language: %ls (game.language = %ls)", g_es ? L"Spanish" : g_pt ? L"Portuguese (Brasil)" : L"English", value);
     } else {
         LANGID ui = GetUserDefaultUILanguage();
         g_es = PRIMARYLANGID(ui) == LANG_SPANISH;
-        say(L"language: %ls (Windows' display language 0x%04x%ls)", g_es ? L"Spanish" : L"English", (unsigned)ui,
+        g_pt = PRIMARYLANGID(ui) == LANG_PORTUGUESE;
+        say(L"language: %ls (Windows' display language 0x%04x%ls)",
+            g_es ? L"Spanish" : g_pt ? L"Portuguese (Brasil)" : L"English", (unsigned)ui,
             have_file ? L"; no game.language in settings.ini" : L"; no settings.ini");
     }
 }
@@ -374,20 +420,97 @@ static int pick_folder(wchar_t *out, size_t n) {
     return ok;
 }
 
-/* Backs up the current save (why), then makes src the save. */
+/* Why savever refused a save, for the player (r->file names the file). */
+static void refusal_text(const SaveConvReport *r, wchar_t *out, size_t n) {
+    switch (r->refused) {
+    case SV_UNKNOWN_VERSION:
+        swprintf(out, n, ES_EN(L"%ls es de una versión del juego que el conversor no conoce (revisión %u). Convierte partidas de 1.1.x, 1.2.x y 1.4.x.",
+                               L"%ls comes from a game version the converter doesn't know (revision %u). It converts saves of 1.1.x, 1.2.x and 1.4.x."),
+                 r->file, r->detail);
+        break;
+    case SV_UNKNOWN_KEYS:
+        swprintf(out, n, ES_EN(L"%ls tiene datos que la versión 1.0.0 no tiene y que el conversor no conoce (%u; una partida modificada o de una "
+                               L"versión posterior a la 1.4.x). Convertida, la partida quedaría rota.",
+                               L"%ls has data that version 1.0.0 doesn't have and that the converter doesn't know (%u; a modified save, or one "
+                               L"from a version after 1.4.x). Converted, the save would be broken."), r->file, r->detail);
+        break;
+    case SV_TOO_BIG:
+        swprintf(out, n, ES_EN(L"%ls tiene más datos de los que caben en una partida de la 1.0.0.", L"%ls holds more than a 1.0.0 save has room for."), r->file);
+        break;
+    case SV_PICTURE:
+        swprintf(out, n, ES_EN(L"No se pudo convertir la imagen de %ls.", L"The picture in %ls couldn't be converted."), r->file);
+        break;
+    case SV_IO:
+        swprintf(out, n, ES_EN(L"No se pudo leer o escribir %ls.", L"%ls couldn't be read or written."), r->file);
+        break;
+    default:
+        swprintf(out, n, ES_EN(L"%ls está dañado o incompleto.", L"%ls is damaged or incomplete."), r->file);
+    }
+}
+
+/* What the conversion changed, one line each (empty when nothing was converted). */
+static void conversion_text(const SaveConvReport *r, wchar_t *out, size_t n) {
+    out[0] = 0;
+    if (!r->files) return;
+    const wchar_t *from = savever_name(r->from);
+    int k = swprintf(out, n, ES_EN(L"\n\nLa partida era de la versión %ls y ahora es de la 1.0.0:", L"\n\nThe save was from version %ls and is now a 1.0.0 save:"),
+                     from ? from : L"?");
+    if (k > 0 && r->keys_dropped + r->flags_dropped)
+        k += swprintf(out + k, n - (size_t)k, ES_EN(L"\n· Se han quitado %d datos de actualizaciones posteriores que la 1.0.0 no tiene.",
+                                                    L"\n· %d entries from later updates that 1.0.0 doesn't have were left out."), r->keys_dropped + r->flags_dropped);
+    if (k > 0 && r->enums_reset)
+        k += swprintf(out + k, n - (size_t)k, ES_EN(L"\n· %d valores que solo existen en versiones posteriores han vuelto a su valor por defecto.",
+                                                    L"\n· %d values that exist only in later versions were set back to their default."), r->enums_reset);
+    if (k > 0 && r->pictures_fitted + r->pictures_blank)
+        k += swprintf(out + k, n - (size_t)k, ES_EN(L"\n· %d imágenes de ranura se han hecho más pequeñas (%d no se podían leer y ahora son negras).",
+                                                    L"\n· %d slot pictures were made smaller (%d couldn't be read and are now black)."),
+                      r->pictures_fitted + r->pictures_blank, r->pictures_blank);
+    if (k > 0 && r->option_dropped)
+        swprintf(out + k, n - (size_t)k, ES_EN(L"\n· Los ajustes del juego (option.sav) no se podían convertir: el juego empezará con los de por defecto.",
+                                               L"\n· The game settings (option.sav) couldn't be converted: the game starts with its defaults."));
+}
+
+/* Backs up the current save (why), then makes src the save. An import from a later game version also keeps the
+ * original, unconverted, in the backups (savever converts the copy that goes in, never src). */
 static void replace_with(const wchar_t *src, const wchar_t *why, const wchar_t *what) {
-    wchar_t bk[MAX_PATH] = L"";
+    wchar_t bk[MAX_PATH] = L"", orig[MAX_PATH] = L"";
     if (saves_backup(g_base, why, bk, MAX_PATH) < 0) {
         message(MB_ICONWARNING, ES_EN(L"No se pudo hacer la copia de la partida actual; no se ha cambiado nada.",
                                       L"Couldn't back up the current save; nothing was changed."));
         return;
     }
-    int r = saves_replace(g_base, src);
-    say(L"%ls from %ls: %ls (backup %ls)", what, src, r ? L"failed" : L"done", bk[0] ? bk : L"none: no save");
-    if (r) message(MB_ICONWARNING, ES_EN(L"No se pudo copiar la partida (paso %d). La partida que había sigue igual.\n\n%ls",
-                                         L"Couldn't copy the save (step %d). Your previous save is unchanged.\n\n%ls"), r, src);
-    else message(MB_ICONINFORMATION, ES_EN(L"Hecho.%ls%ls", L"Done.%ls%ls"),
-                 bk[0] ? ES_EN(L"\n\nLa partida anterior está guardada en:\n", L"\n\nYour previous save is backed up in:\n") : L"", bk);
+    uint32_t rev = savever_dir_revision(src);
+    if (!wcscmp(why, L"before-import") && rev && rev != savever_tables.target &&
+        saves_backup_from(g_base, src, L"original", orig, MAX_PATH) < 0) {
+        message(MB_ICONWARNING, ES_EN(L"No se pudo guardar una copia de la partida que querías importar; no se ha cambiado nada.",
+                                      L"Couldn't keep a copy of the save you wanted to import; nothing was changed."));
+        return;
+    }
+    SaveConvReport rep = {0};
+    int r = saves_replace_report(g_base, src, &rep);
+    say(L"%ls from %ls (revision %u): %ls (backup %ls; original %ls); converted %d files from %u: keys -%d flags -%d enums %d "
+        L"pictures %d+%d option-dropped %d; refused %d %ls %u", what, src, rev, r ? L"failed" : L"done", bk[0] ? bk : L"none: no save",
+        orig[0] ? orig : L"-", rep.files, rep.from, rep.keys_dropped, rep.flags_dropped, rep.enums_reset, rep.pictures_fitted,
+        rep.pictures_blank, rep.option_dropped, rep.refused, rep.file, rep.detail);
+    if (r == 4) {
+        wchar_t why_text[512];
+        refusal_text(&rep, why_text, 512);
+        message(MB_ICONWARNING, L"%ls\n\n%ls\n\n%ls", ES_EN(L"No se ha importado la partida; la que había sigue igual.",
+                                                          L"The save wasn't imported; your previous save is unchanged."), why_text, src);
+        return;
+    }
+    if (r) {
+        message(MB_ICONWARNING, ES_EN(L"No se pudo copiar la partida (paso %d). La partida que había sigue igual.\n\n%ls",
+                                      L"Couldn't copy the save (step %d). Your previous save is unchanged.\n\n%ls"), r, src);
+        return;
+    }
+    wchar_t conv[1024];
+    conversion_text(&rep, conv, 1024);
+    int kept = orig[0] && rep.files;
+    message(MB_ICONINFORMATION, L"%ls%ls%ls%ls%ls%ls", ES_EN(L"Hecho.", L"Done."), conv,
+            kept ? ES_EN(L"\n\nLa partida original, sin convertir, está guardada en:\n", L"\n\nThe original save, not converted, is kept in:\n") : L"",
+            kept ? orig : L"",
+            bk[0] ? ES_EN(L"\n\nLa partida anterior está guardada en:\n", L"\n\nYour previous save is backed up in:\n") : L"", bk);
 }
 
 static void import_save(const SaveCandidate *found, int count) {
@@ -401,8 +524,12 @@ static void import_save(const SaveCandidate *found, int count) {
             wchar_t user[16] = L"";
             if (c[i].user[0]) swprintf(user, 16, L" · %.8ls", c[i].user);
             const wchar_t *source = !wcscmp(c[i].source, L"carpeta") ? ES_EN(L"carpeta", L"folder") : c[i].source;   /* saves.c's */
-            swprintf(labels[i], MAX_PATH + 160, L"%ls%ls · %d %ls · %ls\n%ls", source, user, c[i].slots,
-                     c[i].slots == 1 ? ES_EN(L"ranura", L"slot") : ES_EN(L"ranuras", L"slots"), t, c[i].path);
+            uint32_t rev = savever_dir_revision(c[i].path);
+            const wchar_t *ver = savever_name(rev);
+            wchar_t version[48] = L"";   /* (none for a file that is not a TotK save) */
+            if (rev) swprintf(version, 48, L" · %ls", ver ? ver : ES_EN(L"versión desconocida", L"unknown version"));
+            swprintf(labels[i], MAX_PATH + 160, L"%ls%ls · %d %ls · %ls%ls\n%ls", source, user, c[i].slots,
+                     c[i].slots == 1 ? ES_EN(L"ranura", L"slot") : ES_EN(L"ranuras", L"slots"), t, version, c[i].path);
             radios[i].nButtonID = 1000 + i;
             radios[i].pszButtonText = labels[i];
         }
@@ -415,8 +542,10 @@ static void import_save(const SaveCandidate *found, int count) {
         int radio = 0;
         int b = task(count ? ES_EN(L"Elige la partida que quieres importar", L"Choose the save to import")
                            : ES_EN(L"No se ha encontrado ninguna partida de TotK", L"No TotK saves found"),
-                     ES_EN(L"El juego es la versión 1.0.0: una partida guardada con una versión posterior puede no cargar.",
-                           L"The game is version 1.0.0: a save made with a later version may not load."),
+                     ES_EN(L"El juego es la versión 1.0.0. Una partida de la 1.1.x, 1.2.x o 1.4.x se convierte a la 1.0.0 al importarla; "
+                           L"la original se guarda sin tocar en las copias.",
+                           L"The game is version 1.0.0. A save from 1.1.x, 1.2.x or 1.4.x is converted to 1.0.0 when you import it; "
+                           L"the original is kept, untouched, in the backups."),
                      count ? buttons : buttons + 1, count ? 2 : 1, count ? radios : NULL, (UINT)count, &radio,
                      TDCBF_CANCEL_BUTTON, NULL);
         if (b == 200 && radio >= 1000 && radio < 1000 + count) {
@@ -445,7 +574,8 @@ static void restore_backup(void) {
                             : !wcscmp(why, L"manual") ? ES_EN(L"manual", L"manual")
                             : !wcscmp(why, L"before-import") ? ES_EN(L"antes de importar", L"before import")
                             : !wcscmp(why, L"before-restore") ? ES_EN(L"antes de restaurar", L"before restore")
-                            : !wcscmp(why, L"before-update") ? ES_EN(L"antes de actualizar", L"before update") : why;
+                            : !wcscmp(why, L"before-update") ? ES_EN(L"antes de actualizar", L"before update")
+                            : !wcscmp(why, L"original") ? ES_EN(L"original importada, sin convertir", L"imported original, not converted") : why;
         if (wcslen(nm) >= 20)
             swprintf(labels[i], 160, L"%.2ls/%.2ls/%.4ls %.2ls:%.2ls:%.2ls · %ls · %d %ls", nm + 11, nm + 9, nm + 5, nm + 14, nm + 16,
                      nm + 18, what, b[i].slots, b[i].slots == 1 ? ES_EN(L"ranura", L"slot") : ES_EN(L"ranuras", L"slots"));
@@ -476,6 +606,22 @@ static int find_candidates(SaveCandidate *c, int max) {
             n++;
         }
     }
+    /* our other game versions' saves (userdata-v<tag>\save, e.g. the 1.4.3 build's): into 1.0.0 through savever */
+    wchar_t pat[MAX_PATH];
+    swprintf(pat, MAX_PATH, L"%ls\\userdata-v*", g_base);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            wchar_t p[MAX_PATH];
+            swprintf(p, MAX_PATH, L"%ls\\%ls\\save", g_base, fd.cFileName);
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && n < max && saves_find_under(p, 0, &c[n], 1) == 1) {
+                swprintf(c[n].source, 24, L"nxrecomp %ls", fd.cFileName + 9);   /* "nxrecomp v143" */
+                n++;
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
     wchar_t appdata[MAX_PATH];
     if (GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH)) n += saves_find(appdata, c + n, max - n);
     return n;
@@ -496,8 +642,10 @@ static int saves_menu(void) {
         }
         const TASKDIALOG_BUTTON buttons[] = {
             {100, ES_EN(L"Jugar", L"Play")},
-            {101, ES_EN(L"Importar una partida…\nDe yuzu, Eden, Ryujinx, la versión anterior de nxrecomp o una carpeta (JKSV).",
-                        L"Import a save…\nFrom yuzu, Eden, Ryujinx, the previous version of nxrecomp or a folder (JKSV).")},
+            {101, ES_EN(L"Importar una partida…\nDe yuzu, Eden, Ryujinx, la versión anterior de nxrecomp o una carpeta (JKSV). "
+                        L"Las de versiones posteriores del juego (1.1.x a 1.4.x) se convierten a la 1.0.0.",
+                        L"Import a save…\nFrom yuzu, Eden, Ryujinx, the previous version of nxrecomp or a folder (JKSV). "
+                        L"Saves of later game versions (1.1.x to 1.4.x) are converted to 1.0.0.")},
             {102, ES_EN(L"Restaurar una copia…", L"Restore a backup…")},
             {103, ES_EN(L"Hacer una copia ahora", L"Make a backup now")},
         };
@@ -1163,7 +1311,10 @@ static void mods_readme(const wchar_t *dir, const wchar_t *ver) {   /* (rewritte
            L"card's atmosphere\\contents\\0100F2C0115B6000\\romfs; TKMM's merged output works too).\n"
            L"Order and switches in the game: F10 > Mods (the top one wins); they apply at the next start.\n"
            L"A name starting with _ leaves it out. The resource size table (RSTB) is adjusted by itself.\n"
-           L"This folder (beside the game) and %APPDATA%\\nxrecomp\\TotK-engine\\mods both work.\n", f);
+           L"This folder (beside the game) and %APPDATA%\\nxrecomp\\TotK-engine\\mods both work.\n\n"
+           L"Guía completa / full guide: https://github.com/daniel-madrid-07/weeping-of-the-empire/blob/main/MODS.md\n"
+           L"Controles / controls: https://github.com/daniel-madrid-07/weeping-of-the-empire/blob/main/CONTROLS.md\n"
+           L"Ajustes (F10) / settings: https://github.com/daniel-madrid-07/weeping-of-the-empire/blob/main/SETTINGS.md\n", f);
     fclose(f);
 }
 /* A mod dropped on the launcher (or its shortcut): each path on the command line that exists (an archive or a folder;
@@ -1464,6 +1615,31 @@ static int dump_source_ready(const wchar_t *src) {
     return 0;
 }
 
+/* settings=<file>: the build's defaults, copied where the game reads settings.ini (next to userdata, pc_settings.cpp)
+ * when the player has none yet; the player's own file is never overwritten. defs_out (MAX_PATH, or NULL): the defaults
+ * file, "" when the build has none. */
+static void settings_defaults(const wchar_t *pkg, wchar_t *defs_out) {
+    wchar_t defs[MAX_PATH], dst[MAX_PATH];
+    package_value(pkg, L"settings", 1, defs, MAX_PATH);
+    if (!defs[0] || !exists(defs)) defs[0] = 0;
+    if (defs_out) wcscpy(defs_out, defs);
+    swprintf(dst, MAX_PATH, L"%ls\\settings.ini", g_base);
+    if (defs[0] && !exists(dst))
+        say(L"settings: %ls -> %ls (%ls)", defs, dst, CopyFileW(defs, dst, TRUE) ? L"copied" : L"copy failed");
+}
+
+/* The settings before play (preplay.c) on the game's own settings.ini, the build's defaults first when there is none
+ * yet. note: why it opened (NULL: the player asked). 1: Play. */
+static int preplay(const wchar_t *pkg, const wchar_t *note) {
+    wchar_t defs[MAX_PATH], ini[MAX_PATH], title[128];
+    settings_defaults(pkg, defs);
+    swprintf(ini, MAX_PATH, L"%ls\\settings.ini", g_base);
+    swprintf(title, 128, L"%ls - %ls", TITLE, ES_EN(L"Ajustes", L"Settings"));
+    int play = preplay_dialog(ini, defs[0] ? defs : NULL, g_es ? 1 : g_pt ? 2 : 0, title, note);
+    say(L"settings before play: %ls", play ? L"play" : L"closed");
+    return play;
+}
+
 static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, size_t whyn, HANDLE *game, FILETIME *started) {
     wchar_t exe[MAX_PATH], info[MAX_PATH], img[MAX_PATH], romfs[MAX_PATH], overlay[MAX_PATH], main_bin[MAX_PATH];
     swprintf(exe, MAX_PATH, L"%ls\\totk.exe", pkg);
@@ -1575,19 +1751,13 @@ static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, si
         if (set) say(L"cache-seed: TOTK_PRECOMPILE_SEED from player.txt kept");
         else if (exists(bin)) SetEnvironmentVariableW(L"TOTK_PRECOMPILE_SEED", seed);
     }
-    {   /* settings=<file>: the build's defaults, copied where the game reads settings.ini (next to userdata, pc_settings.cpp)
-           when the player has none yet; the player's own file is never overwritten */
-        wchar_t defs[MAX_PATH], dst[MAX_PATH];
-        package_value(pkg, L"settings", 1, defs, MAX_PATH);
-        swprintf(dst, MAX_PATH, L"%ls\\settings.ini", g_base);
-        if (defs[0] && exists(defs) && !exists(dst))
-            say(L"settings: %ls -> %ls (%ls)", defs, dst, CopyFileW(defs, dst, TRUE) ? L"copied" : L"copy failed");
-    }
+    settings_defaults(pkg, NULL);
 
     prune_files(logs, L"totk-*.log", KEEP_GAME_LOGS - 1);
     SYSTEMTIME t; GetLocalTime(&t);
     swprintf(logp, MAX_PATH, L"%ls\\totk-%04u%02u%02u-%02u%02u%02u.log", logs, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
     SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
+    swprintf(g_game_log, MAX_PATH, L"%ls", logp);
     HANDLE log = CreateFileW(logp, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
     wchar_t cmd[MAX_PATH * 2];
@@ -1656,10 +1826,10 @@ static int play_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, s
                     wchar_t rep[MAX_PATH], logs[MAX_PATH];
                     crash_report_since(started, rep, MAX_PATH);
                     swprintf(logs, MAX_PATH, L"%ls\\logs", g_local);
-                    if (rep[0]) message(MB_ICONWARNING, ES_EN(L"El juego se cerró por un error.\n\nInforme del fallo:\n%ls",
-                                                              L"The game closed because of an error.\n\nCrash report:\n%ls"), rep);
-                    else message(MB_ICONWARNING, ES_EN(L"El juego se cerró con un error (código 0x%08lx).\n\nRegistros: %ls",
-                                                       L"The game closed with an error (code 0x%08lx).\n\nLogs: %ls"), code, logs);
+                    if (rep[0]) message_open(MB_ICONWARNING, rep, ES_EN(L"El juego se cerró por un error.\n\nInforme del fallo:\n%ls",
+                                                                        L"The game closed because of an error.\n\nCrash report:\n%ls"), rep);
+                    else message_open(MB_ICONWARNING, g_game_log, ES_EN(L"El juego se cerró con un error (código 0x%08lx).\n\nRegistros: %ls",
+                                                                        L"The game closed with an error (code 0x%08lx).\n\nLogs: %ls"), code, logs);
                 }
                 return RUNNING;
             }
@@ -1730,6 +1900,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show) {
     }
     install_dropped();   /* (a mod dropped on the launcher: installed, said, then the game starts) */
     int menu = (args && wcsstr(args, L"--saves")) || (GetAsyncKeyState(VK_SHIFT) & 0x8000);
+    /* Ctrl or --settings: the settings before play (preplay.c), for a game that closes or crawls before F10 */
+    int pre = (args && wcsstr(args, L"--settings")) || (GetAsyncKeyState(VK_CONTROL) & 0x8000);
     if (menu) say(L"update check: skipped (saves menu)");   /* the player asked for this folder's menu */
     else if (auto_update()) return 0;                        /* the updated build's launcher does the rest */
     else if (offer_newer_release()) return 0;                /* its launcher does the rest (backups, import offer) */
@@ -1760,6 +1932,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show) {
         return 0;
     }
 
+    if (pre && !preplay(pkgs[0], NULL)) return 0;
     note_package_change(pkgs[0]);   /* a newer package: a named copy of the save before its first start */
     wchar_t bk[MAX_PATH];
     if (saves_backup(g_base, L"auto", bk, MAX_PATH) > 0) say(L"backup %ls", bk);
@@ -1767,6 +1940,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show) {
 
     clean_environment();
     wchar_t why[2][768] = {L"", L""};
+again:
     for (int i = 0; i < count; i++) {
         wchar_t romfs[MAX_PATH];
         package_value(pkgs[i], L"romfs", 1, romfs, MAX_PATH);
@@ -1790,10 +1964,33 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show) {
         if (r == RUNNING || r == QUIT) { maybe_update(pkgs[0]); return 0; }
         if (i + 1 < count) say(L"falling back to %ls", names[i + 1]);
     }
-    maybe_update(pkgs[0]);   /* a newer good commit may start where these failed */
     wchar_t logp[MAX_PATH]; swprintf(logp, MAX_PATH, L"%ls\\launcher.log", g_local);
-    message(MB_ICONWARNING, ES_EN(L"No se pudo arrancar el juego.\n\n%ls\n%ls\n\nRegistro del lanzador: %ls",
-                                  L"Couldn't start the game.\n\n%ls\n%ls\n\nLauncher log: %ls"),
-            why[0], count > 1 ? why[1] : L"", logp);
+    if (!g_messages_logged_only) {   /* lower settings may get it going: the settings before play, then another try */
+        wchar_t content[1600];
+        swprintf(content, 1600, L"%ls\n%ls", why[0], count > 1 ? why[1] : L"");
+        const TASKDIALOG_BUTTON b[] = {
+            {401, ES_EN(L"Cambiar ajustes y volver a intentarlo\nModo seguro, ventana, escala de resolución, fotogramas...",
+                        L"Change settings and try again\nSafe mode, window, resolution scale, frame rate...")},
+            {402, ES_EN(L"Ver el registro", L"Show the log")}};
+        int r = task(ES_EN(L"No se pudo arrancar el juego", L"Couldn't start the game"), content, b, 2, NULL, 0, NULL,
+                     TDCBF_CLOSE_BUTTON, TD_WARNING_ICON);
+        if (r == 401 && preplay(pkgs[0], ES_EN(L"El juego se cerró al arrancar. El modo seguro, una escala de resolución "
+                                               L"más baja o jugar en ventana pueden ayudar.",
+                                               L"The game closed while starting. Safe mode, a lower resolution scale or a "
+                                               L"window may help."))) {
+            why[0][0] = why[1][0] = 0;
+            say(L"settings changed after a failed start: trying again");
+            goto again;
+        }
+        if (r == 402) open_file(g_game_log[0] && exists(g_game_log) ? g_game_log : logp);
+        maybe_update(pkgs[0]);
+        return 1;
+    }
+    maybe_update(pkgs[0]);   /* a newer good commit may start where these failed */
+    /* the game's own log when a game ran (an early crash: why[] names it), else the launcher's */
+    message_open(MB_ICONWARNING, g_game_log[0] && exists(g_game_log) ? g_game_log : logp,
+                 ES_EN(L"No se pudo arrancar el juego.\n\n%ls\n%ls\n\nRegistro del lanzador: %ls",
+                       L"Couldn't start the game.\n\n%ls\n%ls\n\nLauncher log: %ls"),
+                 why[0], count > 1 ? why[1] : L"", logp);
     return 1;
 }

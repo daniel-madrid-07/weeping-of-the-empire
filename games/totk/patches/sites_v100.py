@@ -35,6 +35,9 @@ DP_FOV_SCALE = 68                               # f32: camera field-of-view mult
 DP_SHADOW_SCALE = 72                            # f32: depth shadow map size multiplier, 0 = the game's own
 DP_TEMP_UNIT = 212                              # u32: the map readout's temperature unit, 0 / >2 = the game's, 1 = C, 2 = F
 DP_SHADOW_FIXED = 208                           # f32 / u32: non-zero = the shadow map at its largest size, not the view's
+DP_SHADOW_SPLIT = 216                           # f32: near shadow cascades' reach multiplier, 0 = the game's own
+DP_EASE_K001 = 220                              # f32: 1 - 0.99^r for the game's 0.01-per-frame eases, 0 = the game's 0.01
+DP_TICKS30 = 224                                # s32: 30 Hz ticks of game time this frame - 1, 0 = the game's one per frame
 DP_LOD_SCALE = 76                               # f32: model LOD distance multiplier, 0 = the game's own
 DP_MOUSE_SCALE = 80                             # f32: mouse camera multiplier (setting), 0 = off (platform's stick)
 DP_MOUSE_RATE = 84                              # f32: stick deflection per mouse count at the 30 Hz ratio (runtime)
@@ -775,6 +778,121 @@ def tempunit(lay):
     return p
 
 
+# agl::sdw::DepthShadow::updateSceneMatrix (main+0xa14f7c) hands each cascade of a directional depth shadow its slice of
+# the view to DepthShadowUnit::updateSceneMatrix (main+0xa15140, s0 = near, s1 = far): d = [this+0x308], the cascade
+# boundaries d[0] (the first cascade's start).. d[n] (the far), n = the cascade count (w24); o = [this+0x350], each
+# cascade's overlap. Cascade 0: ldp s0, s1, [x8] (d[0], d[1]) at main+0xa14fd4, far = d[1] + o[0] (b.eq right after: n =
+# 1, d[1] is the far). Cascade i + 1 (x8 = i): ldp s0, s2, [x9, #4] (d[i+1], d[i+2]) at main+0xa1505c, near = d[i+1] -
+# o[i+1], far = d[i+2] + o[i+1] (+ 0 for the last; the eq flag from cmp x23, x8 marks it, d[i+2] = the far). The Main
+# scene's sun: 2 / 32 / 64 / 200 / 3000 m (gsys.bgmsconf depth_shadow_near_0_*, times the shadow-distance RomFS set).
+# The receiving pass picks a pixel's cascade from a copy of d[0.. n-1]: main+ 0xa21f98 copies them once per view per
+# frame with each cascade's matrix (ldr s0, [x4, x27] at main+0xa220a8, x4 = d, x27 = 4 i, x13 = n), and 0xa2d388 sends
+# them up as constants; the copy must hold the moved boundaries too.
+CASCADE_SITE_FIRST, CASCADE_SITE_NEXT, CASCADE_SITE_COPY = 0xa14fd4, 0xa1505c, 0xa220a8
+EXTRA_CASCADE = 48        # offset in the extra veneer area: the three cascade split veneers (84 + 112 + 124 bytes: +48,
+                          # +144 and +256, to +380)
+CASCADE_CAP = 0.75        # a moved boundary stays below 0.75 x the next one (each cascade keeps a quarter of its slice)
+
+
+def _cascade_move(k, d, cap):
+    """d' = max(d, min(k d, 0.75 cap)) for s<d>, with k in s<k> and cap in s<cap> (s5 .. s7 scratch, s<cap> may be
+    s5)."""
+    return [a.fmov_s_imm(6, CASCADE_CAP),
+            a.fmul_s(5, cap, 6),                     # 0.75 x the next boundary
+            a.fmul_s(7, d, k),                       # k x this one
+            a.fminnm_s(7, 7, 5),
+            a.fmaxnm_s(d, d, 7)]                     # never nearer than the game's
+
+
+def cascade(lay):
+    """Near shadow cascades' reach (public #35: the sun shadow's cascade boundary is plain to see at 4K, where the sharp
+    first cascade meets the next one 32 m away): the data page's multiplier k (+216, f32, 0 = the game's own) moves the
+    first two inner boundaries d[1], d[2] out, d' = max(d, min(k d, 0.75 x the next boundary)), so the sharp near
+    cascades reach k times further (the 32 / 64 m lines at 64 / 128 m for k = 2) and every cascade keeps a quarter of its
+    slice. d[0], d[3] and the far stay, and so does the far of a 1- or 2-cascade shadow: only boundaries between two
+    cascades move. Both sites compute the same d' for a boundary (it is the far of one cascade and the near of the next),
+    from the same values, and so does the copy the receiving pass picks its cascade from (main+0xa220a8): a pixel then
+    samples the cascade whose map covers it. Each covered slice grows, so the near shadow is softer by the same factor unless the shadow
+    resolution goes up with it. Scratch: x9 .. x11 (free at both sites) and s3 .. s7 (caller-saved; the unit call that
+    follows clobbers them, and nothing reads them before it); the flags the next b.eq / fcsel read are left alone (cbz,
+    b.eq, sub without s, no fcmp)."""
+    p = Patch('cascade')
+    if lay.extra is None:
+        raise ValueError('cascade needs the extra veneer area (Layout.span)')
+    at = lay.extra[0] + EXTRA_CASCADE
+    s = CASCADE_SITE_FIRST
+    d2far = at + 60
+    end = at + 80
+    first = [Orig(s),                                    # ldp s0, s1, [x8]: d[0], d[1]
+             a.b_cond('eq', at + 4, end),                # one cascade: d[1] is the far
+             a.adrp(10, at + 8, lay.data_off),
+             a.ldr_w(11, 10, DP_SHADOW_SPLIT),           # ldr w11, [x10, #216]
+             a.cbz_w(11, at + 16, end),                  # 0: the game's own
+             a.fmov_s_w(3, 11),                          # k
+             a.sub_w_imm(9, 24, 2),                      # n - 2
+             a.ldr_s(4, 8, 8),                           # d[2]
+             a.cbz_w(9, at + 32, d2far),                 # two cascades: d[2] is the far, kept
+             a.ldr_s(5, 8, 12),                          # d[3]
+             *_cascade_move(3, 4, 5),                    # d[2]'
+             *_cascade_move(3, 1, 4),                    # d[1]' (below d[2]' or the far)
+             a.b(end, s + 4)]
+    assert at + 4 * len(first) == end + 4 and at + 40 + 20 == d2far
+    p.put(s, a.b(s, at), 'cascade: ldp s0, s1, [x8] (cascade 0: d[0], d[1]) -> b <veneer>')
+    p.code(at, first, 'cascade split veneer, cascade 0')
+    at2 = at + 96
+    s = CASCADE_SITE_NEXT
+    j2, j1, j1f, end = at2 + 36, at2 + 60, at2 + 88, at2 + 108
+    nxt = [Orig(s),                                      # ldp s0, s2, [x9, #4]: d[i+1], d[i+2]
+           a.adrp(10, at2 + 4, lay.data_off),
+           a.ldr_w(11, 10, DP_SHADOW_SPLIT),
+           a.cbz_w(11, at2 + 12, end),
+           a.fmov_s_w(3, 11),                            # k
+           a.cbz_x(8, at2 + 20, j1),                     # i = 0: s0 = d[1], s2 = d[2]
+           a.sub_x_imm(11, 8, 1),
+           a.cbz_x(11, at2 + 28, j2),                    # i = 1: s0 = d[2], s2 = d[3] (or the far)
+           a.b(at2 + 32, end),                           # i >= 2: d[3] and on stay
+           *_cascade_move(3, 0, 2),                      # j2: d[2]'
+           a.b(at2 + 56, end),
+           a.b_cond('eq', j1, j1f),                      # j1: two cascades, d[2] is the far: kept
+           a.ldr_s(5, 9, 12),                            # d[3] (x9 = d + 0)
+           *_cascade_move(3, 2, 5),                      # d[2]'
+           *_cascade_move(3, 0, 2),                      # j1f: d[1]' (below d[2]' or the far)
+           a.b(end, s + 4)]
+    assert at2 + 4 * len(nxt) == end + 4 and at2 + 36 + 20 == at2 + 56 and at2 + 64 + 4 + 20 == j1f
+    p.put(s, a.b(s, at2), 'cascade: ldp s0, s2, [x9, #4] (cascade i + 1: d[i+1], d[i+2]) -> b <veneer>')
+    p.code(at2, nxt, 'cascade split veneer, cascades 1 ..')
+    # The receiver's copy: boundary i (s0) becomes the same d' as above, from the same values (the loop copies i < n,
+    # so i = 1 has n >= 2 and i = 2 has n >= 3). Scratch: x28 (rewritten by the csel after the load) and s5.. s7, s16..
+    # s18 (the loop holds q0 / q1 only, and s2.. s5 are written before they are read after it); the lo flag the csels
+    # after the load read is left alone.
+    at3 = at + 208
+    s = CASCADE_SITE_COPY
+    i1, i1cap, end = at3 + 64, at3 + 100, at3 + 120
+    cpy = [Orig(s),                                      # ldr s0, [x4, x27]: d[i]
+           a.adrp(28, at3 + 4, lay.data_off),
+           a.ldr_w(28, 28, DP_SHADOW_SPLIT),
+           a.cbz_w(28, at3 + 12, end),
+           a.fmov_s_w(16, 28),                           # k
+           a.sub_x_imm(28, 27, 4),
+           a.cbz_x(28, at3 + 24, i1),                    # i = 1
+           a.sub_x_imm(28, 27, 8),
+           a.cbnz_x(28, at3 + 32, end),                  # i = 0, i >= 3: kept
+           a.ldr_s(17, 4, 12),                           # i = 2: d[3] (or the far)
+           *_cascade_move(16, 0, 17),                    # d[2]'
+           a.b(at3 + 60, end),
+           a.ldr_s(17, 4, 8),                            # i1: d[2]
+           a.sub_x_imm(28, 13, 2),
+           a.cbz_x(28, at3 + 72, i1cap),                 # two cascades: d[2] is the far, kept
+           a.ldr_s(18, 4, 12),                           # d[3]
+           *_cascade_move(16, 17, 18),                   # d[2]'
+           *_cascade_move(16, 0, 17),                    # i1cap: d[1]' (below d[2]' or the far)
+           a.b(end, s + 4)]
+    assert at3 + 4 * len(cpy) == end + 4 and at3 + 40 + 20 == at3 + 60 and at3 + 80 + 20 == i1cap
+    p.put(s, a.b(s, at3), "cascade: ldr s0, [x4, x27] (the receiver's copy of d[i]) -> b <veneer>")
+    p.code(at3, cpy, 'cascade split veneer, the receiver copy')
+    return p
+
+
 CAMBLEND_SITES = (0xaa8108, 0xaa815c, 0xaa81a4, 0xaa81ec, 0xaa8218)
 FMOV_S1_ONE = 0x1e2e1001   # fmov s1, #1.0
 
@@ -789,6 +907,95 @@ def camblend():
     p = Patch('camblend')
     for s in CAMBLEND_SITES:
         p.put(s, FMOV_S1_ONE, 'camera blend: mov v1.16b, v8.16b (powf exponent dt) -> fmov s1, #1.0')
+    return p
+
+
+# Havok's step controller (the world's, main+0x274a3c, from hknpWorld::buildCollideTasks): s8 = min(dt, max dt +0x30)
+# at the fcsel (HAVOK_DT_SITE), numSteps = clamp(ceil(120 dt), 1, 8), x = n / (120 dt) (s0 after the fdiv by 4), tau =
+# min(1, 0.6 / x^2) from the fmul s5, s0, s0 (HAVOK_TAU_SITE) on -> setTauAndDamping (main+0x10d9b88), then the tail
+# call to setStepInfo (main+0x2588cc) with s8. v0.1.8: game steps under 1/240 s corrupt Havok's worker memory (3 of 4
+# unlocked runs; none with the 1/240 floor). Two off-by-default A/B features split where:
+HAVOK_DT_SITE = 0x274a70     # fcsel s8, s3, s0, mi
+HAVOK_TAU_SITE = 0x274abc    # fmul s5, s0, s0
+EXTRA_HAVOK_DT = 384         # extra veneer area: 24 bytes (after tempunit's +0..+40 and cascade's +48..+380, 74e05619)
+EXTRA_HAVOK_TAU = 416        # 16 bytes, to +432 (the area is 8 KiB: 0x4666000..0x4668000)
+HAVOK_DT_FLOOR = 0x3b888889  # 1/240 as a float
+
+
+def havok_dt(lay):
+    """(a) Havok's dt floored at 1/240 s in the step controller only (game logic keeps the runtime's step): every step
+    count, tau and setStepInfo see dt >= 1/240, so physics runs fast by 1/240 over the step (1.5x at 1/360). A/B only:
+    clean = the fault is in Havok's own step, crashing = game code using dt around it. x16 / v16 are free there."""
+    p = Patch('havok_dt')
+    if lay.extra is None:
+        raise ValueError('havok_dt needs the extra veneer area (Layout.span)')
+    at, s = lay.extra[0] + EXTRA_HAVOK_DT, HAVOK_DT_SITE
+    p.put(s, a.b(s, at), 'havok_dt: fcsel s8, s3, s0, mi (dt = min(dt, max dt)) -> b <veneer>')
+    p.code(at, [Orig(s),
+                a.movz_x(16, HAVOK_DT_FLOOR & 0xffff),
+                a.movk_x(16, HAVOK_DT_FLOOR >> 16, 16),
+                a.fmov_s_w(16, 16),
+                a.fmaxnm_s(8, 8, 16),                 # dt = max(dt, 1/240)
+                a.b(at + 20, s + 4)], 'Havok step dt floor veneer')
+    return p
+
+
+def havok_tau(lay):
+    """(b) Havok's tau held at its 1/240 s value below it (dt untouched): x = n / (120 dt) clamped to 2 before the
+    square, so tau = min(1, 0.6 / x^2) >= 0.15 (the world's +0x1c over 4). At 1/240 and above x <= 2 already (n = 1 up to
+    1/120, then x drops to 1 as n steps up), so the feature changes nothing there. Clean in the A/B = the fix, with no
+    change to motion. v16 is free there."""
+    p = Patch('havok_tau')
+    if lay.extra is None:
+        raise ValueError('havok_tau needs the extra veneer area (Layout.span)')
+    at, s = lay.extra[0] + EXTRA_HAVOK_TAU, HAVOK_TAU_SITE
+    p.put(s, a.b(s, at), 'havok_tau: fmul s5, s0, s0 (x^2 for tau = 0.6 / x^2) -> b <veneer>')
+    p.code(at, [a.fmov_s_imm(16, 2.0),
+                a.fminnm_s(0, 0, 16),                 # x = min(x, 2): tau >= its 1/240 value
+                Orig(s),
+                a.b(at + 12, s + 4)], 'Havok tau floor veneer')
+    return p
+
+
+# The altitude effect: GameEffectModule::calc -> FUN_b58fdc -> main+0xb5b7bc drives one effect from Link's height:
+# +0x3bc eases toward clamp(1 - (y - base) / 800, 0.3,..) by k = 0.01 PER CALL (the literal at main+0x3776940, loaded
+# by `ldr s2, [x8, #0x940]` at EFFECT_EASE_SITE; x8 is reloaded right after), and the emitter takes s x +0x3bc
+# (0xb5b9fc) in the same call; and while Link is below the base - 100, a 150-call count +0x3b4 (set when the emitter
+# is made, 0xb5b970) runs it at 4x (0xb5ba60: subs w8, w8, #1; b.lt out; then the str and bl 0x731c9c with 4.0). Both
+# are frames: at 240 fps the 3.3 s fade became 0.42 s and the 5 s burst 0.63 s.
+EFFECT_EASE_SITE = 0xb5b864     # ldr s2, [x8, #0x940] (k = 0.01)
+EFFECT_BURST_SITE = 0xb5ba64    # subs w8, w8, #1 (the 150-call count)
+EXTRA_EFFECT_EASE = 432         # extra veneer area: 24 bytes (after havok_tau's +416..+432)
+EXTRA_EFFECT_BURST = 456        # 28 bytes, to +484
+
+
+def effectease(lay):
+    """The altitude effect in game time: (a) the ease's k is the data page's 1 - 0.99^r (DP_EASE_K001, written each
+    frame by the runtime for r in (0.01, 1)) instead of 0.01, so the effect follows Link's height with the Switch's
+    time constant (k' = 1 - (1 - k)^r; 0 on the page = the game's 0.01); (b) the burst count steps by the 30 Hz ticks of
+    game time this frame (DP_TICKS30 + 1: 0 or 1 above 30 fps) instead of 1, and runs while the count is >= 1 as the
+    game's subs / b.lt does: 150 ticks = 5 s at any rate. At 30 fps and below the page holds 0 in both: the game's
+    k and step, bit for bit. Scratch: x8 (a), x9 (b) are dead there; (b) leaves the cmp's flags for the b.lt."""
+    p = Patch('effectease')
+    if lay.extra is None:
+        raise ValueError('effectease needs the extra veneer area (Layout.span)')
+    at, s = lay.extra[0] + EXTRA_EFFECT_EASE, EFFECT_EASE_SITE
+    p.put(s, a.b(s, at), 'effectease: ldr s2, [x8, #0x940] (the altitude ease k = 0.01) -> b <veneer>')
+    p.code(at, [Orig(s),                                   # s2 = 0.01 (x8 = its page)
+                a.adrp(8, at + 4, lay.data_off),
+                a.ldr_w(8, 8, DP_EASE_K001),
+                a.cbz_w(8, at + 12, at + 20),              # 0: the game's k
+                a.fmov_s_w(2, 8),                          # k = 1 - 0.99^r
+                a.b(at + 20, s + 4)], 'altitude effect ease k veneer')
+    at, s = lay.extra[0] + EXTRA_EFFECT_BURST, EFFECT_BURST_SITE
+    p.put(s, a.b(s, at), 'effectease: subs w8, w8, #1 (the 150-call burst count) -> b <veneer>')
+    p.code(at, [a.cmp_w_imm(8, 1),                         # lt iff the count < 1: the game's subs #1 / b.lt
+                a.b_cond('lt', at + 4, at + 24),           # (to the way back: the flags say lt for the b.lt)
+                a.adrp(9, at + 8, lay.data_off),
+                a.ldr_w(9, 9, DP_TICKS30),
+                a.sub_w(8, 8, 9),
+                a.sub_w_imm(8, 8, 1),                      # count -= ticks (no flags: the cmp's ge stays)
+                a.b(at + 24, s + 4)], 'altitude effect burst count veneer')
     return p
 
 
@@ -816,6 +1023,10 @@ FEATURES = {
     'ui_cb': (lambda lay: ui_cb(), False, ()),  # off: as is it CRASHES at start; the heap growth is on gp-uicb
     'tempunit': (tempunit, True, ()),   # 0 on the page = the game's own unit: on by default for the Display row
     'camblend': (lambda lay: camblend(), True, ()),   # 2026-11-02 (bow aim zoom at high fps); `--features default,-camblend` off
+    'cascade': (cascade, True, ()),   # public #35 (v0.1.9): 0 on the page = the game's splits, for the F10 row
+    'havok_dt': (havok_dt, False, ()),  # v0.1.9 A/B only: Havok's dt floored at 1/240, physics fast under it
+    'havok_tau': (havok_tau, False, ()),   # v0.1.9 A/B: tau held at its 1/240 value; the fix if it alone is clean
+    'effectease': (effectease, True, ()),   # per-frame sweep R5 (v0.1.9): 0 on the page = the game's frames
 }
 
 

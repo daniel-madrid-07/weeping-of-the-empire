@@ -49,6 +49,12 @@ enum {
                                       the view-derived one (shadowres); 0 = the game's own */
     TOTK_DP_TEMP_UNIT = 212,       /* runtime u32: the Purah Pad map's temperature unit, 0 = the game's (English (US): °F,
                                       the rest °C), 1 = °C, 2 = °F (the tempunit patch and sign hook, v0.1.8)*/
+    TOTK_DP_SHADOW_SPLIT = 216,    /* runtime f32: the near sun shadow cascades' reach multiplier (their inner boundaries
+                                      d[1], d[2] moved out, each below 0.75 x the next), 0 = the game's own (cascade) */
+    TOTK_DP_EASE_K001 = 220,       /* runtime f32: 1 - 0.99^r, the game's 0.01-per-frame ease at the frame's 30 Hz ratio r
+                                      (r in (0.01, 1)); 0 = the game's 0.01 (effectease) */
+    TOTK_DP_TICKS30 = 224,         /* runtime s32: 30 Hz ticks of game time this frame - 1 (r < 1: 0 or -1); 0 = the game's
+                                      one per frame (effectease) */
     /* platform's PlatPcPage (platform/include/platform/pc.h, 0x80 bytes): mouse totals, glyph style, overlay state.
        app binds it after totk_patches_init: plat_pc_page_bind(page + TOTK_DP_PC_OFFSET, sizeof(PlatPcPage)). */
     TOTK_DP_PC_OFFSET = 0x100,

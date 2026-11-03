@@ -52,7 +52,15 @@ import time
 import zipfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-GAME_EXT = ('.nsp', '.xci')
+# Linux (linux-port, 2026-11-02): the same steps natively; what Windows answers through kernel32 / the registry comes
+# from host_linux.py (each such function starts with its Linux line), the toolchain is toolchain.py's Linux assets, the
+# package engine/launcher/win/package.py's Linux layout, the run folders the XDG ones (launcher_linux.py)
+LINUX = sys.platform.startswith('linux')
+if LINUX:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import host_linux
+EXE = 'totk' if LINUX else 'totk.exe'
+GAME_EXT = ('.nsp', '.xci', '.nsz', '.xcz', '.nup')   # (.nsz / .xcz: nsz-compressed, pipeline/nx/ncz.py; .nup: nup.py)
 RELEASE_TOOLS = {'clang': '23.1.1', 'vulkan_sdk': '1.4.357.0'}   # what this repo's releases are built with
 # free space the work folder needs, from its measured parts (setup-speed, 2026-11-01: cold install 2b7c4cb2 on this
 # repo's Builder, sized every 60 s): a first run's peak was romfs.bin 17.1 GB + the code and fonts 0.1 + the build's
@@ -75,6 +83,8 @@ NO_FIRMWARE_CJK = ('Without the firmware, Korean and Chinese text uses a Windows
 def cjk_windows():
     """The game's language is Korean or Chinese: settings.ini's game.language (ko, zh-Hans, zh-Hant), or, empty or
     absent, Windows' display language, as the runtime picks it (pc_lang / hle_pl)"""
+    if LINUX:
+        return host_linux.cjk()
     import ctypes
     ini = os.path.join(os.environ.get('APPDATA', ''), 'nxrecomp', 'TotK-engine', 'settings.ini')
     try:
@@ -92,13 +102,18 @@ TOOLS_GB = 5         # --install: LLVM's part, Python, git, Microsoft's C++ libr
 EXTRACT_GB = 3       # --until extract / romfs: the game's files alone (the code; + COPY_ROMFS_GB with --copy-romfs)
 UPDATE_UNPACK_GB = 18   # --update: 1.4.3's extraction still unpacks its RomFS folder (package.py points that version
                         # at it): 304k files, 17.0 GB + their cluster slack, on top of a first run's or --until's need
-MIN_RAM_GB = 7.5     # an "8 GB" PC reports ~7.8
+# an "8 GB" PC reports 7.3-7.8 GB usable (an iGPU's reserve: ram-diet; 7.5 refused such laptops, though the README says
+# 8 GB).
+WARN_RAM_GB = 7.5
+SMALL_RAM_GB = 8.0          # (build.py's SMALL_RAM_GB / HOT_GIANT_PEAK_GB: one giant at a time and what fits beside it)
+HOT_GIANT_PEAK_GB = 3.2
 # The release PC's game-patch sets: every value the Options sliders offer (totk_engine.c: texture cache 1..3 by 0.5,
 # grass 0.25..4 by 0.25, shadow and fog 0.5..4 by 0.5; 1 is the game's own, no set); outputs, aspects, scenes and fast
 # travel at games.totk.overlays' defaults
 OVERLAY_SETS = ['--texture-cache', '1.5,2,2.5,3',
                 '--grass', '0.25,0.5,0.75,1.25,1.5,1.75,2,2.25,2.5,2.75,3,3.25,3.5,3.75,4',
-                '--shadow', '0.5,1.5,2,2.5,3,3.5,4', '--fog', '0.5,1.5,2,2.5,3,3.5,4',
+                '--shadow', '0.25,0.5,0.75,1.25,1.5,1.75,2,2.25,2.5,2.75,3,3.25,3.5,3.75,4',
+                '--fog', '0.5,1.5,2,2.5,3,3.5,4',
                 '--hud', 'corner,center']   # (the ultrawide sets with the HUD at the edges and in the middle 16:9)
 HEARTBEAT_S = 60     # a step silent this long prints a 'still working' line (step 4 can be quiet for minutes)
 
@@ -134,7 +149,8 @@ def classify(paths):
             firmware = p
         else:
             fail(f'unknown input: {p} (expected the dump, the keys file and the firmware: folder or .zip)')
-    missing = [n for n, v in (('the dump', game), ('the keys file', keys)) if not v]
+    # (a NUP holds the game unencrypted: no keys for it; an update NSP or a firmware still needs them, said in main)
+    missing = [n for n, v in (('the dump', game), ('the keys file', keys or (game and nup_dump(game)))) if not v]
     if missing:
         fail('missing: ' + ', '.join(missing) + '. Drop them onto the window.')
     return game, keys, firmware
@@ -203,6 +219,8 @@ def check_pc():
     """What the built game needs from this PC (problems, not notes: building would waste an hour). A processor without
     AVX2 is not one: --cpu auto builds x86-64-v2 for it. Below v2 (the launcher's start-up floor: SSSE3, SSE4.1, SSE4.2
     and with it POPCNT) the game cannot run at all, so say so before the build."""
+    if LINUX:
+        return host_linux.check_pc()
     import ctypes
     problems = []
     if not all(ctypes.windll.kernel32.IsProcessorFeaturePresent(f) for f in (36, 37, 38)):   # PF_SSSE3, PF_SSE4_1, _2
@@ -245,7 +263,12 @@ def dump_problem(what, msg):
     if 'ticket' in msg.lower():   # (missing, of an unknown signature type, or two that disagree)
         return (f'{what[0].upper() + what[1:]} has no usable ticket ({msg}): dump the game again with its ticket '
                 '(a common ticket).')
-    if 'Expected an XCI or NSP' in msg or 'Truncated' in msg or 'does not match' in msg or 'out of bounds' in msg:
+    if 'this Setup reads' in msg:   # (a NUP of a format this Setup does not read yet)
+        return (f'{what[0].upper() + what[1:]} is a NUP this Setup cannot read ({msg}): choose the '
+                f"{'game' if what == 'the dump' else 'update'} as an .nsp / .xci.")
+    if ('Expected an XCI or NSP' in msg or 'Truncated' in msg or 'does not match' in msg or 'out of bounds' in msg or
+            'NCZ' in msg or ('NUP' in msg and not msg.startswith(('The NUP', 'Expected base game')))):
+        # (".nsp / .xci" for an NSZ / XCZ / NUP too: Setup's sentence is translated as it stands; the cause says which)
         return (f'{what[0].upper() + what[1:]} is not a complete .nsp / .xci file ({msg}): copy or dump it again '
                 '(an interrupted copy or download leaves it short).')
     if what == 'the dump':
@@ -258,21 +281,33 @@ def dump_problem(what, msg):
 
 def check_dump(game, keys, update=None):
     """What stops step 1 found in seconds: the dump's and the update's container and NCA headers opened with these keys
-    through the pipeline's own functions (the ones step 1 runs). '' when they open; else one plain sentence. Without
-    the pipeline's packages (a source checkout before step 0) nothing is checked here: step 1 says it."""
+    through the pipeline's own functions (the ones step 1 runs); a NUP's superblock, table of contents and base game
+    (no keys). '' when they open; else one plain sentence. Without the pipeline's packages (a source checkout before
+    step 0) nothing is checked here: step 1 says it."""
     try:
-        sys.path.insert(0, REPO)
-        from pipeline.nx import container
+        if REPO not in sys.path:
+            sys.path.insert(0, REPO)
+        from pipeline.nx import container, nup
     except ImportError:
         return ''
-    try:
-        keyset = container.load_keys(keys)
-    except (OSError, ValueError) as e:
-        return f'{os.path.basename(keys)} cannot be read as a keys file ({e}): {KEYS_FIX}.'
+    keyset = {}
+    if keys:
+        try:
+            keyset = container.load_keys(keys)
+        except (OSError, ValueError) as e:
+            return f'{os.path.basename(keys)} cannot be read as a keys file ({e}): {KEYS_FIX}.'
+
+    def nup_base(f, keyset, size):
+        nup.base_package(nup.Nup(f, size), container.TOTK_TITLE_ID)
+
+    def nup_update(f, keyset, size):   # (extract.py's choice: the 1.4.3 package, else the newest)
+        nup.update_package(nup.Nup(f, size), container.TOTK_UPDATE_TITLE_ID, 720896)
     for path, what, opener in ((game, 'the dump', container.program_sections),
                                (update, 'the update dump', container.update_program)):
         if not path:
             continue
+        if nup_dump(path):
+            opener = nup_base if what == 'the dump' else nup_update
         try:
             with open(path, 'rb') as f:
                 opener(f, keyset, os.path.getsize(path))
@@ -321,6 +356,14 @@ def check_tools(managed=False):
     git and the clone are checked here."""
     missing, notes, env = [], [], {}
     sys.path.insert(0, REPO)
+    if LINUX and not managed:   # (a developer's run: the LLVM and SDK of tools/linux/env.sh, named by the environment)
+        for var, what in (('NXRECOMP_LLVM_DIR', 'LLVM 23.1.1 (tools/linux/llvm_asset.sh)'),
+                          ('NXR_LINUX_DEPS', 'the Linux SDK\'s deps (tools/linux/sdk.sh)')):
+            if not os.path.isdir(os.environ.get(var, '')):
+                missing.append(f'{var}: the folder of {what}, or use --install (Setup fetches both)')
+        if not shutil.which('git'):
+            missing.append('git (your distribution\'s package)')
+        return missing, notes, env
     if managed:
         if not shutil.which('git') or not os.path.exists(os.path.join(REPO, '.git')):
             missing.append(f'git and a clone of the repository in {REPO} (start Setup again: it fetches both)')
@@ -374,7 +417,17 @@ def check_tools(managed=False):
 
 def follow_gui(pid):
     """When Builder.exe goes (closed, crashed, killed), this build goes with it: its whole tree, compilers included.
-    (Builder.exe's kill-on-close job does not reach every Python: the Microsoft Store one starts outside it.)"""
+    (Builder.exe's kill-on-close job does not reach every Python: the Microsoft Store one starts outside it.)
+    Linux: the Setup window (tools/linux/appimage/setup_gui.py) passes its pid too, and starts this in a process group
+    of its own: a watcher thread sees that pid go and sends SIGTERM to the group (this process and the build's
+    children)."""
+    if LINUX:
+        def watch_linux():
+            while os.path.exists(f'/proc/{pid}'):
+                time.sleep(1)
+            os.killpg(os.getpgid(0), 15)
+        threading.Thread(target=watch_linux, daemon=True).start()
+        return
     import ctypes
     k32 = ctypes.windll.kernel32
     h = k32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
@@ -389,6 +442,8 @@ def follow_gui(pid):
 
 def memory_gb():
     """(total, available) physical memory in GB"""
+    if LINUX:
+        return host_linux.memory_gb()
     import ctypes
 
     class Status(ctypes.Structure):
@@ -401,17 +456,33 @@ def memory_gb():
     return m.total / 2**30, m.avail / 2**30
 
 
+def ram_warning(total_gb):
+    """the warning the build goes on with for this much usable RAM, or None"""
+    if total_gb < WARN_RAM_GB:
+        return (f'warning: this PC has {total_gb:.1f} GB of memory usable. Below 8 GB the game is untested: the build can '
+                'take hours, or stop for lack of memory and go on when Setup runs again; the game itself may not run, or '
+                'may crash on fast travel. Close other apps while it builds.')
+    return None
+
+
 def jobs_for(total_gb, cores):
     """(game, runtime) parallel compiles this PC's memory holds. Sized by RAM, not cores: a many-core PC with little
     memory otherwise runs out of it (other ports' first-build failures). A game unit peaks near 0.5 GB and a few giant
     ones near 2.2 GB (build.py, which also holds back when free commit runs low), a runtime C++ unit near 1.5 GB;
-    4 GB stay for Windows and the rest of the PC."""
+    4 GB stay for Windows and the rest of the PC. Under SMALL_RAM_GB the game's compiles are build.py's: one -O2 giant
+    (HOT_GIANT_PEAK_GB) and what fits beside it, so 1 at 7.0-7.6 GB, 2 at 7.8."""
     usable = max(1.0, total_gb - 4)
-    return max(2, min(cores, int(usable))), max(1, min(cores, 6, int(usable / 1.5)))
+    if total_gb < SMALL_RAM_GB:
+        game = max(1, min(cores, int((total_gb - 4 - HOT_GIANT_PEAK_GB) / 0.5) + 1))
+    else:
+        game = max(2, min(cores, int(usable)))
+    return game, max(1, min(cores, 6, int(usable / 1.5)))
 
 
 def on_wine():
     """Windows' Python under Wine / Proton (Linux, Steam Deck): its ntdll exports wine_get_version (Setup's Wine class)"""
+    if LINUX:   # (native: not Wine)
+        return False
     import ctypes
     try:
         return hasattr(ctypes.windll.ntdll, 'wine_get_version')
@@ -423,6 +494,8 @@ def filesystem(path):
     """the file system of the drive path really is on (through Setup's junction): 'NTFS', 'FAT32', 'exFAT'...
     Under Wine a drive letter is a Linux folder (Z: is /), so the folder itself is asked: Wine answers with the statfs()
     of the file system holding it (a FAT32 SD card mounted below /run/media), the drive root would answer for /"""
+    if LINUX:
+        return host_linux.filesystem(path)
     import ctypes
     real = os.path.realpath(path)
     name = ctypes.create_unicode_buffer(64)
@@ -438,6 +511,47 @@ def filesystem(path):
     return name.value if ok else ''
 
 
+def nup_dump(path):
+    """A NUP (pipeline/nx/nup.py: an unencrypted dump, no keys needed): by its name or its magic"""
+    if path.lower().endswith('.nup'):
+        return True
+    try:
+        with open(path, 'rb') as f:
+            return f.read(3) == b'NUP'
+    except OSError:
+        return False
+
+
+def compressed_dump(path):
+    """An NSZ / XCZ (its NCAs zstd-compressed by nsz, pipeline/nx/ncz.py) or a NUP (its files zstd one by one): by its
+    name, else by its files (a renamed one). The game cannot read its data in place, so it is copied out (romfs.bin)."""
+    if path.lower().endswith(('.nsz', '.xcz')) or nup_dump(path):
+        return True
+    try:
+        if REPO not in sys.path:
+            sys.path.insert(0, REPO)
+        from pipeline.nx import container, ncz
+        with open(path, 'rb') as f:
+            return any(ncz.is_ncz(e[0]) for e in container.container_entries(f, os.path.getsize(path))[1])
+    except (ImportError, OSError, ValueError):   # (before step 0's packages: by its name only)
+        return False
+
+
+def ncz_plain_gb(path):
+    """GB the .ncz NCAs of an NSZ / XCZ decompress to (their headers: pipeline/nx/ncz.py), rounded up; twice the file
+    when they cannot be read here (before step 0's packages)"""
+    try:
+        if REPO not in sys.path:
+            sys.path.insert(0, REPO)
+        from pipeline.nx import container, ncz
+        with open(path, 'rb') as f:
+            total = sum(ncz.NczBody(f, off, size).nca_size for name, off, size in
+                        container.container_entries(f, os.path.getsize(path))[1] if ncz.is_ncz(name))
+    except (ImportError, OSError, ValueError):
+        total = 2 * os.path.getsize(path)
+    return -(-total // 2**30)
+
+
 def in_onedrive(path):
     """the path is in one of this account's OneDrive folders (Setup's Preflight.InOneDrive)"""
     p = os.path.abspath(path).rstrip('\\').lower() + '\\'
@@ -449,6 +563,8 @@ def dump_drive(path):
     """what kind of drive the dump is on: 'fixed' (an internal disk), or 'removable', 'usb', 'network', 'cd' (a drive
     that can go away: the game's data is copied out by default then), 'OneDrive' (it frees space by leaving an
     online-only stub of a file: copied too), 'other' (unknown: treated as fixed)"""
+    if LINUX:
+        return host_linux.dump_drive(path)
     import ctypes
     from ctypes import wintypes
     p = os.path.abspath(path)
@@ -627,6 +743,8 @@ def player_txt(folder):
 def gpus():
     """this PC's display adapters and driver versions, sorted (the display class in the registry, no process): a new
     GPU or driver makes the shader cache step 9 prepared stale, so it joins that step's inputs"""
+    if LINUX:
+        return sorted(host_linux.gpus())
     try:
         import winreg
         found = []
@@ -732,6 +850,7 @@ PGO_URL = 'https://github.com/daniel-madrid-07/weeping-of-the-empire/releases/do
 
 
 HOT_NAME = re.compile(r'^\s+\?([A-Za-z_][A-Za-z0-9_]*)@@')   # ('  ?f_1b4d760@@YAX...:' in llvm-profdata show)
+HOT_NAME_LINUX = re.compile(r'^\s+_Z\d+([A-Za-z_][A-Za-z0-9_]*)P3Ctx:')   # (the Linux profile's: '  _Z9f_1b4d760P3Ctx:')
 
 
 def hot_list(profile, out, llvm_dir, run=subprocess.Popen):
@@ -745,7 +864,7 @@ def hot_list(profile, out, llvm_dir, run=subprocess.Popen):
             text=True, encoding='utf-8', errors='replace')
     hot, name, seen = [], None, 0
     for ln in p.stdout:
-        m = HOT_NAME.match(ln)
+        m = HOT_NAME.match(ln) or (HOT_NAME_LINUX.match(ln) if LINUX else None)
         if m:
             name = m.group(1)
         elif name and ln.lstrip().startswith('Block counts: ['):
@@ -783,22 +902,41 @@ def hot_args(work, pgo, env, dry):
     return ['--hot', out]
 
 
-def pgo_args(work, off, dry):
-    """['--pgo', <the profile>] for build.py game / key, [] to build without one (said in the log)"""
+def pgo_args(work, off, dry, llvm_dir=None):
+    """['--pgo', <the profile>] for build.py game / key, [] to build without one (said in the log). Linux: the release's
+    profile with the generated functions' records renamed to the Linux build's names (tools/linux/pgo_remap.py; their
+    bodies are the same source, so clang takes the counts: 1239 of 1246 functions matched in a check, the others a
+    patch set's differences), the runtime's dropped (no pgo_rt there)."""
     if not PGO:
         return []
     if off:
         say('profile (PGO): off (--no-pgo): plain -O2')
         return []
     dest = os.path.join(work, 'engine', 'pgo', PGO['name'])   # (build.py's own name for it: <sha16>.profdata)
+    remap = os.path.join(REPO, 'tools', 'linux', 'pgo_remap.py')
+    rev = ''   # (Linux: the remap's own hash in the name, so a changed pgo_remap.py makes a new file, never reuses one)
+    if LINUX:
+        with open(remap, 'rb') as f:
+            rev = '-' + hashlib.sha256(f.read().replace(b'\r\n', b'\n')).hexdigest()[:8]
+    linux = os.path.join(work, 'engine', 'pgo', os.path.splitext(PGO['name'])[0] + f'-linux{rev}.profdata')
     if dry:
-        return ['--pgo', dest]
+        return ['--pgo', linux if LINUX else dest]
     import toolchain
     try:
         toolchain.download('the release\'s profile (PGO)', PGO_URL.format(**PGO), dest, PGO['sha256'], PGO['size'])
     except Exception as e:   # (any failure: a network error, a full disk... never stops the build)
         say(f'profile (PGO): not used ({e}); the build goes on without it, plain -O2 (a little slower in play)')
         return []
+    if LINUX:
+        if not os.path.isfile(linux):
+            r = subprocess.run([sys.executable, '-I', remap, dest, linux,
+                                '--llvm', llvm_dir or ''], capture_output=True, text=True)
+            if r.returncode:
+                say(f'profile (PGO): not used (the Linux names could not be made: {(r.stdout + r.stderr).strip()[-300:]}); '
+                    'plain -O2')
+                return []
+            say(r.stdout.strip())
+        return ['--pgo', linux]
     if not PGO_RECORD:
         return ['--pgo', dest]
     try:
@@ -892,6 +1030,9 @@ def player_values(pkg):
 
 
 def player_path(pkg, v):
+    if LINUX:   # (player.txt's paths: absolute, or relative to the package)
+        v = v.rstrip(' ')
+        return v if not v or v.startswith('/') else os.path.abspath(os.path.join(pkg, v))
     v = v.rstrip(' ').replace('/', '\\')
     return v if not v or v[1:2] == ':' or v.startswith('\\\\') else os.path.abspath(os.path.join(pkg, v))
 
@@ -903,6 +1044,10 @@ def prepare_env(pkg, environ=None):
     environ = dict(os.environ if environ is None else environ)
     roam = os.path.join(environ.get('APPDATA', ''), 'nxrecomp', 'TotK-engine')
     local = os.path.join(environ.get('LOCALAPPDATA', ''), 'nxrecomp', 'TotK-engine')
+    if LINUX:   # (the XDG folders the Linux launcher gives the game: engine/launcher/linux/launcher_linux.py)
+        sys.path.insert(0, os.path.join(REPO, 'engine', 'launcher', 'linux'))
+        import launcher_linux
+        roam, local = launcher_linux.user_dirs(environ)
     vals, run = player_values(pkg), os.path.join(local, 'run')
     env = {k: v for k, v in environ.items() if not k.upper().startswith(('TOTK_', 'NXR_'))}
     env.update(TOTK_USERDATA=os.path.join(roam, 'userdata'), TOTK_IMG=player_path(pkg, vals.get('img', '')),
@@ -916,10 +1061,31 @@ def prepare_env(pkg, environ=None):
     return run, env, roam, player_path(pkg, vals.get('settings', ''))
 
 
+def shader_inputs(pkg):
+    """what step 9's result depends on besides the dump, the GPUs and their drivers: the translator (xlate_id.py, the
+    renderer's sources, which the game's own shader-cache keys use), the package's recorded programs (cache-seed), and
+    the player.txt env lines and default settings the game translates with. Not the Setup commit or the package folder:
+    a relink-only update (v0.1.8.1) prepared everything again, 184 of its 335 s."""
+    sys.path.insert(0, os.path.join(REPO, 'tools', 'engine'))
+    import xlate_id
+
+    def digest(path):
+        try:
+            with open(path, 'rb') as f:
+                return hashlib.sha256(f.read()).hexdigest()[:16]
+        except OSError:
+            return None
+    vals = player_values(pkg)
+    return dict(xlate=f'{xlate_id.xlate_id(os.path.join(REPO, "engine")):016x}',
+                seed=digest(os.path.join(pkg, 'cache-seed', 'precompile.bin')),
+                env=sorted(f'{k}={v}' for k, v in vals.items() if k.startswith('env.')),
+                settings=digest(player_path(pkg, vals.get('settings', ''))) if vals.get('settings', '').strip() else None)
+
+
 def prepare_shaders(pkg, n, dry, cmd=None):
     if not PREPARE_SHADERS:
         return
-    exe = os.path.join(pkg, 'totk.exe')
+    exe = os.path.join(pkg, EXE)
     cmd = cmd or [exe, '--prepare']   # (the tests: a fake)
     say(f'step 9/{n} shaders: "{exe}" --prepare')
     if dry:
@@ -988,9 +1154,11 @@ def release_of(repo):
     return (tag, m.group(1)) if tag and m else None
 
 
-def newest_package(out):
-    folders = sorted((d for d in glob.glob(os.path.join(out, 'TotK-PC-*')) if os.path.isdir(d) and not d.endswith('.tmp')),
-                     key=os.path.getmtime)
+def newest_package(out, tag=None):
+    """the newest playable folder in out; with tag ('' for 1.0.0, 'v143'), the newest of that game version (a 1.4.3
+    folder beside a 1.0.0 one is neither's reuse check nor its shaders' folder)"""
+    folders = sorted((d for d in glob.glob(os.path.join(out, 'TotK-PC-*')) if os.path.isdir(d) and not d.endswith('.tmp')
+                      and (tag is None or version_tag(d) == tag)), key=os.path.getmtime)
     return folders[-1] if folders else None
 
 
@@ -1031,6 +1199,24 @@ def carry_mods(old, new):
     return not left
 
 
+def update_romfs_there(work):
+    """Setup unpacked the 1.4.3 update's game files in this work folder (build.py's UPDATE_ROMFS, the same test)"""
+    d = os.path.join(work, 'extracted', UPDATE_DIR)
+    return os.path.isfile(os.path.join(d, 'romfs-index.json')) or \
+        os.path.isfile(os.path.join(d, 'romfs', 'Pack', 'ZsDic.pack.zs'))
+
+
+def same_100_package(out, head):
+    """the newest 1.0.0 game folder in `out` was packaged from this Setup's commit (its overlay can be made again by
+    this Setup's tools without leaving the exe's Options rows and the texts out of step)"""
+    folders = [d for d in glob.glob(os.path.join(out, 'TotK-PC-*'))
+               if os.path.isdir(d) and not d.endswith('.tmp') and not version_tag(d)]
+    if not folders or not head:
+        return False
+    c = player_txt(max(folders, key=os.path.getmtime)).get('commit', '')
+    return bool(c) and (head.startswith(c) or c.startswith(head))
+
+
 def version_tag(folder):
     """'v143' for a package of another game version (package.py names it ...-v143 or ...-v143-beta), '' for 1.0.0"""
     m = re.search(r'-(v\d{3})(-beta)?$', os.path.basename(folder.rstrip('\\/')))
@@ -1054,7 +1240,7 @@ def engine_patches(work, img, py, env, label, dry, table=None):
     the default patch set for the engine (seconds): 1.0.0's, or `table`'s (the update's, version_tables)"""
     pdir = os.path.join(work, 'engine', 'patches', 'builder')
     funcs = os.path.join(pdir, f'funcs_{os.path.basename(img)}_{git_id("engine/tools/funcs.py")}.json')
-    vpy = os.path.join(work, 'engine', 'venv', 'Scripts', 'python.exe')
+    vpy = os.path.join(work, 'engine', 'venv', *(('bin', 'python') if LINUX else ('Scripts', 'python.exe')))
     os.makedirs(pdir, exist_ok=True)
     if dry or not os.path.exists(funcs):
         run(label, [vpy if os.path.exists(vpy) else py, '-I', os.path.join(REPO, 'engine', 'tools', 'funcs.py'),
@@ -1075,7 +1261,10 @@ def app_icon(work, vdir, py, env, label, dry):
     """The app icon: the title screen's ring, from the player's own game files of the version built (vdir; games/totk/
     app_icon.py: Nintendo's artwork, never shipped; a neutral one of ours if the ring cannot be read), linked into
     totk.exe and the launcher (the desktop shortcut's icon). Returns env with TOTK_APP_ICON_RES for the build and the
-    package. Optional, as every such step: a failure says so and returns env as it was (Windows' own icon)."""
+    package. Optional, as every such step: a failure says so and returns env as it was (Windows' own icon).
+    Linux: no resource to link (the launcher's .desktop icon is the AppImage's own): nothing to do."""
+    if LINUX:
+        return env
     out = os.path.join(work, 'engine', 'icon')
     cmd = [py, '-m', 'games.totk.app_icon', '--romfs', vdir, '--out', out]
     say(f'step {label}: ' + ' '.join(f'"{c}"' if ' ' in c else c for c in cmd))
@@ -1090,6 +1279,25 @@ def app_icon(work, vdir, py, env, label, dry):
     return dict(env, TOTK_APP_ICON_RES=res)
 
 
+def version_table_files():
+    """what version_tables() makes, all game-derived and untracked: games/totk/patches/<v>.toml (port) and <v>.engine.json
+    (engine-map), engine/runtime/totk_main_<v>.inc and totk_fields_<v>.inc (engine-map), and with a beta engine map
+    totk_main_<v>_stubs.inc. A step marked done with one of them gone (a clean-up) runs again: v0.1.8's 1.4.3 check
+    died at step 5 on a missing.inc that build.py's snapshot needs."""
+    pat = os.path.join(REPO, 'games', 'totk', 'patches')
+    rt = os.path.join(REPO, 'engine', 'runtime')
+    out = [os.path.join(pat, UPDATE_DIR + '.toml'), os.path.join(pat, UPDATE_DIR + '.engine.json'),
+           os.path.join(rt, f'totk_main_{UPDATE_DIR}.inc'), os.path.join(rt, f'totk_fields_{UPDATE_DIR}.inc')]
+    try:   # (engine_map.py writes the stubs for a beta or diagnostic map, and removes them otherwise)
+        eng = json.load(open(out[1], encoding='utf-8'))
+        stubs = bool(eng.get('beta') or eng.get('diagnostic'))
+    except (OSError, ValueError):
+        stubs = False
+    if stubs:
+        out.append(os.path.join(rt, f'totk_main_{UPDATE_DIR}_stubs.inc'))
+    return out
+
+
 def version_tables(work, v100, vdir, py, env, label, dry):
     """games/totk/patches/v143.toml + v143.engine.json from the player's 1.0.0 and 1.4.3 mains; again when the porter's
     code, the engine or either main changed (a git pull, a new dump)"""
@@ -1099,8 +1307,7 @@ def version_tables(work, v100, vdir, py, env, label, dry):
     marker = os.path.join(rep, f'{UPDATE_DIR}-tables.json')
     want = None if dry else {'code': git_id('games/totk/patches'), 'engine': git_id('engine'),   # (engine-map reads
                              'old': file_id(old), 'new': file_id(new)}                       #  the engine's addresses)
-    if not dry and done_with(marker, want) and all(os.path.isfile(os.path.join(pat, UPDATE_DIR + x))
-                                                   for x in ('.toml', '.engine.json')):
+    if not dry and done_with(marker, want) and all(os.path.isfile(p) for p in version_table_files()):
         return
     os.makedirs(rep, exist_ok=True)
     common = ['--old', old, '--new', new, '--version', UPDATE_VERSION]
@@ -1124,7 +1331,66 @@ def host_cpu():
     return 'v3' if 'avx2' in flags else 'v2'
 
 
+def download_kit(argv):
+    """builder.py --download-kit <nxr-kit> [--setup-items FILE] [--tag TAG] [--gui-pid N]: the rest of a download kit
+    (tools/builder/kit.py), after Setup put its own downloads and the source in: the Python packages (the steps' and
+    the engine venv's), the release's profile, shader seed and FSR runtime, Microsoft's C++ libraries and Windows SDK
+    (a PC without Visual Studio C++ needs them; Setup asked for their terms) and the DLSS / FidelityFX files build.py
+    fetches. A kit made before keeps its files: only what it lacks is downloaded. Ends with the kit marked complete."""
+    ap = argparse.ArgumentParser(prog='builder.py --download-kit')
+    ap.add_argument('kit')
+    ap.add_argument('--setup-items', help='Setup\'s own downloads, already in <kit>/files: sha256 TAB size TAB name TAB url')
+    ap.add_argument('--tag', help='the release the kit is for (Setup\'s)')
+    ap.add_argument('--gui-pid', type=int, help=argparse.SUPPRESS)
+    a = ap.parse_args(argv)
+    if a.gui_pid:
+        follow_gui(a.gui_pid)
+    import toolchain
+    import kit
+    d = os.path.abspath(a.kit)
+    os.environ['NXR_KIT_MAKE'] = os.environ['NXR_KIT'] = d
+    doc = kit.load(d)
+    doc.update(format=kit.FORMAT, complete=False, setup=a.tag or doc.get('setup'))
+    if os.path.isdir(os.path.join(d, 'src.git')):
+        doc['source'] = {'path': 'src.git', 'tag': a.tag}
+    if a.setup_items:
+        with open(a.setup_items, encoding='utf-8') as f:
+            for ln in f:
+                s, size, name, url = ln.rstrip('\n').split('\t')
+                if os.path.isfile(os.path.join(d, 'files', s)):
+                    kit._put(doc, {'name': name, 'url': url, 'sha256': s, 'size': int(size), 'path': 'files/' + s})
+    kit.save(d, doc)
+    scratch = d + '.work'
+    sys.path.insert(0, os.path.join(REPO, 'tools', 'engine'))
+    import build
+    say('download kit: the Python packages')
+    toolchain.kit_wheels(toolchain.PACKAGES + build.VENV_PACKAGES)
+    for what, asset in (('the release\'s profile (PGO)', PGO), ('the profile\'s training record', PGO_RECORD),
+                        ('the shader seed', SEED), ('the FSR runtime (AMD FidelityFX)', FFX)):
+        if asset:
+            toolchain.download(what, PGO_URL.format(**asset), os.path.join(scratch, 'assets', asset['name']),
+                               asset['sha256'], asset['size'])
+    toolchain.ensure_msvc(os.path.join(scratch, 'tools'), fetch_only=True)
+    build.dlss_fetch(build.DLSS_SDK, os.path.join(scratch, 'dlss-sdk'), flat=False)
+    build.dlss_fetch(build.DLSS_DLLS, os.path.join(scratch, 'dlss'), flat=True)
+    build.dlss_fetch(build.FFX_DLLS, os.path.join(scratch, 'ffx'), flat=True, url=build.FFX_URL, what='FidelityFX SDK')
+    doc = kit.load(d)
+    doc['complete'] = True
+    kit.save(d, doc)
+    size = sum(e.get('size', 0) for e in doc['files'])
+    say(f'download kit complete: {len(doc["files"])} files, {size / 2**30:.1f} GB')
+    say(f'KIT: {d}')
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['--download-kit']:
+        import toolchain
+        try:
+            return download_kit(argv[1:])
+        except (toolchain.ToolchainError, OSError) as e:
+            say(f'ERROR: the download kit is not complete: {e}. Start it again: what it has is kept.')
+            sys.exit(1)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('inputs', nargs='+', help='the dump, the keys file and, optional, the firmware (folder or .zip)')
     ap.add_argument('--update', help=f'the player\'s {UPDATE_VERSION} update dump (.nsp): builds version '
@@ -1153,7 +1419,8 @@ def main(argv=None):
         follow_gui(a.gui_pid)
 
     game, keys, firmware = classify(a.inputs)
-    check_keys(keys)
+    if keys:
+        check_keys(keys)
     install = os.path.abspath(a.install) if a.install else None
     work = os.path.join(install, 'work') if install else os.path.abspath(a.work)
     out = os.path.join(install, 'game') if install else os.path.abspath(a.out or os.path.join(work, 'release'))
@@ -1161,10 +1428,23 @@ def main(argv=None):
     update = os.path.abspath(a.update.strip('"')) if a.update else None
     if update and not (os.path.isfile(update) and update.lower().endswith(GAME_EXT)):
         fail(f'the update dump: not a .nsp / .xci file: {update}')
+    # an update NUP (the same .nup as the game, or one of its own) holds its whole RomFS tree: no base RomFS and no keys;
+    # an update NSP / XCI patches the base game's NCA section, which a NUP base has not
+    update_nup = bool(update) and nup_dump(update)
+    if update and not update_nup and nup_dump(game):
+        fail(f'a NUP base game cannot take an update .nsp / .xci: choose the {UPDATE_VERSION} update as a NUP (the same .nup '
+             'when it holds the update), or the base game as an .nsp / .xci')
+    if update and not update_nup and not keys:   # (a NUP needs none; an update NSP / XCI does)
+        fail('missing: the keys file (the update dump is encrypted: prod.keys from your console). Drop it onto the window.')
+    if firmware and not keys:   # (its fonts are in encrypted system NCAs)
+        say('firmware: its fonts need the keys file (prod.keys from your console); without it the game is built '
+            'without them: Korean and Chinese text uses a Windows font')
+        firmware = None
+    keyarg = ['--keys', keys] if keys else []   # (a NUP alone: no keys file at all)
     fw = None if not firmware else firmware_dir(firmware, work) if not a.dry_run or os.path.isdir(firmware) else firmware
     say(f'dump: {os.path.basename(game)}' + (f' + update {os.path.basename(update)} (builds {UPDATE_VERSION})'
                                                if update else '') +
-        f' | keys: {os.path.basename(keys)} | firmware: {fw or "none"}')
+        f' | keys: {os.path.basename(keys) if keys else "none (a NUP needs none)"} | firmware: {fw or "none"}')
     vdir = os.path.join(work, 'extracted', UPDATE_DIR if update else 'v100')   # (the version built: its game files)
     if update:
         say(SAVES_NOTE)
@@ -1181,9 +1461,13 @@ def main(argv=None):
     # the dump, then the other one removed)
     drive = dump_drive(game)
     had_copy = os.path.isfile(os.path.join(v100, 'romfs.bin'))
-    copy = bool(update) or (a.copy_romfs if a.copy_romfs is not None else had_copy or drive not in ('fixed', 'other'))
+    packed = compressed_dump(game)
+    copy = bool(update) or packed or (a.copy_romfs if a.copy_romfs is not None else
+                                      had_copy or drive not in ('fixed', 'other'))
     if not update:
-        say('game data: ' + ('copied out of the dump (romfs.bin, 17 GB)' + ('' if a.copy_romfs else
+        say('game data: ' + ('copied out of the dump (romfs.bin, 17 GB)' + (': the dump is a NUP' if packed and nup_dump(game) else
+                                                                             ': the dump is compressed (NSZ / XCZ)' if packed else
+                                                                             '' if a.copy_romfs else
                                                                              ': kept from the earlier install' if had_copy else
                                                                              ': the dump is in OneDrive' if drive == 'OneDrive' else
                                                                              f': the dump is on a {drive} drive')
@@ -1199,6 +1483,12 @@ def main(argv=None):
         need += COPY_ROMFS_GB
     if update and not extracted and a.until != 'tools':
         need += UPDATE_UNPACK_GB
+        # (an NSZ / XCZ base or update the merge reads out of order: its plaintext spilled once beside the
+        # extraction, pipeline/nx/ncz.py, then removed: the worst case counted)
+        if compressed_dump(game) and not nup_dump(game):
+            need += COPY_ROMFS_GB
+        if compressed_dump(update) and not nup_dump(update):
+            need += ncz_plain_gb(update)
     if install and not os.path.isfile(os.path.join(tools, 'llvm', '.toolchain.json')):
         need += TOOLS_GB
     if free_gb(work) < need:
@@ -1206,13 +1496,15 @@ def main(argv=None):
     fs = filesystem(work)
     if fs.upper().startswith('FAT') and a.until != 'tools':
         problems.append(f'{os.path.realpath(work)[:2]} is formatted {fs}, which cannot hold files over 4 GB (the game '
-                        'data has one of 17 GB): choose a folder on an NTFS drive')
+                        'data has one of 17 GB): choose a folder on ' + ('an ext4, btrfs, xfs or exFAT drive' if LINUX
+                                                                           else 'an NTFS drive'))
     problems += check_pc()
-    ram, _ = memory_gb()
-    if ram < MIN_RAM_GB:
-        problems.append(f'memory: the build needs a PC with at least 8 GB of RAM ({ram:.1f} GB here)')
-    game_jobs, rt_jobs = jobs_for(ram, os.cpu_count() or 2)
-    say(f'{os.cpu_count()} cores, {ram:.0f} GB RAM: up to {game_jobs} compiles at once')
+    ram, _ = memory_gb()   # (no floor: under WARN_RAM_GB said, and Setup asked 'Continue anyway?' before this)
+    cores = host_linux.cpu_count() if LINUX else os.cpu_count()   # (Linux: affinity and the cgroup's quota)
+    game_jobs, rt_jobs = jobs_for(ram, cores or 2)
+    say(f'{cores} cores, {ram:.0f} GB RAM: up to {game_jobs} compiles at once')
+    if ram_warning(ram):
+        say(ram_warning(ram))
     for note in notes:
         say('note: ' + note)
     if problems:
@@ -1264,7 +1556,7 @@ def main(argv=None):
                 env = toolchain.apply(toolchain.ensure(tools), env)
             except toolchain.ToolchainError as e:
                 fail(str(e))
-            old = msvc_too_old(env)   # (ensure() takes the pinned tools over an older Visual Studio: a guard)
+            old = None if LINUX else msvc_too_old(env)   # (ensure() takes the pinned tools over an older VS: a guard)
             if old:
                 fail(old)
             stamps.done(0, 'tools', {'setup': base['setup']})
@@ -1276,13 +1568,13 @@ def main(argv=None):
     #    (the fonts only with the firmware; given on a later run, they are added to an extraction made without)
     if update and (a.dry_run or not os.path.isfile(os.path.join(v100, 'exefs', 'main'))):
         # (1.4.3: the 1.0.0 main too, which the port moves from; its RomFS is not needed)
-        run(f'1/{n} extract', [py, '-m', 'pipeline.build', '--nsp', game, '--keys', keys, '--work', work,
+        run(f'1/{n} extract', [py, '-m', 'pipeline.build', '--nsp', game] + keyarg + ['--work', work,
                                '--steps', 'exefs'], env, a.dry_run)
     if steps and not update and not a.dry_run and 'romfs' in steps:
         drop_partial_folder(v100)
     common = (['--update', update] if update else ['--no-unpack'] + ([] if copy else ['--romfs-in-dump']))
     if steps:
-        run(f'1/{n} extract', [py, '-m', 'pipeline.build', '--nsp', game, '--keys', keys, '--work', work,
+        run(f'1/{n} extract', [py, '-m', 'pipeline.build', '--nsp', game] + keyarg + ['--work', work,
                                '--steps', ','.join(steps + ['ready'])] + common,
             env, a.dry_run,
             watch=None if a.dry_run or 'romfs' not in steps or not copy else   # (in the dump: no file grows)
@@ -1298,7 +1590,7 @@ def main(argv=None):
     # Windows font otherwise), so a firmware these keys cannot open is said and the build goes on (#26: keys dumped by
     # a tool older than the firmware lack its key_area_key_*_NN and the whole install stopped after the game's files)
     if fw and not fonts:
-        ok, out = run(f'1/{n} extract', [py, '-m', 'pipeline.build', '--nsp', game, '--keys', keys, '--work', work,
+        ok, out = run(f'1/{n} extract', [py, '-m', 'pipeline.build', '--nsp', game] + keyarg + ['--work', work,
                                          '--steps', 'fonts,ready', '--firmware', fw] + common,
                       env, a.dry_run, quiet=True, tolerate=True)
         if not ok:
@@ -1348,7 +1640,7 @@ def main(argv=None):
                                     if cpu == 'v2' and a.cpu == 'auto' else ''))
     if update:
         say(f'profile (PGO): none for {UPDATE_VERSION} (the release\'s profile was trained on 1.0.0): plain -O2')
-    variant = march + ([] if update else pgo_args(work, a.no_pgo, a.dry_run))   # (both join the key)
+    variant = march + ([] if update else pgo_args(work, a.no_pgo, a.dry_run, env.get('NXRECOMP_LLVM_DIR')))   # (both join the key)
     variant += hot_args(work, variant[len(march):], env, a.dry_run)   # (the hot list joins the key too)
     # no line tables in the game objects, as the release package (build.py --package): the exe links without a PDB, so
     # they serve nothing (crash reports name guest code through the function table); the same code, ~11% less compile
@@ -1359,7 +1651,7 @@ def main(argv=None):
                                               quiet=True))
     if a.dry_run or not (kinfo.get('built') and key_built(kinfo['dir']) and
                          stamps.reuse(5, 'build', dict(base, key=kinfo['key']),
-                                      [os.path.join(kinfo['dir'], 'exe', 'totk.exe')])):
+                                      [os.path.join(kinfo['dir'], 'exe', EXE)])):
         say('step 5 is the long one: about 25-45 min the first time, minutes after that')
         run(f'5/{n} build', [py, build, 'game'] + pargs + ['--jobs', str(game_jobs), '--jobs-rt', str(rt_jobs)]
             + variant, env, a.dry_run)
@@ -1396,9 +1688,26 @@ def main(argv=None):
     # 7. the engine's data overlay, its aspect copies and their PC key glyph banks (build.py overlay makes them all):
     #    ~1.5 min, again only for another dump or Setup version (a git pull may change it)
     #    (only the shapes' copies of step 6's sets: NXR_ASPECT_SETS; a shape's failed on-demand build is tried again)
+    #    (ptbr: the 1.4.3 update unpacked here, whose Portuguese texts the 1.0.0 overlay serves (build.py, mals.py):
+    #    one given since the last overlay makes it again)
     t7, bank = time.time(), os.path.join(work, 'engine', 'glyphs', 'engine+glyphs')
-    in7 = dict(base, aspects=shapes)
-    if not update and not stamps.reuse(7, 'overlay', in7, [bank]):
+    ptbr = update_romfs_there(work)
+    in7 = dict(base, aspects=shapes, ptbr=ptbr)
+    pt100 = os.path.join(work, 'engine', 'overlay', 'romfs', 'Mals', 'USpt.Product.100.sarc.zs')
+    if update and ptbr and not os.path.isfile(pt100) and same_100_package(out, head):
+        # (the 1.0.0 game of this same Setup next to it: its overlay gets the Portuguese now, from this update; a 1.0.0
+        #  game of another Setup version gets it at its next Setup, whose overlay matches its exe. Optional: a failure
+        #  leaves the 1.0.0 overlay as it was)
+        ok, _ = run(f'7/{n} overlay (1.0.0: Brazilian Portuguese texts from the update)', [py, build, 'overlay', '--force'],
+                    dict(env, NXR_ASPECT_SETS=','.join(shapes)), a.dry_run, quiet=True, tolerate=True)
+        if not a.dry_run:
+            say('1.0.0 game: Portuguese (Brasil) texts ' + ('ready (F10 > Game > Language)' if ok and os.path.isfile(pt100)
+                                                            else 'not made this time (above); the next Setup tries again'))
+    # (the skip-opening set too: an install whose step 7 ran before the set existed, or whose set was deleted, would
+    #  otherwise reuse step 7 without it, and 'Skip the opening' finds nothing; public #65, rival-034)
+    skipset = os.path.join(work, 'engine', 'overlay', 'skip_opening', 'manifest.tsv')   # (a file the set always has: an
+    #  empty folder left by a broken run doesn't count)
+    if not update and not stamps.reuse(7, 'overlay', in7, [bank, skipset]):
         run(f'7/{n} overlay', [py, build, 'overlay', '--force'], dict(env, NXR_ASPECT_SETS=','.join(shapes)), a.dry_run)
         if not a.dry_run and not (os.path.isdir(bank) and os.path.getmtime(bank) >= t7 - 2):   # (made by this step)
             fail('no PC key glyph bank was made: the overlay step says why above')
@@ -1426,17 +1735,18 @@ def main(argv=None):
     # (and whether the firmware's fonts are there: a failed read is optional now (#26), a later success must repackage)
     in8 = dict(base, key=key, release=rel, out=os.path.normcase(out), exefs=exefs, aspect=aspect,
                fonts=os.path.isfile(os.path.join(vdir, 'fonts-report.json')))
-    newest = None if a.dry_run else newest_package(out)
+    tag = UPDATE_DIR if update else ''
+    newest = None if a.dry_run else newest_package(out, tag)
     pt = player_txt(newest) if newest else {}
     c = pt.get('commit', '')
     if a.dry_run or not (pt.get('key') == key and head and c and (head.startswith(c) or c.startswith(head)) and
                          stamps.reuse(8, 'package', dict(in8, folder=os.path.basename(newest)),
-                                      [os.path.join(newest, 'totk.exe')])):
+                                      [os.path.join(newest, EXE)])):
         run(f'8/{n} package', [py, os.path.join(REPO, 'engine', 'launcher', 'win', 'package.py'), '--key', key,
                                '--out', out, '--env', f'TOTK_EXEFS_BUILD={exefs}', '--env', f'TOTK_ASPECT_BUILD={aspect}']
             + (['--commit', head] if head else []) + (['--release', rel[0], '--release-repo', rel[1]] if rel else []),
             env, a.dry_run)
-        newest = None if a.dry_run else newest_package(out)
+        newest = None if a.dry_run else newest_package(out, tag)
         if not a.dry_run and not newest:
             fail(f'no playable folder in {out} after packaging')
         if newest:
@@ -1444,8 +1754,9 @@ def main(argv=None):
     # 9. the shaders the game would compile the first time it sees them, built now into the player's own cache
     #    (reused for the same game folder, GPU and driver while the cache it made is still there: it lives in the
     #    player's profile, %LOCALAPPDATA%, which an uninstall or the player may clear; a stopped or failed one runs
-    #    again)
-    in9 = dict(base, folder=os.path.basename(newest or out), gpus=gpus())
+    #    again); keyed on what the shaders are made from (shader_inputs), not on the Setup commit or the folder
+    in9 = dict({k: v for k, v in base.items() if k != 'setup'}, gpus=gpus(),
+               **(shader_inputs(newest or out) if not a.dry_run else {}))
     cold = None if a.dry_run else os.path.join(prepare_env(newest or out)[0], 'cache', 'precompile_cold.key')
     if not update and not stamps.reuse(9, 'shaders', in9, [cold] if cold else []):   # (1.4.3: none recorded)
         if prepare_shaders(newest or out, n, a.dry_run) in (0, 1, 2):
@@ -1460,7 +1771,7 @@ def main(argv=None):
             tidy.tidy(work, key, head, log=say)
         except Exception as e:   # (never fails an install that worked)
             say(f'tidy: skipped ({e})')
-    say('DONE: ' + os.path.join(newest, 'TotK Launcher.exe'))
+    say('DONE: ' + (newest if LINUX else os.path.join(newest, 'TotK Launcher.exe')))
 
 
 if __name__ == '__main__':

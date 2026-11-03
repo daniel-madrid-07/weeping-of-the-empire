@@ -104,6 +104,16 @@ int main(void) {
     _putenv("TOTK_FOV=3");
     CHECK(totk_settings_from_env(&e) != NULL, "TOTK_FOV out of range refused");
     _putenv("TOTK_FOV=");
+    _putenv("TOTK_SHADOW_REACH=2");
+    CHECK(totk_settings_from_env(&e) == NULL && e.shadow_reach == 2.0f, "TOTK_SHADOW_REACH=2");
+    _putenv("TOTK_SHADOW_REACH=1");
+    CHECK(totk_settings_from_env(&e) == NULL && e.shadow_reach == 0.0f, "TOTK_SHADOW_REACH=1 is the game's own");
+    _putenv("TOTK_SHADOW_REACH=0.5");
+    CHECK(totk_settings_from_env(&e) != NULL, "TOTK_SHADOW_REACH=0.5 refused (only further)");
+    _putenv("TOTK_SHADOW_REACH=5");
+    CHECK(totk_settings_from_env(&e) != NULL, "TOTK_SHADOW_REACH=5 refused");
+    _putenv("TOTK_SHADOW_REACH=");
+    e.shadow_reach = 0.0f;
     _putenv("TOTK_SHADOW_FIXED=on");
     CHECK(totk_settings_from_env(&e) == NULL && e.shadow_fixed == 1.0f, "TOTK_SHADOW_FIXED=on");
     _putenv("TOTK_SHADOW_FIXED=0");
@@ -125,6 +135,7 @@ int main(void) {
     CHECK(f32_at(page, TOTK_DP_RES_FLOOR) == 1.0f, "dynamic resolution floor 1 (fixed)");
     CHECK(f32_at(page, TOTK_DP_FOV_SCALE) == 0.0f, "field of view: the game's own");
     CHECK(f32_at(page, TOTK_DP_SHADOW_FIXED) == 0.0f, "shadow map size: the game's own");
+    CHECK(f32_at(page, TOTK_DP_SHADOW_SPLIT) == 0.0f, "near shadow reach: the game's own");
     CHECK(u32_at(page, TOTK_DP_TEMP_UNIT) == 0, "temperature unit: the game's own");
     totk_temp_unit_set(2);
     CHECK(u32_at(page, TOTK_DP_TEMP_UNIT) == 2, "temperature unit set live: F");
@@ -146,6 +157,21 @@ int main(void) {
         if (want > 1.0 / 15) want = 1.0 / 15;
         float sec = f32_at(page, TOTK_DP_FRAME_SECONDS), ratio = f32_at(page, TOTK_DP_FRAME_RATIO);
         CHECK(fabs(sec - want) < 2e-6 && fabs(ratio - want * 30) < 5e-5, "%g Hz: seconds %g ratio %g, want %g", rates[r], sec, ratio, want);
+        /* effectease's page values (per-frame sweep R5): above 30 fps k = 1 - 0.99^r and one 30 Hz tick per 30 Hz of
+           game time (over a second of frames: 30 ticks, +-1); at 30 and below both 0 (the game's k and step) */
+        const float k = f32_at(page, TOTK_DP_EASE_K001);
+        int ticks = 0;
+        const int n = (int)(1.0 / want + 0.5);
+        for (int i = 0; i < n; i++) {
+            totk_frame_step_update(t += (uint64_t)(1e9 / rates[r]));
+            ticks += (int32_t)u32_at(page, TOTK_DP_TICKS30) + 1;
+        }
+        if (ratio < 1.0f)
+            CHECK(fabsf(k - (float)(1.0 - pow(1.0 - (double)0.01f, ratio))) < 1e-7f && fabsf((float)ticks - n * ratio) <= 1.0f,
+                  "%g Hz: effect ease k %g (want %g), %d ticks in %d frames", rates[r], k,
+                  1.0 - pow(1.0 - (double)0.01f, ratio), ticks, n);
+        else
+            CHECK(k == 0.0f && ticks == n, "%g Hz: effect ease off at r %g (k %g, %d ticks in %d frames)", rates[r], ratio, k, ticks, n);
     }
     /* the hold: released, 300 / 360 fps step at their own rate, 600 at TOTK_MAX_FPS's 1/360; held again, a 360 fps frame
        steps 1/240 at once; the time it ran ahead is not repaid after the release (no slow motion), and the release
@@ -210,12 +236,43 @@ int main(void) {
         CHECK(fabs(hgiven - hreal) < 0.005, "unclamped hold: given %.4f s for %.4f s real", hgiven, hreal);
     }
 
-    /* at most 3 % per frame: a 200 ms hitch at 60 Hz moves the next step by 3 %, not by the hitch */
+    /* a lone 200 ms hitch at 60 Hz leaves the step alone (not owed, not in the EMA) */
     for (int i = 0; i < 3000; i++) totk_frame_step_update(t += 16666667);
     totk_frame_step_update(t += 200000000);
     float hitch = f32_at(page, TOTK_DP_FRAME_SECONDS);
-    CHECK(hitch > 1 / 60.0f && hitch <= 1.031f / 60.0f, "hitch: step %g, want <= 1.03 / 60", hitch);
-    for (int i = 0; i < 3000; i++) totk_frame_step_update(t += 16666667);   /* the hitch's 50 ms repaid */
+    CHECK(fabsf(hitch * 60 - 1) < 1e-4f, "lone hitch: step %g, want 1 / 60", hitch);
+    for (int i = 0; i < 3000; i++) totk_frame_step_update(t += 16666667);
+    /* the bow's first draw (v0.1.9 gate: a 117 ms present at ~7 ms frames): the 2 s after it run at 1.00x, not the
+       1.03-1.05x repay, and the clock ends the hitch's lag behind real time */
+    {
+        for (int i = 0; i < 3000; i++) totk_frame_step_update(t += 7000000);
+        double hgiven = 0, hreal = 0, lo = 9, hi = 0;
+        for (int i = 0; i < 1 + 286; i++) {   /* the hitch, then 2 s */
+            uint64_t d = i ? 7000000 : 117000000;
+            const double s = f32_at(page, TOTK_DP_FRAME_SECONDS);
+            hgiven += s;
+            totk_frame_step_update(t += d);
+            hreal += d * 1e-9;
+            if (i) { const double r = s / (d * 1e-9); if (r < lo) lo = r; if (r > hi) hi = r; }
+        }
+        CHECK(lo > 0.995 && hi < 1.005, "after a lone hitch: frames ran %.3fx .. %.3fx, want 1.00x", lo, hi);
+        CHECK(fabs(hreal - hgiven - (0.117 - 0.007)) < 0.001, "lone hitch: clock %.4f s behind, want 0.110", hreal - hgiven);
+        for (int i = 0; i < 600; i++) totk_frame_step_update(t += 7000000);
+    }
+    /* hitches closer together than HITCH_LONE are owed (the first of them not): 40 ms every 0.5 s at 120 fps, then 6 s
+       steady */
+    {
+        for (int i = 0; i < 3000; i++) totk_frame_step_update(t += 8333333);
+        double hgiven = 0, hreal = 0;
+        for (int i = 0; i < 60 * 10 + 720; i++) {
+            uint64_t d = i < 600 && i % 60 == 0 ? 40000000 : 8333333;
+            hgiven += f32_at(page, TOTK_DP_FRAME_SECONDS);
+            totk_frame_step_update(t += d);
+            hreal += d * 1e-9;
+        }
+        CHECK(fabs(hreal - hgiven - (0.040 - 0.008333)) < 0.003, "repeated hitches: clock %.4f s behind, want only the "
+              "first's 0.032", hreal - hgiven);
+    }
     /* the clock keeps real time: jittery presents (10 / 23.3 ms) and a rate change, given time = real time within 5 ms */
     double given = 0, real = 0;
     for (int i = 0; i < 1200; i++) {
@@ -384,6 +441,10 @@ int main(void) {
     CHECK(f32_at(page, TOTK_DP_SHADOW_SCALE) == 0.0f, "shadow map 1 = the game's own");
     totk_shadow_res_set(4.0f);
     CHECK(f32_at(page, TOTK_DP_SHADOW_SCALE) == 2.0f, "shadow map clamped to 2 (review D3)");
+    totk_shadow_res_set(0.25f);
+    CHECK(f32_at(page, TOTK_DP_SHADOW_SCALE) == 0.25f, "shadow map x0.25 (integrated GPUs)");
+    totk_shadow_res_set(0.1f);
+    CHECK(f32_at(page, TOTK_DP_SHADOW_SCALE) == 0.25f, "shadow map clamped to 0.25");
     totk_shadow_res_set(0.0f);
     totk_lod_set(3.0f);
     CHECK(f32_at(page, TOTK_DP_LOD_SCALE) == 3.0f && totk_lod_current() == 3.0f, "lod x3");
@@ -392,9 +453,12 @@ int main(void) {
     totk_lod_set(0.0f);
     unsigned nrows;
     const TotkSettingRow *rows = totk_setting_rows(&nrows);
-    CHECK(nrows == 9 && rows[0].slot == TOTK_DP_RES_FLOOR && rows[0].def == 1.0 && rows[6].slot == TOTK_DP_TERRAIN_LOD &&
-          rows[7].slot == TOTK_DP_SIM_RADIUS && rows[8].slot == TOTK_DP_MOUSE_SCALE, "settings table");
-    CHECK(rows[2].slot == TOTK_DP_SHADOW_SCALE && rows[2].max == 2.0, "shadow resolution row capped at 2");
+    CHECK(nrows == 10 && rows[0].slot == TOTK_DP_RES_FLOOR && rows[0].def == 1.0 && rows[7].slot == TOTK_DP_TERRAIN_LOD &&
+          rows[8].slot == TOTK_DP_SIM_RADIUS && rows[9].slot == TOTK_DP_MOUSE_SCALE, "settings table");
+    CHECK(rows[4].slot == TOTK_DP_SHADOW_SPLIT && rows[4].def == 1.0 && rows[4].min == 1.0 && rows[4].max == 4.0,
+          "near shadow reach row: x1 (the game's) .. x4");
+    CHECK(rows[2].slot == TOTK_DP_SHADOW_SCALE && rows[2].min == 0.25 && rows[2].max == 2.0,
+          "shadow resolution row x0.25 .. x2");
     CHECK(rows[3].slot == TOTK_DP_SHADOW_FIXED && rows[3].def == 0.0 && rows[3].max == 1.0 && rows[3].step == 1.0,
           "sun shadow map size row: the game's own by default, fixed = 1");
 
@@ -432,6 +496,8 @@ int main(void) {
     char lay[64] = "untouched";
     CHECK(totk_layout_set(2560, 1080, lay) && !strcmp(lay, "aspect-3440x1440"), "2560x1080 is 21:9's layout: %s", lay);
     CHECK(totk_layout_set(3840, 1080, lay) && !strcmp(lay, "aspect-5120x1440"), "3840x1080 is 32:9's layout: %s", lay);
+    CHECK(totk_layout_set(7680, 1440, lay) && !strcmp(lay, "aspect-7680x1440"), "7680x1440 is 48:9's layout: %s", lay);
+    CHECK(totk_layout_set(5760, 1080, lay) && !strcmp(lay, "aspect-7680x1440"), "5760x1080 is 48:9's layout: %s", lay);
     CHECK(totk_layout_set(1280, 1024, lay) && !strcmp(lay, "aspect-1280x1024"), "an unbuilt shape keeps its size: %s", lay);
     strcpy(lay, "untouched");
     CHECK(!totk_layout_set(2560, 1440, lay) && !strcmp(lay, "untouched"), "16:9 has no layout set");
@@ -453,7 +519,7 @@ int main(void) {
     {
         static const struct { const char *key; double min, max; } restart[] = {
             {"graphics.texture_cache", 1, 3}, {"graphics.grass_density", 0.25, 4},
-            {"graphics.shadow_distance", 0.5, 4}, {"graphics.fog_distance", 0.5, 4}};
+            {"graphics.shadow_distance", 0.25, 4}, {"graphics.fog_distance", 0.5, 4}};
         unsigned np, nr;
         const TotkQualityPreset *ps = totk_quality_presets(&np);
         const TotkSettingRow *rows = totk_setting_rows(&nr);

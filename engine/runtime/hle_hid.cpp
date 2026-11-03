@@ -12,10 +12,12 @@
 #include "pc_device_switch.h"   // the device the prompts follow: what counts as a use, the anti-flicker guards
 #include "pc_key_hold.h"        // the move keys' minimum hold (keyboard_read)
 #include "pc_text.h"            // pc_tr (the dead-zone rows' readout)
+#include "pc_input_rec.h"       // TOTK_INPUT_RECORD / TOTK_INPUT_SCRIPT lines (npad_fill)
 #include "totk_menu_cursor.h"
 #include "totk_player_state.h"
 #include "totk_ability.h"
 #include "totk_pcvk.h"
+#include "host_wine.h"          // host_is_wine, host_steam_deck (the Steam Deck IMU reader: a Deck only)
 #include <chrono>
 #include <windows.h>
 #ifndef _WIN32
@@ -48,6 +50,14 @@
 
 enum : u32 { StyleFullKey = 1u << 0, StyleHandheld = 1u << 1, StyleJoyDual = 1u << 2 };
 static std::atomic<s64> g_sample{1};
+// controls.pad_labels (TOTK_PAD_LABELS, restart): a non-Nintendo pad's face buttons by label ("1") or, the default for
+// every pad, by position: the bottom button is the Switch's B, right A, left Y, top X, and the prompts show the pad's own
+// glyph for each. Only a set, non-zero value is "by label" (an empty or "0" value, e.g. a settings file's cleared row,
+// stays by position). Read once: every reader and the prompts agree.
+static bool pad_labels_on() {
+    static const bool on = [] { const char* e = getenv("TOTK_PAD_LABELS"); return e && *e && strcmp(e, "0") != 0; }();
+    return on;
+}
 
 struct NpadState {          // NpadFullKeyState / JoyDual / Handheld / JoyLeft / JoyRight share this layout
     s64 sampling_number; u64 buttons; s32 lx, ly, rx, ry; u32 attributes; u32 reserved;
@@ -394,7 +404,7 @@ static void wgi_vibrate(float left, float right, float left_trigger, float right
 static void pad_read(HostInput* in) {
     paddles_load();
     static XInputGetState_t get = xinput_load();
-    static const bool labels = getenv("TOTK_PAD_LABELS") != nullptr;
+    static const bool labels = pad_labels_on();
     static int slot = -1;
     if (!get) { g_pads_scanned |= 1; return; }  // (no XInput DLL: nothing to wait for)
     static const bool scanning = (std::thread(xinput_scan_thread, get).detach(), true);
@@ -457,6 +467,7 @@ struct HidPad {
 };
 static HidPad g_hidpad[4];
 static HidPad g_mousepad;   // the mouse as the gyro (keyboard_read, TOTK_MOUSE_GYRO): motion only, never in g_hidpad loops
+static HidPad g_deckpad;    // Windows: the Steam Deck's built-in IMU (deck_win_thread): motion only, as g_mousepad
 static std::atomic<u64> g_ctl_held{0};   // TOTK_CTL's buttons at the last refresh (ctl_read; the mouse gyro's aim)
 static std::atomic<u64> g_ctl_pad{0};    // TOTK_CTL "pad": buttons as from a pad, at the last refresh (host_input)
 // TOTK_CTL "sixaxis": the motion fields hid_GetSixAxisSensorStates passes on (the others as a pad lying still), to find
@@ -552,11 +563,13 @@ typedef BOOLEAN(WINAPI* HidD_GetAttributes_t)(HANDLE, void*);
 typedef BOOLEAN(WINAPI* HidD_GetPreparsedData_t)(HANDLE, void**);
 typedef BOOLEAN(WINAPI* HidD_FreePreparsedData_t)(void*);
 typedef BOOLEAN(WINAPI* HidD_GetFeature_t)(HANDLE, void*, ULONG);
+typedef BOOLEAN(WINAPI* HidD_SetFeature_t)(HANDLE, void*, ULONG);
 typedef LONG(WINAPI* HidP_GetCaps_t)(void*, void*);
 typedef DWORD(WINAPI* CM_List_Size_t)(PULONG, LPGUID, void*, ULONG);
 typedef DWORD(WINAPI* CM_List_t)(LPGUID, void*, wchar_t*, ULONG, ULONG);
 static struct {
     HidD_GetAttributes_t attr; HidD_GetPreparsedData_t prep; HidD_FreePreparsedData_t freep; HidP_GetCaps_t caps; HidD_GetFeature_t getfeat;
+    HidD_SetFeature_t setfeat;
     CM_List_Size_t list_size; CM_List_t list;
 } hidapi;
 #endif
@@ -572,7 +585,7 @@ static void sony_decode(const u8* r, PadKind kind, bool bt, HidPad* pad) {
     u8 l2 = ds4_order ? p[7] : p[4], r2 = ds4_order ? p[8] : p[5];
     // by position (Circle = A) or, TOTK_PAD_LABELS, by label as pad_read and the PlayStation prompts have it (Cross = A,
     // Circle = B, Square = X, Triangle = Y)
-    static const bool labels = getenv("TOTK_PAD_LABELS") != nullptr;
+    static const bool labels = pad_labels_on();
     u64 b = 0;
     if (b0 & 0x40) b |= labels ? BtnB : BtnA;   // Circle (right)
     if (b0 & 0x20) b |= labels ? BtnA : BtnB;   // Cross (bottom)
@@ -761,6 +774,21 @@ static void nin_imu(const u8* r, HidPad* pad, Fusion* f) {
         motion_fuse(pad, f, acc, gyro, 0.005f);
     }
 }
+// Steam Deck controller deck state report (its vendor interface, 28de:1205; r = the 64 bytes after any report id:
+// 01 00 09 40 ...): accel x y z, gyro x y z (int16) after the 4-byte header + packet number + buttons + pads, scaled as
+// SDL's HIDAPI Steam Deck driver (accel +-2 g, gyro +-2000 dps; the axes: deck_imu_thread's note). False while the IMU is
+// off (all zero: a live accelerometer never is). deck_imu_settings: the 64-byte feature message that switches it on.
+static bool deck_imu_decode(const u8* r, float acc[3], float gyro[3]) {
+    s16 v[6];
+    for (int i = 0; i < 6; i++) v[i] = le16(r + 24 + 2 * i);
+    if (!(v[0] | v[1] | v[2] | v[3] | v[4] | v[5])) return false;
+    const float ka = 2.0f / 32768.0f, kg = 2000.0f / 32768.0f / 360.0f;
+    for (int i = 0; i < 3; i++) acc[i] = -v[i] * ka, gyro[i] = v[3 + i] * kg;
+    return true;
+}
+static void deck_imu_settings(u8* msg) {   // ID_SET_SETTINGS_VALUES: SETTING_IMU_MODE 48 = raw accel | raw gyro | orientation
+    msg[0] = 0x87; msg[1] = 3; msg[2] = 48; msg[3] = 0x08 | 0x10 | 0x04; msg[4] = 0;
+}
 
 #ifdef _WIN32
 static bool hid_write(HANDLE h, const u8* d, int n, int outlen) {
@@ -946,6 +974,7 @@ static bool hidapi_load() {   // hid.dll + cfgmgr32.dll entry points, once (the 
             hidapi.freep = (HidD_FreePreparsedData_t)GetProcAddress(hid, "HidD_FreePreparsedData");
             hidapi.caps = (HidP_GetCaps_t)GetProcAddress(hid, "HidP_GetCaps");
             hidapi.getfeat = (HidD_GetFeature_t)GetProcAddress(hid, "HidD_GetFeature");
+            hidapi.setfeat = (HidD_SetFeature_t)GetProcAddress(hid, "HidD_SetFeature");
         }
         if (cfg) {
             hidapi.list_size = (CM_List_Size_t)GetProcAddress(cfg, "CM_Get_Device_Interface_List_SizeW");
@@ -1040,6 +1069,147 @@ static void hidpad_scan_thread() {
         }
         g_pads_scanned |= 2;
     }
+}
+
+// Steam Deck built-in IMU on Windows (RIVAL-034: UltraTears reads it through Steam Input): Windows installed on a Steam
+// Deck, or this package under Proton when Proton shows the controller's HID to the game. Proton keeps hidraw off for it
+// by default (Valve's winebus unixlib.c: a device is passed through only if PROTON_ENABLE_HIDRAW, a list like
+// "0x28de/0x1205,..." matched case-insensitively, names it; Proton issue 8672: broken in some Proton 10 builds), and
+// Steam Input's virtual XInput pad has no motion. Whether a Windows program then enumerates it, and whether Steam on
+// Windows leaves its reports to others, is not known (no source found). The Linux reader's protocol (deck_imu_thread,
+// measured on a Deck); NOT measured on Windows or Proton yet: where nothing streams, it only logs once. The vendor interface
+// (a vendor usage page, 64-byte reports after report id 0) streams deck state reports; while they carry an all-zero IMU
+// for 0.5 s the IMU is switched on (at most every 2 s) unless TOTK_DECK_IMU=ro. Motion only, as its own pad after any
+// raw-HID pad with an IMU (imu_pad). Started on a Steam Deck only (host_steam_deck; TOTK_DECK_IMU=1: anywhere,
+// 0: off).
+static bool deck_win_read(HANDLE h, OVERLAPPED* ov, u8* buf, DWORD len, DWORD* n, DWORD ms) {   // false: an error or ms of silence
+    ResetEvent(ov->hEvent);
+    if (!ReadFile(h, buf, len, n, ov)) {
+        if (GetLastError() != ERROR_IO_PENDING) return false;
+        if (WaitForSingleObject(ov->hEvent, ms) != WAIT_OBJECT_0) {
+            CancelIo(h);
+            GetOverlappedResult(h, ov, n, TRUE);
+            return false;
+        }
+    }
+    return GetOverlappedResult(h, ov, n, FALSE) && *n > 0;
+}
+// *seen: 0 no Steam Deck controller vendor interface, 1 found but it does not open, 2 opened but it sends no reports
+static HANDLE deck_win_open(bool quiet, OVERLAPPED* ov, DWORD* inlen, DWORD* featlen, bool* rw, int* seen) {
+    *seen = 0;
+    std::vector<wchar_t> list = hid_paths();
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    static const bool ro = getenv("TOTK_DECK_IMU") && !strcmp(getenv("TOTK_DECK_IMU"), "ro");
+    for (const wchar_t* path = list.data(); !list.empty() && *path; path += wcslen(path) + 1) {
+        HANDLE q = CreateFileW(path, 0, share, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (q == INVALID_HANDLE_VALUE) continue;
+        struct { ULONG size; USHORT vid, pid, ver; } at = {sizeof at, 0, 0, 0};
+        USHORT caps[32] = {};   // HIDP_CAPS: Usage, UsagePage, InputReportByteLength, ...
+        void* pd = nullptr;
+        const bool deck = hidapi.attr(q, &at) && at.vid == 0x28DE && at.pid == 0x1205;
+        if (deck && hidapi.prep(q, &pd)) { hidapi.caps(pd, caps); hidapi.freep(pd); }
+        CloseHandle(q);
+        if (!deck || caps[1] < 0xFF00 || caps[2] < 65 || caps[2] > 1024) continue;   // (its keyboard / mouse interfaces: no)
+        HANDLE h = ro ? INVALID_HANDLE_VALUE
+                      : CreateFileW(path, GENERIC_READ | GENERIC_WRITE, share, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        *rw = h != INVALID_HANDLE_VALUE;
+        if (h == INVALID_HANDLE_VALUE) h = CreateFileW(path, GENERIC_READ, share, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            if (!quiet) printf("[hid] Steam Deck IMU: the controller's interface does not open (error %lu)\n", GetLastError());
+            if (*seen < 1) *seen = 1;
+            continue;
+        }
+        *seen = 2;
+        bool ok = false;   // the vendor interface is the one sending deck state reports
+        u8 r[1024];
+        DWORD n = 0;
+        for (int i = 0; i < 20 && !ok; i++) {
+            if (!deck_win_read(h, ov, r, caps[2], &n, 50)) break;
+            ok = n >= 37 && r[1 + 2] == 0x09;
+        }
+        if (ok) {
+            *inlen = caps[2];
+            *featlen = caps[4] >= 65 && caps[4] <= 1024 ? caps[4] : 65;
+            printf("[hid] Steam Deck IMU: the controller's HID (%s)\n", *rw ? "read / write" : "read-only");
+            return h;
+        }
+        CloseHandle(h);
+    }
+    return INVALID_HANDLE_VALUE;
+}
+static void deck_win_thread() {
+    Fusion fus;
+    bool quiet = false;
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    int said = -1;   // the last 'not found' state logged
+    for (;;) {
+        DWORD inlen = 0, featlen = 65;
+        bool rw = false;
+        int seen = 0;
+        HANDLE h = deck_win_open(quiet, &ov, &inlen, &featlen, &rw, &seen);
+        if (h == INVALID_HANDLE_VALUE) {
+            if (seen != said) {   // (the first Windows / Proton logs answer which it is)
+                said = seen;
+                printf("[hid] Steam Deck IMU: %s; looking again every 5 s\n",
+                       seen == 2   ? "the controller's HID is there but sends no reports (Steam may keep them)"
+                       : seen == 1 ? "the controller's HID is there but does not open"
+                                   : "no Steam Deck controller HID");
+            }
+            quiet = true;
+            Sleep(5000);   // (not dev_event: an auto-reset event the pad scan waits on)
+            continue;
+        }
+        quiet = false;
+        said = -1;
+        fus = Fusion();
+        { std::lock_guard<std::mutex> l(g_deckpad.mmu); g_deckpad.m = Motion(); }
+        g_deckpad.live = true;
+        u64 n = 0, zeros = 0, ons = 0;
+        auto last = std::chrono::steady_clock::time_point(), last_on = last;
+        u8 r[1024];
+        DWORD got = 0;
+        while (deck_win_read(h, &ov, r, inlen, &got, 1000)) {   // (silent for 1 s: gone or suspended, look again)
+            if (got < 37 || r[1 + 2] != 0x09) continue;
+            const auto now = std::chrono::steady_clock::now();
+            float dt = last.time_since_epoch().count() ? std::chrono::duration<float>(now - last).count() : 0.004f;
+            last = now;
+            if (dt < 0.0005f || dt > 0.02f) dt = 0.004f;
+            float acc[3], gyro[3];
+            if (!deck_imu_decode(r + 1, acc, gyro)) {   // (r[0]: the report id)
+                if (rw && hidapi.setfeat && ++zeros >= 125 && now - last_on > std::chrono::seconds(2)) {
+                    last_on = now, zeros = 0;
+                    u8 msg[1024] = {};   // report id 0, then the 64-byte message (65 bytes as the Linux reader's HIDIOCSFEATURE)
+                    deck_imu_settings(msg + 1);
+                    const bool ok = hidapi.setfeat(h, msg, featlen);
+                    if (++ons <= 3 || !(ons & (ons - 1)))
+                        printf("[hid] Steam Deck IMU: data is off, switching it on (%llu): %s\n", (unsigned long long)ons,
+                               ok ? "ok" : "failed");
+                }
+                continue;
+            }
+            zeros = 0;
+            motion_fuse(&g_deckpad, &fus, acc, gyro, dt);
+            if (++n == 1) printf("[hid] Steam Deck IMU: first sample accel %.2f %.2f %.2f g, gyro %.3f %.3f %.3f rev/s\n", acc[0], acc[1],
+                                 acc[2], gyro[0], gyro[1], gyro[2]);
+        }
+        g_deckpad.live = false;
+        g_deckpad.has_imu = false;
+        CloseHandle(h);
+        printf("[hid] Steam Deck IMU: reports stopped after %llu samples; looking again\n", (unsigned long long)n);
+        Sleep(2000);
+    }
+}
+// Only where a Deck's controller can be: a Steam Deck (host_wine.h's host_steam_deck, the one Deck check, Windows or
+// Proton); TOTK_DECK_IMU=1 anywhere
+static void deck_imu_start() {
+    const char* e = getenv("TOTK_DECK_IMU");
+    if (!gyro_on() || (e && *e == '0') || !hidapi_load()) return;
+    const bool deck = host_steam_deck();
+    if (!(e && *e == '1') && !deck) return;
+    printf("[hid] Steam Deck IMU: %s%s, looking for the controller's HID\n", deck ? "a Steam Deck" : "TOTK_DECK_IMU=1",
+           host_is_wine() ? " under Wine / Proton" : "");
+    std::thread(deck_win_thread).detach();
 }
 
 // TOTK_CTL "vpad ds": a virtual DualSense for test boots. Its input reports go through a message-mode named pipe to the
@@ -1303,7 +1473,7 @@ static void gp_close_locked() {
     pad->live = false; pad->has_imu = false; pad->buttons = 0;
 }
 static void pad_read(HostInput* in) {
-    static const bool labels = getenv("TOTK_PAD_LABELS") != nullptr;
+    static const bool labels = pad_labels_on();
     static bool inited, init_ok;
     static u64 next_scan;
     std::lock_guard<std::mutex> l(g_gp_mu);
@@ -1375,7 +1545,7 @@ extern "C" void totk_hid_sensor(int type, const float* d, Uint64 ts_ns) {
 // SDL gamepad has a gyro of its own. TOTK_DECK_IMU=0: off.
 static bool deck_imu_enable(int fd) {
     unsigned char buf[65] = {};   // report id 0, then the 64-byte message (USB path of SDL's SetFeatureReport: always 65 bytes)
-    buf[1] = 0x87; buf[2] = 3; buf[3] = 48; buf[4] = 0x08 | 0x10 | 0x04; buf[5] = 0;
+    deck_imu_settings(buf + 1);
     return ioctl(fd, HIDIOCSFEATURE(sizeof buf), buf) >= 0;
 }
 static int deck_imu_open(bool quiet) {
@@ -1447,9 +1617,8 @@ static void deck_imu_thread() {
             last = now;
             if (dt < 0.0005f || dt > 0.02f) dt = 0.004f;   // (reports come every ~4 ms; after a stall use the nominal step)
             if (g_gp_has_gyro) continue;
-            s16 v[6];
-            memcpy(v, r + 24, sizeof v);   // accel x y z, gyro x y z (int16) after the 4-byte header + packet number + buttons + pads
-            if (!(v[0] | v[1] | v[2] | v[3] | v[4] | v[5])) {   // IMU off (a live accelerometer is never exactly 0 on all axes)
+            float acc[3], gyro[3];
+            if (!deck_imu_decode(r, acc, gyro)) {   // IMU off
                 if (++zeros >= 125 && now - last_on > 2000000000ull) {
                     last_on = now; zeros = 0;
                     bool ok = deck_imu_enable(fd);
@@ -1459,8 +1628,6 @@ static void deck_imu_thread() {
                 continue;
             }
             zeros = 0;
-            const float ka = 2.0f / 32768.0f, kg = 2000.0f / 32768.0f / 360.0f;
-            const float acc[3] = {-v[0] * ka, -v[1] * ka, -v[2] * ka}, gyro[3] = {v[3] * kg, v[4] * kg, v[5] * kg};
             motion_fuse(&g_hidpad[0], &fus, acc, gyro, dt);
             if (++n == 1) printf("[hid] Steam Deck IMU: first sample accel %.2f %.2f %.2f g, gyro %.3f %.3f %.3f rev/s\n", acc[0], acc[1],
                                  acc[2], gyro[0], gyro[1], gyro[2]);
@@ -1480,7 +1647,7 @@ static void deck_imu_start() {
 static void rumble_start();   // below the vibration graph
 static void hidpad_read(HostInput* in) {
 #ifdef _WIN32
-    static bool started = [] { std::thread(hidpad_scan_thread).detach(); rumble_start(); return true; }();
+    static bool started = [] { std::thread(hidpad_scan_thread).detach(); rumble_start(); deck_imu_start(); return true; }();
 #else
     static bool started = [] { rumble_start(); deck_imu_start(); return true; }();
 #endif
@@ -1548,9 +1715,10 @@ static void skip_restart() {
     done = false;
 }
 #endif
-#ifdef _WIN32
 extern "C" void pc_mouse_stick(int32_t* rx, int32_t* ry);   // pc_mouse.cpp
 extern "C" void pc_mouse_stick_counts(int32_t* rx, int32_t* ry, double* cdx, double* cdy);
+extern "C" bool totk_map_mouse_add(double cx, double cy);   // totk_map_speed.cpp: the map's view from the counts
+extern "C" void totk_map_mouse_speed_set(const char* v);
 extern "C" bool pc_mouse_button_ok(int vk);                   // pc_mouse.cpp: a mouse button counts for the game now
 // Key bindings. 24 actions: the 16 Npad buttons in bit order, then move left/up/right/down and camera left/up/right/down; each
 // up to 4 keys or mouse buttons (Windows VK codes, so letters follow the keyboard layout). TOTK_KEYBOARD_LAYOUT: classic: the
@@ -1875,6 +2043,8 @@ static void mouse_read(HostInput* in, bool aiming) {
         double cx = 0, cy = 0;
         if (!pc_mouse_cursor_on()) pc_mouse_stick_counts(&x, &y, &cx, &cy);   // (released: no counts, the map stays)
         mouse_motion_note(cx, cy);
+        // (WASD stays as set before)
+        if (totk_map_mouse_add(cx, cy)) return;
         static ULONGLONG moved_at;
         const ULONGLONG now = GetTickCount64();
         if (cx != 0 || cy != 0) moved_at = now;
@@ -1937,6 +2107,7 @@ static int keysnap_mode() {   // 0 off (each read asks), 1 the polling sampler, 
 static bool keysnap_on() { return keysnap_mode() != 0; }
 // TOTK_KEYS_FRONT=1 (tests): the keys are read as if the game were in front, the cost an A/B of TOTK_KEYSNAP needs to
 // see (behind other windows a read asks nothing)
+#ifdef _WIN32
 static bool game_in_front() {
     static const bool forced = getenv("TOTK_KEYS_FRONT") && !strcmp(getenv("TOTK_KEYS_FRONT"), "1");
     if (forced) return true;
@@ -2037,6 +2208,28 @@ static void keysnap_poll_thread() {
         }
     }
 }
+#else
+// Linux: the snapshot is kept by SDL's key events, on the thread that pumps them (linux/shim_sdl3.c: hid_key_event with
+// the key's Windows VK code, its generic Shift / Ctrl / Alt too), and the front flag by the window's keyboard focus; no
+// sampler thread. A focus loss lets every key go, as Windows' snapshot does behind other windows.
+static bool game_in_front() {
+    static const bool forced = getenv("TOTK_KEYS_FRONT") && !strcmp(getenv("TOTK_KEYS_FRONT"), "1");
+    return forced || g_keysnap_front.load(std::memory_order_acquire);
+}
+static void keysnap_thread() {}
+extern "C" void hid_key_event(int vk, bool down) {
+    if (vk <= 0 || vk >= 256) return;
+    if (down) g_keysnap[vk >> 6].fetch_or(1ull << (vk & 63), std::memory_order_relaxed);
+    else g_keysnap[vk >> 6].fetch_and(~(1ull << (vk & 63)), std::memory_order_relaxed);
+}
+extern "C" void hid_key_focus(bool front) {
+    if (!front) for (auto& w : g_keysnap) w.store(0, std::memory_order_relaxed);
+    g_keysnap_front.store(front, std::memory_order_release);
+}
+static short GetAsyncKeyState(int vk) {   // (TOTK_KEYSNAP=0's per-read path: the same snapshot)
+    return vk > 0 && vk < 256 && (g_keysnap[vk >> 6].load(std::memory_order_relaxed) >> (vk & 63) & 1) ? (short)0x8000 : 0;
+}
+#endif
 static bool keysnap_down(int vk) {
     return vk > 0 && vk < 256 && (g_keysnap[vk >> 6].load(std::memory_order_relaxed) >> (vk & 63) & 1);
 }
@@ -2087,6 +2280,7 @@ static void keyboard_read(HostInput* in) {
         struct Ctx { decltype(key)* key; const Bindings* bd; } kc = {&key, &bd};
         PcRouteIn ri;
         ri.ctx = pc_ctx();
+        ri.front_end = g_title_phase != 0;  // (the title and its save list: E confirms as Enter does)
         ri.now_ms = GetTickCount64();
         ri.user = &kc;
         ri.layout_bits = [](int vk, void* u) {   // (the layout's actions bound to vk: a transition's replayed tap)
@@ -2242,6 +2436,7 @@ CTL_APPLY(ap_wheel, "TOTK_MOUSE_WHEEL", (void)0)
 CTL_APPLY(ap_pause, "TOTK_PAUSE_UNFOCUSED", oe_settings_reload())
 CTL_APPLY(ap_glyphs, "TOTK_GLYPHS", g_glyph_forced = v && *v && strcmp(v, "auto") ? glyph_code(v) : -1)
 CTL_APPLY(ap_map, "TOTK_MOUSE_MAP", (void)0)
+CTL_APPLY(ap_map_speed, "TOTK_MOUSE_MAP_SPEED", totk_map_mouse_speed_set(v))
 CTL_APPLY(ap_menus, "TOTK_MENU_KEYS", (void)0)
 CTL_APPLY(ap_rumble, "TOTK_RUMBLE", rumble_reload())
 CTL_APPLY(ap_rumble_curve, "TOTK_RUMBLE_CURVE", rumble_reload())
@@ -2357,9 +2552,12 @@ static const pc_setting k_ctl_rows[] = {
     {"controls.mouse_wheel", "Controls", KM, "Mouse wheel scrolls the quick menus", "While a D-pad quick menu is held open "
      "(weapons, shields, items, bows), each notch moves one entry.", "", kCtlOnV, kCtlOnN, 0, 0, 0, 0, "TOTK_MOUSE_WHEEL",
      nullptr, ap_wheel, nullptr},
-    {"controls.mouse_map", "Controls", KM, "Map with the mouse", "On the map the mouse moves it as the left stick does "
-     "(the reticle stays at the centre), the wheel zooms, a left click places a pin or stamp and a right click goes back.", "", kCtlOnV, kCtlOnN,
-     0, 0, 0, 0, "TOTK_MOUSE_MAP", nullptr, ap_map, nullptr},
+    {"controls.mouse_map", "Controls", KM, "Map with the mouse", "On the map the mouse moves the map under the reticle "
+     "(it stays at the centre) as far as the pointer would move, the wheel zooms, a left click places a pin or stamp and a "
+     "right click goes back.", "", kCtlOnV, kCtlOnN, 0, 0, 0, 0, "TOTK_MOUSE_MAP", nullptr, ap_map, nullptr},
+    {"controls.mouse_map_speed", "Controls", KM, "Map cursor sensitivity", "How far the map moves for the mouse's motion: "
+     "1 = as far as the desktop pointer would move on the screen, 2 = twice as far.", "1", nullptr, nullptr, 0.25f, 4.0f,
+     0.05f, 0, "TOTK_MOUSE_MAP_SPEED", nullptr, ap_map_speed, nullptr},
     {"controls.menu_keys", "Controls", KM, "Menu keys", "In the pause menu and the Purah Pad: Esc goes back, PageUp / "
      "PageDown (and the wheel in the pause menu) switch tabs, and in the pause menu clicks select (left) and go back "
      "(right).", "", kCtlOffV, kCtlOffN, 0, 0, 0, 0, "TOTK_MENU_KEYS", nullptr, ap_menus, nullptr},
@@ -2435,46 +2633,6 @@ static const pc_setting k_ctl_rows[] = {
 };
 #undef KM
 static struct CtlRows { CtlRows() { pc_settings_add(k_ctl_rows, (int)(sizeof k_ctl_rows / sizeof k_ctl_rows[0])); } } g_ctl_rows;
-#else
-// Keyboard (only while the game window has focus): SDL scancodes = physical key positions (QWERTY), same keys as above.
-static void keyboard_read(HostInput* in) {
-    if (!SDL_GetKeyboardFocus()) return;                        // game window not in front (or no window: headless)
-    int nk = 0;
-    const bool* ks = SDL_GetKeyboardState(&nk);
-    if (!ks) return;
-    auto down = [&](SDL_Scancode sc) { return sc != SDL_SCANCODE_UNKNOWN && (int)sc < nk && ks[sc]; };
-    const SDL_Scancode U = SDL_SCANCODE_UNKNOWN;
-    static const struct { SDL_Scancode a, b; u64 btn; } keys[] = {
-        {SDL_SCANCODE_SPACE, SDL_SCANCODE_UNKNOWN, BtnX}, {SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RSHIFT, BtnB}, {SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_UNKNOWN, BtnB},
-        {SDL_SCANCODE_E, SDL_SCANCODE_UNKNOWN, BtnA}, {SDL_SCANCODE_RETURN, SDL_SCANCODE_UNKNOWN, BtnA}, {SDL_SCANCODE_F, SDL_SCANCODE_UNKNOWN, BtnY},
-        {SDL_SCANCODE_Q, SDL_SCANCODE_UNKNOWN, BtnL}, {SDL_SCANCODE_R, SDL_SCANCODE_UNKNOWN, BtnR}, {SDL_SCANCODE_Z, SDL_SCANCODE_UNKNOWN, BtnZL},
-        {SDL_SCANCODE_C, SDL_SCANCODE_UNKNOWN, BtnZR}, {SDL_SCANCODE_V, SDL_SCANCODE_UNKNOWN, BtnLS}, {SDL_SCANCODE_G, SDL_SCANCODE_UNKNOWN, BtnRS},
-        {SDL_SCANCODE_ESCAPE, SDL_SCANCODE_UNKNOWN, BtnPlus}, {SDL_SCANCODE_M, SDL_SCANCODE_UNKNOWN, BtnMinus}, {SDL_SCANCODE_1, SDL_SCANCODE_UNKNOWN, BtnLeft},
-        {SDL_SCANCODE_2, SDL_SCANCODE_UNKNOWN, BtnUp}, {SDL_SCANCODE_3, SDL_SCANCODE_UNKNOWN, BtnRight}, {SDL_SCANCODE_4, SDL_SCANCODE_UNKNOWN, BtnDown}};
-    for (auto& k : keys) if (down(k.a) || down(k.b)) in->buttons |= k.btn;
-    static bool f9_was = false;
-    bool f9 = down(SDL_SCANCODE_F9);
-    if (f9 && !f9_was) {
-        g_debug_frame_request = 1;
-        printf("[hid] F9: frame capture requested\n");
-    }
-    f9_was = f9;
-    g_f2_down = down(SDL_SCANCODE_F2);   // skip-opening toggle (host_input)
-    g_f10_down = down(SDL_SCANCODE_F10);   // Graphics menu (hle_osd.cpp)
-    auto axis = [&](SDL_Scancode neg, SDL_Scancode pos, SDL_Scancode neg2, SDL_Scancode pos2) { return (down(pos) || down(pos2) ? 1 : 0) - (down(neg) || down(neg2) ? 1 : 0); };
-    int mx = axis(SDL_SCANCODE_A, SDL_SCANCODE_D, U, U), my = axis(SDL_SCANCODE_S, SDL_SCANCODE_W, U, U);
-    int cx = axis(SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT, SDL_SCANCODE_J, SDL_SCANCODE_L), cy = axis(SDL_SCANCODE_DOWN, SDL_SCANCODE_UP, SDL_SCANCODE_K, SDL_SCANCODE_I);
-    float walk = down(SDL_SCANCODE_LCTRL) || down(SDL_SCANCODE_RCTRL) ? 0.45f : 1.0f;
-    if (mx || my) {   // keys win over the pad stick while held
-        float k = 32767.0f * walk / sqrtf((float)(mx * mx + my * my));
-        in->lx = (s32)lrintf(mx * k); in->ly = (s32)lrintf(my * k);
-    }
-    if (cx || cy) {
-        float k = 32767.0f / sqrtf((float)(cx * cx + cy * cy));
-        in->rx = (s32)lrintf(cx * k); in->ry = (s32)lrintf(cy * k);
-    }
-}
-#endif
 
 // TOTK_CTL=<file>: a live pad driven by a command file that a drive or scene tool appends to (off without the variable).
 // One command per line, read as whole lines at most every 50 ms (file size checked first; a file that shrinks was
@@ -3020,7 +3178,7 @@ static const char* kbm_glyph(const char* c, int set = -1) {
     return nullptr;
 }
 static const char* pad_glyph(bool ps, const char* c) {
-    static const bool labels = getenv("TOTK_PAD_LABELS") != nullptr;   // (as pad_read has it)
+    static const bool labels = pad_labels_on();   // (as pad_read has it)
     // the reader's button bits -> the button: by position A = right, B = bottom, X = top, Y = left; by label the letter
     static const char* const face[2][2][4] = {
         {{"xbox_button_b", "xbox_button_a", "xbox_button_y", "xbox_button_x"},
@@ -3316,18 +3474,90 @@ static u64 dpad_gate(u64 buttons) {
     }
     return buttons;
 }
+/// Input recording for support (rival-parity PARITY 1.5, the rival's input_record): TOTK_INPUT_RECORD=<file> (a player's
+// player.txt: env.TOTK_INPUT_RECORD=...) appends what the game is given (after the bindings, the PC scheme and
+// TOTK_PRESS) each time it changes, one line per state (pc_input_rec.h: present count as TOTK_PRESS has it, ms since
+// the first pad read, the Npad buttons without the stick-direction bits 16-23, which are derived again, the sticks),
+// flushed once a second. TOTK_INPUT_SCRIPT=<file> plays such a file back from the next start: each line's state from
+// its present count (TOTK_PRESS_CLOCK=wall: from its ms) until the next line's, the last line ending it, added to the
+// live input as TOTK_PRESS is (buttons or'ed, a stick the line moves wins). Not in it: the mouse camera (its veneer
+// turns the camera without the pad state), motion, touch; a recording replays the same presses at the same frames,
+// not the same game (load times differ between runs).
+static u64 input_ms() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return (u64)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+static void input_record(const NpadState& s) {
+    static const char* const path = getenv("TOTK_INPUT_RECORD");
+    if (!path || !*path) return;
+    static std::mutex mu;
+    static FILE* f = nullptr;
+    static bool failed = false;
+    static InputRec last = {};
+    static u64 flushed = 0;
+    std::lock_guard<std::mutex> l(mu);
+    if (failed) return;
+    if (!f) {
+        if (!(f = fopen(path, "a"))) {
+            failed = true;
+            printf("[hid] input recording: cannot open %s\n", path);
+            return;
+        }
+        fprintf(f, "# TOTK_INPUT_RECORD: present ms buttons lx ly rx ry\n");
+        printf("[hid] input recording to %s\n", path);
+        last.buttons = ~0ull;   // (the first state is written whatever it is)
+    }
+    const InputRec r = {nvn_present_count(), input_ms(), s.buttons & ~0xFF0000ull, s.lx, s.ly, s.rx, s.ry};
+    if (!input_rec_same(r, last)) {
+        input_rec_write(f, r);
+        last = r;
+    }
+    if (r.ms - flushed >= 1000) {
+        fflush(f);
+        flushed = r.ms;
+    }
+}
+// TOTK_INPUT_SCRIPT's state now, or false (no script, before its first line, from its last on)
+static bool input_script(InputRec* out) {
+    static const char* const path = getenv("TOTK_INPUT_SCRIPT");
+    if (!path || !*path) return false;   // (no script: no lock on the pad read)
+    static std::mutex mu;
+    static std::vector<InputRec> lines;
+    static size_t at = 0;
+    static bool loaded = false, wall = false;
+    std::lock_guard<std::mutex> l(mu);
+    if (!loaded) {
+        loaded = true;
+        wall = getenv("TOTK_PRESS_CLOCK") && !strcmp(getenv("TOTK_PRESS_CLOCK"), "wall");
+        FILE* f = fopen(path, "r");
+        if (!f) {
+            printf("[hid] input script: cannot open %s\n", path);
+            return false;
+        }
+        lines = input_rec_read(f, wall);
+        fclose(f);
+        printf("[hid] input script %s: %zu states, by %s\n", path, lines.size(), wall ? "wall-clock ms" : "present count");
+    }
+    return !lines.empty() && input_rec_at(lines, &at, wall ? input_ms() : nvn_present_count(), wall, out);
+}
 static void npad_fill(NpadState* s, u32 id, bool style_ok) {
     memset(s, 0, sizeof *s);
     s->sampling_number = g_sample++;
     if (!npad_connected(id) || !style_ok) return;
     HostInput in = host_input();
-    u64 sb = osd_menu_is_open() ? 0 : scripted_buttons();
+    const bool osd = osd_menu_is_open();   // (the OSD menu open: no scripted input, TOTK_PRESS's or TOTK_INPUT_SCRIPT's)
+    u64 sb = osd ? 0 : scripted_buttons();
     if (sb >> kScriptStick) {
         const s32 M = 32767;
         auto dir = [&](int b) { return (sb >> (kScriptStick + b)) & 1 ? M : 0; };
         if (dir(0) | dir(1) | dir(2) | dir(3)) { in.ly = dir(0) - dir(1); in.lx = dir(3) - dir(2); }
         if (dir(4) | dir(5) | dir(6) | dir(7)) { in.ry = dir(4) - dir(5); in.rx = dir(7) - dir(6); }
         sb &= (1ull << kScriptStick) - 1;
+    }
+    if (InputRec r; !osd && input_script(&r)) {   // TOTK_INPUT_SCRIPT
+        sb |= r.buttons;
+        if (r.lx || r.ly) in.lx = r.lx, in.ly = r.ly;
+        if (r.rx || r.ry) in.rx = r.rx, in.ry = r.ry;
     }
     s->attributes = 1;   // IsConnected
     s->buttons = dpad_gate(in.buttons | sb);
@@ -3337,6 +3567,7 @@ static void npad_fill(NpadState* s, u32 id, bool style_ok) {
     s->buttons |= (u64)(in.lx < -h) << 16 | (u64)(in.ly > h) << 17 | (u64)(in.lx > h) << 18 | (u64)(in.ly < -h) << 19 |
                   (u64)(in.rx < -h) << 20 | (u64)(in.ry > h) << 21 | (u64)(in.rx > h) << 22 | (u64)(in.ry < -h) << 23;
     g_cheat_keys = s->buttons;
+    input_record(*s);
 }
 // pc_mouse.cpp's late latch: the buttons the game was given last (any device, after the pad bindings; bit 9 ZR)
 extern "C" uint64_t hid_game_buttons(void) { return g_cheat_keys.load(); }
@@ -3952,6 +4183,7 @@ static HidPad* imu_pad(u32 handle) {
         if ((dev == 1 && k == PadJoyR) || (dev == 0 && k == PadJoyL)) return &p;
         if (!any || (k != PadJoyL && k != PadJoyR)) any = &p;
     }
+    if (!any && g_deckpad.live && g_deckpad.has_imu) return &g_deckpad;     // the Steam Deck's own IMU (Windows)
     if (!any && g_synthpad.live && g_synthpad.has_imu) return &g_synthpad;   // TOTK_CTL "gyro"
     if (!any && g_mousepad.live && g_mousepad.has_imu) return &g_mousepad;   // no motion pad: the mouse while aiming
     return any;

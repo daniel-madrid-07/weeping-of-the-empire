@@ -24,7 +24,6 @@
 #include <cstring>
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 constexpr u64 kSlots = 0xcb0, kStride = 0x18, kCounter = 4, kActive = 8;
 constexpr int kNum = 20;
 
@@ -51,8 +50,8 @@ void hook_f_1c73fbc(Ctx *__restrict c) {   // ExecuteLikeLikeTarMetaAI::updateIm
         printf("[likelike-spots] tar Like Like hiding spots %s\n", v ? "held in game time" : "held in frames, as the game (TOTK_LIKELIKE_SPOTS=0)");
         return v;
     }();
-    const u64 ai = c->x[0], fd = totk_global(kFrameDelta);
-    const float r = on && totk_ptr_ok(ai) && totk_ptr_ok(fd) ? ldf32(fd + 8) : 1.0f;
+    const u64 ai = c->x[0], fd = totk_frame_delta();
+    const float r = on && totk_ptr_ok(ai) && totk_ptr_ok(fd) ? totk_frame_ratio(fd) : 1.0f;
     if (!(r > 0.01f && r < 1.0f)) { f_1c73fbc_orig(c); return; }
     float frames[kNum];
     s32 shown[kNum];

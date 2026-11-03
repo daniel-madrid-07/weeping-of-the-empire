@@ -47,10 +47,27 @@
 #include <cstring>
 
 namespace {
+// The node indices are the game version's: AINB_IDX(1.0.0 index, 1.4.3 index). 1.4.3's files keep the format (AINB
+// 0x407, the name at file + s32[+0x24] + s32[+0x08], node index = record order) and every listed node, found there by
+// its 16-byte node GUID with the same element type, class, immediates, input closure (the nodes feeding it, by GUID,
+// and their EXB expressions) and place in the tree; two renumbered. The light switches are not listed on 1.4.3: its
+// data multiplies their per-update steps by the AI step rate itself (QueryGenericGetTotalStepRate in each setter's
+// math), so a throttle would run them slower than the Switch. Any other version lists nothing (kAinbKnown): every
+// hook here stays the original.
+#if !defined(TOTK_GAME_VERSION) || TOTK_GAME_VERSION == 100
+#define AINB_IDX(v100, v143) v100
+constexpr bool kAinbKnown = true;
+#elif TOTK_GAME_VERSION == 143
+#define AINB_IDX(v100, v143) v143
+constexpr bool kAinbKnown = true;
+#else
+#define AINB_IDX(v100, v143) v100
+constexpr bool kAinbKnown = false;
+#endif
 struct Allowed { const char *file; unsigned short nodes[12]; };   // node indices, 0xffff-terminated
 constexpr Allowed kAllow[] = {
     {"QuadrupedCommon.utility.module", {3, 0xffff}},
-    {"BattleAnimalCommon.utility.module", {15, 0xffff}},
+    {"BattleAnimalCommon.utility.module", {AINB_IDX(15, 17), 0xffff}},
     {"Zonau_Golem.action.dashattackcommon.module", {16, 0xffff}},
     {"Lynel_EscapeFromTarget.actionseq.root", {7, 0xffff}},
     {"Lynel_UnidentifedTerrorDiscoverd.actionseq.root", {7, 0xffff}},
@@ -74,9 +91,11 @@ constexpr Allowed kAllow[] = {
     {"Ganondorf_Miasma_RitoMiasma.root", {17, 0xffff}},               // Velocity chase
     // Lightning Temple / Gerudo underground light switches: ChargingRate += 1 / ChargingFrame (30) per update while lit,
     // FullChargeTimer -= 1 / FullChargeFrame (75: the 2.5 s the switch holds after the light leaves), ChargingRate -=
-    // 1 / DischargeFrame (30). At 144 fps the hold lasts 0.52 s.
+    // 1 / DischargeFrame (30). At 144 fps the hold lasts 0.52 s. (1.4.3 scales these steps itself: not listed there.)
+#if !defined(TOTK_GAME_VERSION) || TOTK_GAME_VERSION != 143
     {"DgnObj_Gerudo_LightSwith_A_01.root", {6, 17, 24, 0xffff}},
     {"PyramidObj_GerudoUndergroundStatue_A_01_LightSwitch.root", {6, 17, 24, 0xffff}},
+#endif
     // Only easers whose calc ignores the step: LerpF32, ChaseF32ToF32, ChaseVec3fToVec3f, plain Mul / Add math. (the Like
     // Likes' LastLookPos is drawn, the head aims at it: its easers are in kScale. Octorok Notice's RotSpeedRadPerFrame
     // decay is not traced to every update: out)
@@ -99,7 +118,7 @@ constexpr Allowed kAllow[] = {
 // easer nodes (Chase / Lerp) scaled by the step, for drawn values
 constexpr Allowed kScale[] = {
     {"LikeLike.action.chemicalattack.module", {59, 0xffff}},   // ChaseVec3f -> LastLookPos: the head's aim
-    {"LikeLike.action.electricattack.module", {64, 0xffff}},
+    {"LikeLike.action.electricattack.module", {AINB_IDX(64, 66), 0xffff}},
     {"LikeLike.action.iceattack.module", {14, 0xffff}},
     {"LikeLike.action.rockattack.module", {50, 0xffff}},
     {"LikeLike.alwaysRockAction.module", {35, 0xffff}},
@@ -112,8 +131,12 @@ constexpr Allowed kScaleAddA[] = {
 constexpr Allowed kScaleAddB[] = {
     {"Octarock_Water.action.Levitate.module", {4, 0xffff}},    // CurAngle + 6 -> [3]: the water Octorok's bob
 };
-constexpr int kNumAllow = sizeof kAllow / sizeof kAllow[0], kNumScale = sizeof kScale / sizeof kScale[0];
-constexpr int kNumAddA = sizeof kScaleAddA / sizeof kScaleAddA[0], kNumAddB = sizeof kScaleAddB / sizeof kScaleAddB[0];
+#undef AINB_IDX
+// (a version without its indices: 0 entries, so file_entry finds no file and the empty IdxMask stops every node)
+constexpr int kNumAllow = kAinbKnown ? sizeof kAllow / sizeof kAllow[0] : 0;
+constexpr int kNumScale = kAinbKnown ? sizeof kScale / sizeof kScale[0] : 0;
+constexpr int kNumAddA = kAinbKnown ? sizeof kScaleAddA / sizeof kScaleAddA[0] : 0;
+constexpr int kNumAddB = kAinbKnown ? sizeof kScaleAddB / sizeof kScaleAddB[0] : 0;
 
 template <const Allowed *T, int N>
 struct IdxMask {   // the node indices a table lists (any index >= 256: no prefilter)

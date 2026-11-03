@@ -127,6 +127,35 @@ int main(int argc, char **argv) {
     swprintf(p, MAX_PATH, L"%ls\\totk-20261006-000092.log", logs); CHECK(!exists(p));
     swprintf(p, MAX_PATH, L"%ls\\notes.txt", logs); CHECK(exists(p));
     prune_files(logs, L"none-*.log", 7);   /* no match: nothing happens */
+
+    /* message_open: a file that exists is offered by name, a missing one gives the plain box*/
+    swprintf(p, MAX_PATH, L"%ls\\notes.txt", logs);
+    message_open(MB_ICONWARNING, p, L"open-test one");
+    CHECK(log_has("open-test one") && log_has("Abrir notes.txt ahora"));
+    swprintf(p, MAX_PATH, L"%ls\\gone.log", logs);
+    message_open(MB_ICONWARNING, p, L"open-test two");
+    CHECK(log_has("open-test two") && !log_has("Abrir gone.log"));
+
+    /* launcher.log over LOG_MAX: init_paths keeps it as launcher-previous.log and starts an empty one */
+    {
+        wchar_t prev[MAX_PATH], v[MAX_PATH];
+        swprintf(p, MAX_PATH, L"%ls\\launcher.log", g_local);
+        swprintf(prev, MAX_PATH, L"%ls\\launcher-previous.log", g_local);
+        fclose(g_log);
+        FILE *f = _wfopen(p, L"wb");
+        for (int i = 0; i < LOG_MAX / 32; i++) fputs("0123456789012345678901234567890123456789012345678901234567890\n", f);
+        fclose(f);
+        swprintf(v, MAX_PATH, L"%ls\\appdata", g_root); SetEnvironmentVariableW(L"APPDATA", v);
+        swprintf(v, MAX_PATH, L"%ls\\localappdata", g_root); SetEnvironmentVariableW(L"LOCALAPPDATA", v);
+        wchar_t dir[MAX_PATH]; swprintf(dir, MAX_PATH, L"%ls", g_dir);
+        CHECK(init_paths());
+        swprintf(g_dir, MAX_PATH, L"%ls", dir);   /* (init_paths takes the test exe's folder) */
+        WIN32_FILE_ATTRIBUTE_DATA a;
+        CHECK(GetFileAttributesExW(prev, GetFileExInfoStandard, &a) && a.nFileSizeLow > LOG_MAX);
+        CHECK(GetFileAttributesExW(p, GetFileExInfoStandard, &a) && a.nFileSizeLow < 1024);
+        say(L"after the rotation");
+        CHECK(log_has("after the rotation"));
+    }
     CHECK(count(logs, L"totk-*.log") == 7);
 
     /* run_package: each start prunes to KEEP_GAME_LOGS - 1 and adds its own log, so 8 stay */
@@ -472,6 +501,24 @@ int main(int argc, char **argv) {
         g_vp9_probe = vp9_mft_present;
         int real = vp9_mft_present();   /* the real probe runs (either answer is fine on a test PC) */
         CHECK(real == 1 || real == 0 || real == -1);
+    }
+    {   /* lang_init: game.language pt-BR -> Brazilian Portuguese (text_pt.inc by the English, English where it lacks
+         * one), es-419 Spanish, en-US English; Spanish again after (the texts the checks above expect) */
+        swprintf(p, MAX_PATH, L"%ls\\settings.ini", g_base);
+        const wchar_t *vals[] = {L"pt-BR", L"es-419", L"en-US"};
+        for (int i = 0; i < 3; i++) {
+            FILE *f = _wfopen(p, L"w, ccs=UTF-8");
+            fwprintf(f, L"[game]\ngame.language = %ls\n", vals[i]);
+            fclose(f);
+            lang_init();
+            CHECK(g_es == (i == 1) && g_pt == (i == 0));
+        }
+        g_es = 0, g_pt = 1;
+        CHECK(!wcscmp(ES_EN(L"El juego ya está en marcha.", L"The game is already running."), L"O jogo já está em execução."));
+        CHECK(!wcscmp(ES_EN(L"x", L"not in the table"), L"not in the table"));
+        CHECK(pt_of(L"Off") != NULL && wcscmp(pt_of(L"Off"), L"Off"));   /* (preplay's choices too) */
+        g_es = 1, g_pt = 0;
+        DeleteFileW(p);
     }
     fclose(g_log);
     if (g_fail) { fprintf(stderr, "FAILED: launcher (%d)\n", g_fail); return 1; }

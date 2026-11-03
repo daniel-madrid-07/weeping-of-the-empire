@@ -219,6 +219,17 @@ static void add_percent_set(char *list, size_t cap, const char *var, const char 
 static int layout_overlay(const char *set, char *dir, size_t cap);   /* (with graphics.aspect_ratio, below) */
 static void build_shape(const char *const *sets, int n);
 
+/* graphics.hud_layout for a w x h canvas: center / corner as chosen; auto (the default, and unset) by shape: at the
+   screen's edges, but in the middle 16:9 on 48:9 (three 16:9 screens side by side, support #7: the edges are the outer
+   screens' far sides). A file saved before keeps "corner" (a save writes every row): pc_settings.cpp moves it to auto
+   once (graphics.hud_rev), which on 21:9 / 32:9 is the same HUD*/
+static int hud_centered(unsigned w, unsigned h) {
+    const char *hud = getenv("TOTK_HUD_LAYOUT");
+    if (hud && !strcmp(hud, "center")) return 1;
+    if (hud && !strcmp(hud, "corner")) return 0;
+    return (uint64_t)w * 10 >= (uint64_t)h * 48;   /* (48:9's band starts at 4.8) */
+}
+
 static void overlay_sets(void) {
     char names[2][64], list[4096] = "", v[160];
     int n = totk_overlay_sets(&g_s, names);
@@ -227,10 +238,9 @@ static void overlay_sets(void) {
         /* graphics.hud_layout = center (TOTK_HUD_LAYOUT): the set whose HUD stays in the middle 16:9, aspect-<w>x<h>-center
            (built for the ultrawide canvases); an overlay without it keeps the HUD at the edges. A canvas no wider than 16:9
            has no such set: asking would exit the game for a build aspect_sets.py refuses*/
-        const char *hud = getenv("TOTK_HUD_LAYOUT");
         int centered = 0;
         snprintf(center, sizeof center, "%s-center", names[0]);
-        if (hud && !strcmp(hud, "center") && (uint64_t)g_s.output_w * 9 > (uint64_t)g_s.output_h * 16) {
+        if (hud_centered(g_s.output_w, g_s.output_h) && (uint64_t)g_s.output_w * 9 > (uint64_t)g_s.output_h * 16) {
             if (!layout_overlay(center, dir, sizeof dir)) {   /* (not built here: built now, if this install can) */
                 const char *want[1] = {center};
                 build_shape(want, 1);
@@ -253,7 +263,20 @@ static void overlay_sets(void) {
     }
     for (int i = 1; i < n; i++) add_set(list, sizeof list, names[i]);
     add_percent_set(list, sizeof list, "TOTK_GRASS_DENSITY", "grass", 25, 400);
-    add_percent_set(list, sizeof list, "TOTK_SHADOW_DISTANCE", "shadow", 50, 400);
+    {   /* (a canvas that is not 16:9: the shadow distance at x2 at most, as the renderer's shadow maps: textures.c
+           shadow_wide_cap. TOTK_WIDE_SHADOW_CAP=0: no cap)*/
+        const char *o = getenv("TOTK_OUTPUT_RES"), *sd = getenv("TOTK_SHADOW_DISTANCE"), *c = getenv("TOTK_WIDE_SHADOW_CAP");
+        unsigned ow = 0, oh = 0;
+        if (o && sscanf(o, "%ux%u", &ow, &oh) == 2 && oh && sd && *sd && !(c && *c == '0')) {
+            const double a = (double)ow / oh, d = strtod(sd, NULL), m = d <= 10.0 ? d : d / 100.0;
+            if ((a < 1.74 || a > 1.81) && m > 2.0) {
+                fprintf(stderr, "[totk] shadow distance capped at x2 (asked x%g): the canvas %ux%u is not 16:9 "
+                                "(TOTK_WIDE_SHADOW_CAP=0: no cap)\n", m, ow, oh);
+                setenv_("TOTK_SHADOW_DISTANCE", "2");
+            }
+        }
+    }
+    add_percent_set(list, sizeof list, "TOTK_SHADOW_DISTANCE", "shadow", 25, 400);
     add_percent_set(list, sizeof list, "TOTK_FOG_DISTANCE", "fog", 50, 400);
     const char *fast = getenv("TOTK_FAST_TRAVEL");
     if (fast && atoi(fast) > 0) add_set(list, sizeof list, "fasttravel");
@@ -287,6 +310,7 @@ volatile int g_cutscene_16x9;   /* graphics.cutscene_aspect = 16:9 (below; the V
 static const struct { const char *key, *env; } k_row_env[] = {
     {"graphics.min_resolution", "TOTK_DYNAMIC_RES"}, {"graphics.fov", "TOTK_FOV"},
     {"graphics.shadow_resolution", "TOTK_SHADOW_RES"}, {"graphics.shadow_fixed", "TOTK_SHADOW_FIXED"},
+    {"graphics.shadow_reach", "TOTK_SHADOW_REACH"},
     {"graphics.lod_distance", "TOTK_LOD"},
     {"graphics.actor_detail_distance", "TOTK_ACTOR_LOD"}, {"graphics.terrain_detail_distance", "TOTK_TERRAIN_LOD"},
     {"game.simulation_distance", "TOTK_SIM_DISTANCE"},
@@ -345,26 +369,28 @@ static void (*const k_apply[MAX_LIVE_ROWS])(const char *) = {apply_0, apply_1, a
                                                              apply_6, apply_7, apply_8, apply_9, apply_10, apply_11};
 
 static const char *const k_fast_values[] = {"0", "1", NULL}, *const k_fast_names[] = {"Normal", "Fast", NULL};
-static const char *const k_wide_values[] = {"16:9", "window", "16:10", "21:9", "32:9", NULL},
-                         *const k_wide_names[] = {"16:9 (the game's)", "The window's (16:10, 21:9, 32:9)", "16:10", "21:9",
-                                                  "32:9", NULL};
-static const char *const k_hud_values[] = {"corner", "center", NULL},
-                         *const k_hud_names[] = {"At the screen's edges", "In the middle 16:9", NULL};
+/* (the default is "window" since v0.1.9: at "16:9" an ultrawide window was pillarboxed; a 16:9 screen gets the same
+   picture either way. pc_settings.cpp moves a file's old default 16:9 once, graphics.aspect_rev)*/
+static const char *const k_wide_values[] = {"16:9", "window", "16:10", "21:9", "32:9", "48:9", NULL},
+                         *const k_wide_names[] = {"16:9 (the game's)", "The window's (16:10, 21:9, 32:9, 48:9)", "16:10", "21:9",
+                                                  "32:9", "48:9", NULL};
+static const char *const k_hud_values[] = {"auto", "corner", "center", NULL},
+                         *const k_hud_names[] = {"Automatic (in the middle on 48:9)", "At the screen's edges", "In the middle 16:9", NULL};
 static const pc_setting k_restart_rows[] = {
     {"graphics.aspect_ratio", "Graphics", "Game patches", "Aspect ratio",
-     "The window's: on a 16:10, 21:9 or 32:9 window or monitor the game draws a canvas of that shape at start "
-     "(1920x1200, 3440x1440 or 5120x1440), the HUD laid out for it: 21:9 and 32:9 a wider view, 16:10 a taller one (the "
+     "The window's: on a 16:10, 21:9, 32:9 or 48:9 window or monitor the game draws a canvas of that shape at start "
+     "(1920x1200, 3440x1440, 5120x1440 or 7680x1440), the HUD laid out for it: 21:9, 32:9 and 48:9 a wider view, 16:10 a taller one (the "
      "same height of view, a little less at the sides). Other shapes, and 16:9, keep the game's 16:9 picture. 16:10 / "
-     "21:9 / 32:9: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9 and 32:9 are "
+     "21:9 / 32:9 / 48:9: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9, 32:9 and 48:9 are "
      "heavier than the window's own shape: the whole canvas is drawn, then shown smaller). Needs the game patches' "
      "RomFS sets (TOTK_PATCH_SETS) and the overlay's layout for that shape. At the next start: the canvas and the game "
      "files laid out for it are chosen as the game starts. Setup prepares the layouts of this PC's monitors' shapes; "
-     "another shape's are made at the start after you pick it (about 30 s, once).", "16:9", k_wide_values,
+     "another shape's are made at the start after you pick it (about 30 s, once).", "window", k_wide_values,
      k_wide_names, 0, 0, 0, PC_SET_RESTART, "TOTK_WIDE", NULL, NULL, NULL},
-    {"graphics.hud_layout", "Graphics", "Game patches", "HUD position (21:9, 32:9)",
-     "Where the HUD goes on a 21:9 or 32:9 canvas: at the screen's edges, or in the middle 16:9 (closer to the eyes on "
+    {"graphics.hud_layout", "Graphics", "Game patches", "HUD position (21:9, 32:9, 48:9)",
+     "Where the HUD goes on a 21:9, 32:9 or 48:9 canvas: at the screen's edges, or in the middle 16:9 (closer to the eyes on "
      "a very wide screen). Menus are the same either way. Nothing changes at 16:9. At the next start: the game loads "
-     "its interface layouts once, as it starts.", "corner", k_hud_values,
+     "its interface layouts once, as it starts. Automatic (the default): in the middle on 48:9, at the edges otherwise.", "auto", k_hud_values,
      k_hud_names, 0, 0, 0, PC_SET_RESTART, "TOTK_HUD_LAYOUT", NULL, NULL, NULL},
     // (the reasons below: every file open of a run: each set's file is opened once a run, HeapDef, EnvPalette and the
     // shader package at boot, Grass.pack before the title, the travel scene at the first fast travel; hle_fs's sets
@@ -380,7 +406,7 @@ static const pc_setting k_restart_rows[] = {
     {"graphics.shadow_distance", "Graphics", "Game patches", "Shadow distance",
      "Multiplier of the sharp shadow cascades' distances. Needs the game patches' RomFS sets (TOTK_PATCH_SETS)."
      " At the next start: the value is in the shader package, which the game reads once, as it starts.", "1",
-     NULL, NULL, 0.5f, 4.0f, 0.5f, PC_SET_RESTART, "TOTK_SHADOW_DISTANCE", NULL, NULL, NULL},
+     NULL, NULL, 0.25f, 4.0f, 0.25f, PC_SET_RESTART, "TOTK_SHADOW_DISTANCE", NULL, NULL, NULL},
     {"graphics.fog_distance", "Graphics", "Game patches", "Fog distance",
      "Multiplier of the distance fog's start and end (clearer distant mountains). Needs the game patches' RomFS sets "
      "(TOTK_PATCH_SETS). At the next start: the game reads its sky and fog palettes once, as it starts.", "1", NULL,
@@ -392,15 +418,15 @@ static const pc_setting k_restart_rows[] = {
      0, PC_SET_RESTART, "TOTK_FAST_TRAVEL", NULL, NULL, NULL},
 };
 
-/* graphics.cutscene_aspect (live): on a 21:9 / 32:9 canvas, real-time cutscenes (and conversations: the game's events)
+/* graphics.cutscene_aspect (live): on a 21:9 / 32:9 / 48:9 canvas, real-time cutscenes (and conversations: the game's events)
    wide like the game (default) or in the middle 16:9 with bars, the original framing (totk_hooks.c crops the present;
    pre-rendered movies are 16:9 video and always shown that way) */
 static const char *const k_cut_values[] = {"wide", "16:9", NULL},
                          *const k_cut_names[] = {"Wide (more at the sides)", "16:9 (the original framing)", NULL};
 static void cutscene_apply(const char *v) { g_cutscene_16x9 = v && !strcmp(v, "16:9"); }
 static const pc_setting k_cutscene_row[] = {
-    {"graphics.cutscene_aspect", "Graphics", "Game patches", "Cutscenes (21:9, 32:9)",
-     "On a 21:9 or 32:9 canvas, real-time cutscenes and conversations: wide like the rest of the game, or the original "
+    {"graphics.cutscene_aspect", "Graphics", "Game patches", "Cutscenes (21:9, 32:9, 48:9)",
+     "On a 21:9, 32:9 or 48:9 canvas, real-time cutscenes and conversations: wide like the rest of the game, or the original "
      "16:9 framing with bars at the sides (for a scene that looks odd at the edges). Pre-rendered movies are 16:9 video: "
      "always shown in the middle with bars.", "wide", k_cut_values, k_cut_names, 0, 0, 0, 0, NULL, NULL, cutscene_apply,
      NULL, NULL},
@@ -479,8 +505,8 @@ static void add_live_rows(void) {}
 #endif
 
 /* graphics.aspect_ratio = window (TOTK_WIDE=window): the canvas takes the window's shape at start, for the shapes whose
-   sets are built (21:9 -> 3440x1440, 32:9 -> 5120x1440; the scene at the canvas size: the host render scale only scales
-   16:9 targets). = 21:9 / 32:9: that canvas whatever the window's shape (present fits it whole, with bars). The window
+   sets are built (21:9 -> 3440x1440, 32:9 -> 5120x1440, 48:9 -> 7680x1440; the scene at the canvas size: the host render scale only scales
+   16:9 targets). = 21:9 / 32:9 / 48:9: that canvas whatever the window's shape (present fits it whole, with bars). The window
    is not made yet (device.c ui_window_init runs later), so its size is read the way it will be made: fullscreen as shim_win.c settings_load and ui_window_init decide it (TOTK_WINDOW_MODE, else TOTK_FULLSCREEN,
    else borderless with the overlay on; a LARECOMP_WINDOW stays a window unless the mode is named) -> TOTK_EXCLUSIVE_SIZE
    or the monitor (TOTK_MONITOR's, else the primary); windowed -> LARECOMP_WINDOW (else ui_window_init's 1280x720). A
@@ -626,18 +652,25 @@ static void build_shape(const char *const *sets, int n) {
     _exit(0);
 }
 
+/* each shape's canvas and scene: 21:9 / 32:9 / 48:9 drawn whole at the canvas's size; 16:10 (laptops, handhelds) the game's
+   own 1920x1080 output and 1600x900 scene made taller (overlays builds the output-1920x1200[-scene-1600x1000] heap sets;
+   its UI layouts are the 2560x1600 set's, totk_layout_set). lo.. hi: the window shapes that take it*/
+static const struct { const char *name, *canvas, *scene; double lo, hi; } k_shapes[] = {
+    {"16:10", "1920x1200", "1600x1000", 1.55, 1.65},
+    {"21:9", "3440x1440", "3440x1440", 2.2, 2.6},
+    {"32:9", "5120x1440", "5120x1440", 3.3, 3.8},
+    {"48:9", "7680x1440", "7680x1440", 4.8, 5.9},   /* three 16:9 screens (support #7), three 16:10 ones too */
+};
+static int shape_of(double a) {   /* k_shapes' index, -1 for any other shape (16:9 among them) */
+    for (int i = 0; i < (int)(sizeof k_shapes / sizeof k_shapes[0]); i++)
+        if (a >= k_shapes[i].lo && a < k_shapes[i].hi) return i;
+    return -1;
+}
+
 static void wide_canvas(void) {
 #ifdef TOTK_OTHER_VERSION
     return;   /* (no output_res, no layout overlay) */
 #endif
-    /* each shape's canvas and scene: 21:9 / 32:9 drawn whole at the canvas's size; 16:10 (laptops, handhelds) the game's
-       own 1920x1080 output and 1600x900 scene made taller (overlays builds the output-1920x1200[-scene-1600x1000] heap
-       sets; its UI layouts are the 2560x1600 set's, totk_layout_set) */
-    static const struct { const char *name, *canvas, *scene; double lo, hi; } k_shapes[] = {
-        {"16:10", "1920x1200", "1600x1000", 1.55, 1.65},
-        {"21:9", "3440x1440", "3440x1440", 2.2, 2.6},
-        {"32:9", "5120x1440", "5120x1440", 3.3, 3.8},
-    };
     const char *wide = getenv("TOTK_WIDE"), *out = getenv("TOTK_OUTPUT_RES");
     int shape = -1;
     for (int i = 0; wide && i < (int)(sizeof k_shapes / sizeof k_shapes[0]); i++)
@@ -660,8 +693,7 @@ static void wide_canvas(void) {
             return;
         }
         double a = (double)w / h;
-        for (int i = 0; i < (int)(sizeof k_shapes / sizeof k_shapes[0]); i++)
-            if (a >= k_shapes[i].lo && a < k_shapes[i].hi) shape = i;
+        shape = shape_of(a);
         if (shape < 0) {
             fprintf(stderr, "[totk] aspect ratio: the %s is %ux%u (%.3f), no 16:10 or ultrawide shape: the game's 16:9\n",
                     how, w, h, a);
@@ -678,11 +710,10 @@ static void wide_canvas(void) {
     totk_layout_set(cw, ch, set);
     if (!layout_overlay(set, dir, sizeof dir)) {
         /* (with the HUD-in-the-middle set too when that is chosen and missing: one build, one restart) */
-        const char *hud = getenv("TOTK_HUD_LAYOUT");
         char center[80];
         snprintf(center, sizeof center, "%s-center", set);
         const char *want[2] = {set, center};
-        build_shape(want, hud && !strcmp(hud, "center") && cw * 9 > ch * 16 && !layout_overlay(center, dir, sizeof dir) ? 2 : 1);
+        build_shape(want, hud_centered(cw, ch) && cw * 9 > ch * 16 && !layout_overlay(center, dir, sizeof dir) ? 2 : 1);
         fprintf(stderr, "[totk] error: aspect ratio: the %s is %ux%u (%.3f) but the overlay has no %s layout (%s-%s; "
                         "tools/engine/build.py overlay builds it): the game's 16:9\n", how, w, h, a, set,
                 getenv("TOTK_OVERLAY") ? getenv("TOTK_OVERLAY") : "TOTK_OVERLAY unset", set);
@@ -694,6 +725,48 @@ static void wide_canvas(void) {
     fprintf(stderr, "[totk] aspect ratio: the %s is %ux%u (%.3f): canvas %s, scene %s\n", how, w, h, a, canvas,
             getenv("TOTK_RENDER_RES"));
 }
+
+/* graphics.aspect_ratio = window (TOTK_WIDE=window, the default since v0.1.9): the canvas's shape is chosen at the start
+   (wide_canvas above; its heap and layout sets are read once, so it cannot follow live). A window that takes another
+   shape later (a borderless window moved to another monitor, a windowed one resized) keeps the start's picture, shown
+   whole with bars, and one line says that a restart gives the new shape. Once per shape, after it has held for about a
+   second (a drag passes through many). totk_hooks.c calls it from the present; every 15th frame looks. */
+#if defined(_WIN32) && !defined(TOTK_NO_PC_SETTINGS)
+extern void *shim_window_hwnd(void);               /* nvn/vulkan/shim_win.c */
+extern void osd_toast(const char *text, int ms);   /* hle_osd.cpp */
+void totk_window_shape_hint(uint64_t frame) {
+    static int on = -1, start = -2, last = -2, told = -2;
+    static uint64_t since;
+    if (on < 0) {
+        const char *w = getenv("TOTK_WIDE");
+        on = w && !strcmp(w, "window") && !aspect_row_off();
+    }
+    if (!on || frame % 15) return;
+    HWND h = (HWND)shim_window_hwnd();
+    RECT r;
+    if (!h || IsIconic(h) || !GetClientRect(h, &r) || r.right <= 0 || r.bottom <= 0) return;
+    const int cls = shape_of((double)r.right / r.bottom);
+    if (start == -2) {   /* (the first look: the canvas this start chose, and the window as it is now) */
+        const char *out = getenv("TOTK_OUTPUT_RES");
+        unsigned cw = 0, ch = 0;
+        start = told = out && sscanf(out, "%ux%u", &cw, &ch) == 2 && ch ? shape_of((double)cw / ch) : -1;
+        last = cls, since = frame;
+    }
+    if (cls != last) { last = cls, since = frame; return; }
+    if (cls == told || frame - since < 60) return;
+    told = cls;
+    if (cls == start) return;   /* (back to the start's shape: its picture fits again) */
+    char msg[256];
+    if (cls >= 0)
+        snprintf(msg, sizeof msg, pc_tr("Wide picture: F10 > Restart the game now to use %s"), k_shapes[cls].name);
+    else snprintf(msg, sizeof msg, "%s", pc_tr("The window changed shape: F10 > Restart the game now to fit it"));
+    fprintf(stderr, "[totk] aspect ratio: the window is %ldx%ld now, the canvas was chosen for another shape at the "
+                    "start: %s\n", r.right, r.bottom, msg);
+    osd_toast(msg, 8000);
+}
+#else
+void totk_window_shape_hint(uint64_t frame) { (void)frame; }
+#endif
 
 /* The run-time half could not start. Unpatched, that only costs the settings; with the realtime step in main the game
    would freeze at its first frame (the step reads a data page that stays 0), so stop here with the reason instead.*/

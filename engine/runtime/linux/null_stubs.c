@@ -30,6 +30,7 @@ void backend_async_wait(uint64_t ticket) { (void)ticket; }
 void backend_texture_cpu_written(NvnTexture *t) { (void)t; }
 bool renderer_texture_gpu_owned(NvnTexture *t) { (void)t; return false; }
 uint64_t renderer_present_count(void) { return 0; }
+uint64_t vk_frames_shown(uint64_t *generated) { if (generated) *generated = 0; return 0; }   // device.c: the F3 readout's shown frames
 void tex_watch_add(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 bool tex_watched(uint64_t addr) { (void)addr; return false; }
 #endif

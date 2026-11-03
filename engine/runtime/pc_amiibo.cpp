@@ -20,6 +20,7 @@
 
 #include "../third_party/imgui/imgui.h"
 #include "amiibo_dump.h"
+#include "pc_amiibo_hold.h"
 #include "hle.h"
 #include "pc_text.h"
 #ifdef _WIN32
@@ -44,6 +45,14 @@ int g_dev = DevInitialized;
 u64 g_activate, g_deactivate;      // the game's SystemEventType for each (0: not attached)
 amiibo_tag g_tag;
 std::string g_scanned;             // the name of the dump on the reader, for the tab
+AmiiboHold g_hold;                 // the search between a stop and the next start (pc_amiibo_hold.h)
+amiibo_tag g_pending_tag;          // a Scan in g_hold's hold: goes on at the next start
+std::string g_pending;
+
+long long now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 bool ours(u64 handle) { return handle && *(const u64 *)handle == kHandle; }
 bool tag_on() { return g_dev == DevTagFound || g_dev == DevTagMounted; }
@@ -103,12 +112,19 @@ const char *problem_text(int p) {
     default: return nullptr;
     }
 }
-// Scan: the dump goes on the reader while the game searches for one
+// Scan: the dump goes on the reader while the game searches for one (or at its next start, just after a stop)
 bool scan(const Dump &d) {
     u64 ev = 0;
     {
         std::lock_guard<std::mutex> l(g_mtx);
-        if (d.problem || g_dev != DevSearching) return false;
+        if (d.problem) return false;
+        if (g_dev != DevSearching) {
+            if (g_dev != DevInitialized || !g_hold.queue(now_ms())) return false;
+            g_pending_tag = d.tag;
+            g_pending = d.name;
+            printf("[nfp] amiibo %s waits for the game's next search\n", d.name.c_str());
+            return true;
+        }
         g_tag = d.tag;
         g_scanned = d.name;
         g_dev = DevTagFound;
@@ -141,12 +157,14 @@ HLE_AS(nfp_Initialize, "_ZN2nn3nfp10InitializeEv") {
     g_nfp_state = 1;
     std::lock_guard<std::mutex> l(g_mtx);
     g_dev = DevInitialized;
+    g_hold.reset();
     c->x[0] = 0;
 }
 HLE_AS(nfp_Finalize, "_ZN2nn3nfp8FinalizeEv") {
     g_nfp_state = 0;
     std::lock_guard<std::mutex> l(g_mtx);
     g_dev = DevInitialized;
+    g_hold.reset();
     g_activate = g_deactivate = 0;
     c->x[0] = 0;
 }
@@ -185,13 +203,31 @@ HLE_AS(nfp_AttachDeactivateEvent, "_ZN2nn3nfp21AttachDeactivateEventEPNS_2os15Sy
 }
 HLE_AS(nfp_StartDetection, "_ZN2nn3nfp14StartDetectionERKNS0_12DeviceHandleE") {
     if (!ours(c->x[0])) { c->x[0] = kDeviceNotFound; return; }
+    bool fresh, deliver;
+    int restarts;
+    u64 ev = 0;
+    std::string name;
     {
         std::lock_guard<std::mutex> l(g_mtx);
+        fresh = g_hold.start(now_ms(), &deliver);
+        restarts = g_hold.restarts;
         g_dev = DevSearching;
         g_scanned.clear();
+        if (deliver) {   // (a Scan clicked between the last stop and this start)
+            g_tag = g_pending_tag;
+            g_scanned = name = g_pending;
+            g_dev = DevTagFound;
+            ev = g_activate;
+        }
     }
-    osd_toast(pc_tr("amiibo: pick one in F10 (or L3 + R3) > Amiibo"), 6000);
-    printf("[nfp] the game searches for an amiibo\n");
+    if (fresh) {
+        osd_toast(pc_tr("amiibo: pick one in F10 (or L3 + R3) > Amiibo"), 6000);
+        printf("[nfp] the game searches for an amiibo\n");
+    } else if (restarts == 1) {
+        printf("[nfp] the game restarts its search (the same one: no more lines until it ends)\n");
+    }
+    if (deliver) printf("[nfp] amiibo %s on the reader (clicked between the game's stop and start)\n", name.c_str());
+    if (ev) hle_sysevent_signal(ev);
     c->x[0] = 0;
 }
 HLE_AS(nfp_StopDetection, "_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE") {
@@ -200,6 +236,7 @@ HLE_AS(nfp_StopDetection, "_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE") {
     {
         std::lock_guard<std::mutex> l(g_mtx);
         if (tag_on()) ev = g_deactivate;
+        g_hold.stop(now_ms(), g_dev == DevSearching, tag_on());
         g_dev = DevInitialized;
     }
     if (ev) hle_sysevent_signal(ev);
@@ -245,6 +282,13 @@ void pc_amiibo_tab() {
         std::lock_guard<std::mutex> l(g_mtx);
         dev = g_dev;
         scanned = g_scanned;
+        const long long now = now_ms();
+        if (dev == DevInitialized && g_hold.waiting(now)) {
+            scanned = g_pending;   // (goes on at the game's next start)
+            dev = DevTagFound;
+        } else if (dev == DevInitialized && g_hold.held(now)) {
+            dev = DevSearching;   // (the game stopped its search a moment ago and starts it again)
+        }
     }
     ImGui::Spacing();
     if (dev == DevSearching) ImGui::TextUnformatted(pc_tr("The game is waiting for an amiibo."));

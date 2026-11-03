@@ -203,7 +203,11 @@ void vk_preupload_frame(void) {
     if (!loading) stream_report(t0);
     if (!pre_n || (!loading && !stream_budget_ns())) return;
     const int64_t budget = loading ? pre_budget_ns() : stream_budget_ns();
-    const uint64_t cap = loading ? ~0ull : stream_cap_bytes();
+    // (the ring short of host memory, exec.c ring_tight: a loading screen's call takes at most 32 MB of guest bytes, the
+    // rest going to the next frames or to their first use; staging can be up to 16x that (ASTC decoded on the CPU), so
+    // the real protection is vk_ring_guard before each texture below; v0.1.9 gate g19_s1)
+    extern bool vk_ring_tight(void);
+    const uint64_t cap = loading ? (vk_ring_tight() ? 32ull << 20 : ~0ull) : stream_cap_bytes();
     // (tight, not pressure: pressure reads 0 in a residency round's cool-down and once the round's frees answer it on
     // paper, so pre-uploads would restart in the middle of a shortage, as 346fa0ae for blocks)
     extern bool vk_residency_tight(void);
@@ -239,6 +243,8 @@ void vk_preupload_frame(void) {
             pthread_mutex_unlock(&pre_mu);
             continue;
         }
+        extern void vk_ring_guard(void);
+        vk_ring_guard();   // (exec.c: a texture's staging past half a chunk with the ring full submits here, not FATAL)
         TexBackend *b = vk_tex(t, false);
         if (b && b->uploaded) {
             b->preuploaded = true;

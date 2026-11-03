@@ -14,12 +14,19 @@
 #include "pc_settings.h"
 #include "pc_display_modes.h"
 #include "nvn/vulkan/present.h"
+#ifndef _WIN32
+#include <SDL3/SDL_init.h>
+#include <SDL3/SDL_video.h>
+#endif
 
 extern "C" {
 int shim_window_mode(void);                          // 0 windowed, 1 borderless, 2 exclusive
 void shim_set_window_mode(int mode, int monitor);   // monitor: -1 keep, 0 the window's own, 1..N
 void shim_set_exclusive_mode(int w, int h, int hz);
 void *shim_window_hwnd(void);
+#ifndef _WIN32
+void shim_set_window_size(int w, int h);             // linux/shim_sdl3.c: the window's size in pixels, windowed only
+#endif
 }
 
 namespace {
@@ -45,6 +52,11 @@ void window_size_env(const char *v) {
 // Live, windowed only: the client area to WxH ("" = 1280 x 720), measured at the window's DPI. SWP_ASYNCWINDOWPOS: the
 // window thread does it; vk_frame_begin then follows the new size with a new swapchain.
 void window_size_apply(const char *v) {
+#ifndef _WIN32
+    int w = 1280, ht = 720;
+    if (shim_window_mode() != 0 || (*v && sscanf(v, "%dx%d", &w, &ht) != 2)) return;
+    shim_set_window_size(w, ht);
+#else
     HWND h = (HWND)shim_window_hwnd();
     int w = 1280, ht = 720;
     if (!h || shim_window_mode() != 0 || (*v && sscanf(v, "%dx%d", &w, &ht) != 2)) return;
@@ -52,6 +64,7 @@ void window_size_apply(const char *v) {
     AdjustWindowRectExForDpi(&r, (DWORD)GetWindowLongW(h, GWL_STYLE), FALSE, (DWORD)GetWindowLongW(h, GWL_EXSTYLE), GetDpiForWindow(h));
     SetWindowPos(h, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS);
+#endif
 }
 
 void monitor_apply(const char *v) { shim_set_window_mode(shim_window_mode(), *v ? atoi(v) : 0); }
@@ -106,6 +119,7 @@ const char *const N_WINDOW[] = {"Windowed", "Borderless fullscreen (default)", "
 // name them (e.g. "DELL P2422H"), with their desktop mode; and the exclusive lists from the monitor the game starts on
 // (shim_win.c's choice: TOTK_MONITOR, else the remembered one, else the primary). A monitor plugged in later shows at
 // the next start; on another monitor shim_win.c sets the closest mode it has.
+#ifdef _WIN32
 struct MonInfo { std::wstring dev; std::string name; bool primary; pcd_mode desk; };
 BOOL CALLBACK mons_enum(HMONITOR m, HDC, LPRECT, LPARAM p) {
     MONITORINFOEXW mi = {};
@@ -220,12 +234,107 @@ void build_display_lists() {
     fprintf(stderr, "[win] display lists: %d monitor(s); start monitor %d: %d resolutions, %d refresh rates\n", (int)mons.size(),
             start + 1, ns, nr);
 }
+#else
+// Linux: SDL's displays in its order (linux/shim_sdl3.c places the window by the same index), named as SDL names them
+// (the connector or the EDID name), with their desktop modes; the exclusive lists from the start display's fullscreen
+// modes. Wayland has no mode switch: SDL scales a non-native exclusive mode, so the lists still mean the same picture.
+// (Same lists and saved values as the Windows build above; display.last_monitor holds SDL's display name.)
+constexpr int kMaxMon = 8, kMaxSizes = 24, kMaxRates = 16;
+std::string g_mon_names[kMaxMon + 1], g_size_v[kMaxSizes + 1], g_size_n[kMaxSizes + 1], g_rate_v[kMaxRates + 1], g_rate_n[kMaxRates + 1];
+const char *V_MONITOR[kMaxMon + 2], *N_MONITOR[kMaxMon + 2];
+const char *V_XSIZE[kMaxSizes + 3], *N_XSIZE[kMaxSizes + 3], *V_HZ[kMaxRates + 3], *N_HZ[kMaxRates + 3];
+const char *const kMonV[] = {"1", "2", "3", "4", "5", "6", "7", "8"};
+std::string g_size_keep_n, g_rate_keep_n, g_size_keep_v, g_rate_keep_v;
+void build_display_lists() {
+    // (a static initializer, before device.c's SDL_Init: video goes up here once; SDL counts the inits)
+    const bool video = SDL_WasInit(SDL_INIT_VIDEO) || SDL_InitSubSystem(SDL_INIT_VIDEO);
+    int nd = 0;
+    SDL_DisplayID *ids = video ? SDL_GetDisplays(&nd) : nullptr;
+    if (nd > kMaxMon) nd = kMaxMon;
+    const SDL_DisplayID primary = video ? SDL_GetPrimaryDisplay() : 0;
+    V_MONITOR[0] = "";
+    N_MONITOR[0] = "Remember (the one played on last, default)";
+    int start = -1;
+    char v[64];
+    for (int i = 0; i < nd; i++) {
+        const SDL_DisplayMode *d = SDL_GetDesktopDisplayMode(ids[i]);
+        const char *nm = SDL_GetDisplayName(ids[i]);
+        char b[192];
+        snprintf(b, sizeof b, "Monitor %d: %s, %d x %d%s", i + 1, nm && *nm ? nm : "?", d ? (int)(d->w * d->pixel_density) : 0,
+                 d ? (int)(d->h * d->pixel_density) : 0, ids[i] == primary ? " (main)" : "");
+        g_mon_names[i] = b;
+        V_MONITOR[i + 1] = kMonV[i];
+        N_MONITOR[i + 1] = g_mon_names[i].c_str();
+        if (ids[i] == primary && start < 0) start = i;
+    }
+    V_MONITOR[nd + 1] = N_MONITOR[nd + 1] = nullptr;
+    if (pc_settings_raw("display.monitor", v, sizeof v) && atoi(v) >= 1 && atoi(v) <= nd) start = atoi(v) - 1;
+    else if (pc_settings_raw("display.last_monitor", v, sizeof v))
+        for (int i = 0; i < nd; i++)
+            if (const char *nm = SDL_GetDisplayName(ids[i]); nm && !strcmp(nm, v)) start = i;
+    std::vector<pcd_mode> all;
+    if (start >= 0) {
+        int nm = 0;
+        SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(ids[start], &nm);
+        for (int i = 0; modes && i < nm && all.size() < 1024; i++)
+            all.push_back({(int)(modes[i]->w * modes[i]->pixel_density), (int)(modes[i]->h * modes[i]->pixel_density),
+                           (int)(modes[i]->refresh_rate + 0.5f)});
+        SDL_free(modes);
+    }
+    SDL_free(ids);
+    pcd_mode sizes[kMaxSizes];
+    int rates[kMaxRates];
+    const int ns = pcd_sizes(all.data(), (int)all.size(), sizes, kMaxSizes);
+    const int nr = pcd_rates(all.data(), (int)all.size(), rates, kMaxRates);
+    // (from here as the Windows build: keep the two in step)
+    int k = 0;
+    V_XSIZE[k] = ""; N_XSIZE[k++] = "The desktop's (default)";
+    for (int i = 0; i < ns; i++) {
+        snprintf(v, sizeof v, "%dx%d", sizes[i].w, sizes[i].h);
+        g_size_v[i] = v;
+        snprintf(v, sizeof v, "%d x %d", sizes[i].w, sizes[i].h);
+        g_size_n[i] = v;
+        V_XSIZE[k] = g_size_v[i].c_str(); N_XSIZE[k++] = g_size_n[i].c_str();
+    }
+    if (pc_settings_raw("display.exclusive_size", v, sizeof v) && *v) {
+        bool in = false;
+        for (int i = 0; i < ns; i++) in = in || g_size_v[i] == v;
+        if (!in) {
+            g_size_keep_v = v;
+            g_size_keep_n = g_size_keep_v + " (not on this monitor: the desktop's)";
+            V_XSIZE[k] = g_size_keep_v.c_str(); N_XSIZE[k++] = g_size_keep_n.c_str();
+        }
+    }
+    V_XSIZE[k] = N_XSIZE[k] = nullptr;
+    k = 0;
+    V_HZ[k] = ""; N_HZ[k++] = "The desktop's (default)";
+    for (int i = 0; i < nr; i++) {
+        snprintf(v, sizeof v, "%d", rates[i]);
+        g_rate_v[i] = v;
+        snprintf(v, sizeof v, "%d Hz", rates[i]);
+        g_rate_n[i] = v;
+        V_HZ[k] = g_rate_v[i].c_str(); N_HZ[k++] = g_rate_n[i].c_str();
+    }
+    if (pc_settings_raw("display.exclusive_refresh", v, sizeof v) && *v) {
+        bool in = false;
+        for (int i = 0; i < nr; i++) in = in || g_rate_v[i] == v;
+        if (!in) {
+            g_rate_keep_v = v;
+            g_rate_keep_n = g_rate_keep_v + " Hz (not on this monitor: the closest it has)";
+            V_HZ[k] = g_rate_keep_v.c_str(); N_HZ[k++] = g_rate_keep_n.c_str();
+        }
+    }
+    V_HZ[k] = N_HZ[k] = nullptr;
+    fprintf(stderr, "[win] display lists: %d monitor(s); start monitor %d: %d resolutions, %d refresh rates%s\n", nd, start + 1,
+            ns, nr, video ? "" : " (no video: SDL could not start)");
+}
+#endif
 // (21:9 and 32:9: the ultrawide canvases fill a window of their shape, device.c backend_present; a window larger
 // than the desktop is cut to it by Windows, an exclusive mode the monitor lacks falls back to the desktop's)
 const char *const V_SIZE[] = {"", "1600x900", "1920x1080", "2560x1440", "3840x2160", "2560x1080", "3440x1440", "3840x1600",
-                              "5120x1440", nullptr};
+                              "5120x1440", "7680x1440", nullptr};
 const char *const N_SIZE[] = {"1280 x 720 (default)", "1600 x 900", "1920 x 1080", "2560 x 1440", "3840 x 2160",
-                              "2560 x 1080 (21:9)", "3440 x 1440 (21:9)", "3840 x 1600 (21:9)", "5120 x 1440 (32:9)", nullptr};
+                              "2560 x 1080 (21:9)", "3440 x 1440 (21:9)", "3840 x 1600 (21:9)", "5120 x 1440 (32:9)", "7680 x 1440 (48:9)", nullptr};
 const char *const V_VSYNC_ON[] = {"", "off", nullptr};
 const char *const N_VSYNC_ON[] = {"On (default, no tearing)", "Off (tearing, lowest latency)", nullptr};
 const char *const V_VRR[] = {"", "on", nullptr};

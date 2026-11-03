@@ -213,6 +213,60 @@ NVN(nvnSyncSetDebugLabel) { (void)c; }
 void renderer_flush(void);
 void hle_evlog(char op, uint64_t ev, uint64_t lr);   // (hle_os_thread.cpp wait-chain ring: Y/y around the wait)
 static void sync_wait_body(Cpu *c);
+int sync_guard_on(void);                                // hle_os_mem.cpp (LARECOMP_SYNC_GUARD)
+int sync_guard_arm(const void *key, uint64_t ticket);
+// 1.4.3 adds a synchronous wait the frame loop does not have (lr main+0x27e1f98, after a queue call and nvnQueueFlush; its
+// guard not identified yet): a lag there would let the game read work that has not run, so it waits for its own fence.
+// LARECOMP_SYNC_EXACT_SITES=<hex main offsets, comma separated> (default: none in 1.0.0, 0x27e1f98 in 1.4.3) or =none: the
+// call sites that skip both lags (the render thread passes this fence, the GPU waits for it). The offsets are RETURN
+// addresses (the call + 4, what c->x[30] holds), as the log names them: each call site is logged once with its rule ("[nvn]
+// SyncWait site main+...").
+enum { SYNC_SITES = 64 };
+static uint64_t g_ss_lr[SYNC_SITES];      // (insert by CAS from 0)
+static int g_ss_lag[SYNC_SITES];         // 0 unknown, 1 exact, 2 lagged
+static uint64_t g_ss_exact[16];
+static int g_ss_nexact = -1;
+static void sync_sites_init(void) {
+    const char *e = getenv("LARECOMP_SYNC_EXACT_SITES");
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION == 143
+    const char *dflt = "27e1f98";
+#else
+    const char *dflt = "";
+#endif
+    const char *list = e && *e ? (strcmp(e, "none") ? e : "") : dflt;
+    int n = 0;
+    for (const char *q = list; *q && n < 16;) {
+        char *end;
+        const uint64_t o = strtoull(q, &end, 16);
+        if (end == q) break;
+        g_ss_exact[n++] = TOTK_MAIN_BASE + o;
+        q = *end == ',' ? end + 1 : end;
+    }
+    __atomic_store_n(&g_ss_nexact, n, __ATOMIC_RELEASE);
+    if (n) LOG("[nvn] SyncWait: %d call site%s wait for their own fence (LARECOMP_SYNC_EXACT_SITES%s)\n", n, n == 1 ? "" : "s",
+               e && *e ? "" : ", the game version's default");
+}
+static bool sync_site_lags(uint64_t lr) {
+    if (__atomic_load_n(&g_ss_nexact, __ATOMIC_ACQUIRE) < 0) sync_sites_init();   // (two first callers: the same answer twice)
+    unsigned i = (unsigned)(lr >> 2) & (SYNC_SITES - 1);
+    for (int k = 0; k < SYNC_SITES; k++, i = (i + 1) & (SYNC_SITES - 1)) {
+        uint64_t cur = __atomic_load_n(&g_ss_lr[i], __ATOMIC_ACQUIRE);
+        if (!cur && __atomic_compare_exchange_n(&g_ss_lr[i], &cur, lr, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) cur = lr;
+        if (cur != lr) continue;
+        int v = __atomic_load_n(&g_ss_lag[i], __ATOMIC_ACQUIRE);
+        if (!v) {
+            bool exact = false;
+            for (int j = 0; j < g_ss_nexact && !exact; j++) exact = g_ss_exact[j] == lr;
+            v = exact ? 1 : 2;
+            __atomic_store_n(&g_ss_lag[i], v, __ATOMIC_RELEASE);
+            LOG("[nvn] SyncWait site main+%llx: %s\n", (unsigned long long)(lr - TOTK_MAIN_BASE),
+                exact ? "exact (its own fence)" : "lagged (the lags below)");
+        }
+        return v == 2;
+    }
+    for (int j = 0; j < g_ss_nexact; j++) if (g_ss_exact[j] == lr) return false;   // (table full: the list alone)
+    return true;
+}
 NVN(nvnSyncWait) {
     uint64_t sy = A(0), lr = c->x[30];
     hle_evlog('Y', sy, lr);
@@ -241,12 +295,19 @@ static void sync_wait_body(Cpu *c) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     // data the replay reads (guest_copy / guest_direct) while it builds N+1.
     static int tlag = -1;
     if (tlag < 0) { const char *e = getenv("LARECOMP_SYNC_TICKET_LAG"); tlag = !(e && *e == '0'); if (!tlag) LOG("[nvn] SyncWait ticket lag off (LARECOMP_SYNC_TICKET_LAG=0)\n"); }
-    if (backend_async_on() && tlag && lag && !flush && !whole) {
+    const bool site = (lag || tlag) && sync_site_lags(c->x[30]);   // (this call site keeps the lags: LARECOMP_SYNC_EXACT_SITES)
+    const int lag_here = lag && site, tlag_here = tlag && site;
+    if (backend_async_on() && tlag_here && lag_here && !flush && !whole) {
         NvnSync *s = sync_of(A(0));
         uint64_t pt = s->prev_ticket, k = s->nfence;
         if (pt && k > 1) {
             backend_async_wait(pt);
             renderer_wait_seq(s->ring_seq[(k - 1) & 3]);   // (fence k - 1's seq: written before the queue passed pt)
+            // LARECOMP_SYNC_GUARD=1 (hle_os_mem.cpp, default off): the pages this frame's pending replay is expected to read
+            // (those the previous frame's replay read) are read-only until the render thread passes this fence, so a game
+            // write to one of them waits for the replay there; not armed (the first frames, too many page runs, off
+            // Windows): this frame's replay is waited for here, as with LARECOMP_SYNC_TICKET_LAG=0
+            if (sync_guard_on() && !sync_guard_arm(s, s->ticket)) backend_async_wait(s->ticket);
         } else {   // a sync's first fence: the whole wait
             backend_async_wait(s->ticket);
             renderer_wait_seq(s->seq);
@@ -257,11 +318,11 @@ static void sync_wait_body(Cpu *c) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     if (backend_async_on()) {   // the render thread assigns the fence's submission when the queue reaches it
         NvnSync *s = sync_of(A(0));
         backend_async_wait(flush || whole ? 0 : s->ticket);
-        if (flush || whole) renderer_sync(); else renderer_wait_seq(lag && s->prev_seq ? s->prev_seq : s->seq);
+        if (flush || whole) renderer_sync(); else renderer_wait_seq(lag_here && s->prev_seq ? s->prev_seq : s->seq);
         RET(0);
         return;
     }
-    if (lag && !flush && !whole) { NvnSync *s = sync_of(A(0)); renderer_wait_seq(s->prev_seq ? s->prev_seq : s->seq); RET(0); return; }
+    if (lag_here && !flush && !whole) { NvnSync *s = sync_of(A(0)); renderer_wait_seq(s->prev_seq ? s->prev_seq : s->seq); RET(0); return; }
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
     else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
@@ -306,6 +367,7 @@ NVN(nvnMemoryPoolInitialize) {
     p->storage = G(uint64_t, A(1), 0x10);
     p->size = G(uint64_t, A(1), 0x18);
     p->flags = G(uint32_t, A(1), 8);
+    p->refs = 1;   // (the game's handle)
     SET_HOST(A(0), p);
     // The first 256 (the start-up pools), then one a minute with the count: in play TotK makes ~3 a second (28,872 lines
     // in a 3-h log)
@@ -318,7 +380,28 @@ NVN(nvnMemoryPoolInitialize) {
     }
     RET(1);
 }
-NVN(nvnMemoryPoolFinalize) { void *p = HOST(NvnPool, A(0)); SET_HOST(A(0), 0); if (p) backend_async_call(free, p); }
+// NvnPool.refs: taken by each texture made in the pool (texture_from_builder), dropped when it is freed and, for the
+// game's handle, after the lists queued before the pool's finalize
+static void pool_ref(NvnPool *p) {
+    uint16_t n = __atomic_load_n(&p->refs, __ATOMIC_RELAXED);
+    while (n != 0xFFFF && !__atomic_compare_exchange_n(&p->refs, &n, (uint16_t)(n + 1), true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+static void pool_unref(NvnPool *p) {
+    if (!p) return;
+    uint16_t n = __atomic_load_n(&p->refs, __ATOMIC_RELAXED);
+    while (n != 0xFFFF && !__atomic_compare_exchange_n(&p->refs, &n, (uint16_t)(n - 1), true, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {}
+    if (n == 1) free(p);
+}
+static void pool_unref_cb(void *p) { pool_unref((NvnPool *)p); }
+void vk_cpu_read_forget(uint64_t addr, uint64_t size);   // (textures.c: the CPU-read targets kept there are dropped)
+NVN(nvnMemoryPoolFinalize) {
+    NvnPool *p = HOST(NvnPool, A(0));
+    SET_HOST(A(0), 0);
+    if (!p) return;
+    p->finalized = true;   // (before the forget: a note replayed later sees it, textures.c)
+    vk_cpu_read_forget(p->storage, p->size);
+    backend_async_call(pool_unref_cb, p);
+}
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; }
 NVN(nvnMemoryPoolMap) { RET(HOST(NvnPool, A(0))->storage); }
 NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address
@@ -360,7 +443,11 @@ NVN(nvnMemoryPoolFlushMappedRange) {
     NvnPool *p = HOST(NvnPool, A(0));
     backend_pool_written(p->storage + A(1), A(2));
 }
-NVN(nvnMemoryPoolInvalidateMappedRange) { (void)c; }
+void vk_cpu_read_serve(uint64_t addr, uint64_t size);   // (textures.c: small GPU-rendered targets the CPU reads, public #16)
+NVN(nvnMemoryPoolInvalidateMappedRange) {   // (the game reads the range next: the targets GPU-rendered there get their texels)
+    NvnPool *p = HOST(NvnPool, A(0));
+    if (p) vk_cpu_read_serve(p->storage + A(1), A(2));
+}
 NVN(nvnMemoryPoolMapVirtual) {     // (virtualPool, count, requests): TotK maps physical pools into virtual ones
     static int n;
     if (n++ < 16) {
@@ -577,6 +664,7 @@ static NvnTexture *texture_from_builder(uint64_t b) {
     t->stride = G(uint64_t, b, 0x30);
     uint64_t pool = G(uint64_t, b, 0x38);
     t->pool = pool ? HOST(NvnPool, pool) : NULL;
+    if (t->pool) pool_ref(t->pool);   // (kept while the texture is: see NvnPool.refs)
     t->pool_offset = G(uint64_t, b, 0x40);
     t->addr = t->pool ? t->pool->storage + t->pool_offset : 0;
     builder_layout(b, &t->layout);
@@ -636,6 +724,7 @@ static void zombie_release(NvnTexture *t) {  // (exec lock held)
     g_zombies--;
     g_zombie_bytes -= tegra_total_size(&t->layout);
     backend_texture_destroyed(t);
+    pool_unref(t->pool);
     free(t);
 }
 static void zombie_release_cb(void *t) { zombie_release((NvnTexture *)t); }
@@ -708,13 +797,14 @@ static void texture_finalize_locked(void *arg) {
             snprintf(r->label, sizeof r->label, "%s", t->label);
         }
     }
-    backend_texture_destroyed(t); free(t);
+    backend_texture_destroyed(t); pool_unref(t->pool); free(t);
 }
 NVN(nvnTextureFinalize) {
     NvnTexture *t = HOST(NvnTexture, A(0));
     SET_HOST(A(0), 0);
     if (!t || t->zombie || t->fin_queued) return;  // (a second finalize, through a copy of the guest object)
-    t->fin_queued = true;
+    t->fin_queued = true;   // (before the forget: a note replayed later sees it, textures.c)
+    vk_cpu_read_forget(t->addr, 1);
     backend_async_call(texture_finalize_locked, t);
 }
 NVN(nvnTextureSetDebugLabel) {

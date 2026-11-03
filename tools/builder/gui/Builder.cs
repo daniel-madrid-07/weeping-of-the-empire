@@ -23,6 +23,88 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
+// The window's language. Every sentence Setup shows is written in English as L.S("...") and looked up in
+// tools/builder/gui/text/<code>.json (English sentence -> translation, {0} {1} where the values go), which make_setup.py
+// builds into the exe; a missing one shows in English (test_text.py keeps the files complete). Main picks the language
+// before anything is shown: --lang=<code>, else Windows' display language; without Use (the tests) all is English.
+static class L
+{
+    public static readonly string[] Codes = { "es", "ru", "pt-BR", "zh-Hans" };
+    public static string Code = "en";
+    static Dictionary<string, string> text;
+
+    // --lang=<code> (en, es, ru, pt-BR, zh-Hans), else the display language's (any Portuguese reads Brazilian's, any
+    // Chinese Simplified), else English
+    public static string Pick(IEnumerable<string> args, System.Globalization.CultureInfo ui)
+    {
+        foreach (var a in args)
+            if (a.StartsWith("--lang="))
+            {
+                string want = a.Substring("--lang=".Length);
+                return Codes.FirstOrDefault(c => string.Equals(c, want, StringComparison.OrdinalIgnoreCase)) ?? "en";
+            }
+        string lang = ui.TwoLetterISOLanguageName;
+        return lang == "es" ? "es" : lang == "ru" ? "ru" : lang == "pt" ? "pt-BR" : lang == "zh" ? "zh-Hans" : "en";
+    }
+
+    public static void Use(string code)
+    {
+        text = null; Code = "en";
+        if (code == "en") return;
+        try
+        {
+            using (var s = typeof(L).Assembly.GetManifestResourceStream("text." + code + ".json"))
+            {
+                if (s == null) return;   // (an exe built without its text: English)
+                using (var r = new StreamReader(s, Encoding.UTF8)) text = Parse(r.ReadToEnd());
+            }
+            Code = code;
+        }
+        catch { text = null; }
+    }
+
+    // The sentence in the window's language; with values, string.Format's {0} {1}
+    public static string S(string en, params object[] values)
+    {
+        string t;
+        if (text == null || !text.TryGetValue(en, out t)) t = en;
+        if (values.Length == 0) return t;
+        try { return string.Format(t, values); }
+        catch (FormatException) { return string.Format(en, values); }   // (a broken translation: English, never a crash)
+    }
+
+    public static bool Cjk { get { return Code.StartsWith("zh"); } }
+
+    // A flat JSON object of strings (the text files: no numbers, arrays or nesting)
+    public static Dictionary<string, string> Parse(string json)
+    {
+        var d = new Dictionary<string, string>();
+        int i = 0;
+        Func<string> str = () =>
+        {
+            while (json[i] != '"') { if (!char.IsWhiteSpace(json[i]) && json[i] != ',' && json[i] != ':') throw new FormatException("at " + i); i++; }
+            var sb = new StringBuilder();
+            for (i++; json[i] != '"'; i++)
+            {
+                if (json[i] != '\\') { sb.Append(json[i]); continue; }
+                char c = json[++i];
+                if (c == 'u') { sb.Append((char)Convert.ToInt32(json.Substring(i + 1, 4), 16)); i += 4; }
+                else sb.Append(c == 'n' ? '\n' : c == 't' ? '\t' : c == 'r' ? '\r' : c == 'b' ? '\b' : c == 'f' ? '\f' : c);
+            }
+            i++;
+            return sb.ToString();
+        };
+        i = json.IndexOf('{') + 1;
+        while (true)
+        {
+            while (char.IsWhiteSpace(json[i]) || json[i] == ',') i++;
+            if (json[i] == '}') return d;
+            string k = str(), v = str();
+            d[k] = v;
+        }
+    }
+}
+
 // Design tokens. A lab intake form: a graphite field, hairline rules, one cyan accent for "this is done".
 static class T
 {
@@ -54,8 +136,11 @@ static class T
     public static readonly Font Small = Pick("Segoe UI", 9f, FontStyle.Regular);
     public static readonly Font Log = Pick("Cascadia Mono", 8.5f, FontStyle.Regular, "Consolas");
 
+    // (Chinese: these fonts have no CJK glyphs and Windows links none to them, so Microsoft YaHei UI, which every
+    // Windows 10 / 11 carries, for all)
     static Font Pick(string family, float size, FontStyle style, string fallback = "Segoe UI")
     {
+        if (L.Cjk) family = "Microsoft YaHei UI";
         var f = new Font(family, size, style);
         return f.Name == family ? f : new Font(fallback, size, style);
     }
@@ -127,11 +212,11 @@ class Row : Painted
                 if (d.ShowDialog() == DialogResult.OK)
                 {
                     if (accepts(d.SelectedPath)) Set(d.SelectedPath);
-                    else MessageBox.Show(BuilderForm.FolderProblem(d.SelectedPath) ?? "This folder cannot be used.", title);
+                    else MessageBox.Show(BuilderForm.FolderProblem(d.SelectedPath) ?? L.S("This folder cannot be used."), title);
                 }
             return;
         }
-        using (var d = new OpenFileDialog { Title = title, CheckFileExists = false, FileName = "(folder or file)" })
+        using (var d = new OpenFileDialog { Title = title, CheckFileExists = false, FileName = L.S("(folder or file)") })
             if (d.ShowDialog() == DialogResult.OK)
             {
                 var p = File.Exists(d.FileName) ? d.FileName : Path.GetDirectoryName(d.FileName);
@@ -252,7 +337,9 @@ class StatusView : Painted
 {
     public string Step = ""; public float Value; public bool Failed, Running;
     readonly List<string> lines = new List<string>();
-    const int Keep = 5;
+    const int Keep = 5;   // (lines kept, and rows shown)
+    readonly Dictionary<string, List<string>> wrapped = new Dictionary<string, List<string>>();   // (Wrap's rows, per line)
+    int wrapWidth;
 
     public void Add(string line) { lines.Add(line); if (lines.Count > Keep) lines.RemoveAt(0); Invalidate(); }
     public void Clear() { lines.Clear(); Invalidate(); }
@@ -268,11 +355,64 @@ class StatusView : Painted
         if (Running || Value > 0)
             using (var b = new SolidBrush(Failed ? T.Error : T.Accent)) g.FillRectangle(b, 0, y, Width * Math.Max(0f, Math.Min(1f, Value)), h);
         int ly = y + T.S3, lh = T.Log.Height + T.D(2);
-        foreach (var l in lines)
+        if (wrapWidth != Width) { wrapped.Clear(); wrapWidth = Width; }
+        Func<string, List<string>> wrap = s =>
+        {
+            List<string> w;
+            if (!wrapped.TryGetValue(s, out w)) { if (wrapped.Count > 64) wrapped.Clear(); wrapped[s] = w = Wrap(s, T.Log, Width); }
+            return w;
+        };
+        foreach (var l in Shown(lines, wrap, Keep))
         {
             TextRenderer.DrawText(g, l, T.Log, new Rectangle(0, ly, Width, lh), T.TextFaint, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
             ly += lh;
         }
+    }
+
+    // What the room shows of the newest lines, each wrapped whole (a check's sentence used to end in "..." after one
+    // row, its fix unread): the newest lines that fit in rows, oldest first; a newest line longer than all the rows shows
+    // its start, its last row ending in "..." (drawn so)
+    public static List<string> Shown(List<string> lines, Func<string, List<string>> wrap, int rows)
+    {
+        var shown = new List<string>();
+        for (int i = lines.Count - 1; i >= 0; i--)
+        {
+            var w = wrap(lines[i]);
+            if (shown.Count + w.Count > rows)
+            {
+                if (shown.Count == 0) { shown.AddRange(w.Take(rows - 1)); shown.Add(string.Join(" ", w.Skip(rows - 1))); }
+                break;
+            }
+            shown.InsertRange(0, w);
+        }
+        return shown;
+    }
+
+    // s in rows no wider than width: broken at spaces; a word wider than a row (a path; Chinese, which has no spaces)
+    // broken where it reaches the edge
+    public static List<string> Wrap(string s, Font f, int width)
+    {
+        Func<string, bool> fits = t => TextRenderer.MeasureText(t, f, Size.Empty, TextFormatFlags.NoPadding).Width <= width;
+        var rows = new List<string>();
+        string row = "";
+        foreach (var word in s.Split(' '))
+        {
+            string next = row.Length == 0 ? word : row + " " + word;
+            if (fits(next)) { row = next; continue; }
+            if (row.Length > 0) { rows.Add(row); row = ""; }
+            string rest = word;
+            while (!fits(rest))
+            {
+                int lo = 1, hi = rest.Length - 1;   // (the longest start of rest that fits, at least one character)
+                while (lo < hi) { int mid = (lo + hi + 1) / 2; if (fits(rest.Substring(0, mid))) lo = mid; else hi = mid - 1; }
+                if (char.IsHighSurrogate(rest[lo - 1])) lo += lo > 1 ? -1 : 1;   // (never half a character beyond U+FFFF)
+                rows.Add(rest.Substring(0, lo));
+                rest = rest.Substring(lo);
+            }
+            row = rest;
+        }
+        if (row.Length > 0 || rows.Count == 0) rows.Add(row);
+        return rows;
     }
 }
 
@@ -303,7 +443,7 @@ static class Fetch
     // heuristics read as packed (issue #14).
     public static readonly Item Llvm = Asset("LLVM " + Release.LlvmVersion, Release.LlvmTag, Release.LlvmAsset, Release.LlvmSha256, "llvm",
                                              new[] { @"bin\clang.exe", @"bin\clang-cl.exe", @"bin\lld-link.exe" });
-    public static readonly Item Vulkan = Asset("the Vulkan headers and libraries", Release.VulkanTag, Release.VulkanAsset, Release.VulkanSha256,
+    public static readonly Item Vulkan = Asset(L.S("the Vulkan headers and libraries"), Release.VulkanTag, Release.VulkanAsset, Release.VulkanSha256,
                                                "vulkan-sdk", new[] { @"Lib\vulkan-1.lib", @"Lib\shaderc_combined.lib" });
 
     // tag: the release that carries the file (pinned; an unchanged zip stays on the release that first carried it)
@@ -369,7 +509,7 @@ static class Fetch
                                 progress(done, total, rate);
                             }
                         }
-                        if (total > 0 && done < total) throw new IOException("the connection closed early");
+                        if (total > 0 && done < total) throw new IOException(L.S("the connection closed early"));
                     }
                 }
                 complete = true;
@@ -380,16 +520,16 @@ static class Fetch
                 int code = r == null ? 0 : (int)r.StatusCode;
                 if (code == 416) complete = true;   // (a stale .part at least as long as the file: checked as it is)
                 else if (code >= 400 && code < 500 && code != 408 && code != 429)   // (no retry helps: said at once)
-                    throw new IOException(string.Format("Could not download {0}: {1} answered {2} for it. Press Install again later; if it stays " +
-                                                        "like this, report it.", it.Name, new Uri(it.Url).Host, code));
+                    throw new IOException(L.S("Could not download {0}: {1} answered {2} for it. Press Install again later; if it stays " +
+                                              "like this, report it.", it.Name, new Uri(it.Url).Host, code));
                 else err = e;
             }
             catch (IOException e)   // (a connection cut mid-body, or the disk)
             {
                 int hr = Marshal.GetHRForException(e);
                 if (hr == unchecked((int)0x80070070) || hr == unchecked((int)0x80070027))   // ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL
-                    throw new IOException(string.Format("Could not download {0}: the disk is full ({1}). Free some space, then press Install " +
-                                                        "again: the download continues where it stopped.", it.Name, Path.GetDirectoryName(path)));
+                    throw new IOException(L.S("Could not download {0}: the disk is full ({1}). Free some space, then press Install " +
+                                              "again: the download continues where it stopped.", it.Name, Path.GetDirectoryName(path)));
                 err = e;
             }
             if (complete)
@@ -398,8 +538,8 @@ static class Fetch
                 if (!string.Equals(sum, it.Sha256, StringComparison.OrdinalIgnoreCase))
                 {
                     File.Delete(part);
-                    if (start > 0 && !refetched) { refetched = true; note(it.Name + ": the resumed file does not match its checksum: from the start"); continue; }
-                    throw new InvalidDataException(string.Format("{0}: the download does not match its checksum (got {1}); press Install again", it.Name, sum));
+                    if (start > 0 && !refetched) { refetched = true; note(L.S("{0}: the resumed file does not match its checksum: from the start", it.Name)); continue; }
+                    throw new InvalidDataException(L.S("{0}: the download does not match its checksum (got {1}); press Install again", it.Name, sum));
                 }
                 if (File.Exists(path)) File.Delete(path);
                 File.Move(part, path);
@@ -413,13 +553,13 @@ static class Fetch
                 var we = err as WebException;
                 bool offline = we != null && (we.Status == WebExceptionStatus.NameResolutionFailure || we.Status == WebExceptionStatus.ConnectFailure ||
                                               we.Status == WebExceptionStatus.ProxyNameResolutionFailure || we.Status == WebExceptionStatus.Timeout);
-                throw new IOException(string.Format("Could not download {0}: {1} cannot be reached ({2}). {3}Then press Install again: it continues where it stopped.",
+                throw new IOException(L.S("Could not download {0}: {1} cannot be reached ({2}). {3}Then press Install again: it continues where it stopped.",
                     it.Name, host, err == null ? "?" : err.Message,
-                    offline ? "Check that this PC is connected to the internet; a firewall, proxy or school / work network can block " + host + ". "
-                            : "Check the internet connection. "));
+                    offline ? L.S("Check that this PC is connected to the internet; a firewall, proxy or school / work network can block {0}. ", host)
+                            : L.S("Check the internet connection. ")));
             }
             int pause = Math.Min(60, 1 << fails);
-            note(string.Format("{0}: {1}; retrying in {2} s", it.Name, err == null ? "?" : err.Message, pause));
+            note(L.S("{0}: {1}; retrying in {2} s", it.Name, err == null ? "?" : err.Message, pause));
             for (long w = 0; w < (long)pause * PauseMs; w += 250) { if (cancelled()) throw new OperationCanceledException(); Thread.Sleep((int)Math.Min(250, (long)pause * PauseMs - w)); }
         }
     }
@@ -595,7 +735,9 @@ static class Wine
 // problem is one sentence saying what to do. builder.py checks the same again (and the keys, the dump) once it runs.
 static class Preflight
 {
-    const double MinRamGb = 7.5;                       // (builder.py MIN_RAM_GB: an "8 GB" PC reports ~7.8)
+    // no RAM floor: under WarnRamGb a warning Install asks to continue past (builder.py WARN_RAM_GB; an "8 GB"
+    // PC reports 7.3-7.8; build.py sizes its compiles by the RAM under 8 GB)
+    const double WarnRamGb = 7.5;
     // (builder.py FIRST_RUN_GB, COPY_ROMFS_GB, RESUME_GB, TOOLS_GB, UPDATE_UNPACK_GB)
     const int FirstRunGb = 8, CopyRomfsGb = 17, ResumeGb = 9, ToolsGb = 5, UpdateUnpackGb = 18;
 
@@ -613,27 +755,31 @@ static class Preflight
     [DllImport("kernel32.dll")] static extern bool GlobalMemoryStatusEx(ref MemoryStatus m);
 
     // Problems (the install cannot work: Setup stops) and notes (said once, the install goes on); details: for setup.log
-    // only (each GPU the check saw, for support). dir: the install folder (null in Builder mode: builder.py checks it).
+    // only (each GPU the check saw, for support); warnings: Install asks 'Continue anyway?' past them. dir: the install
+    // folder (null in Builder mode: builder.py checks it).
     public static void Check(string dir, List<string> problems, List<string> notes, List<string> details = null, bool update = false,
-                             bool copy = false)
+                             bool copy = false, List<string> warnings = null)
     {
         if (!Environment.Is64BitOperatingSystem)
-            problems.Add("This is 32-bit Windows; the game needs 64-bit Windows 10 or 11.");
+            problems.Add(L.S("This is 32-bit Windows; the game needs 64-bit Windows 10 or 11."));
         if (!(IsProcessorFeaturePresent(36) && IsProcessorFeaturePresent(37) && IsProcessorFeaturePresent(38)))   // PF_SSSE3, PF_SSE4_1, _2
-            problems.Add("This processor is too old for the game: it needs SSE4.2 (Intel from 2008, AMD from 2011 on).");
+            problems.Add(L.S("This processor is too old for the game: it needs SSE4.2 (Intel from 2008, AMD from 2011 on)."));
         else if (!IsProcessorFeaturePresent(40))   // PF_AVX2_INSTRUCTIONS_AVAILABLE
-            notes.Add("This processor has no AVX2: Setup builds the version for older processors (it runs a little slower).");
+            notes.Add(L.S("This processor has no AVX2: Setup builds the version for older processors (it runs a little slower)."));
         var m = new MemoryStatus { Length = (uint)Marshal.SizeOf(typeof(MemoryStatus)) };
-        if (GlobalMemoryStatusEx(ref m) && m.Total / 1073741824.0 < MinRamGb)
-            problems.Add(string.Format("This PC has {0:0.0} GB of memory; building the game needs at least 8 GB.", m.Total / 1073741824.0));
+        if (warnings != null && GlobalMemoryStatusEx(ref m) && m.Total / 1073741824.0 < WarnRamGb)
+            warnings.Add(L.S("This PC has {0:0.0} GB of memory usable. Below 8 GB the game is untested: the build can take hours, " +
+                             "or stop for lack of memory and go on when Setup runs again; the game itself may not run, or may " +
+                             "crash on fast travel. Close other apps while it builds.", m.Total / 1073741824.0));
         if (dir != null) Disk(dir, update, copy, problems);
         if (dir != null && NoHardLinks(dir))
-            notes.Add("This drive is exFAT: the install works, but each update rebuilds the game from scratch (25 to 45 minutes: " +
-                      "exFAT has no hard links, so no build cache is kept). A folder on an NTFS drive updates in minutes.");
+            notes.Add(L.S("This drive is exFAT: the install works, but each update rebuilds the game from scratch (25 to 45 minutes: " +
+                          "exFAT has no hard links, so no build cache is kept). A folder on an NTFS drive updates in minutes."));
         Vulkan(problems, notes, details ?? new List<string>());
         notes.Add(Vp9Note(Vp9Mft()));
-        notes.Add("Visual C++ runtime in Windows: " + (CrtVersion() ?? "none"));
-        if (Wine.Active) notes.Add("Running under Wine " + Wine.Version + (Wine.Proton ? " (Steam's Proton)" : "") + ": Setup takes its Linux paths (README, Linux and Steam Deck).");
+        notes.Add(L.S("Visual C++ runtime in Windows: {0}", CrtVersion() ?? L.S("none")));
+        if (Wine.Active)
+            notes.Add(L.S("Running under Wine {0}: Setup takes its Linux paths (README, Linux and Steam Deck).", Wine.Version + (Wine.Proton ? " (Steam's Proton)" : "")));
     }
 
     // The cutscene movies are VP9: Windows decodes them with the Store's "VP9 Video Extensions" (a Media Foundation
@@ -663,10 +809,14 @@ static class Preflight
 
     public static string Vp9Note(int mft)
     {
-        if (mft > 0) return "Video: Windows has the VP9 Video Extensions; cutscenes are decoded by Windows (on the graphics card where it can).";
-        return "Video: Windows has no " + (mft < 0 ? "Media Foundation (an N edition without the Media Feature Pack) and no " : "") +
-               "VP9 Video Extensions. Cutscenes still play and look the same: the game decodes them with its own decoder (libvpx) on " +
-               "the processor. To decode them on the graphics card, install \"VP9 Video Extensions\" from the Microsoft Store.";
+        if (mft > 0) return L.S("Video: Windows has the VP9 Video Extensions; cutscenes are decoded by Windows (on the graphics card where it can).");
+        return mft < 0
+            ? L.S("Video: Windows has no Media Foundation (an N edition without the Media Feature Pack) and no " +
+                  "VP9 Video Extensions. Cutscenes still play and look the same: the game decodes them with its own decoder (libvpx) on " +
+                  "the processor. To decode them on the graphics card, install \"VP9 Video Extensions\" from the Microsoft Store.")
+            : L.S("Video: Windows has no VP9 Video Extensions. Cutscenes still play and look the same: the game decodes them with " +
+                  "its own decoder (libvpx) on the processor. To decode them on the graphics card, install \"VP9 Video Extensions\" " +
+                  "from the Microsoft Store.");
     }
 
     // The same sum as builder.py's: a first run 8 GB, a run whose game files (of the version built: v100, or v143 with
@@ -710,8 +860,8 @@ static class Preflight
             long bytes = Wine.FreeBytes(dir);   // (the folder's own: under Wine Z:\ is / and the folder often on /home)
             double free = bytes / 1073741824.0;
             if (bytes >= 0 && free < need)
-                return string.Format("Drive {0} has {1:0} GB free; this install needs about {2} GB. Free some space or choose a folder on another drive.",
-                                     Wine.Active ? dir : Path.GetPathRoot(dir).TrimEnd('\\'), free, need);
+                return L.S("Drive {0} has {1:0} GB free; this install needs about {2} GB. Free some space or choose a folder on another drive.",
+                           Wine.Active ? dir : Path.GetPathRoot(dir).TrimEnd('\\'), free, need);
         }
         catch { }   // (builder.py checks again)
         return null;
@@ -729,14 +879,14 @@ static class Preflight
             using (var p = Process.Start(psi))
             {
                 var read = p.StandardOutput.ReadToEndAsync();
-                if (!p.WaitForExit(20000)) { try { p.Kill(); } catch { } notes.Add("Could not check the graphics driver (no answer in 20 s); going on."); return; }
+                if (!p.WaitForExit(20000)) { try { p.Kill(); } catch { } notes.Add(L.S("Could not check the graphics driver (no answer in 20 s); going on.")); return; }
                 var lines = read.Result.Split('\n').Select(l => l.TrimEnd('\r')).ToList();
                 details.AddRange(lines.Where(l => l.StartsWith("gpu\t")).Select(l => "vkcheck: " + l.Substring(4).Replace("\t", " | ").TrimEnd(' ', '|')));
                 line = lines.LastOrDefault(l => l.StartsWith("result\t"));
             }
         }
-        catch (Exception e) { notes.Add("Could not check the graphics driver (" + e.Message + "); going on."); return; }
-        if (line == null) { notes.Add("Could not check the graphics driver (it stopped the check); going on."); return; }
+        catch (Exception e) { notes.Add(L.S("Could not check the graphics driver ({0}); going on.", e.Message)); return; }
+        if (line == null) { notes.Add(L.S("Could not check the graphics driver (it stopped the check); going on.")); return; }
         Verdict(line, problems, notes);
     }
 
@@ -746,22 +896,22 @@ static class Preflight
         var f = line.Split('\t');
         string kind = f.Length > 1 ? f[1] : "";
         if (kind == "noloader" || kind == "nodevice")
-            problems.Add("No graphics driver with Vulkan was found. Install the current driver for your graphics card (from NVIDIA, AMD or Intel), then run Setup again.");
+            problems.Add(L.S("No graphics driver with Vulkan was found. Install the current driver for your graphics card (from NVIDIA, AMD or Intel), then run Setup again."));
         else if (kind == "unfit" && f.Length == 6)
-            problems.Add(string.Format("{0} cannot run the game: {1}. Update the graphics driver{2}, then run Setup again " +
-                                       "(if it still says this, this graphics card cannot run the game).", f[4], f[5], Vendor(f[3])));
+            problems.Add(L.S("{0} cannot run the game: {1}. Update the graphics driver{2}, then run Setup again " +
+                             "(if it still says this, this graphics card cannot run the game).", f[4], f[5], Vendor(f[3])));
         else if (kind == "ok" && f.Length >= 5)
-            notes.Add(string.Format("Graphics: {0}, Vulkan {1}", f[4], f[2]));
-        else notes.Add("Could not check the graphics driver (" + string.Join(" ", f.Skip(1)) + "); going on.");
+            notes.Add(L.S("Graphics: {0}, Vulkan {1}", f[4], f[2]));
+        else notes.Add(L.S("Could not check the graphics driver ({0}); going on.", string.Join(" ", f.Skip(1))));
     }
 
     static string Vendor(string id)
     {
         switch (id)
         {
-            case "10de": return " from nvidia.com/drivers";
-            case "1002": return " from amd.com/support";
-            case "8086": return " from intel.com/support";
+            case "10de": return L.S(" from {0}", "nvidia.com/drivers");
+            case "1002": return L.S(" from {0}", "amd.com/support");
+            case "8086": return L.S(" from {0}", "intel.com/support");
             default: return "";
         }
     }
@@ -903,18 +1053,21 @@ static class Preflight
         string full;
         try { full = Path.GetFullPath(f).TrimEnd('\\') + "\\"; } catch { return null; }
         if (!built && InOneDrive(full))
-            return "This folder is inside OneDrive, which would upload the " + FirstRunGb + " GB of build files. Choose a folder outside OneDrive.";
+            return L.S("This folder is inside OneDrive, which would upload the {0} GB of build files. Choose a folder outside OneDrive.", FirstRunGb);
         // Steam's Proton: C: is the entry's prefix (steamapps/compatdata/<n>/pfx), which Steam deletes with the entry
         if (!built && Wine.Proton && string.Equals(Path.GetPathRoot(full), @"C:\", StringComparison.OrdinalIgnoreCase))
-            return "Under Proton drive C: is this Steam entry's own folder, which Steam deletes with the entry. Choose a folder on a Linux drive" +
-                   (Wine.Home() != null ? ", for example " + Path.Combine(Wine.Home(), BuilderForm.FolderName) : " (drive Z:)") + ".";
+            return Wine.Home() != null
+                ? L.S("Under Proton drive C: is this Steam entry's own folder, which Steam deletes with the entry. Choose a folder on a " +
+                      "Linux drive, for example {0}.", Path.Combine(Wine.Home(), BuilderForm.FolderName))
+                : L.S("Under Proton drive C: is this Steam entry's own folder, which Steam deletes with the entry. Choose a folder on a " +
+                      "Linux drive (drive Z:).");
         if (ControlledFolderAccess())
             foreach (var sf in new[] { Environment.SpecialFolder.MyDocuments, Environment.SpecialFolder.DesktopDirectory, Environment.SpecialFolder.MyPictures,
                                        Environment.SpecialFolder.MyVideos, Environment.SpecialFolder.MyMusic })
             {
                 string p = Environment.GetFolderPath(sf);
                 if (p.Length > 0 && full.StartsWith(p.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))
-                    return "Windows Security's Controlled folder access protects this folder and would block the build. Choose a folder outside Documents, Desktop, Pictures, Videos and Music.";
+                    return L.S("Windows Security's Controlled folder access protects this folder and would block the build. Choose a folder outside Documents, Desktop, Pictures, Videos and Music.");
             }
         return Unwritable(full.TrimEnd('\\'));
     }
@@ -931,7 +1084,7 @@ static class Preflight
         try { Directory.CreateDirectory(probe); Directory.Delete(probe); return null; }
         catch (UnauthorizedAccessException)
         {
-            return string.Format("Windows does not let this account create files in {0}. Choose a folder you can write in, for example C:\\Games.", at);
+            return L.S("Windows does not let this account create files in {0}. Choose a folder you can write in, for example C:\\Games.", at);
         }
         catch { return null; }
     }
@@ -978,59 +1131,191 @@ static class Inputs
     static void Require(bool ok, string why) { if (!ok) throw new Bad(why); }
 
     struct Entry { public string Name; public long Offset, Size; }
-    class Nca { public byte[] Hdr; public int Type; public ulong Title; public bool Bktr; }
+    class Nca { public byte[] Hdr; public int Type; public ulong Title; public bool Bktr, Ncz; }
 
-    // null when the files open; else one sentence saying what to do (update: null without the update)
+    // an NSZ / XCZ (its NCAs nsz's .ncz), by its name or else its container's file names (a renamed one: builder.py's
+    // compressed_dump); no keys needed, a few KB read. False when it cannot be read (Check says why)
+    public static bool Compressed(string path)
+    {
+        if (path == null) return false;
+        if (new[] { ".nsz", ".xcz" }.Any(x => path.EndsWith(x, StringComparison.OrdinalIgnoreCase)) || IsNup(path)) return true;
+        try
+        {
+            using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 4096, FileOptions.RandomAccess))
+                return Entries(f, f.Length).Any(e => IsNcz(e.Name));
+        }
+        catch { return false; }
+    }
+
+    // a NUP (pipeline/nx/nup.py: an unencrypted dump, no keys needed), by its name or its magic (builder.py's nup_dump)
+    public static bool IsNup(string path)
+    {
+        if (path == null) return false;
+        if (path.EndsWith(".nup", StringComparison.OrdinalIgnoreCase)) return true;
+        try
+        {
+            using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 16))
+            {
+                var b = new byte[3];
+                return f.Read(b, 0, 3) == 3 && b[0] == 'N' && b[1] == 'U' && b[2] == 'P';
+            }
+        }
+        catch { return false; }
+    }
+
+    // nup.Nup's checks and nup.base_package's, the same order and words (NUP format 1, SPEC.md of a55uka/nup: the
+    // superblock, the TOC's SHA-256 and records, every file record's codec and extent, the packages); no file is read
+    static void NupCheck(Stream f, long size, bool update = false)
+    {
+        Require(size >= 0x80, "Truncated NUP superblock");
+        var sb = ReadAt(f, 0, 0x80);
+        Require(sb[0] == 'N' && sb[1] == 'U' && sb[2] == 'P', "Expected a NUP file");
+        Require(sb[3] == 1, string.Format("NUP format {0}: this Setup reads NUP format 1 only (a newer NUP tool wrote it)", sb[3]));
+        int headerSize = BitConverter.ToUInt16(sb, 4), headerVersion = BitConverter.ToUInt16(sb, 6);
+        Require(headerVersion == 1, string.Format("NUP header version {0}: this Setup reads version 1 only", headerVersion));
+        ulong tocOffset = BitConverter.ToUInt64(sb, 8), tocSize = BitConverter.ToUInt64(sb, 0x10);
+        ulong blobOffset = BitConverter.ToUInt64(sb, 0x38), fileSize = BitConverter.ToUInt64(sb, 0x40);
+        uint packages = BitConverter.ToUInt32(sb, 0x48), flags = BitConverter.ToUInt32(sb, 0x4C);
+        Require(headerSize >= 0x80 && tocOffset == (ulong)headerSize, "Invalid NUP superblock (header size / TOC offset)");
+        Require(flags == 0, string.Format("NUP flags 0x{0:x}: unknown to this Setup (NUP format 1 has none)", flags));
+        Require(fileSize == (ulong)size, "NUP file size does not match its superblock (a short copy?)");
+        Require(tocSize % 16 == 0 && blobOffset % 16 == 0 && tocOffset + tocSize <= blobOffset && blobOffset <= (ulong)size,
+                "NUP regions out of bounds");
+        Require(packages >= 1 && packages <= 4096 && tocSize >= 0x30 && tocSize <= 512UL << 20, "Invalid NUP package count / TOC size");
+        var toc = ReadAt(f, (long)tocOffset, (long)tocSize);
+        using (var sha = SHA256.Create())
+            Require(sha.ComputeHash(toc).SequenceEqual(sb.Skip(0x18).Take(32)), "NUP table of contents hash mismatch (a damaged file)");
+        Require(toc[0] == 'T' && toc[1] == 'O' && toc[2] == 'C' && toc[3] == 1, "Expected the NUP table of contents");
+        uint pc = BitConverter.ToUInt32(toc, 4);
+        ulong dirCount = BitConverter.ToUInt64(toc, 8), fileCount = BitConverter.ToUInt64(toc, 0x10);
+        ulong poolOff = BitConverter.ToUInt64(toc, 0x18), poolSize = BitConverter.ToUInt64(toc, 0x20);
+        Require(pc == packages, "NUP package count differs between superblock and TOC");
+        ulong dirsAt = 0x30 + (ulong)pc * 0x40;
+        Require(dirCount < 0xFFFFFFFF && fileCount < 0xFFFFFFFF && dirsAt + dirCount * 0x18 + fileCount * 0x50 <= tocSize,
+                "NUP TOC records out of bounds");
+        ulong filesAt = dirsAt + dirCount * 0x18, kidsAt = filesAt + fileCount * 0x50;
+        Require(poolOff + poolSize <= tocSize, "NUP string pool out of bounds");
+        ulong slots = 0;
+        for (ulong i = 0; i < dirCount; i++)
+        {
+            ulong first = BitConverter.ToUInt32(toc, (int)(dirsAt + i * 0x18 + 8)), count = BitConverter.ToUInt32(toc, (int)(dirsAt + i * 0x18 + 12));
+            slots = Math.Max(slots, first + count);
+        }
+        Require(kidsAt + slots * 4 <= tocSize, "NUP children out of bounds");
+        var codecs = new Dictionary<int, string> { { 0, "raw" }, { 1, "zstd" }, { 2, "lz4 (reserved)" }, { 3, "zstd-chunked (reserved)" } };
+        for (ulong i = 0; i < fileCount; i++)
+        {
+            int o = (int)(filesAt + i * 0x50);
+            ulong fsize = BitConverter.ToUInt64(toc, o + 8), eoff = BitConverter.ToUInt64(toc, o + 0x10), esize = BitConverter.ToUInt64(toc, o + 0x18);
+            int codec = toc[o + 0x40];
+            Require(codec == 0 || codec == 1, string.Format("NUP codec {0}: this Setup reads raw and zstd only",
+                                                            codecs.ContainsKey(codec) ? codecs[codec] : codec.ToString()));
+            if (esize == 0) Require(fsize == 0, "NUP file without data");
+            else Require(eoff % 16 == 0 && blobOffset <= eoff && eoff + esize <= (ulong)size, "NUP extent out of bounds");
+            if (codec == 0) Require(esize == fsize, "NUP raw extent size differs from the file size");
+        }
+        int bases = 0;
+        ulong baseTitle = 0;
+        uint baseExefs = 0, baseRomfs = 0;
+        var ups = new List<Tuple<uint, uint, uint>>();   // (version, exefs, romfs) of the game's update packages
+        for (uint i = 0; i < pc; i++)
+        {
+            int o = (int)(0x30 + i * 0x40);
+            ulong title = BitConverter.ToUInt64(toc, o);
+            uint root = BitConverter.ToUInt32(toc, o + 8), exefs = BitConverter.ToUInt32(toc, o + 12), romfs = BitConverter.ToUInt32(toc, o + 16);
+            int kind = toc[o + 0x18];
+            ulong metaOff = BitConverter.ToUInt64(toc, o + 0x20), metaSize = BitConverter.ToUInt32(toc, o + 0x28);
+            Require(kind < 5, string.Format("NUP package kind {0}: unknown to this Setup", kind));
+            foreach (var d in new[] { root, exefs, romfs })
+                Require(d == 0xFFFFFFFF || d < dirCount, "NUP package directory out of range");
+            Require(root != 0xFFFFFFFF, "NUP package without a root directory");
+            Require(metaSize == 0 || metaOff + metaSize <= (ulong)size, "NUP package meta block out of bounds");
+            if (kind == 0 && bases++ == 0) { baseTitle = title; baseExefs = exefs; baseRomfs = romfs; }
+            if (kind == 1 && (title == UpdateTitle || title == Title))
+                ups.Add(Tuple.Create(BitConverter.ToUInt32(toc, o + 0x14), exefs, romfs));
+        }
+        Require(bases <= 1, "A NUP with more than one base package");
+        if (update)   // (nup.update_package: the 1.4.3 one, 720896, else the newest; its own whole tree)
+        {
+            Require(ups.Count > 0, string.Format("The NUP has no update of {0:X16} (no update package)", Title));
+            var u = ups.FirstOrDefault(x => x.Item1 == 720896) ?? ups.OrderByDescending(x => x.Item1).First();
+            Require(u.Item2 != 0xFFFFFFFF && u.Item3 != 0xFFFFFFFF, "The NUP update has no ExeFS or no RomFS");
+            return;
+        }
+        Require(bases == 1, "The NUP has no base game (an update-only NUP): choose the base game");
+        Require(baseTitle == Title, string.Format("Expected base game {0:X16}; this NUP holds {1:X16}", Title, baseTitle));
+        Require(baseExefs != 0xFFFFFFFF && baseRomfs != 0xFFFFFFFF, "The NUP base game has no ExeFS or no RomFS");
+    }
+
+    // null when the files open; else one sentence saying what to do (update: null without the update; keys: null for a
+    // NUP alone, which needs none)
     public static string Check(string dump, string keys, string update)
     {
-        string name = Path.GetFileName(keys);
-        Dictionary<string, byte[]> keyset;
-        try
+        string name = keys == null ? null : Path.GetFileName(keys);
+        Dictionary<string, byte[]> keyset = new Dictionary<string, byte[]>();
+        if (keys != null) try
         {
             var lines = File.ReadAllLines(keys);
             var names = new HashSet<string>(lines.Where(l => l.Contains('=')).Select(l => l.Split('=')[0].Trim().ToLowerInvariant()));
             if (!new[] { "header_key", "key_area_key_application_00", "titlekek_00" }.All(names.Contains))
-                return name + " does not look like a complete keys file. Use the one from your own console.";
+                return L.S("{0} does not look like a complete keys file. Use the one from your own console.", name);
             keyset = LoadKeys(lines);
         }
-        catch (Bad e) { return name + " cannot be read as a keys file (" + e.Message + "): " + KeysFix + "."; }
-        catch (Exception e) { return name + " cannot be read (" + e.Message + "): " + keys; }
+        catch (Bad e) { return L.S("{0} cannot be read as a keys file ({1}): {2}.", name, e.Message, L.S(KeysFix)); }
+        catch (Exception e) { return L.S("{0} cannot be read ({1}): {2}", name, e.Message, keys); }
         foreach (var x in new[] { Tuple.Create(dump, "the dump", false), Tuple.Create(update, "the update dump", true) })
         {
             if (x.Item1 == null) continue;
             try
             {
                 using (var f = new FileStream(x.Item1, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 4096, FileOptions.RandomAccess))
-                    Open(f, keyset, x.Item3);
+                    if (IsNup(x.Item1)) NupCheck(f, f.Length, x.Item3); else Open(f, keyset, x.Item3);
             }
             catch (Bad e) { return Problem(x.Item2, e.Message); }
-            catch (Exception e) { return Cap(x.Item2) + " cannot be read (" + e.Message + "): " + x.Item1; }
+            catch (Exception e)
+            {
+                return x.Item3 ? L.S("The update dump cannot be read ({0}): {1}", e.Message, x.Item1)
+                               : L.S("The dump cannot be read ({0}): {1}", e.Message, x.Item1);
+            }
         }
         return null;
     }
 
-    static string Cap(string s) { return char.ToUpperInvariant(s[0]) + s.Substring(1); }
-
-    // builder.py's dump_problem: the reason a dump / update could not be opened, as one sentence with what to do
+    // builder.py's dump_problem: the reason a dump / update could not be opened, as one sentence with what to do (what:
+    // "the dump" or "the update dump"; each its own sentence, for the translations)
     public static string Problem(string what, string msg)
     {
+        bool dump = what == "the dump";
+        string fix = L.S(KeysFix);
         if (msg.Contains("prod.keys") || msg.Contains("NCA3") || msg.Contains("titlekek") || msg.Contains("key_area_key"))
-            return "Your prod.keys cannot open " + what + " (" + msg + "): " + KeysFix + ".";
+            return dump ? L.S("Your prod.keys cannot open the dump ({0}): {1}.", msg, fix)
+                        : L.S("Your prod.keys cannot open the update dump ({0}): {1}.", msg, fix);
         if (msg.Contains("FS header hash") || msg.Contains("NCA key area"))
-            return Cap(what) + " could not be read correctly (" + msg + "): either your prod.keys is not the one from the console it was " +
-                   "dumped on (" + KeysFix + "), or the file is damaged (copy or dump it again).";
+            return dump ? L.S("The dump could not be read correctly ({0}): either your prod.keys is not the one from the console it was " +
+                              "dumped on ({1}), or the file is damaged (copy or dump it again).", msg, fix)
+                        : L.S("The update dump could not be read correctly ({0}): either your prod.keys is not the one from the console it " +
+                              "was dumped on ({1}), or the file is damaged (copy or dump it again).", msg, fix);
         if (msg.Contains("Personalized"))
-            return Cap(what) + " has a personalized ticket (tied to one console account), which Setup cannot use: dump the game again " +
-                   "so that it carries a common ticket.";
+            return dump ? L.S("The dump has a personalized ticket (tied to one console account), which Setup cannot use: dump the game " +
+                              "again so that it carries a common ticket.")
+                        : L.S("The update dump has a personalized ticket (tied to one console account), which Setup cannot use: dump " +
+                              "the game again so that it carries a common ticket.");
         if (msg.ToLowerInvariant().Contains("ticket"))
-            return Cap(what) + " has no usable ticket (" + msg + "): dump the game again with its ticket (a common ticket).";
-        if (msg.Contains("Expected an XCI or NSP") || msg.Contains("Truncated") || msg.Contains("does not match") || msg.Contains("out of bounds"))
-            return Cap(what) + " is not a complete .nsp / .xci file (" + msg + "): copy or dump it again (an interrupted copy or download " +
-                   "leaves it short).";
-        if (what == "the dump")
-            return "The dump is not Tears of the Kingdom's base game, version 1.0.0 (title 0100F2C0115B6000): choose the base game's " +
-                   ".nsp / .xci. The " + BuilderForm.UpdateVersion + " update goes in the Update row, and DLC is not used (" + msg + ").";
-        return "The update dump is not Tears of the Kingdom's update: choose its own .nsp, or leave the Update row empty (" + msg + ").";
+            return dump ? L.S("The dump has no usable ticket ({0}): dump the game again with its ticket (a common ticket).", msg)
+                        : L.S("The update dump has no usable ticket ({0}): dump the game again with its ticket (a common ticket).", msg);
+        if (msg.Contains("this Setup reads"))   // (a NUP of a format this Setup does not read yet)
+            return dump ? L.S("The dump is a NUP this Setup cannot read ({0}): choose the game as an .nsp / .xci.", msg)
+                        : L.S("The update dump is a NUP this Setup cannot read ({0}): choose the update as an .nsp / .xci.", msg);
+        if (msg.Contains("Expected an XCI or NSP") || msg.Contains("Truncated") || msg.Contains("does not match") || msg.Contains("out of bounds") ||
+            msg.Contains("NCZ") || (msg.Contains("NUP") && !msg.StartsWith("The NUP") && !msg.StartsWith("Expected base game")))
+            return dump ? L.S("The dump is not a complete .nsp / .xci file ({0}): copy or dump it again (an interrupted copy or download " +
+                              "leaves it short).", msg)
+                        : L.S("The update dump is not a complete .nsp / .xci file ({0}): copy or dump it again (an interrupted copy or " +
+                              "download leaves it short).", msg);
+        if (dump)
+            return L.S("The dump is not Tears of the Kingdom's base game, version 1.0.0 (title 0100F2C0115B6000): choose the base game's " +
+                       ".nsp / .xci. The {0} update goes in the Update row, and DLC is not used ({1}).", BuilderForm.UpdateVersion, msg);
+        return L.S("The update dump is not Tears of the Kingdom's update: choose its own .nsp, or leave the Update row empty ({0}).", msg);
     }
 
     // container.py load_keys: name = hex value lines, '#' starts a comment
@@ -1055,7 +1340,8 @@ static class Inputs
     {
         var entries = Entries(f, f.Length);
         var tickets = Tickets(f, entries);
-        var ncas = entries.Where(e => e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)).Select(e => Header(f, e, keys)).ToList();
+        var ncas = entries.Where(e => e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase) || IsNcz(e.Name))
+                          .Select(e => Header(f, e, IsNcz(e.Name) ? NczSize(f, e) : e.Size, keys)).ToList();
         var meta = ncas.Where(n => n.Type == 1).ToList();
         var programs = ncas.Where(n => n.Type == 0).ToList();
         Nca program;
@@ -1166,22 +1452,60 @@ static class Inputs
     }
 
     // read_nca_header: the 0xC00-byte header, AES-XTS with header_key, sectors numbered big-endian (Nintendo's tweak)
-    static Nca Header(Stream f, Entry e, Dictionary<string, byte[]> keys)
+    //   (size: the NCA's, an .ncz's from NczSize)
+    static Nca Header(Stream f, Entry e, long size, Dictionary<string, byte[]> keys)
     {
-        Require(e.Size >= 0xc00, "Truncated NCA header");
+        Require(size >= 0xc00, "Truncated NCA header");
         Require(keys.ContainsKey("header_key"), "Missing header_key in prod.keys");
         Require(keys["header_key"].Length == 32, "header_key in prod.keys is not 32 bytes");
         var hdr = XtsDecrypt(keys["header_key"], ReadAt(f, e.Offset, 0xc00));
         Require(Encoding.ASCII.GetString(hdr, 0x200, 4) == "NCA3", "Expected NCA3 (check prod.keys and the game file)");
-        Require(BitConverter.ToInt64(hdr, 0x208) == e.Size, "NCA size does not match container entry");
+        Require(BitConverter.ToInt64(hdr, 0x208) == size, "NCA size does not match container entry");
         for (int i = 0; i < 4; i++)
         {
             long start = BitConverter.ToUInt32(hdr, 0x240 + i * 16) * 512L, end = BitConverter.ToUInt32(hdr, 0x244 + i * 16) * 512L;
-            Require((start == 0 && end == 0) || (0xc00 <= start && start < end && end <= e.Size), "NCA section out of bounds");
+            Require((start == 0 && end == 0) || (0xc00 <= start && start < end && end <= size), "NCA section out of bounds");
         }
         bool bktr = false;
         for (int i = 0; i < 4; i++) bktr |= hdr[0x400 + i * 512 + 4] == 4;   // (an FS header of crypt type 4: an update's patch)
-        return new Nca { Hdr = hdr, Type = hdr[0x205], Title = BitConverter.ToUInt64(hdr, 0x210), Bktr = bktr };
+        return new Nca { Hdr = hdr, Type = hdr[0x205], Title = BitConverter.ToUInt64(hdr, 0x210), Bktr = bktr, Ncz = IsNcz(e.Name) };
+    }
+
+    static bool IsNcz(string name) { return name.EndsWith(".ncz", StringComparison.OrdinalIgnoreCase); }
+
+    // ncz.NczBody's header checks: an .ncz's NCA size (nsz's sections, back to back from 0x4000) and its block table
+    static long NczSize(Stream f, Entry e)
+    {
+        Require(e.Size > 0x4000 + 16, "Truncated NCZ");
+        var head = ReadAt(f, e.Offset + 0x4000, 16);
+        Require(Encoding.ASCII.GetString(head, 0, 8) == "NCZSECTN", "Expected NCZSECTN (not an nsz-compressed NCA)");
+        ulong count = BitConverter.ToUInt64(head, 8);
+        Require(count >= 1 && count <= 64, "Invalid NCZ section count");
+        var raw = ReadAt(f, e.Offset + 0x4010, (long)count * 0x40);
+        ulong end = 0x4000;
+        foreach (var s in Enumerable.Range(0, (int)count).Select(i => new[] { BitConverter.ToUInt64(raw, i * 0x40), BitConverter.ToUInt64(raw, i * 0x40 + 8) })
+                                    .OrderBy(s => s[0]))
+        {
+            Require(s[0] < 1UL << 48 && s[1] < 1UL << 48, "Invalid NCZ section");
+            Require(s[0] >= end && s[1] > 0, "Overlapping NCZ sections");
+            Require(s[0] == end || end == 0x4000, "NCZ sections leave a gap");
+            end = s[0] + s[1];
+        }
+        long pos = 0x4010 + (long)count * 0x40;
+        Require(pos + 8 <= e.Size, "Truncated NCZ");
+        if (Encoding.ASCII.GetString(ReadAt(f, e.Offset + pos, 8)) == "NCZBLOCK")
+        {
+            var b = ReadAt(f, e.Offset + pos, 24);
+            int exponent = b[11];
+            ulong blocks = BitConverter.ToUInt32(b, 12), total = BitConverter.ToUInt64(b, 16);
+            Require(b[8] == 2 && b[9] == 1 && exponent >= 14 && exponent <= 32, "Unsupported NCZ block header");
+            Require(total == end - 0x4000 && blocks == (total + (1UL << exponent) - 1) >> exponent, "Invalid NCZ blocks");
+            var sizes = ReadAt(f, e.Offset + pos + 24, 4 * (long)blocks);
+            pos += 24 + 4 * (long)blocks;
+            for (long i = 0; i < (long)blocks; i++) pos += BitConverter.ToUInt32(sizes, (int)(4 * i));
+            Require(pos <= e.Size, "NCZ blocks out of bounds");
+        }
+        return (long)end;
     }
 
     // nca_ctr_key, short of decrypting: the key it needs is in prod.keys (and, rights-managed, its ticket in the file)
@@ -1235,6 +1559,66 @@ static class Inputs
 // folder (a dump or keys the player keeps there) stays, and so does the folder then; links inside are removed as links,
 // never followed. The saves, settings and mods (%APPDATA%\nxrecomp\TotK-engine, and a game folder's mods\) go only when
 // the player says so (asked separately, default No).
+// The download kit (tools/builder/kit.py, which owns kit.json): Setup's side. Setup --download-kit <dir> puts its own
+// downloads into <dir>\nxr-kit\files\<sha256> and the source at its tag into nxr-kit\src.git, then builder.py
+// --download-kit adds the rest and writes kit.json. Setup beside an nxr-kit folder (or --kit, or the folder dropped on
+// the window) takes each file from there when its sha256 is the pinned one, and fetches the source from src.git.
+static class Kit
+{
+    public static readonly List<string> Items = new List<string>();   // (made here: sha256 TAB size TAB name TAB url)
+
+    // dir as a kit: the folder itself when it holds kit.json, else its nxr-kit; null when neither is one
+    public static string Dir(string dir)
+    {
+        try
+        {
+            foreach (var d in new[] { dir, Path.Combine(dir, "nxr-kit") })
+                if (File.Exists(Path.Combine(d, "kit.json"))) return Path.GetFullPath(d).TrimEnd('\\');
+        }
+        catch { }
+        return null;
+    }
+
+    static string Json(string kit)
+    {
+        try { return File.ReadAllText(Path.Combine(kit, "kit.json")); } catch { return ""; }
+    }
+
+    public static string Tag(string kit)
+    {
+        var m = Regex.Match(Json(kit), "\"setup\"\\s*:\\s*\"([^\"]+)\"");
+        return m.Success ? m.Groups[1].Value : null;
+    }
+
+    public static bool Complete(string kit) { return Regex.IsMatch(Json(kit), "\"complete\"\\s*:\\s*true"); }
+
+    // The kit's copy of a pinned download: files\<sha256>, only when its content has that sha256 (else never used)
+    public static string Find(string kit, string sha)
+    {
+        if (string.IsNullOrEmpty(sha)) return null;
+        string p = Path.Combine(kit, "files", sha.ToLowerInvariant());
+        try { return File.Exists(p) && string.Equals(Fetch.Sha256(p), sha, StringComparison.OrdinalIgnoreCase) ? p : null; }
+        catch { return null; }
+    }
+
+    // Making a kit: the item's downloaded file into it (once) and into Items, which builder.py --download-kit lists
+    public static void Put(string kit, string file, Fetch.Item it)
+    {
+        string sha = it.Sha256.ToLowerInvariant(), p = Path.Combine(kit, "files", sha);
+        Directory.CreateDirectory(Path.GetDirectoryName(p));
+        if (Find(kit, sha) == null) { File.Copy(file, p + ".tmp", true); if (File.Exists(p)) File.Delete(p); File.Move(p + ".tmp", p); }
+        Items.Add(string.Join("\t", sha, new FileInfo(p).Length.ToString(), it.Name, it.Url));
+    }
+
+    // The kit's source (a bare repository at the tag, fetched over file://), or null
+    public static string Source(string kit)
+    {
+        if (kit == null) return null;
+        string git = Path.Combine(kit, "src.git");
+        return Directory.Exists(git) ? new Uri(git).AbsoluteUri : null;
+    }
+}
+
 static class Uninstaller
 {
     public static readonly string AppsKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\" + BuilderForm.FolderName;
@@ -1250,10 +1634,10 @@ static class Uninstaller
     {
         string mark;
         try { mark = File.ReadAllText(Path.Combine(root, ".setup-root")).Trim(); }
-        catch { return root + " has no .setup-root (the mark Setup leaves in its install folder)"; }
+        catch { return L.S("{0} has no .setup-root (the mark Setup leaves in its install folder)", root); }
         Func<string, string> norm = p => { try { return Path.GetFullPath(p).TrimEnd('\\'); } catch { return p; } };
         if (!string.Equals(norm(mark), norm(root), StringComparison.OrdinalIgnoreCase))
-            return root + "'s .setup-root names another folder (" + mark + ")";
+            return L.S("{0}'s .setup-root names another folder ({1})", root, mark);
         bool stamp = false;
         try
         {
@@ -1262,7 +1646,7 @@ static class Uninstaller
                     (Directory.Exists(game) && Directory.GetDirectories(game, "TotK-PC-*").Length > 0);
         }
         catch { }
-        return stamp ? null : root + " holds none of Setup's tools or builds";
+        return stamp ? null : L.S("{0} holds none of Setup's tools or builds", root);
     }
 
     public static string JunctionName(string root)
@@ -1272,6 +1656,9 @@ static class Uninstaller
     }
 
     static bool IsLink(string p) { try { return (File.GetAttributes(p) & FileAttributes.ReparsePoint) != 0; } catch { return false; } }
+
+    // A tree Setup made, wholly (git's read-only objects too; links removed as links): true when it is gone
+    public static bool DeleteTree(string p) { return Delete(p, new Result(), null); }
 
     // a tree, bottom up, links removed as links; keep(p) true: p stays (and so do its parents)
     static bool Delete(string p, Result r, Func<string, bool> keep)
@@ -1535,6 +1922,21 @@ static class Win32
         catch { return null; }
         finally { Marshal.FinalReleaseComObject(sl); }
     }
+
+    // A .lnk's arguments ("" for none), or null when it does not load
+    public static string ShortcutArgs(string lnk)
+    {
+        var sl = (IShellLinkW)new ShellLinkObject();
+        try
+        {
+            ((System.Runtime.InteropServices.ComTypes.IPersistFile)sl).Load(lnk, 0);
+            var sb = new StringBuilder(1024);
+            sl.GetArguments(sb, sb.Capacity);
+            return sb.ToString();
+        }
+        catch { return null; }
+        finally { Marshal.FinalReleaseComObject(sl); }
+    }
 }
 
 class BuilderForm : Form
@@ -1552,6 +1954,8 @@ class BuilderForm : Form
     string source;                 // --source=: the repository Setup fetches from instead of GitHub's
     bool acceptTerms, auto, hidden, noShortcut, noPreflight, scanNote;
     string toolsDir;               // <install>\tools once a run set it up (a failed run checks what an antivirus took)
+    string kit;                    // the download kit fetches look in first (Kit), or null
+    string makeKit;                // --download-kit: the kit this window makes (<dir>\nxr-kit), or null
     string builderArgs = "";
     StreamWriter log;              // <install>\setup.log: every line the window shows (for a bug report)
 
@@ -1561,7 +1965,8 @@ class BuilderForm : Form
     void AutoStart()
     {
         if (!auto) return;
-        if (build.Enabled) Start();
+        if (makeKit != null) StartKit();
+        else if (build.Enabled) Start();
         else if (hidden) { Console.Error.WriteLine("Setup: inputs missing"); Environment.Exit(2); }
     }
     static readonly Regex StepLine = new Regex(@"step (\d+)/(\d+) (\w+)");
@@ -1585,16 +1990,28 @@ class BuilderForm : Form
     void CopyDefault()
     {
         if (copy == null) return;
-        copy.Locked = update.FilePath != null || Busy;
+        // (an NSZ / XCZ, also renamed: its data is zstd inside the dump, which the game cannot read in place; the copy's
+        // 17 GB then join the disk check too)
+        bool packed = Inputs.Compressed(dump.FilePath);
+        copy.Locked = update.FilePath != null || packed || Busy;
         if (update.FilePath != null) { copy.Set(true, false); return; }
+        if (packed)
+        {
+            copyWhy = L.S("Your dump is compressed (NSZ / XCZ), which the game cannot read in place, so they are copied");
+            copy.Set(true, false);
+            return;
+        }
         if (copy.Touched) { copy.Invalidate(); return; }
         bool had = install != null && install.FilePath != null &&
                    File.Exists(Path.Combine(install.FilePath, "work", "extracted", "v100", "romfs.bin"));
         string kind = had ? null : DumpDriveCanGo(dump.FilePath);
-        copyWhy = had ? "Kept from your earlier install, which runs without the dump"
+        copyWhy = had ? L.S("Kept from your earlier install, which runs without the dump")
                 : kind == null ? null
-                : kind == "OneDrive" ? "Your dump is in OneDrive, which can turn it into an online-only file, so they are copied"
-                : "Your dump is on a " + kind + " drive, which can be unplugged, so they are copied";
+                : kind == "OneDrive" ? L.S("Your dump is in OneDrive, which can make it online-only, so they are copied")
+                : kind == "network" ? L.S("Your dump is on a network drive, which can be unplugged, so they are copied")
+                : kind == "disc" ? L.S("Your dump is on a disc drive, which can be unplugged, so they are copied")
+                : kind == "USB" ? L.S("Your dump is on a USB drive, which can be unplugged, so they are copied")
+                : L.S("Your dump is on a removable drive, which can be unplugged, so they are copied");
         copy.Set(had || kind != null, false);
     }
 
@@ -1649,24 +2066,23 @@ class BuilderForm : Form
         StartPosition = FormStartPosition.CenterScreen;
 
         var title = new Label { Text = repo != null ? "Builder" : Release.Product, Font = T.Display, ForeColor = T.Text, AutoSize = true, Location = new Point(pad - T.D(2), T.S6) };
-        var sub = new Label { Text = "Turns a dump of your own console into a native PC build.", Font = T.Body, ForeColor = T.TextDim,
+        var sub = new Label { Text = L.S("Turns a dump of your own console into a native PC build."), Font = T.Body, ForeColor = T.TextDim,
                               AutoSize = true, Location = new Point(pad, T.S6 + T.D(36)) };
 
-        dump = new Row(1, "Dump", "Drop it here or click to choose", f => IsDump(f));
-        keys = new Row(2, "Keys", "The keys file from the same console", f => File.Exists(f) &&
+        dump = new Row(1, L.S("Dump"), L.S("Drop it here or click to choose"), f => IsDump(f));
+        keys = new Row(2, L.S("Keys"), L.S("The keys file from the same console"), f => File.Exists(f) &&
             f.EndsWith(".keys", StringComparison.OrdinalIgnoreCase) && !f.EndsWith("title.keys", StringComparison.OrdinalIgnoreCase));
         // (the game's 1.4.3 update dump: builds that version, next to a 1.0.0 one; without it, 1.0.0 as before)
-        update = new Row(3, "Update (optional)", "Your " + UpdateVersion + " update dump: builds version " + UpdateVersion,
-            f => IsDump(f)) { Clearable = true, Describe = f => Path.GetFileName(f) + "   (right-click to remove: builds 1.0.0)" };
-        firmware = new Row(ShowUpdate ? 4 : 3, "Firmware (optional)",
-            CjkWindows ? "Recommended: Korean and Chinese text looks right with its fonts" : "Only Korean and Chinese text needs it: its folder or .zip",
+        update = new Row(3, L.S("Update (optional)"), L.S("Your {0} update dump: builds version {0}", UpdateVersion),
+            f => IsDump(f)) { Clearable = true, Describe = f => Path.GetFileName(f) + "   " + L.S("(right-click to remove: builds 1.0.0)") };
+        firmware = new Row(4, L.S("Firmware (optional)"),
+            CjkWindows ? L.S("Recommended: Korean and Chinese text looks right with its fonts") : L.S("Only Korean and Chinese text needs it: its folder or .zip"),
             f => Directory.Exists(f) ||
             (File.Exists(f) && f.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)))
             // (optional, and remembered from the last run: a firmware the keys cannot open must be removable, #26)
-            { Clearable = true, Describe = f => Path.GetFileName(f) + "   (right-click to remove)" };
-        install = new Row(ShowUpdate ? 5 : 4, "Install to", "A folder with about " + Preflight.FirstInstallGb(true, false) + " GB free", f => IsFolderTarget(f)) { FolderOnly = true, Describe = DescribeFolder };
-        rows = (repo != null ? new[] { dump, keys, update, firmware } : new[] { dump, keys, update, firmware, install })
-            .Where(r => ShowUpdate || r != update).ToArray();
+            { Clearable = true, Describe = f => Path.GetFileName(f) + "   " + L.S("(right-click to remove)") };
+        install = new Row(5, L.S("Install to"), L.S("A folder with about {0} GB free", Preflight.FirstInstallGb(true, false)), f => IsFolderTarget(f)) { FolderOnly = true, Describe = DescribeFolder };
+        rows = repo != null ? new[] { dump, keys, update, firmware } : new[] { dump, keys, update, firmware, install };
         int rowY = T.D(104), rowH = T.D(62);
         var top = new Label { BackColor = T.Rule, Bounds = new Rectangle(pad, rowY - 1, inner, 1) };   // rule above the list
         for (int i = 0; i < rows.Length; i++) { rows[i].Bounds = new Rectangle(pad, rowY + i * rowH, inner, rowH); rows[i].Changed += UpdateState; }
@@ -1674,38 +2090,47 @@ class BuilderForm : Form
         update.Changed += () =>
         {
             if (update.FilePath == null || Busy) return;
-            status.Add(SavesNote);
-            status.Add(string.Format("With the {0} update the first build needs about {1} GB free (its game files are unpacked).",
-                                     UpdateVersion, Preflight.FirstInstallGb(repo == null, true)));
+            status.Add(L.S(SavesNote, UpdateVersion));
+            status.Add(L.S("With the {0} update the first build needs about {1} GB free (its game files are unpacked).",
+                           UpdateVersion, Preflight.FirstInstallGb(repo == null, true)));
         };
         // the game's files: read from the dump in place (no 17 GB copy), or copied out so the dump can go; by default
         // copied only when the dump is on a drive that can go away (builder.py dump_drive), an update's always
-        copy = new OptionRow("Copy the game files (17 GB)", on => update.FilePath != null ? "Version " + UpdateVersion + " always copies them"
-            : on ? (copyWhy ?? "Uses 17 GB more; afterwards the dump can be moved or deleted")
-            : "The game reads them from your dump: keep it where it is")
+        copy = new OptionRow(L.S("Copy the game files (17 GB)"), on => update.FilePath != null ? L.S("Version {0} always copies them", UpdateVersion)
+            : on ? (copyWhy ?? L.S("Uses 17 GB more; afterwards the dump can be moved or deleted"))
+            : L.S("The game reads them from your dump: keep it where it is"))
         { Bounds = new Rectangle(pad, rowY + rows.Length * rowH, inner, rowH) };
         dump.Changed += CopyDefault;
         update.Changed += CopyDefault;
         install.Changed += CopyDefault;
 
-        build = new PrimaryButton { Text = repo != null ? "Build" : "Install", Bounds = new Rectangle(pad, copy.Bottom + T.S6, inner, T.D(42)), Enabled = false };
-        build.Click += (s, e) => { if (!build.Enabled) return; if (launcher != null && proc == null && worker == null) Play(); else Start(); };
+        build = new PrimaryButton { Text = repo != null ? L.S("Build") : L.S("Install"), Bounds = new Rectangle(pad, copy.Bottom + T.S6, inner, T.D(42)), Enabled = false };
+        build.Click += (s, e) =>
+        {
+            if (!build.Enabled) return;
+            if (makeKit != null) StartKit();
+            else if (launcher != null && proc == null && worker == null) Play();
+            else Start();
+        };
         status = new StatusView { Bounds = new Rectangle(pad, build.Bottom + T.S6, inner, T.D(28) + T.S3 + 5 * (T.Log.Height + T.D(2))) };
 
         var rule = new Label { BackColor = T.Rule, Bounds = new Rectangle(pad, status.Bottom + T.S4, inner, 1) };
         var notice = new Label
         {
-            Text = "Only use files you dumped yourself from a console you own. This tool includes no game content " +
-                   "and does not support piracy or files obtained any other way.",
-            Font = T.Small, ForeColor = T.TextFaint, Bounds = new Rectangle(pad, rule.Bottom + T.S3, inner, T.D(36)),
+            Text = L.S("Only use files you dumped yourself from a console you own. This tool includes no game content " +
+                       "and does not support piracy or files obtained any other way."),
+            Font = T.Small, ForeColor = T.TextFaint,
         };
+        // (as many lines as the language needs: two in English)
+        notice.Bounds = new Rectangle(pad, rule.Bottom + T.S3, inner, Math.Max(T.D(36),
+            TextRenderer.MeasureText(notice.Text, T.Small, new Size(inner, 0), TextFormatFlags.WordBreak).Height + T.D(4)));
         ClientSize = new Size(W, notice.Bottom + T.S5);
         Controls.AddRange(new Control[] { title, sub, top, build, status, rule, notice });
         // Uninstall: a faint secondary link on the title line, only when an install exists, hidden while building
         string installed = InstalledDir();
         if (repo == null && installed != null)
         {
-            uninstall = new LinkLabel { Text = "Uninstall", Font = T.Small, AutoSize = true, BackColor = T.Bg, LinkColor = T.TextFaint,
+            uninstall = new LinkLabel { Text = L.S("Uninstall"), Font = T.Small, AutoSize = true, BackColor = T.Bg, LinkColor = T.TextFaint,
                                         ActiveLinkColor = T.TextDim, VisitedLinkColor = T.TextFaint, LinkBehavior = LinkBehavior.HoverUnderline, TabStop = true };
             uninstall.Location = new Point(W - pad - uninstall.PreferredWidth, title.Top + (title.PreferredHeight - uninstall.PreferredHeight) / 2);
             uninstall.MouseEnter += (s, e) => uninstall.LinkColor = T.TextDim;
@@ -1728,7 +2153,7 @@ class BuilderForm : Form
         DragDrop += (s, e) => Distribute((string[])e.Data.GetData(DataFormats.FileDrop));
         FormClosing += (s, e) =>
         {
-            if (Busy && MessageBox.Show("A build is running. Stop it and close? Pressing Install again later continues where it stopped.",
+            if (Busy && MessageBox.Show(L.S("A build is running. Stop it and close? Pressing Install again later continues where it stopped."),
                                         Text, MessageBoxButtons.YesNo) == DialogResult.No) e.Cancel = true;
             else
             {
@@ -1736,8 +2161,8 @@ class BuilderForm : Form
                 if (log != null) { try { log.WriteLine("Stopped: the window was closed"); log.Dispose(); } catch { } log = null; }
             }
         };
-        status.Add(string.Format("The first build takes 30 to 60 minutes and needs about {0} GB free.", Preflight.FirstInstallGb(repo == null, false)));   // the empty state says what to expect
-        status.Add("Later builds and updates reuse what is already done and take minutes.");
+        status.Add(L.S("The first build takes 30 to 60 minutes and needs about {0} GB free.", Preflight.FirstInstallGb(repo == null, false)));   // the empty state says what to expect
+        status.Add(L.S("Later builds and updates reuse what is already done and take minutes."));
         if (repo == null) { RestoreChoices(); CheckNewer(); }
         // Files dropped onto the exe's icon, and options for an unattended run (tests, scripted installs):
         //   --install-to=DIR  --accept-terms  --auto (press Install)  --hidden (no window; exits 0 / 1 at the end)  --no-shortcut
@@ -1750,8 +2175,13 @@ class BuilderForm : Form
         var argv = Environment.GetCommandLineArgs().Skip(1).ToList();
         int dd = argv.IndexOf("--");   // what follows "--" goes to builder.py as is (e.g. -- --until romfs)
         if (dd >= 0) { builderArgs = string.Concat(argv.Skip(dd + 1).Select(x => " \"" + x + "\"")); argv = argv.Take(dd).ToList(); }
+        for (int i = 0; i + 1 < argv.Count; i++)   // (--kit DIR, --download-kit DIR: as --kit=DIR)
+            if ((argv[i] == "--kit" || argv[i] == "--download-kit") && !argv[i + 1].StartsWith("--")) { argv[i] += "=" + argv[i + 1]; argv.RemoveAt(i + 1); }
+        string kitArg = null;
         foreach (var a in argv)
             if (a.StartsWith("--source=")) source = a.Substring("--source=".Length);
+            else if (a.StartsWith("--kit=")) kitArg = a.Substring("--kit=".Length);
+            else if (a.StartsWith("--download-kit=")) makeKit = Path.Combine(Path.GetFullPath(a.Substring("--download-kit=".Length)), "nxr-kit");
             else if (a.StartsWith("--install-to=")) to = a.Substring("--install-to=".Length);
             else if (a == "--accept-terms") acceptTerms = true;
             else if (a == "--auto") auto = true;
@@ -1759,9 +2189,22 @@ class BuilderForm : Form
             else if (a == "--no-shortcut") noShortcut = true;
             else if (a == "--no-preflight") noPreflight = true;   // (support: a PC check that is wrong about this PC)
             else if (a == "--play") { }   // (nothing installed yet: Main showed this window instead)
+            else if (a.StartsWith("--lang=")) { }   // (Main: L.Pick)
             else files.Add(a);
+        // the download kit: --kit, else an nxr-kit folder beside this exe (or one dropped on the window: Distribute)
+        if (kitArg != null && !UseKit(kitArg)) status.Add(L.S("No download kit in {0} (no kit.json there).", kitArg));
+        if (kitArg == null && makeKit == null) UseKit(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "nxr-kit"), true);
         Distribute(files.ToArray());
         if (to != null && repo == null) install.Set(Path.GetFullPath(to));
+        if (makeKit != null)
+        {
+            Lock(true);
+            build.Text = L.S("Make the download kit");
+            status.Step = L.S("Ready");
+            status.Clear();
+            status.Add(L.S("Setup puts every file the install downloads into {0}, for a PC without internet: copy that folder " +
+                           "next to Setup.exe there.", makeKit));
+        }
         if (hidden) CreateHandle();   // (BeginInvoke needs it; the window itself never shows)
         if (auto)
         {
@@ -1769,8 +2212,24 @@ class BuilderForm : Form
             t.Tick += (s, e) => { t.Stop(); AutoStart(); };
             t.Start();
         }
-        else if (repo == null && !noPreflight) EarlyCheck();
+        else if (repo == null && !noPreflight && makeKit == null) EarlyCheck();
         UpdateState();
+    }
+
+    // The download kit at dir (an nxr-kit folder, or the folder holding one) for every fetch from now on; false when
+    // there is none. quiet: no line when there is none (the folder beside the exe)
+    bool UseKit(string dir, bool quiet = false)
+    {
+        string k = Kit.Dir(dir);
+        if (k == null) return false;
+        kit = k;
+        status.Add(L.S("Download kit: {0}. Setup takes what it needs from there; what it lacks comes from the internet. " +
+                           "Use only a kit you made yourself.", k));
+        string made = Kit.Tag(k);
+        if (!Kit.Complete(k)) status.Add(L.S("The download kit is not complete (its making stopped): what it lacks comes from the internet."));
+        else if (made != null && made != Release.Tag)
+            status.Add(L.S("The download kit was made by Setup {0}; this is {1}: only the files they share are used.", made, Release.Tag));
+        return true;
     }
 
     // What the PC lacks, shown as the window opens (before the three files are even chosen); Install checks again
@@ -1778,8 +2237,9 @@ class BuilderForm : Form
     {
         new Thread(() =>
         {
-            var problems = new List<string>();
-            try { Preflight.Check(null, problems, new List<string>()); } catch { return; }   // (the disk: DiskRecheck)
+            var problems = new List<string>(); var warnings = new List<string>();
+            try { Preflight.Check(null, problems, new List<string>(), null, false, false, warnings); } catch { return; }   // (the disk: DiskRecheck)
+            problems.AddRange(warnings);   // (said as the window opens too; Install asks about them)
             if (problems.Count > 0) Post(() => { if (!Busy) foreach (var p in problems) status.Add(p); });
         }) { IsBackground = true }.Start();
         DiskRecheck();
@@ -1818,20 +2278,36 @@ class BuilderForm : Form
     void Distribute(string[] files)
     {
         if (Busy) return;
+        if (makeKit == null)
+            foreach (var f in files.Where(f => Directory.Exists(f) && Kit.Dir(f) != null).ToList())
+            {
+                UseKit(f);
+                files = files.Where(x => x != f).ToArray();   // (not the firmware row's)
+            }
+        var twice = new HashSet<string>(files.GroupBy(f => f, StringComparer.OrdinalIgnoreCase).Where(g => g.Count() > 1)
+                                             .Select(g => g.Key), StringComparer.OrdinalIgnoreCase);
         foreach (var f in files.OrderByDescending(f => IsDump(f) ? new FileInfo(f).Length : 0))
-            if (!rows.Any(r => r.FilePath == f) && !dump.Offer(f) && !keys.Offer(f) && !(ShowUpdate && IsDump(f) && update.Offer(f)))
+        {
+            // a NUP that holds the game and its update goes in both rows: given twice at once (Setup's arguments, a
+            // drop of it twice), its second time is the Update row's (README; builder.py builds 1.4.3 from its update
+            // package). Once, it is the dump alone; the Update row's own picker takes it too.
+            if (twice.Contains(f) && string.Equals(dump.FilePath, f, StringComparison.OrdinalIgnoreCase) &&
+                update.FilePath == null && Inputs.IsNup(f))
+            {
+                update.Offer(f);
+                continue;
+            }
+            if (!rows.Any(r => r.FilePath == f) && !dump.Offer(f) && !keys.Offer(f) && !(IsDump(f) && update.Offer(f)))
                 firmware.Offer(f);
+        }
     }
 
     public const string UpdateVersion = "1.4.3";   // (builder.py's UPDATE_VERSION)
-    // v0.1.8 ships without the 1.4.3 row: the row is not shown, a dropped or remembered update dump is not taken;
-    // builder.py's --update stays (Setup... -- --update <nsp>)
-    static readonly bool ShowUpdate = false;
-    const string SavesNote = UpdateVersion + " keeps its own saves: the first time it starts it copies your 1.0.0 saves once. " +
-        "Progress you make later in 1.0.0 does not appear in " + UpdateVersion + ", and " + UpdateVersion + " saves never go back to 1.0.0.";
+    const string SavesNote = "{0} keeps its own saves: the first time it starts it copies your 1.0.0 saves once. " +
+        "Progress you make later in 1.0.0 does not appear in {0}, and {0} saves never go back to 1.0.0.";
     static bool IsDump(string f)
     {
-        return File.Exists(f) && (f.EndsWith(".nsp", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".xci", StringComparison.OrdinalIgnoreCase));
+        return File.Exists(f) && new[] { ".nsp", ".xci", ".nsz", ".xcz", ".nup" }.Any(x => f.EndsWith(x, StringComparison.OrdinalIgnoreCase));   // (builder.py's GAME_EXT)
     }
 
     // Windows' display language is Korean or Chinese: the game follows it, and without the firmware's shared fonts it
@@ -1855,20 +2331,26 @@ class BuilderForm : Form
         return null;
     }
 
+    // (a NUP game, alone or with a NUP update: unencrypted; an NSP / XCI in either row needs the keys)
+    bool KeysOptional() { return Inputs.IsNup(dump.FilePath) && (update.FilePath == null || Inputs.IsNup(update.FilePath)); }
+
     void UpdateState()
     {
         // the firmware is optional: its shared fonts are only for Korean and Chinese text (a Windows font without them);
         // the update too: without it the build is 1.0.0
-        int n = 0, need = rows.Count(r => r != firmware && r != update);   // (the update row may be hidden: ShowUpdate)
-        foreach (var r in rows) if (r != firmware && r != update && r.FilePath != null) n++;
-        build.Enabled = n == need && !Busy;
+        // (the keys too for a NUP alone: its files are unencrypted; the update dump and the firmware still need them)
+        bool noKeys = KeysOptional();
+        int n = 0, need = rows.Length - 2 - (noKeys ? 1 : 0);
+        foreach (var r in rows) if (r != firmware && r != update && !(noKeys && r == keys) && r.FilePath != null) n++;
+        build.Enabled = (n == need || makeKit != null) && !Busy;
+        if (makeKit != null) return;   // (the kit's window: its status line is StartKit's / FinishKit's)
         if (launcher != null && !Busy) return;   // (Done: the button plays)
         if (!Busy && !status.Failed)
         {
-            status.Step = n < need ? string.Format("{0} of {1} ready", n, need)
-                        : firmware.FilePath != null ? "Ready"
-                        : CjkWindows ? "Ready: without the firmware, Korean and Chinese text uses a Windows font"
-                        : "Ready";
+            status.Step = n < need ? L.S("{0} of {1} ready", n, need)
+                        : firmware.FilePath != null ? L.S("Ready")
+                        : CjkWindows ? L.S("Ready: Korean and Chinese use a Windows font (no firmware)")
+                        : L.S("Ready");
             status.Value = 0; status.Invalidate();
         }
     }
@@ -1905,14 +2387,14 @@ class BuilderForm : Form
     {
         try
         {
-            if (!Path.IsPathRooted(f) || File.Exists(f)) return "Choose a folder.";
+            if (!Path.IsPathRooted(f) || File.Exists(f)) return L.S("Choose a folder.");
             if (built) return Preflight.FolderProblem(f, true);
             var d = new DriveInfo(Path.GetPathRoot(f));
-            if (d.DriveType != DriveType.Fixed) return "Choose a folder on a local drive (not a removable or network one).";
+            if (d.DriveType != DriveType.Fixed) return L.S("Choose a folder on a local drive (not a removable or network one).");
             string format = Wine.FileSystem(f) ?? d.DriveFormat;
             if (format.StartsWith("FAT", StringComparison.OrdinalIgnoreCase))
-                return string.Format("{0} is formatted {1}, which cannot hold files over 4 GB (the game's data needs one of 17 GB). Choose a folder on an NTFS drive.",
-                                     Wine.Active ? f : d.Name, format);
+                return L.S("{0} is formatted {1}, which cannot hold files over 4 GB (the game's data needs one of 17 GB). Choose a folder on an NTFS drive.",
+                           Wine.Active ? f : d.Name, format);
             return Preflight.FolderProblem(f);
         }
         catch (Exception e) { return e.Message; }
@@ -1921,9 +2403,9 @@ class BuilderForm : Form
     static string DescribeFolder(string f)
     {
         long free = Wine.FreeBytes(f);
-        string exfat = Preflight.NoHardLinks(f) ? "exFAT: each update rebuilds from scratch" : null;
+        string exfat = Preflight.NoHardLinks(f) ? L.S("exFAT: each update rebuilds from scratch") : null;
         return free < 0 ? (exfat == null ? f : f + "   (" + exfat + ")")
-             : string.Format("{0}   ({1:0} GB free{2})", f, free / 1073741824.0, exfat == null ? "" : ", " + exfat);
+             : f + "   (" + L.S("{0:0} GB free", free / 1073741824.0) + (exfat == null ? "" : ", " + exfat) + ")";
     }
 
     // The product's name as one word ("WeepingOfTheEmpire"): folder names without spaces
@@ -1956,8 +2438,8 @@ class BuilderForm : Form
                 using (var r = req.GetResponse()) using (var s = new StreamReader(r.GetResponseStream())) body = s.ReadToEnd();
                 var m = Regex.Match(body, "\"tag_name\"\\s*:\\s*\"([^\"]+)\"");
                 if (m.Success && m.Groups[1].Value != Release.Tag)
-                    Post(() => status.Add(string.Format("A newer version is out ({0}): get its Setup from github.com/{1}/releases",
-                                                                          m.Groups[1].Value, Release.Repo)));
+                    Post(() => status.Add(L.S("A newer version is out ({0}): get its Setup from github.com/{1}/releases",
+                                                                m.Groups[1].Value, Release.Repo)));
             }
             catch { }   // (offline, or no release yet)
         }) { IsBackground = true }.Start();
@@ -1976,10 +2458,10 @@ class BuilderForm : Form
                                       new { Row = firmware, Name = "Firmware" } })
             {
                 string p = get(r.Name);
-                if (p != null && (File.Exists(p) || Directory.Exists(p)) && (ShowUpdate || r.Row != update)) r.Row.Offer(p);
+                if (p != null && (File.Exists(p) || Directory.Exists(p))) r.Row.Offer(p);
             }
             string tag = get("Tag");
-            if (tag != null) build.Text = tag == Release.Tag ? "Rebuild" : "Update";
+            if (tag != null) build.Text = tag == Release.Tag ? L.S("Rebuild") : L.S("Update");
             object copied = k == null ? null : k.GetValue("CopyGameFiles");   // (the player's own choice, once made)
             if (copied is int) copy.Set((int)copied != 0, true);
         }
@@ -1992,7 +2474,8 @@ class BuilderForm : Form
             using (var k = Registry.CurrentUser.CreateSubKey(RegKey))
             {
                 k.SetValue("InstallDir", install.FilePath); k.SetValue("Dump", dump.FilePath);
-                k.SetValue("Keys", keys.FilePath); if (firmware.FilePath != null) k.SetValue("Firmware", firmware.FilePath); else k.DeleteValue("Firmware", false);
+                if (keys.FilePath != null) k.SetValue("Keys", keys.FilePath); else k.DeleteValue("Keys", false);
+                if (firmware.FilePath != null) k.SetValue("Firmware", firmware.FilePath); else k.DeleteValue("Firmware", false);
                 if (update.FilePath != null) k.SetValue("Update", update.FilePath); else k.DeleteValue("Update", false);
                 if (copy.Touched && update.FilePath == null) k.SetValue("CopyGameFiles", copy.Checked ? 1 : 0, RegistryValueKind.DWord);
                 if (done) k.SetValue("Tag", Release.Tag);
@@ -2040,8 +2523,10 @@ class BuilderForm : Form
             catch { }
         }
         if (Wine.Active)   // (no Linux link either: the folder itself must be plain)
-            throw new IOException("Could not reach " + dir + " through a plain-named folder (Wine could not make the Linux link Setup uses). Choose a folder whose path uses only English letters, digits and - _ . and has at most " + MaxRoot + " characters, for example " + (Wine.Home() != null ? Path.Combine(Wine.Home(), FolderName) : @"C:\" + FolderName) + ".");
-        throw new IOException("Could not reach " + dir + " through a plain-named folder. Choose a folder whose name uses only English letters and digits.");
+            throw new IOException(L.S("Could not reach {0} through a plain-named folder (Wine could not make the Linux link Setup uses). " +
+                                      "Choose a folder whose path uses only English letters, digits and - _ . and has at most {1} characters, " +
+                                      "for example {2}.", dir, MaxRoot, Wine.Home() != null ? Path.Combine(Wine.Home(), FolderName) : @"C:\" + FolderName));
+        throw new IOException(L.S("Could not reach {0} through a plain-named folder. Choose a folder whose name uses only English letters and digits.", dir));
     }
 
     // ---- running ------------------------------------------------------------------------------------------------------
@@ -2065,14 +2550,14 @@ class BuilderForm : Form
         {
             int i = int.Parse(m.Groups[1].Value), n = int.Parse(m.Groups[2].Value);
             var name = m.Groups[3].Value;
-            status.Step = i == 0 ? "Getting the build tools" : string.Format("Step {0} of {1}: {2}", i, n, char.ToUpper(name[0]) + name.Substring(1));
+            status.Step = i == 0 ? L.S("Getting the build tools") : L.S("Step {0} of {1}: {2}", i, n, char.ToUpper(name[0]) + name.Substring(1));
             stepStart = Progress(name); stepSpan = Span(name);
             status.Value = stepStart;
             status.Add(string.Format("step {0}/{1} {2}", i, n, name));   // (the command line itself is noise here)
             if (name == "romfs" && !scanNote)   // (the first step that writes tens of GB: antivirus scanning shows here)
             {
                 scanNote = true;
-                Append("[Builder] Windows Security scans every new file: on some PCs that makes this step and the build slower. That is normal.");
+                Append("[Builder] " + L.S("Windows Security scans every new file: on some PCs that makes this step and the build slower. That is normal."));
             }
             return;
         }
@@ -2147,6 +2632,79 @@ class BuilderForm : Form
         catch { return null; }
     }
 
+    // --download-kit: Setup's own downloads and the source at its tag into makeKit (nxr-kit), then builder.py
+    // --download-kit adds everything the build downloads (tools/builder/kit.py). A kit made before keeps its files:
+    // only what it lacks is downloaded. The scratch folder beside it (nxr-kit.work) goes at the end.
+    void StartKit()
+    {
+        if (repo != null || !Consent()) return;
+        Environment.SetEnvironmentVariable("GIT_CONFIG_COUNT", "1");   // (as Start: a kit on an exFAT stick)
+        Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_0", "safe.directory");
+        Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_0", "*");
+        build.Enabled = false; stopping = false;
+        status.Clear(); status.Failed = false; status.Running = true; status.Value = 0; status.Step = L.S("Making the download kit"); status.Invalidate();
+        string dir = makeKit, scratch = makeKit + ".work";
+        worker = new Thread(() =>
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.Combine(dir, "files"));
+                var w = new StreamWriter(Path.Combine(dir, "setup.log"), true, new UTF8Encoding(false)) { AutoFlush = true };
+                w.WriteLine("---- " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " Setup " + Release.Tag + " --download-kit");
+                Post(() => log = w);
+                if (!Uninstaller.DeleteTree(scratch)) throw new IOException(L.S("Could not remove {0} (in use?)", scratch));   // (a cut run's; the kit's own files stay)
+                kit = dir;   // (what the kit has is taken from it, not downloaded again)
+                Kit.Items.Clear();
+                string tools = Path.Combine(scratch, "tools");
+                Ensure(Fetch.Python, tools); Ensure(Fetch.Git, tools); Ensure(Fetch.Vulkan, tools); Ensure(Fetch.Llvm, tools);
+                string git = Path.Combine(tools, "git", "cmd", "git.exe"), bare = Path.Combine(dir, "src.git");
+                string url = source ?? "https://github.com/" + Release.Repo + ".git";
+                if (!Directory.Exists(bare)) Run(git, string.Format("init --quiet --bare \"{0}\"", bare), null);
+                Append("[Builder] " + L.S("fetching the source ({0})", Release.Tag));
+                try { Run(git, string.Format("-C \"{0}\" fetch --progress --depth 1 --force \"{1}\" \"+refs/tags/{2}:refs/tags/{2}\"", bare, url, Release.Tag), null); }
+                catch (IOException e)
+                {
+                    throw new IOException(L.S("Could not download the source code ({0}) from {1}. Check the internet connection; a firewall, " +
+                        "proxy or school / work network can block github.com. Then press Install again. ({2})", Release.Tag, source ?? "github.com", e.Message));
+                }
+                string src = Source(scratch, tools);   // (from the kit's src.git, as the PC without internet will)
+                string items = Path.Combine(scratch, "setup-items.tsv");
+                File.WriteAllLines(items, Kit.Items, new UTF8Encoding(false));
+                Post(() =>
+                {
+                    worker = null;
+                    var env = new Dictionary<string, string> { { "PATH", Path.Combine(tools, "git", "cmd") + ";" + Environment.GetEnvironmentVariable("PATH") } };
+                    RunBuilder(src, Path.Combine(tools, "python", "python.exe"), "-E -s -X utf8 ", env, "",
+                               string.Format("--download-kit \"{0}\" --setup-items \"{1}\" --tag \"{2}\"", dir, items, Release.Tag));
+                });
+            }
+            catch (Exception ex)
+            {
+                Post(() =>
+                {
+                    if (!(ex is OperationCanceledException)) Append("[Builder] ERROR: " + ex.Message);
+                    worker = null; Finish(false);
+                });
+            }
+        }) { IsBackground = true };
+        worker.Start();
+    }
+
+    void FinishKit(bool ok)
+    {
+        build.Enabled = true;
+        if (ok)
+        {
+            status.Step = L.S("Download kit ready: {0}", makeKit); status.Value = 1f;
+            status.Add(L.S("Copy the nxr-kit folder next to Setup.exe on the PC without internet, then start Setup there."));
+            Uninstaller.DeleteTree(makeKit + ".work");
+        }
+        else status.Step = stopping ? L.S("Stopped") : L.S("Stopped: see the last lines below");
+        status.Invalidate();
+        if (log != null) { log.WriteLine(status.Step); log.Dispose(); log = null; }
+        if (hidden) { Environment.ExitCode = ok ? 0 : 1; Close(); }
+    }
+
     void Start()
     {
         if (repo == null && !Consent()) return;
@@ -2154,7 +2712,7 @@ class BuilderForm : Form
         Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_0", "safe.directory");
         Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_0", "*");
         build.Enabled = false; Lock(true); stopping = false; launcher = null; scanNote = false;
-        status.Clear(); diskLine = null; status.Failed = false; status.Running = true; status.Value = 0; status.Step = "Starting"; status.Invalidate();
+        status.Clear(); diskLine = null; status.Failed = false; status.Running = true; status.Value = 0; status.Step = L.S("Starting"); status.Invalidate();
         if (repo != null) { RunBuilder(repo, "py", "-3 ", null, CopyArg()); return; }
         SaveChoices(false);
         string dir = install.FilePath.TrimEnd('\\');
@@ -2172,12 +2730,13 @@ class BuilderForm : Form
                 if (folder != null) throw new IOException(folder);
                 Directory.CreateDirectory(dir);
                 var w = new StreamWriter(Path.Combine(dir, "setup.log"), true, new UTF8Encoding(false)) { AutoFlush = true };
-                w.WriteLine("---- " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " Setup " + Release.Tag);
+                w.WriteLine("---- " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " Setup " + Release.Tag + (L.Code == "en" ? "" : " (" + L.Code + ")"));
                 Post(() => log = w);
                 if (!noPreflight)
                 {
                     var problems = new List<string>(); var notes = new List<string>(); var details = new List<string>();
-                    Preflight.Check(dir, problems, notes, details, withUpdate, copyRomfs);
+                    var warnings = new List<string>();
+                    Preflight.Check(dir, problems, notes, details, withUpdate, copyRomfs, warnings);
                     string files = Inputs.Check(dumpFile, keysFile, updateFile);   // (a wrong dump or keys: before the downloads)
                     if (files != null) problems.Add(files);
                     Post(() => { if (log != null) foreach (var d in details) log.WriteLine(d); });   // (the log only: support)
@@ -2185,11 +2744,18 @@ class BuilderForm : Form
                     foreach (var p in problems) Append("[Builder] " + p);
                     if (problems.Count > 0)   // (the log, not the window: for support, when the check is wrong about a PC)
                         Post(() => { if (log != null) log.WriteLine("(support: starting Setup with --no-preflight skips this check)"); });
-                    if (problems.Count > 0) throw new IOException("Setup stopped before downloading anything: fix what is said above, then press Install again.");
+                    if (problems.Count > 0) throw new IOException(L.S("Setup stopped before downloading anything: fix what is said above, then press Install again."));
+                    // a warning (little memory): said, then asked once; No stops before any download. --auto / --hidden
+                    // go on, the warning in the log
+                    foreach (var wn in warnings) Append("[Builder] " + L.S("warning: {0}", wn));
+                    if (warnings.Count > 0 && !auto && !hidden && !(bool)Invoke(new Func<bool>(() => MessageBox.Show(this,
+                            string.Join("\n\n", warnings) + "\n\n" + L.S("Continue anyway?"), Text, MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes)))
+                        throw new OperationCanceledException();
                 }
                 File.WriteAllText(Path.Combine(dir, ".setup-root"), dir);   // (SafeRoot checks its junction by it)
                 string root = SafeRoot(dir);
-                if (root != dir) Append("[Builder] working through " + root + " (a short plain path every compiler takes)");
+                if (root != dir) Append("[Builder] " + L.S("working through {0} (a short plain path every compiler takes)", root));
                 string tools = Path.Combine(root, "tools");
                 toolsDir = tools;
                 Ensure(Fetch.Python, tools); Ensure(Fetch.Git, tools);
@@ -2225,18 +2791,33 @@ class BuilderForm : Form
         Directory.CreateDirectory(tools);
         string zip = Path.Combine(tools, it.Dir + ".zip");
         Append("[Builder] step 0/8 tools");
-        string local = Fetch.Local(it, AppDomain.CurrentDomain.BaseDirectory);
-        if (local != null) { Append("[Builder] " + it.Name + ": the copy next to Setup"); File.Copy(local, zip, true); }
+        string local = Fetch.Local(it, AppDomain.CurrentDomain.BaseDirectory), inKit = kit == null ? null : Kit.Find(kit, it.Sha256);
+        if (local != null) { Append("[Builder] " + L.S("{0}: the copy next to Setup", it.Name)); File.Copy(local, zip, true); }
+        else if (inKit != null) { Append("[Builder] " + L.S("{0}: from the download kit", it.Name)); File.Copy(inKit, zip, true); }
         else
         {
-            Append("[Builder] downloading " + it.Name);
-            Fetch.Download(it, zip, (done, total, rate) => Append(total > 0
-                ? string.Format("[Builder] download {0}: {1}% ({2:0}/{3:0} MB{4})", it.Name, done * 100 / total, done / 1048576.0, total / 1048576.0,
-                                Fetch.RateText(done, total, rate))
-                : string.Format("[Builder] download {0}: {1:0} MB{2}", it.Name, done / 1048576.0, Fetch.RateText(done, 0, rate))), () => stopping,
-                m => Append("[Builder] download " + m));
+            Append("[Builder] " + L.S("downloading {0}", it.Name));
+            try
+            {
+                Fetch.Download(it, zip, (done, total, rate) => Append(total > 0
+                    ? string.Format("[Builder] download {0}: {1}% ({2:0}/{3:0} MB{4})", it.Name, done * 100 / total, done / 1048576.0, total / 1048576.0,
+                                    Fetch.RateText(done, total, rate))
+                    : string.Format("[Builder] download {0}: {1:0} MB{2}", it.Name, done / 1048576.0, Fetch.RateText(done, 0, rate))), () => stopping,
+                    m => Append("[Builder] download " + m));
+            }
+            catch (IOException e)
+            {
+                if (kit == null) throw;
+                throw new IOException(e.Message + L.S(" It is not in the download kit ({0}) either: make the kit again with Setup " +
+                                                      "--download-kit on a PC with internet, or connect this PC.", kit));
+            }
         }
-        Append("[Builder] unpacking " + it.Name);
+        if (makeKit != null)
+        {
+            Kit.Put(makeKit, zip, it);
+            if (it != Fetch.Python && it != Fetch.Git) { File.Delete(zip); return; }   // (the kit's run needs only these two unpacked)
+        }
+        Append("[Builder] " + L.S("unpacking {0}", it.Name));
         Fetch.Unzip(it, zip, dir);
         File.Delete(zip);
         if (after != null) after(dir);
@@ -2277,11 +2858,11 @@ class BuilderForm : Form
         using (var k = Registry.CurrentUser.OpenSubKey(RegKey))
             if (k != null && k.GetValue("AcceptedTerms") as string == TermsVersion) return true;
         var r = MessageBox.Show(
-            "Setup downloads the free tools the build needs into the install folder: Python, MinGit, the Python " +
-            "packages the build uses, and LLVM's compiler and the Vulkan SDK files from this project's GitHub release. " +
-            "When Visual Studio's C++ tools are not installed, it also downloads " +
-            "Microsoft's C++ libraries and the Windows SDK from Microsoft's servers, under the Visual Studio Build " +
-            "Tools license:\n\n" + MsLicense + "\n\nNothing is installed system-wide. Accept and continue?",
+            L.S("Setup downloads the free tools the build needs into the install folder: Python, MinGit, the Python " +
+                "packages the build uses, and LLVM's compiler and the Vulkan SDK files from this project's GitHub release. " +
+                "When Visual Studio's C++ tools are not installed, it also downloads " +
+                "Microsoft's C++ libraries and the Windows SDK from Microsoft's servers, under the Visual Studio Build " +
+                "Tools license:\n\n{0}\n\nNothing is installed system-wide. Accept and continue?", MsLicense),
             Text, MessageBoxButtons.YesNo, MessageBoxIcon.Information);
         if (r != DialogResult.Yes) return false;
         try { using (var k = Registry.CurrentUser.CreateSubKey(RegKey)) k.SetValue("AcceptedTerms", TermsVersion); } catch { }
@@ -2296,23 +2877,65 @@ class BuilderForm : Form
     string Source(string root, string tools)
     {
         string git = Path.Combine(tools, "git", "cmd", "git.exe"), src = Path.Combine(root, "src");
-        string url = source ?? "https://github.com/" + Release.Repo + ".git";
+        string github = "https://github.com/" + Release.Repo + ".git", url = source ?? Kit.Source(kit) ?? github;
         if (!Directory.Exists(Path.Combine(src, ".git")))
         {
-            if (Directory.Exists(src)) Directory.Delete(src, true);   // (a first fetch cut short)
+            if (Directory.Exists(src)) Uninstaller.DeleteTree(src);   // (a first fetch cut short; git's objects are read-only)
             Run(git, string.Format("init --quiet \"{0}\"", src), null);
             Run(git, string.Format("-C \"{0}\" config core.autocrlf false", src), null);
         }
         // only the tag's own files (no history); an update moves the same folder to the newer tag
-        Append("[Builder] fetching the source (" + Release.Tag + ")");
-        try { Run(git, string.Format("-C \"{0}\" fetch --progress --depth 1 --force \"{1}\" \"{2}\"", src, url, Release.Tag), null); }
+        Append("[Builder] " + L.S("fetching the source ({0})", Release.Tag));
+        bool fetched = false;
+        if (source == null && url != github)   // (the download kit's src.git; one made by another Setup lacks this tag)
+        {
+            try
+            {
+                Run(git, string.Format("-C \"{0}\" fetch --progress --depth 1 --force \"{1}\" \"{2}\"", src, url, Release.Tag), null);
+                string got = FetchedCommit(git, src);
+                if (Release.Commit.Length == 0 || got == Release.Commit) fetched = true;
+                else Append("[Builder] " + L.S("The download kit's source for {0} is not the release's (commit {1}): it is not used.", Release.Tag, got));
+            }
+            catch (IOException) { Append("[Builder] " + L.S("The download kit has no source for {0}: from the internet.", Release.Tag)); }
+            if (!fetched) url = github;
+        }
+        try
+        {
+            if (!fetched) Run(git, string.Format("-C \"{0}\" fetch --progress --depth 1 --force \"{1}\" \"{2}\"", src, url, Release.Tag), null);
+        }
         catch (IOException e)   // (git's own last lines are already in the log above)
         {
-            throw new IOException(string.Format("Could not download the source code ({0}) from {1}. Check the internet connection; a firewall, " +
-                "proxy or school / work network can block github.com. Then press Install again. ({2})", Release.Tag, source ?? "github.com", e.Message));
+            throw new IOException(L.S("Could not download the source code ({0}) from {1}. Check the internet connection; a firewall, " +
+                "proxy or school / work network can block github.com. Then press Install again. ({2})", Release.Tag, source ?? "github.com", e.Message) +
+                (kit == null ? "" : L.S(" It is not in the download kit ({0}) either: make the kit again with Setup " +
+                                        "--download-kit on a PC with internet, or connect this PC.", kit)));
         }
+        // only the release's own commit is built: the tag on GitHub or in a download kit could have been moved (a kit
+        // found beside Setup may not be the player's own); Release.Commit is what make_setup.py read off the public tag
+        string commit = FetchedCommit(git, src);
+        if (Release.Commit.Length > 0 && commit != Release.Commit)
+            throw new IOException(L.S("The source fetched for {0} is commit {1}, not the release's ({2}): Setup does not build it.",
+                                      Release.Tag, commit ?? "?", Release.Commit));
         Run(git, string.Format("-C \"{0}\" checkout --quiet --force --detach FETCH_HEAD", src), null);
         return src;
+    }
+
+    // The commit the last fetch into src got, lower case; null when there is none. Through git (FETCH_HEAD^{commit}):
+    // for an annotated tag FETCH_HEAD holds the tag object, not the commit make_setup.py baked
+    public static string FetchedCommit(string git, string src)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(git, string.Format("-C \"{0}\" rev-parse --verify --quiet FETCH_HEAD^{{commit}}", src))
+            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            using (var p = Process.Start(psi))
+            {
+                string o = p.StandardOutput.ReadToEnd().Trim();
+                p.WaitForExit();
+                return p.ExitCode == 0 && Regex.IsMatch(o, "^[0-9a-fA-F]{40}$") ? o.ToLowerInvariant() : null;
+            }
+        }
+        catch { return null; }
     }
 
     // A helper process to its end; its output goes to the log (git's progress moves the bar); a failure throws
@@ -2346,17 +2969,19 @@ class BuilderForm : Form
             if (p.ExitCode != 0)
             {
                 lock (tail) foreach (var ln in tail) Append(ln);
-                throw new IOException(string.Format("{0} failed (exit code {1}); the last lines are below", Path.GetFileName(exe), p.ExitCode));
+                throw new IOException(L.S("{0} failed (exit code {1}); the last lines are below", Path.GetFileName(exe), p.ExitCode));
             }
         }
     }
 
-    void RunBuilder(string src, string python, string pyArgs, Dictionary<string, string> env, string extra = "")
+    void RunBuilder(string src, string python, string pyArgs, Dictionary<string, string> env, string extra = "", string args = null)
     {
         string fw = firmware.FilePath == null ? "" : " \"" + firmware.FilePath.TrimEnd('\\') + "\"";   // (optional)
         if (update.FilePath != null) fw += " --update \"" + update.FilePath + "\"";   // (optional: builds 1.4.3)
-        var psi = new ProcessStartInfo(python, string.Format("{0}\"{1}\" \"{2}\" \"{3}\"{4} --gui-pid {5}{6}",   // (it ends with us)
-            pyArgs, Path.Combine(src, "tools", "builder", "builder.py"), dump.FilePath, keys.FilePath, fw,
+        // (args: in place of the dump, keys, firmware and update: the download kit's own run)
+        var psi = new ProcessStartInfo(python, string.Format("{0}\"{1}\" {2} --gui-pid {3}{4}",   // (it ends with us)
+            pyArgs, Path.Combine(src, "tools", "builder", "builder.py"),
+            args ?? string.Format("\"{0}\"{1}{2}", dump.FilePath, keys.FilePath == null ? "" : " \"" + keys.FilePath + "\"", fw),
             Process.GetCurrentProcess().Id, extra))
         {
             WorkingDirectory = src, UseShellExecute = false, CreateNoWindow = true,
@@ -2365,6 +2990,7 @@ class BuilderForm : Form
         };
         psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
         psi.EnvironmentVariables["PYTHONUTF8"] = "1";
+        if (kit != null) psi.EnvironmentVariables["NXR_KIT"] = kit;   // (tools/builder/kit.py: every download looks there first)
         if (env != null) foreach (var kv in env) psi.EnvironmentVariables[kv.Key] = kv.Value;
         try
         {
@@ -2379,15 +3005,16 @@ class BuilderForm : Form
         catch (Exception ex)
         {
             proc = null; Finish(false);
-            status.Step = "Python not found";
-            status.Add("Could not start Python (" + python + "): " + ex.Message);
-            if (repo != null) status.Add("Install Python 3.11 or newer from python.org, then try again.");
+            status.Step = L.S("Python not found");
+            status.Add(L.S("Could not start Python ({0}): {1}", python, ex.Message));
+            if (repo != null) status.Add(L.S("Install Python 3.11 or newer from python.org, then try again."));
         }
     }
 
     void Finish(bool ok)
     {
         status.Running = false; status.Failed = !ok;
+        if (makeKit != null) { FinishKit(ok); return; }
         Lock(false);
         if (ok && launcher != null && File.Exists(launcher))
         {
@@ -2395,20 +3022,20 @@ class BuilderForm : Form
             // (Controlled folder access blocks an unknown program's shortcut on the desktop: then Play is the way in)
             // (Wine: a desktop shortcut lands in the prefix's own Desktop folder, which no Linux desktop shows: Steam's
             // "Add a Non-Steam Game" with the launcher is the way in, README)
-            status.Step = Wine.Active ? "Done: press Play, or add " + Wine.LinuxPath(launcher) + " to Steam (README, Linux and Steam Deck)"
-                        : noShortcut || Shortcut(launcher) ? "Done: the game is on your desktop"
-                        : "Done: press Play (Windows did not let Setup put a shortcut on the desktop)";
-            status.Value = 1f; build.Text = "Play";
+            status.Step = Wine.Active ? L.S("Done: press Play, or add {0} to Steam (README, Linux and Steam Deck)", Wine.LinuxPath(launcher))
+                        : noShortcut || Shortcut(launcher) ? L.S("Done: the game is on your desktop")
+                        : L.S("Done: press Play (Windows refused the desktop shortcut)");
+            status.Value = 1f; build.Text = L.S("Play");
         }
         else
         {
             launcher = null;
-            status.Step = stopping ? "Stopped" : ok ? "Done" : "Stopped: see the last lines below";
+            status.Step = stopping ? L.S("Stopped") : ok ? L.S("Done") : L.S("Stopped: see the last lines below");
             string gone = !ok && !stopping && toolsDir != null ? RemovedTool(toolsDir) : null;
             if (gone != null)
-                Append("[Builder] Windows Security (or another antivirus) seems to have removed " + gone + ". Restore it in Windows Security > " +
-                       "Virus & threat protection > Protection history (Allow), then press Install again: Setup fetches what is missing.");
-            build.Text = "Try again";
+                Append("[Builder] " + L.S("Windows Security (or another antivirus) seems to have removed {0}. Restore it in Windows Security > " +
+                                          "Virus & threat protection > Protection history (Allow), then press Install again: Setup fetches what is missing.", gone));
+            build.Text = L.S("Try again");
         }
         status.Invalidate();
         build.Enabled = true;
@@ -2427,7 +3054,7 @@ class BuilderForm : Form
                 File.Copy(Application.ExecutablePath, copyTo, true);
             Uninstaller.Register(root, copyTo, launcher);
         }
-        catch (Exception e) { Append("[Builder] Windows' Apps list entry not written (" + e.Message + "): Setup --uninstall still works"); }
+        catch (Exception e) { Append("[Builder] " + L.S("Windows' Apps list entry not written ({0}): Setup --uninstall still works", e.Message)); }
     }
 
     void Play()
@@ -2444,20 +3071,25 @@ class BuilderForm : Form
                 Process.Start(new ProcessStartInfo(launcher) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(launcher) });
             }
         }
-        catch (Exception ex) { status.Add("Could not start the game: " + ex.Message); }
+        catch (Exception ex) { status.Add(L.S("Could not start the game: {0}", ex.Message)); }
     }
 
     // The desktop shortcut, pointed at the newest build (an update re-points it; saves and settings live in the user's
-    // profile, not in the build folder, so they carry over)
-    static bool Shortcut(string target)
+    // profile, not in the build folder, so they carry over). desktop: the user's (test_uninstall.cs: a temp folder)
+    internal static bool Shortcut(string target, string desktop = null)
     {
         try
         {
             // (a 1.4.3 build, ...-v143 folder, gets its own shortcut: the 1.0.0 one keeps pointing at 1.0.0)
             var v = Regex.Match(Path.GetFileName(Path.GetDirectoryName(target)), @"-v(\d)(\d)(\d)(-beta)?$");
             string name = Release.Product + (v.Success ? string.Format(" {0}.{1}.{2}", v.Groups[1], v.Groups[2], v.Groups[3]) : "");
-            string lnk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), name + ".lnk");
+            string lnk = Path.Combine(desktop ?? Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), name + ".lnk");
             Win32.SaveShortcut(lnk, target, Path.GetDirectoryName(target));
+            // and "<name> - Settings": the same launcher with --settings, its settings window before the game starts
+            // (rival034-preplay; Setup makes no Start-menu entries, so this is how players find it). Uninstall removes
+            // it with the other: it is named after the game and points into the install folder (Uninstaller.Shortcuts)
+            try { Win32.SaveShortcut(Path.Combine(Path.GetDirectoryName(lnk), name + " - Settings.lnk"), target, Path.GetDirectoryName(target), "--settings"); }
+            catch { }   // (the game's own shortcut is what counts; Ctrl held at Play opens the same window)
             return File.Exists(lnk);
         }
         catch { return false; }
@@ -2544,7 +3176,8 @@ class BuilderForm : Form
         string title = Release.Product + " Setup";
         if (string.IsNullOrEmpty(root) || !Directory.Exists(root))
         {
-            MessageBox.Show("Nothing to uninstall: no install folder was found" + (string.IsNullOrEmpty(root) ? "." : " at " + root + "."), title);
+            MessageBox.Show(string.IsNullOrEmpty(root) ? L.S("Nothing to uninstall: no install folder was found.")
+                                                       : L.S("Nothing to uninstall: no install folder was found at {0}.", root), title);
             try { Registry.CurrentUser.DeleteSubKeyTree(Uninstaller.AppsKey, false); } catch { }
             return 1;
         }
@@ -2556,24 +3189,24 @@ class BuilderForm : Form
         string why = Uninstaller.NotOurs(root);
         if (why != null)
         {
-            MessageBox.Show("Nothing was removed: " + why + ", so it does not look like a folder Setup installed into.", title,
+            MessageBox.Show(L.S("Nothing was removed: {0}, so it does not look like a folder Setup installed into.", why), title,
                             MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return 1;
         }
         if (Process.GetProcessesByName("totk").Length > 0 || Process.GetProcessesByName("TotK Launcher").Length > 0)
         {
-            MessageBox.Show("A game window is open (TotK Launcher or totk.exe, from any folder). Close it, then uninstall again.", title,
+            MessageBox.Show(L.S("A game window is open (TotK Launcher or totk.exe, from any folder). Close it, then uninstall again."), title,
                             MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return 1;
         }
-        if (MessageBox.Show(string.Format("Uninstall {0} from {1}?\n\nThis removes the game build, its tools, the desktop shortcut, and the " +
-                                          "game's caches and logs (shared by every build of the game on this PC). Your dump and keys are not touched.", Release.Product, root), title,
+        if (MessageBox.Show(L.S("Uninstall {0} from {1}?\n\nThis removes the game build, its tools, the desktop shortcut, and the " +
+                                "game's caches and logs (shared by every build of the game on this PC). Your dump and keys are not touched.", Release.Product, root), title,
                             MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
             return 2;   // (the player said No)
         string roaming = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "nxrecomp", "TotK-engine");
         string local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "nxrecomp", "TotK-engine");
         bool saves = Directory.Exists(roaming) &&
-            MessageBox.Show("Also delete your saves, settings and mods?\n\n" + roaming + "\n\nNo keeps them: a later install finds them again.",
+            MessageBox.Show(L.S("Also delete your saves, settings and mods?\n\n{0}\n\nNo keeps them: a later install finds them again.", roaming),
                             title, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
         var parents = new[] { Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), Path.GetPathRoot(Environment.SystemDirectory) }
             .Select(x => Path.Combine(x, FolderName));
@@ -2581,13 +3214,13 @@ class BuilderForm : Form
                                 local, saves ? roaming : null, Uninstaller.ShortcutTarget, keepSelf);
         try { Registry.CurrentUser.DeleteSubKeyTree(RegKey, false); } catch { }
         try { Registry.CurrentUser.DeleteSubKeyTree(Uninstaller.AppsKey, false); } catch { }
-        if (r.Refused != null) { MessageBox.Show("Nothing was removed: " + r.Refused + ".", title); return 1; }
-        string msg = string.Format("{0} is uninstalled: about {1:0.0} GB freed.", Release.Product, Math.Max(0, r.Freed) / 1e9);
-        if (!saves && Directory.Exists(roaming)) msg += "\n\nYour saves and settings stay in " + roaming + ".";
-        if (keepSelf != null) msg += "\n\nThis Setup (" + keepSelf + ") is still running, so it stays: delete " + root + " once this window is closed.";
+        if (r.Refused != null) { MessageBox.Show(L.S("Nothing was removed: {0}.", r.Refused), title); return 1; }
+        string msg = L.S("{0} is uninstalled: about {1:0.0} GB freed.", Release.Product, Math.Max(0, r.Freed) / 1e9);
+        if (!saves && Directory.Exists(roaming)) msg += "\n\n" + L.S("Your saves and settings stay in {0}.", roaming);
+        if (keepSelf != null) msg += "\n\n" + L.S("This Setup ({0}) is still running, so it stays: delete {1} once this window is closed.", keepSelf, root);
         var others = r.Kept.Where(k => keepSelf == null || !string.Equals(k, keepSelf, StringComparison.OrdinalIgnoreCase)).ToList();
-        if (others.Count > 0) msg += "\n\nLeft in place (not made by Setup):\n" + string.Join("\n", others.Take(6)) + (others.Count > 6 ? "\n..." : "");
-        if (r.Failed.Count > 0) msg += "\n\nCould not remove (in use?):\n" + string.Join("\n", r.Failed.Take(4)) + (r.Failed.Count > 4 ? "\n..." : "");
+        if (others.Count > 0) msg += "\n\n" + L.S("Left in place (not made by Setup):") + "\n" + string.Join("\n", others.Take(6)) + (others.Count > 6 ? "\n..." : "");
+        if (r.Failed.Count > 0) msg += "\n\n" + L.S("Could not remove (in use?):") + "\n" + string.Join("\n", r.Failed.Take(4)) + (r.Failed.Count > 4 ? "\n..." : "");
         MessageBox.Show(msg, title, MessageBoxButtons.OK, r.Failed.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
         return r.Failed.Count == 0 ? 0 : 1;
     }
@@ -2596,6 +3229,7 @@ class BuilderForm : Form
     static void Main()
     {
         if (Environment.GetCommandLineArgs().Skip(1).FirstOrDefault() == "--vkcheck") { Environment.Exit(Preflight.VulkanChild()); return; }
+        L.Use(L.Pick(Environment.GetCommandLineArgs().Skip(1), System.Globalization.CultureInfo.CurrentUICulture));   // (before any text)
         try { SetProcessDpiAwareness(1); } catch { SetProcessDPIAware(); }   // DPI aware: drawn at the real resolution, sharp text
         if (Environment.GetCommandLineArgs().Contains("--uninstall")) { Environment.Exit(UninstallMain(Environment.GetCommandLineArgs())); return; }
         if (Environment.GetCommandLineArgs().Contains("--play") && PlayInstalled()) return;   // (before the job: the game outlives us)

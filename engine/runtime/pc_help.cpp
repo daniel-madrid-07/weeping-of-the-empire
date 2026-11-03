@@ -32,7 +32,12 @@ const Help k_help[] = {
                                        "up.")},
     {"display.fps_cap", PC_T("The most frames per second the game shows. Higher is smoother and costs more GPU and CPU; 30 is "
                              "the Switch's. Unlocked follows the monitor's refresh rate (240 at most); steady holds a rate "
-                             "the scene can keep.")},
+                             "the scene can keep. For an even picture pick a cap that divides the refresh rate (30 or 60 "
+                             "on 60 Hz, 40 on 120 Hz), or turn VRR on. Steam Deck: 60 (OLED: 90) at first; if it is not "
+                             "held, lower it to 40 with the screen at 40 Hz (Quick Access > Performance).")},
+    {"display.steady_floor", PC_T("Frame rate \"Unlocked, steady\" only: the lowest rate it holds. 30 (default) suits most "
+                                  "PCs. On one that cannot hold 30, 20 or 15 show every frame for the same time (3 or 4 "
+                                  "refreshes on 60 Hz) instead of an uneven 15-20.")},
     {"display.vsync", PC_T("On (default): no tearing. Off: slightly less input latency, with tearing lines.")},
     {"display.vrr", PC_T("Variable refresh rate (G-SYNC, FreeSync): the monitor waits for each frame, smooth below its "
                          "refresh rate and without tearing. Needs a VRR monitor with VRR on in Windows or the driver.")},
@@ -57,13 +62,19 @@ const Help k_help[] = {
                                          "chosen, to hold the frame rate. Off keeps the picture sharp all the time; On is "
                                          "smoother on a slower GPU.")},
     {"graphics.native_ui", PC_T("Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the "
-                                "game's 1080p stretched. Sharper text for a little GPU.")},
+                                "game's 1080p stretched. Sharper text for a little GPU. Off by default for now: at some "
+                                "resolutions it can show broken text (being fixed).")},
     {"graphics.dlss", PC_T("Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: "
                            "NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR: any GPU. All "
                            "cost some GPU; Off is the game's own.")},
     {"graphics.frame_gen", PC_T("Generated frames between the real ones make motion look smoother, but the game itself does "
                                 "not run faster and input latency rises a little. DLSS x2: RTX 40 and newer, x3 and x4: RTX "
                                 "50; FSR x2: any GPU. Best when the game already runs well.")},
+    {"graphics.frame_gen_pace", PC_T("Smooth keeps the frames shown in step with the monitor's refresh. Maximum fps adds the "
+                                     "generated frames to every real frame the PC makes, even past the refresh rate: more "
+                                     "frames than the screen shows (the fps readout counts them all), for VRR panels or low "
+                                     "latency; Smooth looks steadier on a fixed refresh. With V-sync off the picture can "
+                                     "tear.")},
     {"graphics.upscaler_3d", PC_T("How the 3D scene is scaled up to the output: Bicubic (the port's) or FSR 1 (the game's "
                                   "own). Matters only below 100 % render resolution; either costs little.")},
     {"graphics.scene_upscaler", PC_T("The filter that scales the 3D scene when the render resolution is not 100 %: "
@@ -78,6 +89,10 @@ const Help k_help[] = {
                                  "GPU; 16x suits most GPUs. The game's: its own setting.")},
     {"graphics.lod_bias", PC_T("Which texture detail level is used; 0 is the game's. Below 0 is sharper but can shimmer; "
                                "above 0 is blurrier and can break textures (red grass). Not a quality slider: leave it at 0.")},
+    {"graphics.compact_textures", PC_T("For graphics cards with 4 GB of video memory or less: the textures take a "
+                                       "quarter of the memory, so the game no longer runs out of it (stutters, blurry "
+                                       "or late textures). Fine colour detail gets a little softer. Automatic turns it "
+                                       "on only on such cards.")},
     {"graphics.shadow_scale", PC_T("The resolution of the renderer's shadow maps: 1x is the Switch's, 2x (default) sharper, "
                                    "3x and 4x sharper still for more GPU time and memory.")},
     {"graphics.soft_shadows", PC_T("Sun shadows grow softer the farther they fall from what casts them, as in real light. Off "
@@ -111,11 +126,14 @@ const Help k_help[] = {
     {"display.hdr_paper", PC_T("How bright ordinary white (menus, the sky) is in HDR. Raise it if the picture looks dim, "
                                "lower it if it is too bright.")},
     // Graphics > Game patches
-    {"graphics.aspect_ratio", PC_T("Wide screens: The window's draws a 21:9 or 32:9 picture with a wider view on such a "
-                                   "window or monitor; 16:9 keeps the game's own. A wider picture costs more GPU.")},
-    {"graphics.hud_layout", PC_T("On 21:9 or 32:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a "
-                                 "very wide screen). Nothing changes at 16:9.")},
-    {"graphics.cutscene_aspect", PC_T("On 21:9 or 32:9: real-time cutscenes wide like the rest of the game, or the original "
+    {"graphics.aspect_ratio", PC_T("The window's (the default): on a 16:10, 21:9, 32:9 or 48:9 window or monitor the "
+                                   "picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 "
+                                   "among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9: that shape "
+                                   "whatever the window. A new shape's layouts are made at its first start (about "
+                                   "30 s, once). A wider picture costs more GPU.")},
+    {"graphics.hud_layout", PC_T("On 21:9, 32:9 or 48:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a "
+                                 "very wide screen). Nothing changes at 16:9. Automatic (the default): the middle on 48:9, the edges otherwise.")},
+    {"graphics.cutscene_aspect", PC_T("On 21:9, 32:9 or 48:9: real-time cutscenes wide like the rest of the game, or the original "
                                       "16:9 with bars at the sides.")},
     {"graphics.fov", PC_T("Widens or narrows the camera's view (1 = the game's). Wider shows more of the world and costs some "
                           "GPU and CPU.")},
@@ -126,6 +144,9 @@ const Help k_help[] = {
                                         "more GPU.")},
     {"graphics.shadow_fixed", PC_T("Fixed keeps the sun's shadow map at its largest size: steadier, sharper leaf shadows for "
                                    "some GPU. The game's changes its size with the view.")},
+    {"graphics.shadow_reach", PC_T("Moves the lines where the sun's sharp near shadows hand over to coarser ones further away "
+                                   "(1 = the game's, 2 = twice as far). Near shadows get a little softer: raise Shadow "
+                                   "resolution with it. Costs a little GPU and CPU.")},
     {"graphics.shadow_distance", PC_T("How far the sharp shadows reach. Higher looks better in the distance and costs GPU.")},
     {"graphics.fog_distance", PC_T("Pushes the distance fog back: clearer far mountains. Higher shows more and costs some "
                                    "GPU.")},
@@ -178,6 +199,8 @@ const Help k_help[] = {
                                   "one entry.")},
     {"controls.mouse_map", PC_T("On the map the mouse pans, the wheel zooms, a left click places a pin and a right click goes "
                                 "back.")},
+    {"controls.mouse_map_speed", PC_T("How far the map moves under the reticle for the mouse's motion: 1 = like the desktop "
+                                      "pointer, 2 = twice as far.")},
     {"controls.walk_speed", PC_T("With the walk key held (Alt in the PC layout), how far the movement keys push the stick: "
                                  "lower walks slower; 1 is as without the key.")},
     {"controls.key_min_hold_ms", PC_T("How long a quick tap of W, A, S or D keeps Link moving, so he takes a step instead of "
@@ -191,6 +214,12 @@ const Help k_help[] = {
     {"controls.pad_labels", PC_T("A non-Nintendo pad's face buttons: by position (the Switch layout: the right button "
                                  "confirms) or by label (Xbox A confirms).")},
     {"controls.rumble", PC_T("Controller vibration: off, normal, or stronger (x2 to x4).")},
+    {"controls.rumble_curve", PC_T("How light rumbles feel next to strong ones: below 1 light ones come through stronger, "
+                                   "above 1 only strong ones do. 1 = the game's own.")},
+    {"controls.rumble_triggers", PC_T("Xbox One / Series pads: the trigger motors buzz with the game's rumble. Off by "
+                                      "default (the Switch pad has none).")},
+    {"controls.stick_camera_speed", PC_T("How fast the right stick turns the camera: 1 = the game's own, 2 = twice as "
+                                         "fast. The mouse keeps its own sensitivity.")},
     {"controls.gyro", PC_T("A pad's motion controls (aiming, some puzzles). Off ignores the gyro.")},
     {"controls.gyro_scale", PC_T("How far motion aim turns for a turn of the pad: 1 = the pad's own, 2 = twice as far.")},
     {"controls.deadzone_left", PC_T("How far the left stick must move before it counts. Raise it if Link moves with the stick "
@@ -198,9 +227,10 @@ const Help k_help[] = {
     {"controls.deadzone_right", PC_T("How far the right stick must move before it counts. Raise it if the camera turns with "
                                      "the stick at rest; lower it for finer aiming. 0 = the pad's own.")},
     // Game
-    {"game.language", PC_T("The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Simplified "
-                           "Chinese; Brazilian Portuguese on a Portuguese Windows). Automatic: Windows' language if the "
-                           "game has it, else English.")},
+    {"game.language", PC_T("The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Brazilian "
+                           "Portuguese, Simplified Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the "
+                           "1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' "
+                           "language if the game has it, else English.")},
     {"game.skip_opening", PC_T("A new game skips the opening and starts on the Great Sky Island. F2 or Minus on the title "
                                "screen also switch it.")},
     {"game.console_mode", PC_T("Docked (default) or handheld: handheld renders at the Switch's lower handheld resolution "
@@ -214,6 +244,11 @@ const Help k_help[] = {
                                 "sent anywhere.")},
     {"launcher.auto_update", PC_T("Checks GitHub for a newer version when the game starts (at most once a day); asks first if "
                                   "the update rebuilds the game.")},
+    {"graphics.safe_mode", PC_T("For a game that crashes or hangs: the renderer without its faster paths, DLSS, FSR and "
+                                "frame generation, and without the driver paths some GPUs crash in. Slower. At the next "
+                                "start.")},
+    {"game.discord", PC_T("Shows \"Playing\" and the time played on your Discord profile while Discord runs. Nothing else "
+                          "is sent.")},
 };
 }  // namespace
 

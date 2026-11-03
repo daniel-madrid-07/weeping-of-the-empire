@@ -20,6 +20,10 @@
 #include "../shim/las.h"
 #include "vk.h"
 #include <vulkan/vulkan_win32.h>   // (VK_EXT_full_screen_exclusive)
+#ifdef _WIN32  // (present.c is built on Linux too: linux/windows.h has no DWM)
+#include <dwmapi.h>                  // (DWM_TIMING_INFO only: DwmGetCompositionTimingInfo is loaded at run time)
+#endif
+#include "composed_check.h"           // (cmp_classify: the composed-window verdict, CPU-tested)
 #include "present.h"
 
 // ================================================================== settings
@@ -379,6 +383,29 @@ static void pace_report_locked(uint64_t now) {
     last = now;
 }
 
+// ================================================================== composed window check (one log line) Whether the desktop
+// composes the game window (DWM: overlays, overlapping windows, a window across monitors, some multi-monitor desktops)
+// instead of flipping it to the screen on its own: composed, the VRR row's FIFO gets neither VRR nor the monitor's rate and
+// holds every present for the compositor's refresh. Windows), how long the render thread was held by the presentation engine
+// per present (window image acquire + the queued-frame limit), and the verdict of composed_check.h (FIFO only: on screen no
+// faster than 1.5 monitor periods, under 3/4 of its rate, held a quarter of the interval, 75 % of the intervals within 0.6 ms
+// of 1-4 compositor periods CPU test tools/engine/test_composed_check.py). Not seen: presents of the FG present thread
+// (DLSS-G on: vk_present_done does not run).
+static uint32_t g_cmp_iv[256];             // on-screen intervals, us (pw_thread)
+static atomic_uint g_cmp_ivn;
+static uint64_t g_cmp_last_seen;           // (pw_thread)
+static uint64_t g_cmp_blk_ns, g_cmp_pres;  // render thread: held by the presentation engine; presents
+static atomic_int g_cmp_done;              // the line was logged: nothing is measured any more
+static void cmp_seen(uint64_t t) {
+    if (atomic_load(&g_cmp_done)) return;
+    if (g_cmp_last_seen && t - g_cmp_last_seen < 200000000ull) {
+        const unsigned i = atomic_fetch_add(&g_cmp_ivn, 1);
+        g_cmp_iv[i & 255] = (uint32_t)((t - g_cmp_last_seen) / 1000);
+    }
+    g_cmp_last_seen = t;
+}
+static void cmp_check(void);
+
 // ================================================================== present wait (display times, queued-frame limit)
 typedef struct { uint64_t id, t_present; VkSwapchainKHR sc; } Pend;
 enum { PEND = 64 };
@@ -393,9 +420,11 @@ static CONDITION_VARIABLE g_pw_cv = CONDITION_VARIABLE_INIT;
 static void display_seen(uint64_t id, uint64_t t, uint64_t t_present) {
     AcquireSRWLockExclusive(&g_st_lock);
     if (s_disp.last && t - s_disp.last < 500000ull) { w_replaced++; s_replaced++; }   // completed with the next one: never shown
-    else stream_add(&s_disp, t);
-    w_lat_sum += (t - t_present) / 1e6;
-    w_lat_n++;
+    else {   // (a replaced one has no present -> display time of its own: frame generation's 'Maximum fps' replaces many)
+        stream_add(&s_disp, t);
+        w_lat_sum += (t - t_present) / 1e6;
+        w_lat_n++;
+    }
     ReleaseSRWLockExclusive(&g_st_lock);
     log_row("d,%llu,%llu\n", (unsigned long long)id, (unsigned long long)t);
 }
@@ -425,7 +454,7 @@ VkResult vk_present_acquire(VkSemaphore sem, uint64_t timeout_ns, uint32_t *imag
         vk_swapchain_unlock();
         const uint64_t el = SDL_GetTicksNS() - t0;
         if ((r != VK_TIMEOUT && r != VK_NOT_READY) || el >= timeout_ns) {
-            if (tries) vk_present_jit_wait(el);   // (waited for a window image: FIFO without the queued limit, low latency)
+            if (tries) vk_present_jit_wait(el), g_cmp_blk_ns += el;   // (waited for a window image: FIFO without the queued limit, low latency)
             return r;
         }
         wait_half_ms(timer);
@@ -483,7 +512,7 @@ static DWORD WINAPI pw_thread(void *arg) {
             g_pend_tail++;
             if (e.id > g_shown_id) g_shown_id = e.id;
             seen = r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
-            if (seen) g_seen_ns = t;
+            if (seen) g_seen_ns = t, cmp_seen(t);
         }
         WakeAllConditionVariable(&g_pw_cv);
         ReleaseSRWLockExclusive(&g_pw_lock);
@@ -581,7 +610,8 @@ static void present_limits(uint64_t id, uint64_t seq, int extra) {
                 g_lim_off_ns = 0;
             } else mq = 0;
         }
-        for (uint64_t t0 = SDL_GetTicksNS(); mq > 0 && g_last_id - g_shown_id >= (uint64_t)mq;) {
+        const uint64_t t_q = SDL_GetTicksNS();
+        for (uint64_t t0 = t_q; mq > 0 && g_last_id - g_shown_id >= (uint64_t)mq;) {
             uint64_t el = SDL_GetTicksNS() - t0;
             if (el >= 100000000ull) {   // (minimised, occluded: never block a frame for long)
                 static int warned;
@@ -594,6 +624,7 @@ static void present_limits(uint64_t id, uint64_t seq, int extra) {
             SleepConditionVariableSRW(&g_pw_cv, &g_pw_lock, (DWORD)((100000000ull - el) / 1000000ull) + 1, 0);
         }
         ReleaseSRWLockExclusive(&g_pw_lock);
+        if (!extra) g_cmp_blk_ns += SDL_GetTicksNS() - t_q;   // (the render thread's presents: held for the screen)
     }
     // frames in flight: the GPU work of the frame fif - 1 back has to be done before the next frame starts
     static uint64_t fseq[8], fn;
@@ -605,6 +636,8 @@ static void present_limits(uint64_t id, uint64_t seq, int extra) {
 void vk_present_done(uint64_t frame, uint64_t id, uint64_t seq, VkResult r, uint64_t t_submit, uint64_t t_paced) {
     present_record(frame, id, r, t_submit, t_paced, g_vk.swapchain);
     present_limits(id, seq, 0);
+    g_cmp_pres++;
+    cmp_check();
 }
 
 // device.c backend_present: a frame that was not shown (held, minimised)
@@ -645,6 +678,49 @@ const void *vk_present_swapchain_pnext(void) {
     if (!g_ll_ext) return fse;
     g_sc_lat.pNext = fse;   // (every swapchain latency-capable: the setting turns the sleep on and off live)
     return &g_sc_lat;
+}
+
+// The desktop compositor's refresh (DwmGetCompositionTimingInfo, loaded at run time; 0: unknown, and always off Windows)
+static double dwm_hz(void) {
+#ifndef _WIN32
+    return 0;
+#else
+    static HRESULT (WINAPI *get)(HWND, DWM_TIMING_INFO *);
+    static int tried;
+    if (!tried++) {
+        HMODULE m = LoadLibraryW(L"dwmapi.dll");
+        if (m) get = (HRESULT (WINAPI *)(HWND, DWM_TIMING_INFO *))(void *)GetProcAddress(m, "DwmGetCompositionTimingInfo");
+    }
+    DWM_TIMING_INFO ti = {.cbSize = sizeof ti};
+    return get && get(NULL, &ti) == S_OK && ti.rateRefresh.uiDenominator ? (double)ti.rateRefresh.uiNumerator / ti.rateRefresh.uiDenominator : 0;
+#endif
+}
+int vi_window_refresh_hz(void);   // hle_vi.cpp: the window's monitor refresh (0: unknown)
+bool vk_sc_vrr_row(void);         // device.c: the swapchain was made with the VRR row on
+static void cmp_check(void) {   // (render thread, vk_present_done)
+    static uint64_t t0;
+    if (atomic_load(&g_cmp_done)) return;
+    const uint64_t now = SDL_GetTicksNS();
+    if (!t0 || now - t0 > 10000000000ull) { t0 = now, g_cmp_blk_ns = g_cmp_pres = 0; atomic_store(&g_cmp_ivn, 0); return; }
+    if (now - t0 < 2000000000ull) return;
+    const double secs = (now - t0) / 1e9, blk_ms = g_cmp_blk_ns / 1e6;
+    const uint64_t pres = g_cmp_pres;
+    unsigned n = atomic_exchange(&g_cmp_ivn, 0);
+    t0 = now, g_cmp_blk_ns = g_cmp_pres = 0;
+    if (n > 256) n = 256;
+    if (g_excl_on || !g_pw || n < 60 || !pres) return;   // (exclusive fullscreen is never composed; too few presents yet)
+    atomic_store(&g_cmp_done, 1);
+    const int hz = vi_window_refresh_hz(), mode = atomic_load(&g_mode_active);
+    const double dwm = dwm_hz();
+    const CmpVerdict v = cmp_classify(g_cmp_iv, n, secs, pres, blk_ms, hz > 0 ? hz : 1, dwm);
+    const bool fifo = mode == VK_PRESENT_MODE_FIFO_KHR;
+    LOG("[present] composition check: %s, VRR row %s; on screen every %.2f ms or more (10th percentile), %.0f presents/s; "
+        "monitor %d Hz, desktop compositor %.1f Hz (%u of %u intervals on its grid); render thread held %.2f ms a present by "
+        "the presentation engine: %s\n",
+        mode_name(mode), vk_sc_vrr_row() ? "on" : "off", v.p10_ms, v.rate, hz, dwm, v.grid, v.n, v.held_ms,
+        !fifo ? "not judged (not FIFO)" : hz < 90 ? "not judged (monitor under 90 Hz)"
+        : v.comp ? "COMPOSED by the desktop: FIFO held at its rate, no VRR (exclusive fullscreen, F10 Window mode, avoids it)"
+                 : "not composed-looking");
 }
 
 // ================================================================== low latency (VK_NV_low_latency2)
@@ -854,9 +930,11 @@ void vk_present_latency_sleep(void) {
 //  - nothing waits more than one slot after it arrives (so a schedule ahead of the frames cannot hold every real frame
 //    for a whole interval, 34 ms at 30 fps);
 //  - any other present (FG paused: a menu, no scene; the start screen) at once.
-// The queued-frame and frames-in-flight limits stay on the render thread (present_limits after the push). Opt-in,
-// TOTK_FG_PRESENT_THREAD=1: in seven exclusive rounds it matched the inline presenter's latency but not its placement
-// (Kakariko 4-7 % of generated frames bunched against 2-4 %).
+// The queued-frame and frames-in-flight limits stay on the render thread (present_limits after the push). On by default
+// since 2026-11-03 (TOTK_FG_PRESENT_THREAD=0: the inline presenter): inline, the render thread slept to each generated
+// frame's due time and delayed the next real frame. Earlier it was opt-in: in seven exclusive rounds at lower rates it
+// matched the inline presenter's latency but not its placement (Kakariko 4-7 % of generated frames bunched against 2-4
+// %). One queue in the family: it shares the render thread's (vk_queue_lock).
 typedef struct {
     VkSwapchainKHR sc;
     VkSemaphore wait;
@@ -943,7 +1021,9 @@ static DWORD WINAPI pq_thread(void *arg) {
                                .pWaitSemaphores = &e.wait, .swapchainCount = 1, .pSwapchains = &e.sc, .pImageIndices = &e.img};
         ll_mark(e.ll_frame, VK_LATENCY_MARKER_PRESENT_START_NV);
         vk_swapchain_lock();
+        vk_queue_lock();   // (g_pq_shared: the render thread's queue)
         VkResult r = vkQueuePresentKHR(g_pq_queue, &pi);
+        vk_queue_unlock();
         vk_swapchain_unlock();
         ll_mark(e.ll_frame, VK_LATENCY_MARKER_PRESENT_END_NV);
         present_record(e.frame, e.id, r, e.t_submit, t_paced, e.sc);
@@ -972,19 +1052,26 @@ static DWORD WINAPI pq_thread(void *arg) {
     return 0;
 }
 
-// device.c create_device: the second queue of the graphics family, asked for with TOTK_FG_PRESENT_THREAD=1 (VK_NULL_HANDLE:
-// none; FG then presents inline, the default)
+// device.c create_device: the second queue of the graphics family (VK_NULL_HANDLE: none; FG then presents inline). On by
+// default since 2026-11-03: inline, the render thread slept to each generated frame's due time, and that wait delayed
+// the next real frame. TOTK_FG_PRESENT_THREAD=0: inline, as before.
 bool vk_present_queue_wanted(void) {
     const char *e = getenv("TOTK_FG_PRESENT_THREAD");
-    return e && *e == '1';
+    return !(e && *e == '0');
 }
-void vk_present_queue_init(VkQueue q) {
+// shared: q is g_vk.queue (no second queue in the family, AMD's usual): the thread presents only in frame generation's
+// 'Maximum fps' (mailbox / immediate: a present returns at once, so the queue lock it holds never waits on a vblank), and
+// every use of the queue takes vk_queue_lock (device.c)
+static bool g_pq_shared;
+void vk_present_queue_init(VkQueue q, bool shared) {
     if (!q || !vk_present_queue_wanted()) return;
-    g_pq_queue = q;
-    LOG("[present] FG present thread on (TOTK_FG_PRESENT_THREAD=1)\n");
+    g_pq_queue = q, g_pq_shared = shared;
+    LOG("[present] FG present thread ready (presents with frame generation; TOTK_FG_PRESENT_THREAD=0: inline)%s\n",
+        shared ? "; on the render queue (one in its family): with frame generation's 'Maximum fps' on mailbox / immediate only"
+               : "; on its own queue (the family's second)");
     CloseHandle(CreateThread(NULL, 0, pq_thread, NULL, 0, NULL));
 }
-bool vk_present_queue_on(void) { return g_pq_queue && vk_ngx_fg_on(); }
+bool vk_present_queue_on(void) { return g_pq_queue && vk_ngx_fg_on() && (!g_pq_shared || vk_fg_max_free()); }
 // device.c vk_frame_end instead of vkQueuePresentKHR (its submit already in the queue: vkq_drain before)
 void vk_present_queue_push(uint32_t img, VkSemaphore wait, uint64_t id, uint64_t frame, uint64_t seq, uint64_t t_submit,
                            int kind, int k, int n) {

@@ -18,7 +18,6 @@
 #include <cstring>
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 constexpr u64 kBar = 0x1a8, kTarget = 0x1d0, kFrame = 0x20;
 
 void stf(u64 a, float v) { u32 w; memcpy(&w, &v, 4); st32(a, w); }
@@ -41,9 +40,9 @@ void hook_f_1aa6a94(Ctx *__restrict c) {   // UIHorseGaugeScreen's update (this)
         printf("[horse-gauge] horse gauge bar tween %s\n", v ? "in game time" : "per frame, as the game (TOTK_HORSE_GAUGE=0)");
         return v;
     }();
-    const u64 s = c->x[0], fd = totk_global(kFrameDelta);
+    const u64 s = c->x[0], fd = totk_frame_delta();
     const u64 bar = on && totk_ptr_ok(s) ? ld64(s + kBar) : 0;
-    const float r = bar && totk_ptr_ok(bar) && totk_ptr_ok(fd) ? ldf32(fd + 8) : 1.0f;
+    const float r = bar && totk_ptr_ok(bar) && totk_ptr_ok(fd) ? totk_frame_ratio(fd) : 1.0f;
     if (!(r > 0.01f && r < 1.0f)) { f_1aa6a94_orig(c); return; }
     const float f0 = ldf32(bar + kFrame);
     f_1aa6a94_orig(c);

@@ -20,6 +20,28 @@ FIELD = {'x': 44, 'y': 48, 'scale_x': 68, 'scale_y': 72}
 KEEP_ROOT = {'AppMenuBG_00', 'PauseMenuBG_00', 'ShopMenuParasailBG_00', 'ShortCutBG_00', 'TitleMenuBG_00', 'EventFade_00',
              'EventFadeWipe_00', 'CameraShutter_00', 'PaAppPictureBookDetail_00', 'AppMenuOverlay_00'}
 
+# Layouts whose markers the game places over a point in the world (the lock-on arrow, the name of what is in front of
+# Link, enemy life bars and notices, speech balloons): the code moves a pane under the root to the target's projected
+# position on the 1920x1080 grid, which spans the whole canvas. Under a narrowed root that position is narrowed too and
+# the marker lands short of its target, toward the middle (at half the distance on 32:9). Their root keeps scale 1 and
+# the scale goes one level down, to these panes: ones the code does not move and no animation scales (all at scale 1 in
+# 1.0.0 and 1.4.3), so the markers keep their 16:9 shape. Shared with tall_layout.py. From valentderah/totk-pc-recomp
+# tools/ultrawide_layout.py.
+MARKER_ROOT = {
+    'AttentionBalloon_00': ('C_Capture_00', 'N_InOut_00'),     # N_PosRoot_00 moves; N_InOut_00 animates y and alpha
+    'AttentionLockOn_00': ('N_Offset_00',),                     # N_PosRoot_00 moves; N_Offset_00 animates y
+    'EnemyInfo_00': ('Pa_EnemyLife_00', 'Pa_EnemyNotice_00'),   # the parts move; N_EnemyLifeArea_* stay canvas-sized
+    'BalloonMessage_00': ('Pa_BalloonMessage_00',),
+}
+
+def scale_markers(blarc, layout, pane_offset, field, k):
+    """A MARKER_ROOT layout: its root stays at 1, its listed panes take the scale k (each checked at 1 first)."""
+    for pane in ('RootPane',) + MARKER_ROOT[layout]:
+        at = pane_offset(layout, pane) + field
+        have = struct.unpack_from('<f', blarc, at)[0]
+        if abs(have - 1.0) > 1e-3: raise SystemExit(f'{layout} {pane}: scale {have}, expected 1.0')
+        if pane != 'RootPane': struct.pack_into('<f', blarc, at, k)
+
 def edits(k, hud_corner):
     """(layout, pane, field, value) for the aspect: k = 16/9 over the aspect (the root's scale), w = how far a 1920-wide
     layout's edge moves out in its own units (960 * (1 / k - 1)). OFF moves a pane out of sight."""
@@ -109,13 +131,13 @@ def find_pane(found, layout, name):
 
 def apply(blarc, members, width, height, hud_corner=True, common=True):
     """Edits blarc (bytearray) in place for a width x height canvas. Returns the members it changed. common=False: one of
-    the other layout archives (Title: the title screen's own copies of the system menus and the loading screen; Boot):
+    the other layout archive (Title: the title screen's own copies of the system menus and the loading screen):
     every root pane is narrowed the same way, and the edits apply to the layouts and animations it has."""
     k = (16 / 9) / (width / height)
     assert k < 1, 'only for canvases wider than 16:9'
     changed, layouts = set(), {}
-    unknown = sorted(n for n in KEEP_ROOT if f'blyt/{n}.bflyt' not in members)
-    if unknown and common: raise SystemExit(f'KEEP_ROOT names no layout: {unknown}')
+    unknown = sorted(n for n in KEEP_ROOT | MARKER_ROOT.keys() if f'blyt/{n}.bflyt' not in members)
+    if unknown and common: raise SystemExit(f'KEEP_ROOT or MARKER_ROOT names no layout: {unknown}')
     def pane_offset(layout, pane):
         member = f'blyt/{layout}.bflyt'
         if member not in layouts: layouts[member] = panes(blarc, *members[member])
@@ -123,6 +145,9 @@ def apply(blarc, members, width, height, hud_corner=True, common=True):
         return find_pane(layouts[member], layout, pane)
     for member in sorted(m for m in members if m.startswith('blyt/') and m.endswith('.bflyt')):
         if member[5:-6] in KEEP_ROOT: continue
+        if member[5:-6] in MARKER_ROOT:
+            scale_markers(blarc, member[5:-6], pane_offset, FIELD['scale_x'], k)
+            continue
         struct.pack_into('<f', blarc, pane_offset(member[5:-6], 'RootPane') + FIELD['scale_x'], k)
     # Every edit's value at k = 1 is the value the game ships (a scale of 1, the 16:9 position): checked before writing,
     # so a version with other numbers stops here instead of getting wrong positions. OFF moves a pane away: not checked.

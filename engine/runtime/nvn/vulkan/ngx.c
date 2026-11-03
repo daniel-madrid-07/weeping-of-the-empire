@@ -280,10 +280,10 @@ void vk_ngx_gbuffer_draw(const float *cb8, uint64_t size, uint32_t depth_w, uint
     }
 }
 
-// ================================================================== Super Resolution / DLAA. The feature is created on the first evaluate (the title screen) and again only when the output size or the flags change or the
-// scene gets bigger than it (released only after the GPU is done with the old one): a smaller scene (dynamic resolution) is evaluated as a subrect of the feature's size, as DLSS allows, instead of a new feature and its
-// hitch. Inputs: scene colour (TotK's upscale pass input is already tonemapped: hdr false), D32 depth, motion vectors at render size (MVLowRes, not jittered, in render pixels unless mv_scale says otherwise); output: a
-// storage image at output size. Exposure: DLSS's own (AutoExposure) until the game's exposure value is found (our earlier Rust renderer feeds a 1x1 R32F).
+// ================================================================== Super Resolution / DLAA. The feature is created on the first evaluate (the title screen) and again only when the output size or the flags change or the scene
+// gets bigger than it (released only after the GPU is done with the old one): a smaller scene (dynamic resolution) is evaluated as a subrect of the feature's size, as DLSS allows, instead of a new feature and its hitch. Inputs:
+// scene colour (TotK's upscale pass input is already tonemapped: hdr false TOTK_DLSS_HDR's input is the linear scene before the tonemap: hdr true, vk_ngx_sr_hdr), D32 depth, motion vectors at render size (MVLowRes, not jittered,
+// in render pixels unless mv_scale says otherwise); output: a storage image at output size. Exposure: DLSS's own (AutoExposure) until the game's exposure value is found (our earlier Rust renderer feeds a 1x1 R32F).
 static NVSDK_NGX_Handle *g_sr;
 static NVSDK_NGX_Parameter *g_sr_par;
 static uint32_t g_sr_rw, g_sr_rh, g_sr_ow, g_sr_oh;
@@ -415,9 +415,12 @@ static NVSDK_NGX_Resource_VK sr_res(const VkNgxImage *im, bool rw, VkImageAspect
 
 // The feature of the other output size. TotK's menus draw the scene into a 960x540 canvas behind them: a feature whose
 // output changes is kept here, and swapped back when that output comes again, so going in and out of a menu costs
-// nothing after the first time.
+// nothing after the first time. The same for other flags: TOTK_DLSS_HDR's IsHDR feature and the upscale pass's LDR one
+// (a frame whose tonemap was not found). Two are kept besides the live one (the HDR canvas, the LDR canvas, the LDR
+// menu), newest first.
 typedef struct { NVSDK_NGX_Handle *h; uint32_t rw, rh, ow, oh, minw, minh; int flags; } SrFeature;
-static SrFeature g_sr_spare;
+#define SR_SPARES 2
+static SrFeature g_sr_spare[SR_SPARES];
 
 static SrFeature sr_current(void) {
     return (SrFeature){g_sr, g_sr_rw, g_sr_rh, g_sr_ow, g_sr_oh, g_sr_minw, g_sr_minh, g_sr_flags};
@@ -436,9 +439,10 @@ static void sr_release(NVSDK_NGX_Handle *h) {
 
 static bool sr_create(VkCommandBuffer cb, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, int flags) {
     if (!g_sr_par && NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&g_sr_par))) { g_sr_fails = 99; return false; }
-    if (g_sr && (ow != g_sr_ow || oh != g_sr_oh)) {   // (another output: kept as the spare)
-        sr_release(g_sr_spare.h);
-        g_sr_spare = sr_current();
+    if (g_sr && (ow != g_sr_ow || oh != g_sr_oh || flags != g_sr_flags)) {   // (another output or flags: kept, the oldest goes)
+        sr_release(g_sr_spare[SR_SPARES - 1].h);
+        memmove(&g_sr_spare[1], &g_sr_spare[0], (SR_SPARES - 1) * sizeof g_sr_spare[0]);
+        g_sr_spare[0] = sr_current();
     } else sr_release(g_sr);
     g_sr = NULL;
     NVSDK_NGX_DLSS_Create_Params cp;
@@ -476,14 +480,20 @@ bool vk_ngx_sr_evaluate(VkCommandBuffer cb, const VkNgxImage *color, const VkNgx
     if (!g_ready || g_sr_fails > 3) return false;
     int flags = sr_flags(hdr, depth_inverted);
     bool swapped = false;
-    if (g_sr && (out->w != g_sr_ow || out->h != g_sr_oh) && g_sr_spare.h && out->w == g_sr_spare.ow && out->h == g_sr_spare.oh) {
-        SrFeature cur = sr_current();   // (back to the other output: its feature is kept)
-        sr_set(g_sr_spare);
-        g_sr_spare = cur;
+    int si = -1;
+    if (g_sr && (out->w != g_sr_ow || out->h != g_sr_oh || flags != g_sr_flags))
+        for (int i = 0; i < SR_SPARES && si < 0; i++)
+            if (g_sr_spare[i].h && out->w == g_sr_spare[i].ow && out->h == g_sr_spare[i].oh && flags == g_sr_spare[i].flags) si = i;
+    if (si >= 0) {
+        SrFeature cur = sr_current();   // (back to another output or flags: its feature was kept; the live one is now)
+        sr_set(g_sr_spare[si]);
+        memmove(&g_sr_spare[1], &g_sr_spare[0], (size_t)si * sizeof g_sr_spare[0]);
+        g_sr_spare[0] = cur;
         swapped = reset = true;
         static int nswap;
-        if (++nswap <= 20) LOG("[dlss] SR feature %ux%u -> %ux%u back in use (kept: %ux%u -> %ux%u)\n", g_sr_rw, g_sr_rh,
-                               g_sr_ow, g_sr_oh, cur.rw, cur.rh, cur.ow, cur.oh);
+        if (++nswap <= 20) LOG("[dlss] SR feature %ux%u -> %ux%u flags 0x%x back in use (kept: %ux%u -> %ux%u flags 0x%x)\n",
+                               g_sr_rw, g_sr_rh, g_sr_ow, g_sr_oh, (unsigned)g_sr_flags, cur.rw, cur.rh, cur.ow, cur.oh,
+                               (unsigned)cur.flags);
     }
     bool same = g_sr && out->w == g_sr_ow && out->h == g_sr_oh;
     if (!same || swapped || !g_sr_seen_w) g_sr_seen_w = color->w, g_sr_seen_h = color->h;
@@ -752,8 +762,10 @@ static void cam_lens(const float *c, bool flip, bool zminus, VkTemporalInputs *t
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) ti->clip_to_prev_clip[i][j] = i == j;
 }
 
-bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, TexBackend *out, uint64_t frame,
-                       bool flip_y, bool zminus) {
+// hdr (vk_ngx_sr_hdr): color is the game's linear HDR scene before its tonemap and out is that same image (DLAA), the
+// feature IsHDR; the canvas is drawn later by the game's own passes, so its HUD-less copy is not taken here (exec.c).
+static bool sr_run(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, TexBackend *out, uint64_t frame, bool flip_y,
+                   bool zminus, bool hdr) {
     if (!vk_ngx_sr_on() || !color || !depth || !out) return false;
     if (g_sr_frame == frame) { sr_reject(5, NULL); return false; }   // (once a frame)
     if (color->width != depth->width || color->height != depth->height) {
@@ -841,11 +853,11 @@ bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth,
         ti.color = ic, ti.depth = idp, ti.mv = im, ti.out = io;
         if (g_bias_mode) ti.bias = ib;
         ti.jx = g_jsx * jx, ti.jy = g_jsy * jy, ti.mv_sx = ti.mv_sy = 1.f;
-        ti.reset = reset, ti.depth_inverted = inv, ti.frame = frame;
+        ti.reset = reset, ti.depth_inverted = inv, ti.frame = frame, ti.hdr = hdr;
         cam_lens(c, flip_y, zminus, &ti);
         ok = vk_ffx_sr_evaluate(cb, &ti);
         if (!ok) g_sr_fails++;
-    } else ok = vk_ngx_sr_evaluate(cb, &ic, &idp, &im, &io, g_jsx * jx, g_jsy * jy, 1.f, 1.f, reset, inv, false, g_bias_mode ? &ib : NULL);
+    } else ok = vk_ngx_sr_evaluate(cb, &ic, &idp, &im, &io, g_jsx * jx, g_jsy * jy, 1.f, 1.f, reset, inv, hdr, g_bias_mode ? &ib : NULL);
     if (!ok) {
         sr_reject(4, NULL);
         return false;
@@ -861,7 +873,7 @@ bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth,
                       {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)out->width, (int32_t)out->height, 1}}};
     vkCmdBlitImage(cb, g_out.img, VK_IMAGE_LAYOUT_GENERAL, out->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
     vk_full_barrier(cb);
-    vk_ngx_fg_keep_hudless(cb, out, frame);
+    if (!hdr) vk_ngx_fg_keep_hudless(cb, out, frame);
     g_sr_frame = frame;
     g_sr_last = g_in_last = true;
     g_sr_evals++;
@@ -872,9 +884,77 @@ bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth,
     g_cam_eval_n = g_cam_n;
     static uint64_t nlog, nprinted;   // (every 300th evaluate and each reset, 200 lines at most)
     if ((nlog++ % 300 == 0 || reset) && nprinted++ < 200)
-        LOG("[dlss] SR frame %llu: %ux%u -> %ux%u, depth %s%s, flip_y %d, jitter %+.3f %+.3f%s\n", (unsigned long long)frame,
-            w, h, out->width, out->height, inv ? "inverted" : "forward", zminus ? " (-1..1)" : "", flip_y, jx, jy, reset ? ", reset" : "");
+        LOG("[dlss] SR frame %llu: %ux%u -> %ux%u%s, depth %s%s, flip_y %d, jitter %+.3f %+.3f%s\n", (unsigned long long)frame,
+            w, h, out->width, out->height, hdr ? " HDR (before the tonemap)" : "", inv ? "inverted" : "forward",
+            zminus ? " (-1..1)" : "", flip_y, jx, jy, reset ? ", reset" : "");
     return true;
+}
+
+bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, TexBackend *out, uint64_t frame,
+                       bool flip_y, bool zminus) {
+    return sr_run(cb, color, depth, out, frame, flip_y, zminus, false);
+}
+
+// ================================================================== TOTK_DLSS_HDR=1: SR on the linear HDR scene Where
+// NVIDIA puts DLSS: after the scene's geometry, before the tonemap and the post-processing that follows it, on the linear
+// HDR colour (IsHDR FSR: its HIGH_DYNAMIC_RANGE flag). By default SR replaces the game's upscale pass, whose input is
+// already tonemapped (gamma-encoded SDR in a float target): DLSS then resolves the jitter in a non-linear space, and
+// highlights clipped by the tonemap reach it already flattened. With TOTK_DLSS_HDR=1, exec.c finds the tonemap draw
+// (learned from the FXAA after it) and calls this right before that draw: the same SR (motion vectors, depth, jitter, bias
+// mask, either backend), with the scene as input and as output (blitted back over it from our RGBA16F output), so the
+// tonemap, FXAA (left out as under SR) and EASU then run on the resolved image at the same size. Only as DLAA: the scene
+// at the canvas's size; the game's post-processing runs at the scene's size, so an upscale from there would be undone.
+// Exposure: the game's exposure value is not known (its own auto-exposure, a compute pass), so DLSS / FSR measure their
+// own (AutoExposure), pre-exposure 1: the guides' setting when no exposure input is given. The bloom and the game's
+// exposure pass before the tonemap still see the jittered scene (both average it away).
+static uint64_t g_hdr_frame = UINT64_MAX;   // the frame SR last ran (or was tried) on the HDR scene
+bool vk_ngx_sr_hdr_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("TOTK_DLSS_HDR");
+        on = e && *e && strcmp(e, "0") != 0;
+        if (on) LOG("[dlss] TOTK_DLSS_HDR=1: SR (DLSS or FSR) on the linear HDR scene before the game's tonemap, as DLAA "
+                    "(the scene at the canvas's size); otherwise on the upscale pass as before\n");
+    }
+    return on && vk_ngx_sr_on() && g_sr_want && sr_ready() && g_sr_fails <= 3;
+}
+
+uint64_t vk_ngx_sr_hdr_frame(void) { return g_hdr_frame; }
+
+static bool hdr_format(VkFormat f) {
+    return f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || f == VK_FORMAT_R16G16B16A16_SFLOAT || f == VK_FORMAT_R32G32B32A32_SFLOAT;
+}
+
+bool vk_ngx_sr_hdr(VkCommandBuffer cb, TexBackend *scene, TexBackend *depth, uint64_t frame, bool flip_y, bool zminus) {
+    if (!vk_ngx_sr_hdr_on() || !scene || !depth || g_hdr_frame == frame || g_sr_frame == frame) return false;
+    static VkFormat fmt_ok[4], fmt_no[4];   // (blit support of the scene's format, asked once each)
+    bool ok = false, no = false;
+    for (int i = 0; i < 4; i++) {
+        ok |= scene->format && fmt_ok[i] == scene->format;
+        no |= scene->format && fmt_no[i] == scene->format;
+    }
+    if (!ok && !no) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, scene->format, &fp);
+        ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
+        VkFormat *l = ok ? fmt_ok : fmt_no;
+        for (int i = 0; i < 4; i++) if (!l[i]) { l[i] = scene->format; break; }
+    }
+    const char *why = !hdr_format(scene->format) ? "not a float format" : !ok ? "the GPU cannot blit into its format"
+                    : !(scene->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ? "no transfer-destination use"
+                    : scene->samples > 1 ? "multisampled"
+                    : scene->width != depth->width || scene->height != depth->height ? "not the G-buffer depth's size" : NULL;
+    if (why) {
+        static int told;
+        if (told++ < 4) LOG("[dlss] SR on the HDR scene not run (%ux%u format %d: %s): the upscale pass's SR runs\n",
+                            scene->width, scene->height, (int)scene->format, why);
+        return false;
+    }
+    g_hdr_frame = frame;   // (tried: the upscale pass leaves this frame to the game's own draw, exec.c)
+    static int told;
+    if (!told++) LOG("[dlss] SR on the HDR scene: %ux%u format %d, before the game's tonemap (IsHDR, auto exposure)\n",
+                     scene->width, scene->height, (int)scene->format);
+    return sr_run(cb, scene, depth, scene, frame, flip_y, zminus, true);
 }
 
 // ================================================================== DLSS Frame Generation (DLSS-G). The SDK's C++ helper
@@ -933,10 +1013,13 @@ static int fg_frames(void) {
 // hle_vi.cpp's pacer: how many to generate now (the frame cap counts the frames shown; fewer than asked only where the
 // real frames would fall under 30)
 int vk_ngx_fg_frames(void) { return vk_ngx_fg_on() ? fg_frames() : 0; }
+// (-1, Automatic FG with the game at most of the panel's rate: one frame is still generated, so FG's history goes on,
+// and none is shown: the real frames at the panel's rate; vk_ngx_fg_frame)
 void vk_ngx_fg_set_active(int n) { InterlockedExchange(&g_fg_active, n); }
+static bool fg_show_none(void) { return InterlockedCompareExchange(&g_fg_active, 0, 0) == -1; }
 static int fg_frames_now(void) {
     int n = fg_frames(), a = (int)InterlockedCompareExchange(&g_fg_active, 0, 0);
-    return a >= 1 && a < n ? a : n;
+    return a == -1 ? 1 : a >= 1 && a < n ? a : n;
 }
 
 bool vk_ngx_fg_on(void) {
@@ -1178,9 +1261,9 @@ static bool apply_request(void) {   // true: a feature was turned on or off, its
     if (want_sr != g_sr_want || (want_sr && sr_ffx != g_sr_ffx)) {   // (the old backend's SR goes)
         if (g_sr_want && !g_sr_ffx) {
             sr_release_live(g_sr);
-            sr_release_live(g_sr_spare.h);
+            for (int i = 0; i < SR_SPARES; i++) sr_release_live(g_sr_spare[i].h);
             g_sr = NULL, g_sr_flags = -1, g_sr_exact = false, g_sr_seen_w = g_sr_seen_h = 0;
-            memset(&g_sr_spare, 0, sizeof g_sr_spare);
+            memset(g_sr_spare, 0, sizeof g_sr_spare);
         }
         ffx_off |= g_sr_want && g_sr_ffx;
         if (!want_sr) own_free(&g_out);
@@ -1251,7 +1334,8 @@ void vk_ngx_prepare(VkCommandBuffer cb, const TexBackend *b) {
             renderer_submit();
             cb = vk_cmd();
         }
-        sr_ok = sr_create(cb, rw, rh, ow, oh, sr_flags(false, false)), made = true;
+        // (TOTK_DLSS_HDR as DLAA: the HDR scene's feature, IsHDR; the upscale pass's LDR one is made if a frame needs it)
+        sr_ok = sr_create(cb, rw, rh, ow, oh, sr_flags(vk_ngx_sr_hdr_on() && rw == ow && rh == oh, false)), made = true;
     }
     // (the presented image's own format: the last FG frame's, this present's when canvas-sized, else TotK's RGBA8)
     VkFormat fmt = g_fg_pres_fmt;
@@ -1435,7 +1519,7 @@ generated:
     if ((nlog++ % 300 == 0 || reset) && nprinted++ < 200)
         LOG("[dlss] FG frame %llu: %ux%u from motion %ux%u, near %.3f far %.0f, jitter %+.3f %+.3f%s%s\n", (unsigned long long)g_fg_id, w, h, rw, rh,
             fabsf(n), fabsf(f), g_fg_jx, g_fg_jy, reset ? ", reset" : "", hl ? ", HUD-less" : "");
-    return g_fg_mode == 1 ? nact : 0;
+    return g_fg_mode == 1 && !fg_show_none() ? nact : 0;
 }
 
 #else   // !_WIN32: no NGX; every query answers "unavailable" and nothing is replaced
@@ -1471,6 +1555,12 @@ bool vk_ngx_sr_frame_jitter(uint64_t frame, uint32_t render_w, uint32_t out_w, f
 bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, TexBackend *out, uint64_t frame,
                        bool flip_y, bool zminus) {
     (void)cb; (void)color; (void)depth; (void)out; (void)frame; (void)flip_y; (void)zminus;
+    return false;
+}
+bool vk_ngx_sr_hdr_on(void) { return false; }
+uint64_t vk_ngx_sr_hdr_frame(void) { return UINT64_MAX; }
+bool vk_ngx_sr_hdr(VkCommandBuffer cb, TexBackend *scene, TexBackend *depth, uint64_t frame, bool flip_y, bool zminus) {
+    (void)cb; (void)scene; (void)depth; (void)frame; (void)flip_y; (void)zminus;
     return false;
 }
 bool vk_ngx_fg_on(void) { return false; }

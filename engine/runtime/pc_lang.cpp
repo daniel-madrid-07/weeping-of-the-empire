@@ -14,17 +14,26 @@
 
 namespace {
 
-// TotK 1.0's languages (its 14 message archives): the Switch codes the game maps to them
-const char *const V_LANG[] = {"", "en-US", "en-GB", "es", "es-419", "fr", "fr-CA", "de", "it", "nl", "ru", "ja", "ko",
-                              "zh-Hans", "zh-Hant", nullptr};
+// TotK 1.0's languages (its 14 message archives): the Switch codes the game maps to them; and pt-BR (lang-ptbr): both
+// exes map it to USpt (1.0.0 main 0x106de08 / 0x106e22c, 1.4.3's 0xbdf450 / 0xbdf85c), which only 1.4.x ships. The
+// 1.4.3 build answers it; 1.0.0 stays en-US (its voices and sounds have no Portuguese) and hle_fs.cpp serves the USpt
+// archive Setup made from the player's own 1.4.3 update in place of the one the game opens (mals.py)
+const char *const V_LANG[] = {"", "en-US", "en-GB", "es", "es-419", "fr", "fr-CA", "de", "it", "nl", "pt-BR", "ru", "ja",
+                              "ko", "zh-Hans", "zh-Hant", nullptr};
 const char *const N_LANG[] = {"Automatic (Windows' language)", "English (US)", "English (UK)", "Español (España)",
                               "Español (Latinoamérica)", "Français", "Français (Canada)", "Deutsch", "Italiano",
-                              "Nederlands", "Russian", "Japanese", "Korean", "Chinese (Simplified)",
-                              "Chinese (Traditional)", nullptr};
+                              "Nederlands", "Português (Brasil)", "Russian", "Japanese", "Korean",
+                              "Chinese (Simplified)", "Chinese (Traditional)", nullptr};
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+constexpr bool kGamePt = true;    // (1.4.x: the game's own Portuguese)
+#else
+constexpr bool kGamePt = false;
+#endif
 
 const pc_setting k_lang[] = {
     {"game.language", "Game", "Language", "Language", "TOTK_LANG: the game's texts and voices' subtitles, and the PC "
-     "settings' own texts (English, Spanish, Russian, Simplified Chinese; Brazilian Portuguese on a Portuguese Windows). "
+     "settings' own texts (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese). Português (Brasil): "
+     "1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. "
      "Automatic: Windows' display language if the game has it, else English.",
      "", V_LANG, N_LANG, 0, 0, 0, PC_SET_RESTART, "TOTK_LANG", nullptr, nullptr, nullptr},
 };
@@ -60,6 +69,7 @@ const char *code_of_tag(const char *tag) {
         return "en-US";
     }
     if (!strcmp(lang, "fr")) return !strcmp(region, "CA") ? "fr-CA" : "fr";
+    if (!strcmp(lang, "pt")) return kGamePt ? "pt-BR" : "en-US";   // (pt-PT too: the Portuguese there is; 1.0.0: pc_lang_text)
     if (!strcmp(lang, "zh")) return !strcmp(region, "TW") || !strcmp(region, "HK") || !strcmp(region, "MO") ? "zh-Hant" : "zh-Hans";
     static const char *const same[] = {"de", "it", "nl", "ru", "ja", "ko"};
     for (const char *s : same) if (!strcmp(lang, s)) return s;
@@ -103,38 +113,53 @@ static const char *with_fonts(const char *c) {
 }
 
 static char g_windows_tag[96];   // Windows' display language, when game.language follows it ("": it does not)
+static bool g_text_pt;           // the texts are Brazilian Portuguese (game.language pt-BR, or a Portuguese Windows)
 extern "C" const char *pc_lang_code(void) {
     static const char *code = [] {
         add_lang_rows();
         const char *e = getenv("TOTK_LANG");
         for (int i = 1; e && *e && V_LANG[i]; i++)
             if (!strcmp(e, V_LANG[i])) {
+                g_text_pt = !strcmp(V_LANG[i], "pt-BR");
+                if (g_text_pt && !kGamePt) {
+                    printf("[lang] en-US (game.language pt-BR: 1.0.0 has no Portuguese; its texts in Portuguese (Brasil) "
+                           "when Setup made them from the 1.4.3 update, hle_fs)\n");
+                    return "en-US";
+                }
                 printf("[lang] %s (game.language)\n", V_LANG[i]);
                 return with_fonts(V_LANG[i]);
             }
         const char *c = windows_code(g_windows_tag, sizeof g_windows_tag);
-        printf("[lang] %s (Windows' display language %s)\n", c, g_windows_tag);
+        g_text_pt = !strncmp(g_windows_tag, "pt", 2) &&
+                    (!g_windows_tag[2] || g_windows_tag[2] == '-' || g_windows_tag[2] == '_');
+        printf("[lang] %s (Windows' display language %s%s)\n", c, g_windows_tag,
+               g_text_pt && !kGamePt ? "; texts in Portuguese (Brasil) when Setup made them from the 1.4.3 update" : "");
         return with_fonts(c);
     }();
     return code;
 }
 
+extern "C" const char *pc_lang_text(void) {
+    const char *c = pc_lang_code();   // (decides g_text_pt)
+    return g_text_pt ? "pt-BR" : c;
+}
+
 // The PC port's own texts follow the game's language where they have it (Spanish, Russian, Simplified Chinese), and
-// Brazilian Portuguese, which the game lacks (it plays in English then), when the game follows a Portuguese Windows
+// Brazilian Portuguese when the texts are (1.4.3's own, or 1.0.0's from the player's 1.4.3 update) or would be (1.0.0
+// without them: the game in English, the port in Portuguese, as before)
 extern "C" const char *pc_ui_lang(void) {
     static const char *ui = [] {
-        const char *c = pc_lang_code();
+        const char *c = pc_lang_text();
         if (c[0] == 'e' && c[1] == 's') return "es";
         if (!strcmp(c, "ru") || !strcmp(c, "zh-Hans")) return c;
-        if (!strncmp(g_windows_tag, "pt", 2) && (!g_windows_tag[2] || g_windows_tag[2] == '-' || g_windows_tag[2] == '_'))
-            return "pt";
+        if (!strcmp(c, "pt-BR")) return "pt";
         return "";
     }();
     return ui;
 }
 
 extern "C" const char *pc_lang_key(void) {
-    const char *c = pc_lang_code();
+    const char *c = pc_lang_text();   // (the texts' language: key names inside 1.0.0's Portuguese texts are Portuguese)
     if (!strncmp(c, "zh-", 3)) return c;
     static char two[3];
     if (!two[0]) { two[0] = c[0]; two[1] = c[1]; }

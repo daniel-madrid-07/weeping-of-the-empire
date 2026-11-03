@@ -17,7 +17,6 @@
 #include <cstring>
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 constexpr u64 kState = 0x78, kCounter = 0x80;
 
 void stf(u64 a, float v) { u32 w; memcpy(&w, &v, 4); st32(a, w); }
@@ -40,8 +39,8 @@ void hook_f_1a4f0ac(Ctx *__restrict c) {   // the extra-stamina gauge's event up
         printf("[stamina-pause] extra-stamina gauge pause %s\n", v ? "in game time" : "in frames, as the game (TOTK_STAMINA_PAUSE=0)");
         return v;
     }();
-    const u64 g = c->x[0], fd = totk_global(kFrameDelta);
-    const float r = on && totk_ptr_ok(g) && totk_ptr_ok(fd) ? ldf32(fd + 8) : 1.0f;
+    const u64 g = c->x[0], fd = totk_frame_delta();
+    const float r = on && totk_ptr_ok(g) && totk_ptr_ok(fd) ? totk_frame_ratio(fd) : 1.0f;
     if (!(r > 0.01f && r < 1.0f)) { f_1a4f0ac_orig(c); return; }
     const u32 st = ld32(g + kState);
     const float v0 = ldf32(g + kCounter);

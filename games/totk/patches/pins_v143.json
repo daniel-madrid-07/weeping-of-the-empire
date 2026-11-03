@@ -35,6 +35,12 @@
   "why": "the UI controller's frame update: placed by its caller's call pattern; the edge step is inlined, the hold / trigger / release words stay at +0x114 / +0x08 / +0x0c",
   "checked": "totk_menu_cursor.cpp hook_f_83e3f8 (its writes after the original to +0x114 / +0x08 / +0x0c) read against the 1.4.3 listing; one callee taking the controller is unread"
  },
+ "0x850d7c": {
+  "new": "0x3e6f6c",
+  "body": "ebb6069fa792d488ec1f58cfbbb46f6e3816333ef8c77c7e8cb25e8299157d6d",
+  "why": "the frame-delta object's counter getter: called at the same point of the approach-target-speed pair; the glide hook calls it",
+  "checked": "read side by side: returns the object itself unless the alternative per-core counter is on (1.0.0 flag +0x10c, 1.4.3 +0x134), a pure lookup in both"
+ },
  "0x8f4510": {
   "new": "0x3e2968",
   "body": "0aa6dcd896523bbe7f270fb4767a30bc17672145257097bcbd02cc0398e89286",
@@ -53,11 +59,23 @@
   "why": "the heap allocation (heap, size, align, 0) that 1.4.3's inlined choices allocation calls",
   "checked": "totk_options_ui.h HeapAlloc against the inlined 1.4.3 copy"
  },
+ "0x9d8d00": {
+  "new": "0x272454",
+  "body": "af815d1eefc27f15a3259c28996d910a7dbe9886086f0d98cae2db2192f6b703",
+  "why": "the special-power receiver's ultrahand post-calc: the only function counting the u8 at +0x1a0 down; its caller pairs with the 1.0.0 caller by body",
+  "checked": "totk_autobuild_settle.cpp: the window byte at +0x1a0 (decrement and a contact pass while above zero, else the bond stabiliser over +0x188) the same; 1.4.3 moved part of the body out"
+ },
  "0xa02aec": {
   "new": "0x66de24",
   "body": "1e8d7b35160832ff391ca4af33e6723d6cb08f5efb6e6ad545bf08472f515c8d",
   "why": "the flag setter: 16 call slots agree",
   "checked": "totk_player_state.cpp call site"
+ },
+ "0xa5f010": {
+  "new": "0x62aac4",
+  "body": "0349a20caa5d964f4b6d89a5628a292c99bfc5fca3428e29f775e7a502a60213",
+  "why": "the lightning manager's calc: its format-string anchor and the body match agree (ratio 0.29, 153 shared runs, next best 30)",
+  "checked": "totk_lightning.cpp: flags +8 (far bolt 1, flash 8), countdown +0xa0, offset +0xa4, target +0x98 (+0x88 / +0x8c), the 90 delay and the 0.013333 / 0.01 chances, the same"
  },
  "0xbb9f74": {
   "new": "0x7216f0",
@@ -83,11 +101,35 @@
   "why": "a caller of the ride link component's query (it loads the component array's +0x410 and calls): paired by its call",
   "checked": "aligned listing read: 31 of 36 offset accesses the same; Actor +0x220 -> +0x228 (3 sites), a GOT slot moved; the +0x410 load and its call the same"
  },
+ "0xf0fdec": {
+  "new": "0x2159640",
+  "body": "ff0b8c47f36ad01e95f38f8a905405847fb02e2ce0578226e8f63698ab390c21",
+  "why": "the map's Hero's Path player: the porter's anchor pair (not confirmed), its step-table read and index logic agree",
+  "checked": "totk_map_speed.cpp: the step table (placed 0x2d1711c), row = speed (+0xbb4 is +0xc44, fields_v143 MapScreen) if under 4, column = zoom +0x2b4 if under 4, the index +0xc40"
+ },
+ "0xf15364": {
+  "new": "0x2154790",
+  "body": "24abb6725c10b5d432df79e16ca4c08fbc147b3a46a3db7abe4ced61f381b5f6",
+  "why": "the map screen's per-frame move: body match (ratio 0.23, 686 shared four-word runs; next best 8)",
+  "checked": "totk_map_speed.cpp: target +0x2c8 / +0x2cc, velocity +0x2e0, view +0x2d0 / +0x2d8 the same; the snap flag +0xc1c is +0xcac (fields_v143 MapScreen), both snap-and-clear blocks read"
+ },
  "0xf6092c": {
   "new": "0x9ea500",
   "body": "89fca625243e143ab3b70dbbe7fc2abab62a7b4c2c5cfcfdffae330d64e9720f",
   "why": "the options screen setup: body grew, the choices allocation is inlined; entry allocation at call slot 5",
   "checked": "totk_options_ui.h / totk_options_menu.cpp read against decomp-lead's 1.4.3 offset diff and the inlined allocation"
+ },
+ "0x1076be0": {
+  "new": "0xbd3a40",
+  "body": "eaa664f4106785957f9fb0a08ea1b122088a0ac911231ec7422ac469a98ff2d9",
+  "why": "the gravity-scaled factor helper the paraglider calls before and after the speed call",
+  "checked": "totk_glide_ease.cpp calls it with s0 = s1 = 0.1 and acts only when it returns 0.1"
+ },
+ "0x10bc078": {
+  "new": "0xb5aa84",
+  "body": "ea0916984b21dd65a9008772334d368f3c1ee32b57c8a84328f56fbeaf7bad91",
+  "why": "the event actor's initialize (called each frame until it returns true): the same vtable slot of the event actor class (slot port)",
+  "checked": "totk_event_waits.cpp: the equipment count at +0x408 (zero runs the first-call setup, plus one on each not-yet call, the 600 limit compare) the same in 1.4.3; the rest of the body is rewritten"
  },
  "0x12af610": {
   "new": "0xc7f440",
@@ -101,6 +143,12 @@
   "why": "an actor reference's affordance mask getter: placed by its 8 paired callers' aligned calls",
   "checked": "6 instructions read side by side: the same, the mask moved from actor +0x5a0 to +0x5a8 (the actor grew by 8, as +0x220 -> +0x228)"
  },
+ "0x13bd680": {
+  "new": "0x193ec10",
+  "body": "f11d6d7b426e79f3b44f75ffdcd6938ba65b3badca712c60f7c95c283b504176",
+  "why": "the event context's load-finished query: the same vtable slot of the event context (slot port, 11.5 votes)",
+  "checked": "totk_event_waits.cpp: the stable count at +0x568 (reset on every not-ready reason, old + 1, finished past 59) the same; the +0x34 time fallback is untouched by the hook"
+ },
  "0x1557e84": {
   "new": "0x1b26f74",
   "body": "e5cce2a12fe17c2f8413dfff98d80e873739c903ebb8957f8cf505fcc0a2c260",
@@ -112,6 +160,24 @@
   "body": "bb5c6a57e766ed64a4b8019b1f4bd46074952812340fb9ec5bf08e8e9574e4e7",
   "why": "a dynamic equipment component method (its owner at +0x18, the state flags byte at +0x3d0, the state at +0x3d4): paired by its anchors",
   "checked": "aligned listing read: 24 of 36 offset accesses the same; +0x3d0 and the owner +0x18 unchanged, a member past them +0x408 -> +0x420, string and GOT offsets moved"
+ },
+ "0x16e4610": {
+  "new": "0x1cfbc70",
+  "body": "dcf30018ff170506ce923ffed987047bd7d8d7e97df74a7d3ee03510388065a5",
+  "why": "the actor's stick-mash test: body match (ratio 0.46; the only candidate) with the same trigger mask, dead zone and pi/16 test",
+  "checked": "totk_stick_mash.cpp: the player component +0x3a8 of the actor's components (Actor +0x228 on 1.4.3, fields_v143), its +0x38 / +0x98 / +0xa8 / +0x68 / +0x78 the same"
+ },
+ "0x16e4b80": {
+  "new": "0x1cfcb50",
+  "body": "da18b57bc8b1a10f996af01f8b2e2c0a2fa43d1914ea7c7366434debbc818751",
+  "why": "the actor's approach-target-speed: 16 paired callers' aligned calls vote for it, the body is the same but for the component offset",
+  "checked": "totk_glide_ease.cpp: r0 through the getter pinned below (no object offset); the glide caller keeps the node in x21, the stick at frame -0x20, velocity +0x24, the 0.1 ease"
+ },
+ "0x16e4f90": {
+  "new": "0x1cfcf90",
+  "body": "a61387eaf10608759edaa499270232d29b0933b127f7addb804ba360ab0e086d",
+  "why": "the actor's swim speed getter before the swim velocity ease: the same logic, the actor's +0x220 moved to +0x228 and +0x19c read as a halfword",
+  "checked": "totk_swim_ease.cpp reads none of the actor's fields: it compares the return address, checks the node's vptr where placed, then scales the stick factor by the result"
  },
  "0x16e7e2c": {
   "new": "0x1bd0044",
@@ -131,6 +197,12 @@
   "why": "a player-state test on slot 0's verb and Player +0xad8 / +0xae3 (the walk scheduler's family): paired by its call",
   "checked": "whole body read side by side: same code, Actor +0x220 -> +0x228, a verb class gains verb 46 (mask bit 34; Invalid stays 284), callee 0x1122bbc -> 0x1bccec0; verb chain, +0xad8 same"
  },
+ "0x171fafc": {
+  "new": "0x1d4ac34",
+  "body": "f49c189ed4824dee71bb24fcbb6dd3cb1591e7e704a37201db410614409e3eb4",
+  "why": "Recall's next-velocity step: the 500 / -400 / 100 / 900 constants and the 1/30 step agree (4 of 5, next best 3); 1.4.3 inlines the move-toward helper and moved the k ramp to its caller",
+  "checked": "totk_recall_accel.cpp hook_f_171fafc: k at +0x2c of x0, read only for the two steps (500 - 400 k) / 30 and over the mass s0; w1 zero returns at once; the 900 speed clamp after"
+ },
  "0x1a067c8": {
   "new": "0x9ead30",
   "body": "2528080c5320bddd3757ed87b97a5f397c3b88f54ea8eb546b53910fc141b4af",
@@ -148,6 +220,12 @@
   "body": "f5ca98ce1052f3ed46ffdef7daa89915e3849f53926c0e86c0a680083cab4998",
   "why": "options section hook (n-th row): same call slot in 3 callers",
   "checked": "totk_options_menu.cpp zones against decomp-lead's 1.4.3 offset diff (entry fields unchanged)"
+ },
+ "0x1a4f0ac": {
+  "new": "0x20ea784",
+  "body": "44d3a477b4df654662ab57b83c8106b9e8bfa35400102a415e97a9153c357bfc",
+  "why": "the extra-stamina gauge's event path: body match (ratio 0.60; next best 0.26)",
+  "checked": "totk_stamina_pause.cpp: state +0x78 (2 starts, 3 counts, 4 after 15) and the counter +0x80 adding one per call, the same; 1.4.3 adds a second start branch that also adds one"
  },
  "0x1a85b3c": {
   "new": "0x212bf04",
@@ -179,17 +257,53 @@
   "why": "options row hook: confirmed pair, body changed",
   "checked": "totk_options_ui.h against decomp-lead's 1.4.3 offset diff (selection row +8)"
  },
+ "0x1aa3e44": {
+  "new": "0x214c7b4",
+  "body": "571965da8f539019d1f5318be4e96572ae082fab9ade9c378fd44482a7d61828",
+  "why": "the get-item window's per-frame update: the same slot of its screen class's vtable (slot port, 37 votes), 280 bytes in both",
+  "checked": "totk_get_info_delay.cpp read against 1.4.3: the delay at +0x264, the state at +0x260, the minus-one step and the 10 / 90 frame starts the same, instruction for instruction"
+ },
+ "0x1aa6a94": {
+  "new": "0x215012c",
+  "body": "87c448787e9aa5e864f691a480498ac44937384b161de66aaf8add4512c19919",
+  "why": "the horse gauge screen's per-frame update: the same slot of its screen class's vtable (slot port, 53 votes)",
+  "checked": "totk_horse_gauge.cpp: the bar animator at +0x1a8, its frame +0x20, the target +0x1d0, the one-frame step towards it clamped to the target and the set-frame call, the same"
+ },
  "0x1ad7af4": {
   "new": "0x218bba8",
   "body": "6dbb04833a89f26cf1dff721651ca8e580d7f9eec24cdf07fe59a31a8b6008ac",
   "why": "a return address: the options screen creation's row-count call returns here",
   "checked": "totk_options_menu.cpp kCreateCountReturn"
  },
+ "0x1b3ebac": {
+  "new": "0x220922c",
+  "body": "96d72d8a5224f6637e892eca7b26f06cf93202f49b044c761d3893a63040122a",
+  "why": "the cooking pot set-check node's update: the same vtable slot of its node class (slot port)",
+  "checked": "totk_cook_settle.cpp: the settle count at +0x20 counts down to zero, then On; a failed check stores 10; the same; 1.4.3 also sets a done byte at +0x24, which the hook leaves alone"
+ },
+ "0x1b7ba58": {
+  "new": "0x224652c",
+  "body": "49ab629a973c6c622f06e0ff842b009975bd0c21ff0454700dc254d2ea462256",
+  "why": "the average-Vec3f node's update: the same vtable slot of its node class (slot port)",
+  "checked": "totk_follow_average.cpp: the ring at +0x20 (data, capacity +0x28, head +0x2c, count +0x30, 12-byte samples), input +0x1a0, output +0x1a8 and the push helper read side by side, the same"
+ },
  "0x1c019f8": {
   "new": "0x194f744",
   "body": "fb2983b63e4652a11386f26ddb62df05eaf302a51f1f1317c0ba2795507a9a40",
   "why": "the actor's SpecialPower component getter (totk_player_state.cpp): paired by its call",
   "checked": "6 instructions read side by side: the same, Actor +0x220 -> +0x228, the component array +0x478 unchanged"
+ },
+ "0x1c17fb0": {
+  "new": "0x22f3ba8",
+  "body": "4bc3e2ed070226bc81848e93af13f8cbb149ec02007c4a6a5d4ea3be1382bd44",
+  "why": "the terrain-stable event wait's node update: the same vtable slot of its node class (slot port), 104 bytes in both",
+  "checked": "totk_event_waits.cpp: the ready count at +0x20 (old + 1, limit 4, zero when not ready) read side by side, the same; only the GOT pages differ"
+ },
+ "0x1c73fbc": {
+  "new": "0x235da14",
+  "body": "0d2ba2e7cd5a853f5b588219a5466bfb9e58a1ffa750b3be5514228fcc0914e9",
+  "why": "the tar Like Like meta AI's update: the same vtable slot of its AI class (slot port)",
+  "checked": "totk_likelike_spots.cpp: 20 spot slots at +0xcb0 (stride 0x18: owner, counter +4, active +8), the members' hold test, the 100 limit and the release writes the same"
  },
  "0x1ccf894": {
   "new": "0xf23d70",
@@ -203,6 +317,12 @@
   "why": "the attention lock: identical masked body, same call slot in the key-hold hook",
   "checked": "totk_pc_vk.cpp call site (arguments unchanged per decomp-lead)"
  },
+ "0x1cd0260": {
+  "new": "0xf24ab0",
+  "body": "91d2791650052ab9a502fe5951ba07a0fe44ebcbec29f464412485fa061a97d8",
+  "why": "the player's stick calculator: the same vtable slot (slot port); every field it touches, with the same use count per field, and its constants agree",
+  "checked": "totk_roll_input.cpp: angle +0xe0, sum +0xe8, grace +0xec..+0xf4, length at the pointer +0x58, outputs +0x78 / +0xb8 / +0xa8 and the band and cap constants, the same values in 1.4.3"
+ },
  "0x1cfe320": {
   "new": "0x23eb604",
   "body": "8ed8e813a446558d8af3366133bfe07bbae84419e62b03d9008396003150c658",
@@ -214,6 +334,90 @@
   "body": "dcafb081e53dfd5f7eb40dc34a2b1bc8dcdb4dcd7787dd6e75b0342f85769ece",
   "why": "the player's move rate getter (a float clamped to 0 .. 0.5, 0 when negative): placed by its paired caller's aligned call",
   "checked": "read side by side: the same clamp (1.4.3 compares and selects instead of a min), the float moved from +0xf24 to +0xf48"
+ },
+ "0x1d0d16c": {
+  "new": "0x23f9f9c",
+  "body": "dff8962bfd30a715bf8524295891557524378e8a907e4c52cf5bc4d8ae9e1428",
+  "why": "return address after the pinned approach-target-speed call in the paraglider's physics update (its velocity ease)",
+  "checked": "totk_glide_ease.cpp compares x30 with it; the same sequence follows in 1.4.3 (flags +0x18 / +0xb06, cap select, dir sp+0x30, v +0x24..0x2c; fmadd ease)"
+ },
+ "0x1d23614": {
+  "new": "0x2410bcc",
+  "body": "a6e1787afdf80411f6efe7f262b4661cac0e4871efad3e800e8a902de3dd84b7",
+  "why": "the tumble-slide sound tail of the slipping-down node: body match (ratio 0.55, 46 shared four-word runs; next best 0.21)",
+  "checked": "totk_slide_sound.cpp: phase +0x58, grace +0x5c (stop at 5), period +0x60 (7, then 5..8 at random), active +0x64, the volume formula and the period re-pick test, the same"
+ },
+ "0x1d25ac0": {
+  "new": "0x2413080",
+  "body": "80868c220ecab90525dd894347bac4b56998500ea34995d049f86b1fb7bf62bb",
+  "why": "return address after the swim speed getter's call in the swim-move physics; the direction is read from the stack and multiplied as in 1.0.0",
+  "checked": "totk_swim_ease.cpp compares x30 with it; dir sp+0x30, v x21+0x24..0x2c, s9 as 1.0.0; the ease is fmadd in 1.4.3 (the same math)"
+ },
+ "0x1d97648": {
+  "new": "0x2481c6c",
+  "body": "4fda49587ff1639c5196f991e1b1e5af75fa1309e9a1068c88a6b7c1e97d5f29",
+  "why": "the wait-create-actor event node's update: the same vtable slot (slot port) and the porter's callee pairing agree, 264 bytes in both",
+  "checked": "totk_event_waits.cpp: the ready count at +0x20 (old + 1, limit 60, zero when anything loads) read side by side, the same; two GOT loads became direct page references"
+ },
+ "0x1dbdcf0": {
+  "new": "0x24a6e24",
+  "body": "66da7a734398004241299b9ebe36e580dafa2171316a50c296b0e4474742bd4f",
+  "why": "the flying enemies' path-finding module update: the same vtable slot of the module class (slot port)",
+  "checked": "totk_keese_probe.cpp: the probe phase moved from +0x38c to +0x39c (fields_v143 FlyingPathModule); the mod-4 and mod-15 helper tests and the mod-15 advance the same"
+ },
+ "0x1f61d6c": {
+  "new": "0x2616bf4",
+  "body": "1e593bc127ffdd906e4736a2c65ac169f754c93d19541c585c27e1b28cfb5a48",
+  "why": "the controller get-stick query worker: placed by its two paired callers' aligned calls; its neighbour 0x261677c is the button query",
+  "checked": "totk_pouch_rotate.cpp: the sticks copied from controller +0x128 / +0x120 into +0x20 / +0x28, the user name pointer at +0x38, the outputs after the copy, the same in 1.4.3"
+ },
+ "0x200f61c": {
+  "new": "0x26a5dd0",
+  "body": "2e6db2a1ec44b18dc81eabd089d396e31f4bedf7a5628bd8ba78709eb0cdc4db",
+  "why": "the chase-f32 query calc: the same vtable slot of its node class (slot port), 116 bytes in both",
+  "checked": "totk_ai_integrators.cpp: the speed behind the tagged pointer at +0x30, from +0x20 / to +0x28, the output, read side by side, the same"
+ },
+ "0x200f8b0": {
+  "new": "0x26a5f90",
+  "body": "31b9805c25b5d98942da71e4963e991b12ff0e7a8284d253323cfbb5978913d2",
+  "why": "the chase-vec3f query calc: the same vtable slot of its node class (slot port)",
+  "checked": "totk_ai_integrators.cpp: the speed behind the tagged pointer at +0x30, from +0x20 / to +0x28, output +0x38 / +0x40, the same; the stack frame and register use differ"
+ },
+ "0x20147f4": {
+  "new": "0x26a9648",
+  "body": "a974d8fe046904484a4626dfcd14d72fd93976e237bdc699de9569080cdc76bc",
+  "why": "the lerp-f32 query calc: the same vtable slot of its node class (slot port, 9 votes)",
+  "checked": "totk_ai_integrators.cpp: the rate behind the tagged pointer at +0x30, from +0x20 / to +0x28, output +0x38; 1.4.3 fuses the multiply-add"
+ },
+ "0x212b740": {
+  "new": "0x27918e0",
+  "body": "cd278485144755d1df5a70cdd009b38eac46ca615453432c7eb1190512cc63c7",
+  "why": "the inventory Link selector's update: the same vtable slot of the selector class (slot port)",
+  "checked": "totk_pouch_player.cpp: the committed tab at +0x2c, the debounce count at +0x30 (zero on the same tab, commit past 9) the same; the equipment wait at +0x40 is untouched"
+ },
+ "0x27dcb98": {
+  "new": "0x205de04",
+  "body": "8a5e89b55552c19860d1a0d9157c1fc4d3ec4e9c5f4e6148bd230fb8f7b5a1e7",
+  "why": "the add-f32 query calc: the one 1.4.3 calc with the same add form (the sub and mul siblings sit beside it), at slot 34 of its vtable as in 1.0.0",
+  "checked": "totk_ai_integrators.cpp: input A behind +0x28, input B behind +0x30, the sum at +0x20, the output pointer at +0x38, the same"
+ },
+ "0x2833b60": {
+  "new": "0x625fc8",
+  "body": "04b96c5ae0866b62d67cb1bcfd3962da080794845b71121eae5984b34f1b4f12",
+  "why": "the shared update of the blackboard setters: the same function in all 12 setter vtables, slot spacing equal in both builds; 1.4.3 inlines the likely setters",
+  "checked": "totk_ai_integrators.cpp: the hook runs or skips the whole call; the flag test at +0x18 and the set slot +0x110 the same; the step at the update context +8 as the event waits read it"
+ },
+ "0x3746b38": {
+  "new": "0x2cf6128",
+  "body": "dff8962bfd30a715bf8524295891557524378e8a907e4c52cf5bc4d8ae9e1428",
+  "why": "the paraglider's speed cap f32[2] {0.4, 0.74}",
+  "checked": "values verified in 1.4.3; read as the caller reads it (+4 when the Player component's +0xb06 bit 3 is clear)"
+ },
+ "0x377671c": {
+  "new": "0x2d0215c",
+  "body": "80868c220ecab90525dd894347bac4b56998500ea34995d049f86b1fb7bf62bb",
+  "why": "the swim velocity ease's factor f32 0.175",
+  "checked": "value verified in 1.4.3; read as the caller reads it"
  },
  "0x455aa88": {
   "new": "0x398a9d8",

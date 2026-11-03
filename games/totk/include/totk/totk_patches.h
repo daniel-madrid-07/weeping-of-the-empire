@@ -34,6 +34,7 @@ typedef struct TotkSettings {
     float fov_scale;                    /* camera vertical field-of-view multiplier (default 0 = the game's own) */
     float shadow_scale;                 /* depth shadow map size multiplier (default 0 = the game's own) */
     float shadow_fixed;                 /* 1 = the shadow map at its largest size, steady (default 0 = the view's) */
+    float shadow_reach;                 /* near sun shadow cascades' reach multiplier, 1..4 (default 0 = the game's) */
     float lod_scale;                    /* model LOD distance multiplier (default 0 = the game's own) */
     float actor_lod_scale;              /* actor LOD area distance multiplier (default 0 = the game's own) */
     float terrain_lod_scale;            /* terrain LoD distance multiplier (default 0 = the game's own) */
@@ -58,7 +59,7 @@ void totk_settings_default(TotkSettings *s);
 /* TOTK_REALTIME=0|1, TOTK_RENDER_RES=<w>x<h>, TOTK_OUTPUT_RES=<w>x<h>, TOTK_OUTPUT_MAX=<w>x<h>, TOTK_ASPECT=<w>:<h> |
  * <ratio> | 0, TOTK_MAX_FPS=<hz 30..totk_max_fps_highest()> (lower clamp of the frame step), TOTK_DYNAMIC_RES=off | on | <floor 0.25..1> (off: fixed
  * scene size, the default; on: the game's dynamic resolution), TOTK_FOV=<multiplier 0.5..2> | 0 (the game's own),
- * TOTK_SHADOW_RES=<multiplier 0.5..2> | 0 (the game's own), TOTK_LOD=<multiplier 0.5..8> | 0 (the game's own), TOTK_ACTOR_LOD=<multiplier 0.5..4> | 0 (the game's own),
+ * TOTK_SHADOW_RES=<multiplier 0.25..2> | 0 (the game's own), TOTK_LOD=<multiplier 0.5..8> | 0 (the game's own), TOTK_ACTOR_LOD=<multiplier 0.5..4> | 0 (the game's own),
  * TOTK_TERRAIN_LOD=<multiplier 0.5..2> | 0 (the game's own), TOTK_SIM_DISTANCE=<multiplier 0.5..4> (1 = the game's own),
  * TOTK_TEXTURE_CACHE=<multiplier 1..3 | percentage 100..300> (texture cache size, needs its HeapDef set),
  * TOTK_MOUSE_CAMERA=<multiplier 0..4> (0: platform's stick

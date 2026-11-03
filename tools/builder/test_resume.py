@@ -27,6 +27,8 @@ for p in (dump, keys):
 v100 = os.path.join(work, 'extracted', 'v100')
 kdir = os.path.join(work, 'engine', 'game', 'K1')
 bank = os.path.join(work, 'engine', 'glyphs', 'engine+glyphs')
+skipset = os.path.join(work, 'engine', 'overlay', 'skip_opening')
+skipman = os.path.join(skipset, 'manifest.tsv')
 head = builder.subprocess.run(['git', '-C', builder.REPO, 'rev-parse', 'HEAD'], capture_output=True,
                               text=True).stdout.strip()
 state = {'fail_at': None, 'ran': [], 'lines': [], 'pkg': 0, 'prepared': 0, 'gpus': [['GPU A', '32.0.15.1']]}
@@ -56,6 +58,8 @@ def fake_run(step, cmd, env, dry, beat=None, quiet=False, watch=None):
     elif num == '7':
         os.makedirs(bank, exist_ok=True)
         os.utime(bank)
+        os.makedirs(skipset, exist_ok=True)   # (build.py overlay --force makes the skip-opening set too)
+        open(skipman, 'w').write('x')
     elif num == '8':
         state['pkg'] += 1
         d = os.path.join(out, f'TotK-PC-2026110{state["pkg"]}-0000-{head[:9]}')
@@ -131,6 +135,15 @@ builder.shutil.rmtree(bank)
 go()
 check('overlay output gone: overlay again, the build reused', '7 overlay' in state['ran'] and '5 game' not in
       state['ran'] and reused(5), str(state['ran']))
+# 5b. the skip-opening set gone (an install from before it existed, public #65): step 7 again
+builder.shutil.rmtree(skipset)
+go()
+check('skip-opening set gone: overlay again, the build reused', '7 overlay' in state['ran'] and '5 game' not in
+      state['ran'] and os.path.isfile(skipman), str(state['ran']))
+# 5c. an empty skip folder (a broken run) does not count: step 7 again
+os.remove(skipman)
+go()
+check('empty skip-opening folder: overlay again', '7 overlay' in state['ran'] and os.path.isfile(skipman), str(state['ran']))
 # 6. step 9's cache is in the player's profile: cleared (an uninstall, the player), it is prepared again
 os.remove(cold)
 go()

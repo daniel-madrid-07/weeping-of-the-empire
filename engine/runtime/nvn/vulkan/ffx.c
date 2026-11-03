@@ -201,21 +201,37 @@ static FfxApiResource res_of(const VkNgxImage *im, uint32_t usage) {
 static ffxContext g_ctx;
 static uint32_t g_rw, g_rh, g_ow, g_oh, g_flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
 static uint64_t g_t_last;
+// The context of the other input kind (HIGH_DYNAMIC_RANGE or not: ngx.c TOTK_DLSS_HDR's linear scene, or the upscale
+// pass's tonemapped one in a frame whose tonemap was not seen), kept so either kind's frames swap instead of remaking
+// it
+static struct { ffxContext ctx; uint32_t rw, rh, ow, oh, flags; } g_other;
 
 // (FFX's own allocations: outside textures.c's residency budget; a few tens of MB at 1440p, made once per size)
 static void ctx_wait(void) {   // (its last dispatch done: as ngx.c's sr_release; not vkDeviceWaitIdle, which races the record
     vk_wait_seq(vk_pending_seq() - 1);  // thread's own submits and cannot see work still in the vkq ring)
 }
 
-static void sr_release(void) {
-    if (!g_ctx) return;
+static void ctx_destroy(ffxContext *c) {
+    if (!*c) return;
     ctx_wait();   // (a context is remade only on a size / flag change)
-    p_destroy(&g_ctx, NULL);
-    g_ctx = NULL;
+    p_destroy(c, NULL);
+    *c = NULL;
+}
+
+static void sr_release(void) { ctx_destroy(&g_ctx); ctx_destroy(&g_other.ctx); }
+
+static void sr_swap(void) {   // (the current context <-> the other kind's)
+    ffxContext c = g_ctx;
+    uint32_t rw = g_rw, rh = g_rh, ow = g_ow, oh = g_oh, fl = g_flags;
+    g_ctx = g_other.ctx, g_rw = g_other.rw, g_rh = g_other.rh, g_ow = g_other.ow, g_oh = g_other.oh, g_flags = g_other.flags;
+    g_other.ctx = c, g_other.rw = rw, g_other.rh = rh, g_other.ow = ow, g_other.oh = oh, g_other.flags = fl;
 }
 
 static bool sr_create(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, uint32_t flags) {
-    sr_release();
+    if (g_ctx && ((g_flags ^ flags) & FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE)) {   // (the other kind: kept)
+        ctx_destroy(&g_other.ctx);
+        sr_swap();
+    } else ctx_destroy(&g_ctx);
     struct ffxCreateBackendVKDesc be;
     backend_desc(&be);
     struct ffxCreateContextDescUpscale cd;
@@ -251,9 +267,14 @@ bool vk_ffx_sr_prepare(VkCommandBuffer cb, uint32_t rw, uint32_t rh, uint32_t ow
 
 bool vk_ffx_sr_evaluate(VkCommandBuffer cb, const VkTemporalInputs *in) {
     if (!ffx_load() || g_fails > 3) return false;
+    // (hdr: the linear scene before the game's tonemap, ngx.c TOTK_DLSS_HDR; FFX's own exposure as for the LDR input)
     const uint32_t flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION
-                         | (in->depth_inverted ? FFX_UPSCALE_ENABLE_DEPTH_INVERTED : 0);
+                         | (in->depth_inverted ? FFX_UPSCALE_ENABLE_DEPTH_INVERTED : 0)
+                         | (in->hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0);
     bool reset = in->reset;
+    if (g_ctx && ((g_flags ^ flags) & FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE) && g_other.ctx &&
+        !((g_other.flags ^ flags) & FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE))
+        sr_swap(), reset = true;   // (the other input kind's context, kept)
     // (as DLSS's feature: the largest scene seen at this output; a larger one or another output makes a new context)
     if (!g_ctx || in->out.w != g_ow || in->out.h != g_oh || flags != g_flags || in->color.w > g_rw || in->color.h > g_rh) {
         const bool same = g_ctx && in->out.w == g_ow && in->out.h == g_oh;

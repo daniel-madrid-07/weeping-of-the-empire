@@ -19,7 +19,14 @@
 typedef struct NvnPool {
     uint64_t storage, size;
     uint32_t flags;
+    bool finalized;   // (nvnMemoryPoolFinalize, game thread: the struct is freed later, in the render thread's order)
+    // The game's handle (until its finalize, dropped in the render thread's order) and each NvnTexture made in it:
+    // freed at 0 (objects.c pool_unref). A texture can outlive its pool's finalize (a zombie still named by pool
+    // slots, a level change), and t->pool is read for its flags then (textures.c CPU-read, capture.c); freed with the
+    // finalize it was a use after free (the rival's #501 level-change crash). Saturates at 0xFFFF (never freed then).
+    uint16_t refs;
 } NvnPool;
+_Static_assert(sizeof(NvnPool) == 24, "capture / replay records hold NvnPool as is");
 
 typedef struct NvnTexture {
     TexLayout layout;

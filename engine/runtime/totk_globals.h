@@ -43,3 +43,11 @@ inline u64 totk_player_actor() {
     if (vt < kTotkMain || vt >= kTotkMain + 0x6000000 || ld32(proc + totk_field(BaseProc, 0x24)) - 7 < 5) return 0;
     return proc;
 }
+
+// The frame-delta setter's object (VFRMgr; totk_pc_vk.cpp's TimeScale): the global at GOT slot main+0x45577c0. Its
+// update stores the frame's 30 Hz ratio r (1.0 at 30 fps, 0.5 at 60) that the game-time hooks scale by: 1.0.0
+// main+0x7a83e4 at +8 (ratio, seconds: `stp s0, s1, [x0, #8]`), 1.4.3 main+0x3e67f0 at +0x10 (ratio, 1 / ratio,
+// seconds, fps). totk_frame_delta() is 0 (each hook's original alone) when the object or the ratio's offset is not
+// known in this build.
+inline u64 totk_frame_delta() { return totk_field_known(TimeScale, 0x8) ? totk_global(0x45577c0) : 0; }
+inline float totk_frame_ratio(u64 fd) { return ldf32(fd + totk_field(TimeScale, 0x8)); }

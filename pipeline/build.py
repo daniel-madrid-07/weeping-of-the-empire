@@ -81,7 +81,7 @@ _ensure_python()
 sys.path.insert(0, str(REPO))
 
 from pipeline import extract, modules  # noqa: E402
-from pipeline.nx import romsource  # noqa: E402
+from pipeline.nx import nup as nup_mod, romsource  # noqa: E402
 from pipeline.locks import FileLock  # noqa: E402
 from pipeline.manifest import Manifest  # noqa: E402
 from pipeline.sync import sync_tree  # noqa: E402
@@ -433,6 +433,12 @@ class Build:
                                                          total_seconds=round(total, 1),
                                                          finished=time.strftime('%Y-%m-%dT%H:%M:%S')))
 
+    def need_keys(self):
+        """prod.keys, but for a NUP (nx/nup.py: its files are unencrypted): the update's, which these steps read with
+        --update (its ExeFS, its RomFS: a NUP update's own whole tree), else the base game's"""
+        if not nup_mod.is_nup_path(self.a.update or self.a.nsp):
+            self.need('--keys', self.a.keys)
+
     def need(self, what, value):
         if not value:
             raise BuildError(f'{what} is required for this step')
@@ -462,7 +468,7 @@ class Build:
 
         status = 'adopted existing (hashes match)'
         if not matches():
-            self.need('--keys', self.a.keys)
+            self.need_keys()
             extract.extract_exefs(self.a.nsp, self.a.keys, self.ext, log=log, update=self.a.update)
             status = 'extracted'
         ver = self.expected['display_version']
@@ -501,10 +507,11 @@ class Build:
                  and rep.get('image', 'romfs.bin') == image.name and image_there()
                  and (self.a.no_unpack or in_dump or rep.get('tree') == 'romfs'))
         if not adopt:
-            self.need('--keys', self.a.keys)
+            self.need_keys()
             # Heavy job: run the extractor as a child of the slot limiter (keys passed as a path only).
-            cmd = [sys.executable, '-m', 'pipeline.extract', 'romfs', '--nsp', str(self.a.nsp), '--keys',
-                   str(self.a.keys), '--out', str(self.ext), '--expected', str(self.a.expected)]
+            cmd = [sys.executable, '-m', 'pipeline.extract', 'romfs', '--nsp', str(self.a.nsp)] + \
+                (['--keys', str(self.a.keys)] if self.a.keys else []) + ['--out', str(self.ext), '--expected',
+                                                                         str(self.a.expected)]
             if self.a.no_unpack:
                 cmd.append('--no-unpack')
             if in_dump:

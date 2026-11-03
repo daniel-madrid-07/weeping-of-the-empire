@@ -128,7 +128,7 @@ PC_PAGE("Menus",    CHOICE,   "choice_1",       "Answer 1")
 PC_PAGE("Menus",    CHOICE,   "choice_2",       "Answer 2")
 PC_PAGE("Menus",    CHOICE,   "choice_3",       "Answer 3")
 PC_PAGE("Menus",    CHOICE,   "choice_4",       "Answer 4")
-PC_PAGE("Menus",    CUTSCENE, "confirm",        "Advance (events)")
+PC_PAGE("Menus",    CUTSCENE, "interact",       "Advance (events)")
 PC_PAGE("Menus",    CUTSCENE, "skip",           "Skip")
 PC_PAGE("Menus",    CUTSCENE, "skip_x",         "Skip (short scenes)")
 

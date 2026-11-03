@@ -311,11 +311,19 @@ static void sw_panic() {
     printf("[os] alias soft write watch: VirtualProtect failed (err %lu), off for good: the window is copied when bound%s\n", err,
            rw ? "" : "; making it writable failed too: pages still read-only are made writable one by one as they fault");
 }
+static bool sg_guards(u64 a);   // (the sync guard below: a page it holds read-only is its fault to handle, not this one's)
+static LONG CALLBACK sg_fault(EXCEPTION_POINTERS* e);
 static LONG CALLBACK sw_fault(EXCEPTION_POINTERS* e) {
     const EXCEPTION_RECORD* r = e->ExceptionRecord;
     if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
     u64 off = (u64)r->ExceptionInformation[1] - g_alias_import_base;
     if (!g_sw_st || off >= g_alias_import_size) return EXCEPTION_CONTINUE_SEARCH;
+    // (handled here, not passed on: sg_fault may have seen no guard on this page a moment ago, before an arm set it, and
+    // left it to this handler)
+    if (sg_guards((u64)r->ExceptionInformation[1])) {
+        const LONG v = sg_fault(e);
+        if (v != EXCEPTION_CONTINUE_SEARCH) return v;
+    }
     u64 i = off >> 12;
     void* page = (void*)(g_alias_import_base + (i << 12));
     DWORD o;
@@ -455,10 +463,19 @@ extern "C" void alias_import_extent(u64 end) {
     u64 cur = g_sw_arm_end.load(std::memory_order_acquire);
     while (end > cur && !g_sw_arm_end.compare_exchange_weak(cur, end, std::memory_order_acq_rel)) {}
 }
+#include "sync_guard.inc"   // LARECOMP_SYNC_GUARD (objects.c's SyncWait ticket lag): the pages the pending replay reads
 #else
 extern "C" void alias_soft_io(const void*, size_t, int) {}
 extern "C" void alias_soft_pause(void) {}
 extern "C" void alias_import_extent(u64) {}
+// (the sync guard is Windows-only: LARECOMP_SYNC_GUARD does nothing here, the ticket lag stays as it is)
+extern "C" int sync_guard_on(void) { return 0; }
+extern "C" void sync_guard_note(u64, u64) {}
+extern "C" void sync_guard_note_write(u64, u64) {}
+extern "C" void sync_guard_fence(const void*, u64) {}
+extern "C" int sync_guard_arm(const void*, u64) { return 0; }
+extern "C" void sync_guard_io(const void*, size_t, int) {}
+extern "C" void sync_guard_hold(int) {}
 #endif
 // Dirty ranges of the window since the previous call (GetWriteWatch with reset), as (offset, length) pairs from the
 // window base, coalesced; at most `max` ranges (the last one widens to cover the rest). Returns -1 without write watch.

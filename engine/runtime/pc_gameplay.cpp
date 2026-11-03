@@ -108,7 +108,7 @@ struct Run {
     bool waiting = false, held = false;   // MAC_BOW: an attack charge to let finish first; counted in g_bow_held
     bool cancel_was = false; uint64_t cancel_until = 0;   // the bow's draw on the horse: the cancel key's edge, B pulse
     bool bow_mode = false;          // MAC_ATTACK: the bow in hand at the press (the draw), else the attack
-    uint64_t held_vk = 0;           // MAC_ATTACK / MAC_SPRINT: the VK held in the hook's macro word
+    uint64_t held_vk = 0;           // MAC_ATTACK / MAC_SPRINT / MAC_THROW: the VK held in the hook's macro word
                                     // (cleared on drop)
     bool vk_deferred = false; uint64_t vk_frame0 = 0, vk_at = 0;   // MAC_ATTACK: VK 9 waiting for the hook's resume
     uint64_t vk_rel_ms = 0;         // MAC_ATTACK: when LMB was seen up (the 2-frame minimum hold ends 500 ms after it)
@@ -561,6 +561,36 @@ bool tick_run(Run &r, const PcMacroIn *in, PcMacroOut *o) {
         if (!r.held_vk) o->bits |= kB;
         return true;
     }
+    case MAC_THROW: {
+        // G (public #36: G did not throw a carried pot). The weapon's throw reads VK 12 (ExecutePlayerThrowWeapon: hold
+        // aims, the release throws), the row this replaced. A carried object's throw (ThrowObject, started by
+        // Player.scheduler.throwobject) reads none of the bits ExecutePlayerCarry or its own class test, so while
+        // carrying (verb 44 in any slot, as MAC_SPRINT's put-away) G holds the pad R's whole set, VK 11 | 12 | 14, which
+        // is what the pad's R gives there. Decided at the press; held for as long as G is down, with a latched tap first
+        // (a G shorter than a game frame still reaches the game, as MAC_SPRINT / MAC_ATTACK). Before the hook has run
+        // once: the pad's R held
+        if (first) {
+            bool carrying = false;
+            for (int s = 0; s < 5; s++) carrying = carrying || totk_player_verb(s) == 44;
+            const uint64_t vk = 1ull << 12 | (carrying ? 1ull << 11 | 1ull << 14 : 0);
+            if (totk_pcvk_frames() > 0) {
+                totk_pcvk_tap(vk);
+                totk_pcvk_macro_hold(vk, true);
+                r.held_vk = vk;
+            }
+            static int logs;
+            if (logs++ < 100)
+                printf("[pc] throw: %s\n", !r.held_vk ? "the pad's R held (no VK hook yet)"
+                                           : carrying ? "carrying, VK 11 | 12 | 14 held (the pad's R)" : "VK 12 held");
+        }
+        if (r.released) {
+            if (r.held_vk) totk_pcvk_macro_hold(r.held_vk, false);
+            r.held_vk = 0;
+            return false;
+        }
+        if (!r.held_vk) o->bits |= kR;
+        return true;
+    }
     case MAC_PULL: case MAC_PUSH:
         if (d < 6) { o->bits |= r.id == MAC_PULL ? kDU : kDD; return true; }
         return false;
@@ -758,7 +788,7 @@ using Table = OpsTable<MAC_DODGE, MAC_PARRY, MAC_BOW, MAC_ABILITY_1, MAC_ABILITY
                        MAC_PULL, MAC_PUSH, MAC_ROTATE, MAC_RAISE, MAC_LOWER, MAC_UNSTICK, MAC_SECONDARY, MAC_PRIMARY,
                        MAC_ARROW_NEXT, MAC_ARROW_PREV, MAC_BOW_STRIP, MAC_VEHICLE_LEAVE, MAC_ATTACK, MAC_WEAPON_STRIP, MAC_HOLSTER, MAC_BOW_TOGGLE, MAC_SPRINT,
                        MAC_BOW_OUT, MAC_BOW_DRAW, MAC_CONSTRUCT_ATTACH, MAC_CONSTRUCT_LEAVE, MAC_RECIPE_OPEN,
-                       MAC_RECIPE_HISTORY>;
+                       MAC_RECIPE_HISTORY, MAC_THROW>;
 static_assert(sizeof(Table::ids) / sizeof(int) == MAC_COUNT - 1, "every macro id has its ops");
 
 bool register_all() {

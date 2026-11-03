@@ -29,7 +29,6 @@
 #include <cstring>
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 constexpr u64 kPhase = 0x58, kGrace = 0x5c, kPeriod = 0x60, kActive = 0x64;
 constexpr float kGraceEnd = 5.0f;        // the original's stop (main+0x1d236e4)
 
@@ -53,8 +52,8 @@ void hook_f_1d23614(Ctx *__restrict c) {   // ExecutePlayerSlippingDown's sound 
         printf("[slide-sound] tumble-slide sound %s\n", v ? "timed in game time" : "timed in frames, as the game (TOTK_SLIDE_SOUND=0)");
         return v;
     }();
-    const u64 n = c->x[0], fd = totk_global(kFrameDelta);
-    const float r = on && totk_ptr_ok(n) && totk_ptr_ok(fd) ? ldf32(fd + 8) : 1.0f;
+    const u64 n = c->x[0], fd = totk_frame_delta();
+    const float r = on && totk_ptr_ok(n) && totk_ptr_ok(fd) ? totk_frame_ratio(fd) : 1.0f;
     if (!(r > 0.01f && r < 1.0f)) { f_1d23614_orig(c); return; }
     const float a = ldf32(n + kPhase), g = ldf32(n + kGrace);
     const s32 p = (s32)ld32(n + kPeriod);

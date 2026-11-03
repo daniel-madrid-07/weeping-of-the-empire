@@ -17,6 +17,11 @@ static int is_dir(const wchar_t *p) {
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 static int dots(const wchar_t *n) { return !wcscmp(n, L".") || !wcscmp(n, L".."); }
+/* A link (symbolic link, junction, WSL link: a name-surrogate reparse point) is never followed. Other reparse points
+ * are ordinary files and folders: OneDrive's cloud files above all (the rival port's #374 lost saves skipping them). */
+int saves_is_link(const WIN32_FIND_DATAW *fd) {
+    return (fd->dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && IsReparseTagNameSurrogate(fd->dwReserved0);
+}
 static int newer(FILETIME a, FILETIME b) { return CompareFileTime(&a, &b) > 0; }
 
 int saves_is_save(const wchar_t *dir, int *slots, FILETIME *newest) {
@@ -62,7 +67,7 @@ static void each_subdir(const wchar_t *dir, dir_fn fn, void *ctx) {
     HANDLE h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !dots(fd.cFileName) && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !dots(fd.cFileName) && !saves_is_link(&fd))
             if (fn(dir, fd.cFileName, ctx)) break;
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -141,7 +146,7 @@ static void walk(Scan *s, const wchar_t *dir, int depth) {
     HANDLE h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || dots(fd.cFileName) || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || dots(fd.cFileName) || saves_is_link(&fd)) continue;
         wchar_t sub[MAX_PATH];
         if (swprintf(sub, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName) < 0) continue;
         walk(s, sub, depth - 1);
@@ -176,7 +181,7 @@ int saves_copy_tree(const wchar_t *src, const wchar_t *dst) {
     if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND ? 0 : -1;
     int rc = 0;
     do {
-        if (dots(fd.cFileName) || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        if (dots(fd.cFileName) || saves_is_link(&fd)) continue;
         wchar_t s[MAX_PATH], d[MAX_PATH];
         if (swprintf(s, MAX_PATH, L"%ls\\%ls", src, fd.cFileName) < 0 || swprintf(d, MAX_PATH, L"%ls\\%ls", dst, fd.cFileName) < 0) { rc = -1; break; }
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) rc = saves_copy_tree(s, d);
@@ -198,7 +203,7 @@ int saves_delete_tree(const wchar_t *dir) {
             if (dots(fd.cFileName)) continue;
             wchar_t p[MAX_PATH];
             if (swprintf(p, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName) < 0) { rc = -1; continue; }
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !saves_is_link(&fd)) {
                 if (saves_delete_tree(p)) rc = -1;
             } else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 if (!RemoveDirectoryW(p)) rc = -1;   /* a junction: the link, not what it points at */
@@ -209,7 +214,10 @@ int saves_delete_tree(const wchar_t *dir) {
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    if (!RemoveDirectoryW(dir) && exists(dir)) rc = -1;
+    if (!RemoveDirectoryW(dir) && exists(dir)) {   /* a read-only folder (OneDrive's, an SD card's copy) goes too */
+        SetFileAttributesW(dir, FILE_ATTRIBUTE_NORMAL);
+        if (!RemoveDirectoryW(dir) && exists(dir)) rc = -1;
+    }
     return rc;
 }
 
@@ -226,8 +234,13 @@ void saves_recover(const wchar_t *base) {
 }
 
 int saves_backup(const wchar_t *base, const wchar_t *why, wchar_t *out_path, size_t n) {
-    wchar_t save[MAX_PATH], dir[MAX_PATH], tmp[MAX_PATH], dst[MAX_PATH];
+    wchar_t save[MAX_PATH];
     saves_dir(base, save, MAX_PATH);
+    return saves_backup_from(base, save, why, out_path, n);
+}
+
+int saves_backup_from(const wchar_t *base, const wchar_t *save, const wchar_t *why, wchar_t *out_path, size_t n) {
+    wchar_t dir[MAX_PATH], tmp[MAX_PATH], dst[MAX_PATH];
     if (!saves_is_save(save, NULL, NULL)) return 0;
     saves_backups_dir(base, dir, MAX_PATH);
     mkdirs(dir);
@@ -295,7 +308,10 @@ void saves_prune(const wchar_t *base, int keep) {
     free(all);
 }
 
-int saves_replace(const wchar_t *base, const wchar_t *src) {
+int saves_replace(const wchar_t *base, const wchar_t *src) { return saves_replace_report(base, src, NULL); }
+
+int saves_replace_report(const wchar_t *base, const wchar_t *src, SaveConvReport *r) {
+    SaveConvReport mine = {0};
     wchar_t save[MAX_PATH], fresh[MAX_PATH], old[MAX_PATH], parent[MAX_PATH];
     saves_dir(base, save, MAX_PATH);
     swprintf(fresh, MAX_PATH, L"%ls.new", save);
@@ -306,6 +322,10 @@ int saves_replace(const wchar_t *base, const wchar_t *src) {
     if (g_saves_fail_step == 1 || saves_copy_tree(src, fresh) || !saves_is_save(fresh, NULL, NULL)) {
         saves_delete_tree(fresh);
         return 1;
+    }
+    if (savever_convert_dir(&savever_tables, fresh, r ? r : &mine) < 0) {   /* a later version's save, if it is one */
+        saves_delete_tree(fresh);
+        return 4;
     }
     int had = exists(save);
     if (had) {

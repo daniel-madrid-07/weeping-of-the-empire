@@ -19,8 +19,6 @@
 #include <cstring>
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
-constexpr u64 kPhase = 0x38c;
 constexpr u32 kIdlePhase = 1;            // 1 % 4 != 2 and 1 % 15 != 0: no probe
 
 struct Mod { u64 module; float acc; };
@@ -46,8 +44,8 @@ void hook_f_1dbdcf0(Ctx *__restrict c) {   // FlyingEnemyPathFindinUserUsePathfi
         printf("[keese-probe] flying enemies' path probes %s\n", v ? "per 30 Hz of game time" : "per frame, as the game (TOTK_KEESE_PROBE=0)");
         return v;
     }();
-    const u64 m = c->x[0], fd = totk_global(kFrameDelta);
-    const float r = on && totk_ptr_ok(m) && totk_ptr_ok(fd) ? ldf32(fd + 8) : 1.0f;
+    const u64 m = c->x[0], fd = totk_field_known(FlyingPathModule, 0x38c) ? totk_frame_delta() : 0;
+    const float r = on && totk_ptr_ok(m) && totk_ptr_ok(fd) ? totk_frame_ratio(fd) : 1.0f;
     if (!(r > 0.01f && r < 1.0f)) { f_1dbdcf0_orig(c); return; }
     bool advance;
     while (g_lock.test_and_set(std::memory_order_acquire)) {}
@@ -58,8 +56,9 @@ void hook_f_1dbdcf0(Ctx *__restrict c) {   // FlyingEnemyPathFindinUserUsePathfi
     if ((advance = p->acc >= 1.0f - 1e-4f)) p->acc -= 1.0f;
     g_lock.clear(std::memory_order_release);
     if (advance) { f_1dbdcf0_orig(c); return; }
-    const u32 n = ld32(m + kPhase);
-    st32(m + kPhase, kIdlePhase);
+    const u64 phase = m + totk_field(FlyingPathModule, 0x38c);   // (1.4.3: +0x39c, the same % 4 / % 15 tests)
+    const u32 n = ld32(phase);
+    st32(phase, kIdlePhase);
     f_1dbdcf0_orig(c);
-    st32(m + kPhase, n);
+    st32(phase, n);
 }

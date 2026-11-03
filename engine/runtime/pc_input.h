@@ -234,7 +234,7 @@ bool pc_input_capture_msg(void *hwnd, unsigned msg, uintptr_t wp, intptr_t lp);
 bool pc_input_capture_wants_wheel(void);
 bool pc_input_capture_wheel(int notches);
 // The key's name for the player, UTF-8, static storage. lang: the game's language code (en, es, fr, de, it, nl, ru, ja,
-// ko, zh-Hans, zh-Hant). Named keys (Space, Shift, Ctrl, Alt, Tab, Enter, Esc, Backspace, the arrows, the mouse
+// ko, zh-Hans, zh-Hant, pt). Named keys (Space, Shift, Ctrl, Alt, Tab, Enter, Esc, Backspace, the arrows, the mouse
 // buttons, the wheel, the numpad, F1-F24) translated; letters, digits and punctuation what the active layout prints at
 // that key; anything else GetKeyNameTextW's.
 const char *pc_key_name(int input, const char *lang);
@@ -254,6 +254,7 @@ struct PcRouteIn {
     uint64_t (*layout_bits)(int vk, void *user);     // the console layout's action bits for a key (a transition's replay)
     uint64_t frame;                                  // presents so far: pulses last 2 game frames (4.11 P4)
     bool refocus = false;                            // the first read in front after reads behind: keys down are dead
+    bool front_end = false;                          // still at the title (hle_fs.cpp g_title_phase): E is a second Enter
 };
 struct PcRouteOut {
     uint64_t bits; bool claimed[256]; bool wheel_taken;

@@ -12,6 +12,15 @@ and this set applies every patcher's functions to each archive (several to one M
 previous one's output) and writes each archive once. Every SARC member no patcher names stays byte-identical (checked);
 what a patcher keeps of its own MSBT is its own check. An archive no patcher touches is not written.
 Patchers: options_menu (LayoutMsg/SystemOption_00.msbt: the PC rows of the Options screen).
+
+Brazilian Portuguese (lang-ptbr, v0.1.9): 1.0.0 ships no Portuguese; 1.4.x adds Mals/USpt.Product.14x. With the
+player's own update (--update <work>/extracted/v143, what Setup unpacked from the update they gave it; nothing of the
+game is shipped by us) the set also writes Mals/USpt.Product.100.sarc.zs: USen 1.0.0's archive, every member and
+label as 1.0.0 has them, each message's text taken from the update's USpt by its label. A message the update lacks, or
+one using a control tag no 1.0.0 archive uses, keeps its English text (counted and listed in USpt.fallback.tsv); so
+does StaticMsg/GuideKeyIcon.msbt (the glyph bank finds it in memory by its USen bytes). The patchers then run on it as
+on USen ('pt' texts, else English). The game keeps answering en-US (its voices and sounds have no Portuguese in any
+version); hle_fs.cpp serves this archive in place of the one it opens when game.language is Português (Brasil).
 """
 import argparse
 import importlib
@@ -29,7 +38,15 @@ PATCHERS = ('games.totk.overlays.options_menu',)
 LANGS = ('CNzh', 'EUde', 'EUen', 'EUes', 'EUfr', 'EUit', 'EUnl', 'EUru', 'JPja', 'KRko', 'TWzh', 'USen', 'USes', 'USfr')
 # the language of each archive, for texts written per language (a patcher's 'en' is the fallback)
 LANG_KEY = {'CNzh': 'zhs', 'TWzh': 'zht', 'JPja': 'ja', 'KRko': 'ko', 'EUru': 'ru', 'EUnl': 'nl', 'EUit': 'it',
-            'EUde': 'de', 'EUfr': 'fr', 'USfr': 'fr', 'EUes': 'es', 'USes': 'es', 'EUen': 'en', 'USen': 'en'}
+            'EUde': 'de', 'EUfr': 'fr', 'USfr': 'fr', 'EUes': 'es', 'USes': 'es', 'EUen': 'en', 'USen': 'en',
+            'USpt': 'pt'}
+PT = 'USpt'                      # (written only from the player's update, below; not one of LANGS)
+PT_BASE = 'USen'                 # the archive it is laid out as, and the English of every fallback
+PT_SOURCES = ('143', '142', '141', '140', '130', '121', '120', '112', '111', '110')   # the update's archive version
+GUIDE_KEY_ICON = 'StaticMsg/GuideKeyIcon.msbt'   # (games/totk/glyphs/bank.py: matched in memory by its USen bytes)
+# The letters Portuguese needs past ASCII, checked in the game's text fonts
+PT_LETTERS = 'ãõçêáéíóúâôàÃÕÇÊÁÉÍÓÚÂÔÀ'
+FONT_ARCHIVE = 'Font/Font.Nin_NX_NVN.bfarc.zs'
 
 
 def archive(lang):
@@ -144,6 +161,169 @@ def sarc_replace(data, members):
     struct.pack_into('<I', out, 8, len(out))
     return bytes(out)
 
+# ------------------------------------------------------------------------------------------------------------ pt-BR
+
+
+def msbt_tags(raw):
+    """{(group, type)} of the control tags in one TXT2 text (UTF-16: 0x0e group type size params, 0x0f group type)."""
+    out, n, i = set(), len(raw) // 2, 0
+    if b'\x0e\x00' not in raw and b'\x0f\x00' not in raw:
+        return out
+    u = struct.unpack(f'<{n}H', raw[:2 * n])
+    while i < n:
+        c = u[i]
+        if c == 0x0e and i + 3 < n:
+            out.add((u[i + 1], u[i + 2]))
+            i += 4 + u[i + 3] // 2
+        elif c == 0x0f and i + 2 < n:
+            out.add((u[i + 1], u[i + 2]))
+            i += 3
+        else:
+            i += 1
+    return out
+
+
+def sarc_msbts(sarc):
+    return {name: sarc[lo:hi] for name, (lo, hi) in sarc_members(sarc).items() if name.endswith('.msbt')}
+
+
+def archive_tags(sarc):
+    """Every control tag the texts of one decompressed archive use."""
+    out = set()
+    for data in sarc_msbts(sarc).values():
+        for _, raw in msbt_parse(data)[2]:
+            out |= msbt_tags(raw)
+    return out
+
+
+def pt_member(name, en, pt, allowed):
+    """(MSBT bytes, {'pt': n, 'missing': [labels], 'tags': [labels]}): en's labels, order and hash table with each text
+    from pt (same label) where pt has it with no tag outside `allowed`, else en's. en itself when nothing changes."""
+    header, buckets, msgs = msbt_parse(en)
+    theirs = dict(msbt_parse(pt)[2]) if pt is not None else {}
+    stats, out = dict(pt=0, missing=[], tags=[]), []
+    for label, raw in msgs:
+        t = theirs.get(label)
+        if t is None:
+            stats['missing'].append(label)
+        elif not msbt_tags(t) <= allowed:
+            stats['tags'].append(label)
+        else:
+            stats['pt'] += 1
+            raw = t
+        out.append((label, raw))
+    if all(a[1] == b[1] for a, b in zip(out, msgs)):
+        return en, stats
+    return msbt_build(header, buckets, out), stats
+
+
+def update_archive(update):
+    """(RomFS path, raw bytes) of the update's Portuguese archive (1.4.3 has Product.142's)."""
+    for v in PT_SOURCES:
+        path = f'Mals/{PT}.Product.{v}.sarc.zs'
+        try:
+            return path, update.read(path)
+        except (KeyError, FileNotFoundError):
+            continue
+    raise FileNotFoundError(f'the update has no Mals/{PT}.Product.*.sarc.zs (tried {", ".join(PT_SOURCES)})')
+
+
+def pt_sarc(en_sarc, pt_sarc_, allowed):
+    """(the merged archive, per-member stats): en_sarc's members, each MSBT's texts from pt_sarc_ (pt_member);
+    GuideKeyIcon stays English byte for byte."""
+    en_m, pt_m = sarc_msbts(en_sarc), sarc_msbts(pt_sarc_)
+    new, stats = {}, {}
+    for name, data in en_m.items():
+        if name == GUIDE_KEY_ICON:
+            stats[name] = dict(pt=0, missing=[], tags=[], kept=True)
+            continue
+        body, st = pt_member(name, data, pt_m.get(name), allowed)
+        stats[name] = st
+        if body != data:
+            new[name] = body
+    return sarc_replace(en_sarc, new), stats
+
+# ------------------------------------------------------------------------------------------------------------ fonts
+
+
+def bfotf_otf(data):
+    """The OpenType font of a .bfotf / .bfttf (the words XORed with a key: the first is 0x7F9A0218 ^ key, the second
+    the size ^ key; games/totk/glyphs/bank.py decrypt_bfotf, without numpy)."""
+    key = struct.unpack_from('>I', data, 0)[0] ^ 0x7F9A0218
+    size = struct.unpack_from('>I', data, 4)[0] ^ key
+    body = bytes(data[8:8 + (len(data) - 8) // 4 * 4])
+    mask = struct.pack('>I', key) * (len(body) // 4)
+    return (int.from_bytes(body, 'big') ^ int.from_bytes(mask, 'big')).to_bytes(len(body), 'big')[:size]
+
+
+def otf_chars(otf):
+    """The code points an OpenType font maps to a glyph (cmap formats 4 and 12, every subtable)."""
+    tables = {bytes(otf[12 + 16 * i:16 + 16 * i]): struct.unpack_from('>I', otf, 20 + 16 * i)[0]
+              for i in range(struct.unpack_from('>H', otf, 4)[0])}
+    base, out = tables[b'cmap'], set()
+    for i in range(struct.unpack_from('>H', otf, base + 2)[0]):
+        st = base + struct.unpack_from('>I', otf, base + 8 + 8 * i)[0]
+        fmt = struct.unpack_from('>H', otf, st)[0]
+        if fmt == 4:
+            seg = struct.unpack_from('>H', otf, st + 6)[0] // 2
+            ends = struct.unpack_from(f'>{seg}H', otf, st + 14)
+            starts = struct.unpack_from(f'>{seg}H', otf, st + 16 + 2 * seg)
+            deltas = struct.unpack_from(f'>{seg}h', otf, st + 16 + 4 * seg)
+            ro_at = st + 16 + 6 * seg
+            ros = struct.unpack_from(f'>{seg}H', otf, ro_at)
+            for k in range(seg):
+                for c in range(starts[k], ends[k] + 1):
+                    if c == 0xffff:
+                        continue
+                    if ros[k] == 0:
+                        g = (c + deltas[k]) & 0xffff
+                    else:
+                        g = struct.unpack_from('>H', otf, ro_at + 2 * k + ros[k] + 2 * (c - starts[k]))[0]
+                        g = (g + deltas[k]) & 0xffff if g else 0
+                    if g:
+                        out.add(c)
+        elif fmt == 12:
+            for k in range(struct.unpack_from('>I', otf, st + 12)[0]):
+                lo, hi, g = struct.unpack_from('>3I', otf, st + 16 + 12 * k)
+                out.update(c for c in range(lo, hi + 1) if g + c - lo)
+    return out
+
+
+def font_check(fonts_sarc, used, english):
+    """The game's text fonts (those with every ASCII letter and digit) against Portuguese: {font: the PT_LETTERS it
+    lacks}, and the characters of the served text that no text font has and the English text does not use either."""
+    alnum = {ord(c) for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'}
+    fonts = {}
+    for name, (lo, hi) in sarc_members(fonts_sarc).items():
+        if name.endswith(('.bfotf', '.bfttf')):
+            chars = otf_chars(bfotf_otf(fonts_sarc[lo:hi]))
+            if alnum <= chars:
+                fonts[name] = chars
+    every = set().union(*fonts.values()) if fonts else set()
+    return dict(fonts={n: ''.join(c for c in PT_LETTERS if ord(c) not in cs) for n, cs in sorted(fonts.items())},
+                in_no_font=[f'U+{c:04X}' for c in sorted(used - every - english)])
+
+
+def text_chars(sarc):
+    """The code points of every text in a decompressed archive, control tags left out."""
+    out = set()
+    for data in sarc_msbts(sarc).values():
+        for _, raw in msbt_parse(data)[2]:
+            n = len(raw) // 2
+            u, i = struct.unpack(f'<{n}H', raw[:2 * n]), 0
+            while i < n:
+                c = u[i]
+                if c == 0x0e and i + 3 < n:
+                    i += 4 + u[i + 3] // 2
+                    continue
+                if c == 0x0f:
+                    i += 3
+                    continue
+                if c >= 0x20:
+                    out.add(c)
+                i += 1
+    return out
+
 # ------------------------------------------------------------------------------------------------------------ set
 
 
@@ -164,7 +344,12 @@ def one_language(lang, romfs, zstd, patchers):
     path = archive(lang)
     raw = romfs.read(path)
     sarc, dict_id = zstd.decompress(raw)
-    sarc = bytes(sarc)
+    out, edited = apply_patches(bytes(sarc), patches)
+    return (path, zstd.compress(out, dict_id), raw), edited
+
+
+def apply_patches(sarc, patches):
+    """(the archive with every patcher's functions applied, {MSBT: patchers}); every other member checked unchanged"""
     where = sarc_members(sarc)
     new, edited = {}, {}
     for msbt, fns in patches.items():
@@ -180,25 +365,71 @@ def one_language(lang, romfs, zstd, patchers):
     for name, (a, b) in where.items():
         a2, b2 = after[name]
         assert out[a2:b2] == (new[name] if name in new else sarc[a:b]), name
-    return (path, zstd.compress(out, dict_id), raw), edited
+    return out, edited
 
 
-def build_mals(romfs, zstd, out_root, patchers=PATCHERS):
+def portuguese(romfs, zstd, update, patchers):
+    """(the entry of Mals/USpt.Product.100.sarc.zs, {MSBT: patchers}, report, fallback lines) from the player's
+    update RomFS (`update`): pt_sarc over USen 1.0.0, the patchers, the font check. The manifest's original is USen's
+    (engine_dir.SERVED_AS: the file the game opens in its place)."""
+    source, raw_pt = update_archive(update)
+    pt, _ = Zstd(update).decompress(raw_pt)
+    raw_en = romfs.read(archive(PT_BASE))
+    en, dict_id = zstd.decompress(raw_en)
+    en, pt = bytes(en), bytes(pt)
+    # the tags 1.0.0 knows: every one its own 14 archives use (1.4.3's USpt has one more, in one message)
+    allowed = set()
+    for lang in LANGS:
+        allowed |= archive_tags(en if lang == PT_BASE else bytes(zstd.decompress(romfs.read(archive(lang)))[0]))
+    merged, stats = pt_sarc(en, pt, allowed)
+    out, edited = apply_patches(merged, patches_of(PT, patchers))
+    fonts, _ = zstd.decompress(romfs.read(FONT_ARCHIVE))
+    glyphs = font_check(bytes(fonts), text_chars(out), text_chars(en))
+    lines = [f'{m}\t{label}\t{why}' for m, st in sorted(stats.items())
+             for why in ('missing', 'tags') for label in st[why]]
+    total = sum(st['pt'] + len(st['missing']) + len(st['tags']) for st in stats.values())
+    report = dict(source=source, members=len(stats), messages=total,
+                  portuguese=sum(st['pt'] for st in stats.values()),
+                  english_missing=sum(len(st['missing']) for st in stats.values()),
+                  english_tags=sum(len(st['tags']) for st in stats.values()),
+                  english_kept=[m for m, st in stats.items() if st.get('kept')], glyphs=glyphs)
+    return (archive(PT), zstd.compress(out, dict_id), raw_en), edited, report, lines
+
+
+def build_mals(romfs, zstd, out_root, patchers=PATCHERS, update=None):
     # the languages at once: most of the time is zstd at level 19, which runs outside the GIL (2026-10-30); the
     # entries and the report keep LANGS order, the bytes are the same
     for mod in patchers:
         importlib.import_module(mod)   # (imported once here, not by 14 threads at once)
-    with ThreadPoolExecutor(min(len(LANGS), os.cpu_count() or 4)) as ex:
+    with ThreadPoolExecutor(min(len(LANGS) + 1, os.cpu_count() or 4)) as ex:
+        pt = ex.submit(portuguese, romfs, zstd, update, patchers) if update is not None else None
         done = list(ex.map(lambda lang: one_language(lang, romfs, zstd, patchers), LANGS))
+        problem = None
+        try:   # (Portuguese is extra: an update it cannot read leaves the other 14 archives as they are)
+            pt = pt.result() if pt else None
+        except (ValueError, KeyError, OSError, AssertionError, struct.error) as e:
+            pt, problem = None, f'{type(e).__name__}: {e}'
     entries, edited = [], {}
-    for r in done:
+    for r in done + ([pt[:2]] if pt else []):
         if r:
             entries.append(r[0])
             for msbt, who in r[1].items():
                 edited.setdefault(msbt, who)
     out_dir = Path(out_root) / 'mals'
     _write_set(out_dir, entries)
-    return dict(set='mals', status='pass', files=len(entries), msbt=edited, out=str(out_dir))
+    report = dict(set='mals', status='pass', files=len(entries), msbt=edited, out=str(out_dir))
+    fallback = out_dir / f'{PT}.fallback.tsv'   # (not in the manifest: engine_dir copies listed files only)
+    if pt:
+        report[PT] = dict(status='pass', **pt[2])
+        with open(fallback, 'w', newline='\n', encoding='utf-8') as f:
+            f.write('# member\tlabel\twhy English (missing: not in the update; tags: a control tag 1.0.0 does not use)\n')
+            f.write(''.join(ln + '\n' for ln in pt[3]))
+    else:
+        if problem:
+            report[PT] = dict(status='skipped', problem=problem)
+        if fallback.exists():
+            fallback.unlink()
+    return report
 
 
 def main(argv=None):
@@ -206,9 +437,20 @@ def main(argv=None):
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--romfs', required=True, type=Path)
     p.add_argument('--out', required=True, type=Path, help='<work>/overlays')
+    p.add_argument('--update', type=Path, help='the player\'s 1.4.x update RomFS (<work>/extracted/v143): also '
+                   'writes the Brazilian Portuguese archive from its USpt')
     a = p.parse_args(argv)
     romfs = RomFS(a.romfs)
-    print(json.dumps(build_mals(romfs, Zstd(romfs), a.out)))
+    update, problem = None, None
+    if a.update:
+        try:
+            update = RomFS(a.update)
+        except (ValueError, OSError) as e:   # (half unpacked, or another tool's folder: no Portuguese, the rest built)
+            problem = f'{type(e).__name__}: {e}'
+    report = build_mals(romfs, Zstd(romfs), a.out, update=update)
+    if problem:
+        report[PT] = dict(status='skipped', problem=problem)
+    print(json.dumps(report))
     return 0
 
 

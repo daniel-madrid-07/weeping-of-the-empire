@@ -1,0 +1,66 @@
+name: Compatibility report
+description: How the game runs on your PC, good or bad. Every report goes into COMPATIBILITY.md.
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks: a report for hardware nobody has listed yet (older or integrated GPUs, laptops, handhelds, Intel Arc) helps the most. Never attach game files, keys or builds.
+  - type: textarea
+    id: sysinfo
+    attributes:
+      label: System info
+      description: In the game, press F10 and then **Copy system info** at the bottom of the window, and paste it here (version, Windows, CPU, GPU and driver, display, the settings you changed). If the game does not start, write your CPU, GPU and driver version, RAM and Windows version.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: ram
+    attributes:
+      label: RAM
+      placeholder: "16 GB"
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Plays well
+        - Plays, with problems (say which below)
+        - Crashes or freezes in game
+        - Does not reach the title screen
+        - Setup does not finish
+    validations:
+      required: true
+  - type: dropdown
+    id: spot
+    attributes:
+      label: Where you measured
+      description: Pick a place near the start of the game so reports compare. Stand still for ten seconds, looking the same way the game faces you when you arrive.
+      options:
+        - Lookout Landing (the skyview tower's base)
+        - Kakariko Village (the travel point)
+        - Hateno Village (the travel point)
+        - Great Sky Island (the Temple of Time)
+        - The Depths (a lightroot)
+        - Somewhere else (say where below)
+        - Did not measure
+    validations:
+      required: true
+  - type: input
+    id: fps
+    attributes:
+      label: Frame rate there
+      description: From the frame-rate readout (F3 shows it; set F10's frame-rate readout to Detailed for the 1 % low) or the F9 overlay.
+      placeholder: "62 fps, 1 % low 48"
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings that matter
+      description: Window size and mode, graphics preset, render resolution, frame-rate cap, upscaler and frame generation (none, DLSS, FSR). The system info above already lists what you changed; add anything it misses.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Problems or notes
+      description: Stutter, graphics errors, crashes (attach the newest `totk-*.log` from `%LOCALAPPDATA%\nxrecomp\TotK-engine\logs`), how long Setup took.

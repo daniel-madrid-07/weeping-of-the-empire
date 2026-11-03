@@ -20,7 +20,6 @@
 #include <cstring>
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 constexpr u64 kDelay = 0x264;
 
 void stf(u64 a, float v) { u32 w; memcpy(&w, &v, 4); st32(a, w); }
@@ -43,9 +42,9 @@ void hook_f_1aa3e44(Ctx *__restrict c) {   // UIGetWindowScreen's update (this)
         printf("[get-info] get-item info line %s\n", v ? "timed in game time" : "timed in frames, as the game (TOTK_GET_INFO_DELAY=0)");
         return v;
     }();
-    const u64 scr = c->x[0], fd = totk_global(kFrameDelta);
+    const u64 scr = c->x[0], fd = totk_frame_delta();
     if (on && totk_ptr_ok(scr) && totk_ptr_ok(fd)) {
-        const float r = ldf32(fd + 8), d = ldf32(scr + kDelay);
+        const float r = totk_frame_ratio(fd), d = ldf32(scr + kDelay);
         if (r > 0.01f && r < 1.0f && d > 0.0f) stf(scr + kDelay, d - r + 1.0f);
     }
     f_1aa3e44_orig(c);

@@ -11,6 +11,14 @@ system-wide and no administrator:
 
 Each part is stamped (<part>/.toolchain.json) once complete; a run cut short redoes only the part it was in, and a
 download continues from where it stopped (.part files). ensure() returns the environment the build steps need.
+
+Linux (linux-port, 2026-11-02): two release assets instead, pinned in assets.json like Setup's own:
+  llvm      setup-linux-llvm.tar.zst: LLVM 23.1.1 (the same release), cut to what a build runs, runnable on any
+            distribution (tools/linux/llvm_asset.sh)
+  sdk       setup-linux-sdk.tar.zst: the glibc 2.35 / libstdc++ sysroot the game is built against and its libraries
+            (SDL3, Opus, libvpx, the Vulkan SDK's headers and shaderc: tools/linux/sdk.sh)
+  python    as above
+NXR_LINUX_LLVM_ARCHIVE / NXR_LINUX_SDK_ARCHIVE: a local archive instead of the download (before an asset is published).
 """
 import hashlib
 import http.client
@@ -27,6 +35,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+
+import kit  # (the download kit: tools/builder/kit.py)
 
 LLVM = dict(version='23.1.1', sha256='c54ac8146b420fe72e11e6fdd56498d6818011ad23267196b6ab37b5ac9264c3', size=901304424,
             url='https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/'
@@ -87,6 +97,9 @@ def download(name, url, dest, sha256=None, size=None, tries=6):
     a partial file: dest exists only once complete (and its sha256 checked when pinned); a resumed .part whose checksum
     fails (left by another version's file of the same name) is fetched once more from the start."""
     if os.path.isfile(dest) and (not sha256 or file_sha256(dest) == sha256):
+        kit.record(dest, url, name, sha256)
+        return dest
+    if kit.take(url, dest, sha256, name, say):
         return dest
     part = dest + '.part'
     os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -142,11 +155,12 @@ def download(name, url, dest, sha256=None, size=None, tries=6):
                         continue
                     raise ToolchainError(f'{name}: the download does not match its checksum ({got}); start again')
             os.replace(part, dest)
+            kit.record(dest, url, name, sha256)
             return dest
         gained = os.path.exists(part) and os.path.getsize(part) > start
         fails = 1 if gained else fails + 1
         if fails >= tries:
-            raise ToolchainError(unreachable(name, url, err))
+            raise ToolchainError(unreachable(name, url, err) + kit.missing_note())
         pause = min(60, 2 ** fails)
         say(f'download {name}: {err}; retrying in {pause} s')
         time.sleep(pause)
@@ -161,13 +175,20 @@ def file_sha256(path):
 
 
 def fetch_json(url):
+    p = kit.find(url, name=url, say=say)   # (a kit holds the manifests it was made with: the channel moves)
+    if p:
+        with open(p, 'rb') as f:
+            return json.load(f)
     for attempt in range(1, 5):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
-                return json.load(r)
+                data = r.read()
+            doc = json.loads(data)
+            kit.record_bytes(data, url, url)
+            return doc
         except (OSError, ValueError, http.client.HTTPException) as e:
             if attempt == 4:
-                raise ToolchainError(f'could not read {url} ({e}). Check the internet connection.')
+                raise ToolchainError(f'could not read {url} ({e}). Check the internet connection.' + kit.missing_note())
             time.sleep(3 * attempt)
 
 
@@ -344,9 +365,10 @@ def msi_staging(dl):
     raise ToolchainError('no plain folder for the Windows SDK installers (ProgramData has an unusual name)')
 
 
-def ensure_msvc(tools):
+def ensure_msvc(tools, fetch_only=False):
     """Microsoft's C/C++ runtime + Windows SDK into <tools>/msvc; returns the environment variables that point the
-    build at them (INCLUDE, LIB, VCToolsInstallDir...: the build's vcvars search is skipped when they are set)."""
+    build at them (INCLUDE, LIB, VCToolsInstallDir...: the build's vcvars search is skipped when they are set).
+    fetch_only: the downloads alone, nothing unpacked (a download kit records them); returns None."""
     d = os.path.join(tools, 'msvc')
     try:
         with open(os.path.join(d, '.toolchain.json'), encoding='utf-8') as f:
@@ -363,6 +385,8 @@ def ensure_msvc(tools):
     for pid, p in pkgs.items():   # VSIX packages: zips whose Contents/ is the tree under the VS root
         for i, pay in enumerate(p.get('payloads', [])):
             z = download(pid.split('.', 6)[-1], pay['url'], os.path.join(dl, f'{pid}.{i}.vsix'), pay.get('sha256', '').lower() or None)
+            if fetch_only:
+                continue
             with zipfile.ZipFile(z) as zf:
                 for m in zf.infolist():
                     name = m.filename.replace('\\', '/')
@@ -393,6 +417,8 @@ def ensure_msvc(tools):
             if c.lower() in pays:
                 pay = pays[c.lower()]
                 download(c, pay['url'], os.path.join(sdk_dl, c), pay.get('sha256', '').lower() or None)
+        if fetch_only:
+            continue
         for wait in (0, 10, 20, 40, 60, 90):   # 1618: another installation is running (Windows Update...): wait
             time.sleep(wait)
             r = subprocess.run(f'msiexec.exe /a "{msi}" /quiet /qn TARGETDIR="{tmp}"', capture_output=True)
@@ -402,6 +428,9 @@ def ensure_msvc(tools):
         if r.returncode:
             raise ToolchainError(f'Windows SDK: unpacking {n} failed (msiexec exit code {r.returncode})')
         say(f'unpacked {n[:-4]}')
+    if fetch_only:
+        shutil.rmtree(sdk_dl, ignore_errors=True)
+        return None
     shutil.move(os.path.join(tmp, 'Windows Kits', '10'), os.path.join(d, 'kits'))   # (maybe another drive)
     shutil.rmtree(sdk_dl, ignore_errors=True)
     kits = os.path.join(d, 'kits')
@@ -462,24 +491,113 @@ def ensure_packages(py=sys.executable):
     # -E -s, as Setup starts us: pip sees only this Python's own site-packages. Without them a user site of the same
     # Python version (a Microsoft Store Python 3.13 with these wheels) made pip say 'already satisfied' and install
     # nothing, and the import that follows failed ('No module named cryptography', a fresh v0.1.6 install, 11-01)
-    pyx = [py, '-E', '-s']
-    if subprocess.run([*pyx, '-m', 'pip', '--version'], capture_output=True).returncode:
-        r = subprocess.run([*pyx, '-m', 'ensurepip', '--default-pip'], capture_output=True, text=True)
-        if r.returncode:
-            raise ToolchainError('pip could not be set up: ' + (r.stdout + r.stderr)[-600:])
-    r = subprocess.run([*pyx, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-warn-script-location',
-                        '--only-binary', ':all:', *missing], capture_output=True, text=True)
-    if r.returncode:
-        raise ToolchainError('installing the Python packages failed (internet?):\n' + (r.stdout + r.stderr)[-1500:])
+    pyx = pip(py)
+    pip_install(pyx, missing)
     import importlib
     importlib.invalidate_caches()   # (this process imports them next: its finders cached site-packages without them)
     say('Python packages installed')
 
 
+def pip(py=sys.executable):
+    """[py, -E, -s] with pip set up"""
+    pyx = [py, '-E', '-s']
+    if subprocess.run([*pyx, '-m', 'pip', '--version'], capture_output=True).returncode:
+        r = subprocess.run([*pyx, '-m', 'ensurepip', '--default-pip'], capture_output=True, text=True)
+        if r.returncode:
+            raise ToolchainError('pip could not be set up: ' + (r.stdout + r.stderr)[-600:])
+    return pyx
+
+
+def pip_install(pyx, specs, quiet=False):
+    """pip install specs, wheels only: from the download kit's wheels alone when it has them (each checked), else (or
+    when the kit lacks one) from the package index. tools/engine/build.py's venv uses it too."""
+    base = [*pyx, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-warn-script-location',
+            '--only-binary', ':all:'] + (['--quiet'] if quiet else [])
+    wheels = kit.wheels(say)
+    if wheels:
+        r = subprocess.run(base + ['--no-index', '--find-links', wheels, *specs], capture_output=True, text=True)
+        if not r.returncode:
+            say('Python packages: from the download kit')
+            return
+        say('Python packages: not all in the download kit; from the package index')
+    r = subprocess.run(base + list(specs), capture_output=True, text=True)
+    if r.returncode:
+        raise ToolchainError('installing the Python packages failed (internet?):\n' + (r.stdout + r.stderr)[-1500:] +
+                             kit.missing_note())
+
+
+def kit_wheels(specs, py=sys.executable):
+    """Making a download kit: the wheels of specs (and what they need) for this Python into <kit>/wheels, listed"""
+    d = os.path.join(kit.making(), 'wheels')
+    os.makedirs(d, exist_ok=True)
+    r = subprocess.run([*pip(py), '-m', 'pip', 'download', '--disable-pip-version-check', '--only-binary', ':all:',
+                        '--dest', d, *specs], capture_output=True, text=True)
+    if r.returncode:
+        raise ToolchainError('downloading the Python packages failed (internet?):\n' + (r.stdout + r.stderr)[-1500:])
+    kit.record_wheels(d)
+    say(f'Python packages: {sum(n.endswith(".whl") for n in os.listdir(d))} wheels in the kit')
+
+
 # ---- all of it -----------------------------------------------------------------------------------------------------
+
+LINUX = sys.platform.startswith('linux')
+ASSETS_REPO = 'daniel-madrid-07/weeping-of-the-empire'
+
+
+def linux_asset(used_by):
+    """assets.json's entry for used_by, or None"""
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets.json'), encoding='utf-8') as f:
+        return next((x for x in json.load(f)['assets'] if x['used_by'] == used_by), None)
+
+
+def ensure_linux_part(tools, part, used_by, env_override, probe):
+    """<tools>/<part> from its pinned asset (a .tar.zst of one top folder, unpacked without it), stamped by its sha256"""
+    d = os.path.join(tools, part)
+    local = os.environ.get(env_override, '')
+    pin = linux_asset(used_by)
+    if not pin and not local:
+        raise ToolchainError(f'no {part} for Linux in this source (assets.json {used_by}): this version cannot build on Linux')
+    if local and not os.path.isfile(local):
+        raise ToolchainError(f'{env_override}: no file at {local}')
+    if local and pin and file_sha256(local) != pin['sha256']:   # (a local copy of a published asset must be that asset)
+        raise ToolchainError(f'{env_override}: {local} is not the {pin["name"]} this version pins (sha256 differs)')
+    what = {'asset': local and os.path.basename(local) or pin['name'], 'sha256': local and file_sha256(local) or pin['sha256']}
+    if stamped(d, what) and os.path.exists(os.path.join(d, probe)):
+        return d
+    arc = local or download(f'{part} ({pin["name"]})', f'https://github.com/{ASSETS_REPO}/releases/download/{pin["tag"]}/{pin["name"]}',
+                            os.path.join(tools, 'downloads', pin['name']), pin['sha256'], pin['size'])
+    import zstandard   # (PACKAGES: ensure_packages ran first)
+    fresh(d)
+    with open(arc, 'rb') as raw:
+        src = _Counting(raw, part, os.path.getsize(arc))
+        with zstandard.ZstdDecompressor().stream_reader(src) as z, tarfile.open(fileobj=z, mode='r|') as tf:
+            for m in tf:
+                rel = m.name.split('/', 1)[1] if '/' in m.name else ''
+                if not rel:
+                    continue
+                m.name = rel
+                tf.extract(m, d, filter='data')   # (relative symlinks inside the folder: kept; nothing outside it)
+    if not os.path.exists(os.path.join(d, probe)):
+        raise ToolchainError(f'{part}: {probe} missing after unpacking')
+    stamp(d, what)
+    if not local:
+        os.remove(arc)
+    return d
+
+
+def ensure_linux(tools):
+    """Linux: LLVM and the SDK into <tools>; the environment build.py reads (its Linux side)"""
+    os.makedirs(tools, exist_ok=True)
+    ensure_packages()
+    llvm = ensure_linux_part(tools, 'llvm', 'setup:LinuxLlvm', 'NXR_LINUX_LLVM_ARCHIVE', os.path.join('bin', 'clang'))
+    sdk = ensure_linux_part(tools, 'linux-sdk', 'setup:LinuxSdk', 'NXR_LINUX_SDK_ARCHIVE', os.path.join('sysroot', 'usr', 'include', 'stdio.h'))
+    return {'NXRECOMP_LLVM_DIR': llvm, 'NXR_LINUX_DEPS': os.path.join(sdk, 'deps'), 'NXR_SYSROOT': os.path.join(sdk, 'sysroot')}
+
 
 def ensure(tools):
     """Everything into <tools>; returns the environment variables for the build steps"""
+    if LINUX:
+        return ensure_linux(tools)
     os.makedirs(tools, exist_ok=True)
     ensure_packages()
     env = {'NXRECOMP_LLVM_DIR': ensure_llvm(tools), 'VULKAN_SDK': ensure_vulkan(tools)}
@@ -504,7 +622,7 @@ def apply(env, base):
         if k != 'PATH_PREFIX':
             out[k] = v
     key = next((k for k in out if k.upper() == 'PATH'), 'PATH')
-    out[key] = ';'.join(p for p in (os.path.join(env['NXRECOMP_LLVM_DIR'], 'bin'), prefix, out.get(key, '')) if p)
+    out[key] = os.pathsep.join(p for p in (os.path.join(env['NXRECOMP_LLVM_DIR'], 'bin'), prefix, out.get(key, '')) if p)
     return out
 
 

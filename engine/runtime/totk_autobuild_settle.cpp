@@ -21,7 +21,6 @@
 #include <cstring>
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 constexpr u64 kWindow = 0x1a0;
 
 struct Open { u64 receiver; float left; u8 stored; };   // stored: the u8 the original left after the hook's last call
@@ -59,8 +58,8 @@ void hook_f_9d8d00(Ctx *__restrict c) {   // SpecialPowerReceiver::postCalcUltra
         printf("[autobuild-settle] settle window after an Autobuild %s\n", v ? "in game time" : "in frames, as the game (TOTK_AUTOBUILD_SETTLE=0)");
         return v;
     }();
-    const u64 fd = totk_global(kFrameDelta);
-    const float r = on && totk_ptr_ok(fd) ? ldf32(fd + 8) : 1.0f;
+    const u64 fd = totk_frame_delta();
+    const float r = on && totk_ptr_ok(fd) ? totk_frame_ratio(fd) : 1.0f;
     if (!(r > 0.01f && r < 1.0f)) { f_9d8d00_orig(c); return; }
     while (g_lock.test_and_set(std::memory_order_acquire)) {}
     Open *o = find(rcv, true);

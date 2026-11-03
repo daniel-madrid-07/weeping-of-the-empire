@@ -21,16 +21,19 @@
 #include <cstdint>
 #include <cstdlib>
 
-// The rungs' periods in ns, fastest first, from the ceiling's period (cap) down to 30 fps: whole multiples of refresh
-// (the window's monitor period x unit; 0 when unknown: the ceiling's period), or with tenth the ceiling's period /
-// 0.9^k (TOTK_UNLOCK_STEADY=vrr). top: the ceiling is the first rung. Never empty.
-static inline int pace_ladder_build(int64_t cap, int64_t refresh, bool tenth, bool top, int64_t out[32]) {
-    const int64_t floor30 = 1000000000ll / 30, r = refresh ? refresh : cap;
+// The rungs' periods in ns, fastest first, from the ceiling's period (cap) down to the floor's (30 fps; 20 or 15 with
+// display.steady_floor, #23: a Vega 7 at 15-17 fps on a 60 Hz FIFO swapchain showed its frames 3, 4 or 5 refreshes
+// each, where rungs of 3 and 4 refreshes hold them even): whole multiples of refresh (the window's monitor period x
+// unit; 0 when unknown: the ceiling's period), or with tenth the ceiling's period / 0.9^k (TOTK_UNLOCK_STEADY=vrr).
+// top: the ceiling is the first rung. Never empty.
+static inline int pace_ladder_build(int64_t cap, int64_t refresh, bool tenth, bool top, int64_t out[32],
+                                    int64_t floor = 1000000000ll / 30) {
+    const int64_t r = refresh ? refresh : cap;
     int m = 0;
     if (top) out[m++] = cap;
     for (int i = 1; m < 32; i++) {
         const int64_t p = tenth ? (int64_t)(cap / std::pow(0.9, i - 1)) : r * i;
-        if (p > floor30 + floor30 / 50) break;
+        if (p > floor + floor / 50) break;
         if (p >= cap - cap / 100 && (!m || p > out[m - 1])) out[m++] = p;
     }
     if (!m) out[m++] = cap;
@@ -46,6 +49,8 @@ struct PaceLadder {
     int64_t good = -1;   // the rung to go back to (-1: the first one)
     int ceil_was = 0, held = 0, falls = 0;
     bool probe = false;  // the rung came from a promotion and has not held 4 s yet
+    int64_t excused[3] = {};   // the ends of the last stalls excused as hitches (frame: at most 3 within 10 s)
+    unsigned excused_n = 0;
     int k = 0, l = 0;    // the last judgement's frames and late ones (for the log)
 
     // One frame at the pacer: ceil the ceiling (fps), now its arrival (ns, monotonic, not 0), late a quarter period or
@@ -67,18 +72,48 @@ struct PaceLadder {
         if (now - evaluated < 500 * kMs || since < (probe ? 500 : 1000) * kMs) return target;
         evaluated = now;
         k = l = 0;
-        for (auto &r : ring)
-            if (r.t && now - r.t <= window) k++, l += r.late;
-        if (k < 15) return target;
-        const double fps = k * 1e9 / window;   // (the frames' rate over the window)
+        int64_t gap = 0, prev = 0, gap_end = 0;   // (the window's longest interval between two frames, and its end)
+        for (unsigned i = n > 512 ? n - 512 : 0; i < n; i++) {
+            const Frame &r = ring[i & 511];
+            if (!r.t || now - r.t > window) continue;
+            k++, l += r.late;
+            if (prev && r.t - prev > gap) gap = r.t - prev, gap_end = r.t;
+            prev = r.t;
+        }
         int64_t lad[32];
         const int m = build(lad);
+        // (15 frames to judge. Under 30 fps, display.steady_floor: 70 % of what the slowest rung shows in the window, 10 at
+        // 15 fps over a second, 7 over a probe's half second: a 15 rung shows 14 or 15 frames a second, so a scene there
+        // was never judged and never climbed back, nor went to the ladder's last rung after the floor was raised live; a
+        // probe to 20 was judged only after a whole second of uneven frames. Rungs down to 30 fps keep the 15)
+        const int64_t slow = std::max(lad[m - 1], target);
+        if (k < (slow > 34 * kMs ? window * 7 / 10 / slow : 15)) return target;
+        const double fps = k * 1e9 / window;   // (the frames' rate over the window)
         int cur = 0;
         while (cur + 1 < m && lad[cur] < target) cur++;
         int to = cur;
         if (falls && now - fell_at > 60000 * kMs) falls = 0;
         const double rate = 1e9 / lad[cur], miss = (double)l / k;
-        if ((fps < 0.93 * rate || miss > 0.10) && cur + 1 < m) {
+        // One long stall (a scene hitch: 4 rung periods or more) is not a rate the game cannot hold: the slots it swallowed
+        // count as held when the frames around it make the rate. At DLSS-G / FSR FG's 60-real rung on a 120 Hz panel (rungs
+        // 60 and 30 only) one 120 ms hitch in the judged second left 54 frames, under 93 %, and fell to 30; the next
+        // hitches made every climb back a failed probe, held there ~30 s (FSR FG boot r47ffsrfg, +40.. +66 s; the same
+        // hitches cost SR / off a dip of a few fps) A stall that keeps coming is the scene's rate, not a hitch: a 4th stall
+        // within 10 s of 3 excused ones is judged without the excuse. Stalls, not judgements: each is in two judged windows
+        // (every 0.5 s over 1 s), known by its end. At display.steady_floor's 20 fps rung a hitch is 200 ms or more; at 15
+        // it would be 267 ms, past the 250 ms gap above, which already starts the judging over (and 15 is the floor:
+        // nothing to fall to)
+        bool hitch = gap >= 4 * lad[cur] && (k + (double)gap / lad[cur] - 1) * 1e9 / window >= 0.93 * rate;
+        if (hitch && fps < 0.93 * rate && miss <= 0.10) {   // (only where the excuse applies: no slot spent otherwise)
+            int recent = 0;
+            bool known = false;
+            for (int64_t e : excused) recent += e && now - e <= 10000 * kMs, known |= e == gap_end;
+            if (!known) {
+                if (recent >= 3) hitch = false;
+                else excused[excused_n++ % 3] = gap_end;
+            }
+        }
+        if ((fps < 0.93 * rate || miss > 0.10) && !(hitch && miss <= 0.10) && cur + 1 < m) {
             to = cur + 1;
             if (fps < 0.93 * rate)
                 while (to + 1 < m && fps < 0.95 * (1e9 / lad[to])) to++;

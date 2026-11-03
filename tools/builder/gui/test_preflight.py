@@ -16,7 +16,7 @@ RELEASE = ('static class Release\n{\n    public const string Product = "Prefligh
            '    public const string LlvmVersion = "0";\n    public const string VulkanSha256 = "";\n'
            '    public const string LlvmSha256 = "";\n    public const string VulkanAsset = "setup-vulkan-sdk.zip";\n'
            '    public const string LlvmAsset = "setup-llvm.zip";\n    public const string VulkanTag = "v9.9.8";\n'
-           '    public const string LlvmTag = "v9.9.8";\n}\n')
+           '    public const string LlvmTag = "v9.9.8";\n    public const string Commit = "";\n}\n')
 
 
 def check_assets():
@@ -105,6 +105,57 @@ def check_inputs(exe, tmp):
         'size-bad.nsp': syn.partition([('program.nca', size_bad)]),
         'update.nsp': syn.partition(update_files), 'update-no-meta.nsp': syn.partition(update_files[::2]),
     }
+
+    def mutated(image, magic, at, fmt, value):   # (an NSZ / XCZ whose .ncz header field at magic + at is set to value)
+        image = bytearray(image)
+        struct.pack_into(fmt, image, image.find(magic) + at, value)
+        return bytes(image)
+
+    # NSZ / XCZ (nsz's .ncz, pipeline/nx/ncz.py): Setup's NczSize says what ncz.NczBody says
+    nsz = syn.game_image('nsp', compress='solid')
+    images.update({
+        'base.nsz': nsz, 'base-managed.nsz': syn.game_image('nsp', True, compress=16),
+        'base.xcz': syn.game_image('xci', compress=14), 'cut.nsz': nsz[:-700], 'renamed-nsz.nsp': nsz,
+        'no-nczsectn.nsz': mutated(nsz, b'NCZSECTN', 0, '<B', ord('X')),
+        'ncz-count.nsz': mutated(nsz, b'NCZSECTN', 8, '<Q', 65),
+        'ncz-gap.nsz': mutated(nsz, b'NCZSECTN', 16, '<Q', 0x4200),
+        'ncz-huge.nsz': mutated(nsz, b'NCZSECTN', 24, '<Q', 1 << 50),
+        'ncz-blocks.xcz': mutated(syn.game_image('xci', compress=14), b'NCZBLOCK', 16, '<Q', 12345),
+        'ncz-exp.xcz': mutated(syn.game_image('xci', compress=14), b'NCZBLOCK', 11, '<B', 13),
+        'update.nsz': syn.partition([('program.ncz', syn.ncz(syn.nca(True, exefs_crypt=4, first=0x4000)))] +
+                                    update_files[1:]),
+    })
+    # NUP (pipeline/nx/nup.py; written by pipeline/tests/nupwrite.py from the spec): Setup's NupCheck says what nup.Nup
+    # and base_package say, with or without keys
+    from pipeline.tests.nupwrite import nup
+    import hashlib
+    exefs, romfs = {'main': b'm', 'main.npdm': b'n'}, {'a.txt': b'alpha', 'b/c.bin': bytes(range(256)) * 64}
+    good_nup = nup([dict(title_id=syn.TITLE, exefs=exefs, romfs=romfs), dict(title_id=UPDATE, kind=1, romfs={'a.txt': b'x'})])
+
+    def resealed(data, fn):   # (a TOC changed and its SHA-256 written again: a well-formed NUP of other content)
+        b = bytearray(data)
+        off, size = struct.unpack_from('<QQ', b, 8)
+        toc = bytearray(b[off:off + size])
+        fn(toc)
+        b[off:off + size] = toc
+        b[0x18:0x38] = hashlib.sha256(toc).digest()
+        return bytes(b)
+    pc0 = struct.unpack_from('<I', good_nup, 0x84)[0]   # (the TOC at 0x80: magic, packages, dirs, files)
+    dc0, fc0 = struct.unpack_from('<QQ', good_nup, 0x88)
+    images.update({
+        'base.nup': good_nup, 'renamed-nup.nsp': good_nup,
+        'other.nup': nup([dict(title_id=OTHER, exefs=exefs, romfs=romfs)]),
+        'update-only.nup': nup([dict(title_id=UPDATE, kind=1, flags=1, romfs=romfs)]),
+        'two-bases.nup': nup([dict(title_id=syn.TITLE, exefs=exefs, romfs=romfs), dict(title_id=syn.TITLE, exefs=exefs, romfs=romfs)]),
+        'no-exefs.nup': nup([dict(title_id=syn.TITLE, romfs=romfs)]),
+        'format2.nup': good_nup[:3] + b'\x02' + good_nup[4:],
+        'hdr2.nup': good_nup[:6] + struct.pack('<H', 2) + good_nup[8:],
+        'flags.nup': good_nup[:0x4c] + struct.pack('<I', 4) + good_nup[0x50:],
+        'cut.nup': good_nup[:-16],
+        'toc.nup': nup([dict(title_id=syn.TITLE, exefs=exefs, romfs=romfs)], corrupt='toc'),
+        'codec.nup': resealed(good_nup, lambda t: t.__setitem__(0x30 + pc0 * 0x40 + dc0 * 0x18 + 0x40, 3)),
+        'kind.nup': resealed(good_nup, lambda t: t.__setitem__(0x30 + 0x18, 9)),
+    })
     good = syn.keys_text()
     keyfiles = {'prod.keys': good, 'short.keys': 'header_key = ' + syn.HEADER.hex() + '\n',
                 'badhex.keys': good + 'titlekek_01 = zz\n',
@@ -117,28 +168,50 @@ def check_inputs(exe, tmp):
         with open(os.path.join(tmp, name), 'w', encoding='utf-8', newline='\n') as f:
             f.write(text)
     # (dump, keys, update, good?)
-    cases = [('base.nsp', 'prod.keys', None, True), ('base-managed.nsp', 'prod.keys', None, True),
-             ('base.xci', 'prod.keys', None, True), ('base.nsp', 'comment.keys', None, True),
-             ('base.nsp', 'prod.keys', 'update.nsp', True), ('base-managed.nsp', 'prod.keys', 'update.nsp', True)]
-    cases += [(d, 'prod.keys', None, False) for d in images if d not in ('base.nsp', 'base-managed.nsp', 'base.xci', 'update.nsp')]
+    goods = ('base.nsp', 'base-managed.nsp', 'base.xci', 'base.nsz', 'base-managed.nsz', 'base.xcz', 'renamed-nsz.nsp',
+             'base.nup', 'renamed-nup.nsp')
+    cases = [(d, 'prod.keys', None, True) for d in goods]
+    cases += [('base.nsp', 'comment.keys', None, True),
+              ('base.nsp', 'prod.keys', 'update.nsp', True), ('base-managed.nsp', 'prod.keys', 'update.nsp', True),
+              ('base.nsz', 'prod.keys', 'update.nsp', True)]
+    cases += [(d, 'prod.keys', None, False) for d in images if d not in goods + ('update.nsp',)]
     cases += [('base.nsp', k, None, False) for k in ('short.keys', 'badhex.keys', 'other.keys')]
-    cases += [('base.nsp', 'prod.keys', u, False) for u in ('base.nsp', 'update-no-meta.nsp', 'cut.nsp', 'personal.nsp')]
+    cases += [('base.nsp', 'prod.keys', u, False) for u in ('base.nsp', 'update-no-meta.nsp', 'cut.nsp', 'personal.nsp',
+                                                            'base.nsz')]
+    cases += [('base.nsp', 'prod.keys', 'update.nsz', True), ('base.nsz', 'prod.keys', 'update.nsz', True)]   # (BKTR from NCZ)
     cases += [('update.nsp', 'prod.keys', 'base.nsp', False)]
+    # a NUP without any keys file: fine alone; its checks as with keys
+    cases += [('base.nup', None, None, True), ('renamed-nup.nsp', None, None, True)]
+    cases += [(d, None, None, False) for d in images if d.endswith('.nup') and d != 'base.nup']
+    # 1.4.3 from a NUP (its update package, the 1.4.3 one or the newest): no keys with a NUP game, keys with an NSP one;
+    # an update NSP without keys fails on its keys
+    with open(os.path.join(tmp, 'with-update.nup'), 'wb') as f:
+        f.write(nup([dict(title_id=syn.TITLE, exefs=exefs, romfs=romfs),
+                     dict(title_id=UPDATE, kind=1, version=0x10000, exefs=exefs, romfs=romfs),
+                     dict(title_id=syn.TITLE, kind=1, version=720896, exefs=exefs, romfs=romfs)]))
+    with open(os.path.join(tmp, 'update-only-ok.nup'), 'wb') as f:
+        f.write(nup([dict(title_id=UPDATE, kind=1, flags=1, version=720896, exefs=exefs, romfs=romfs)]))
+    cases += [('with-update.nup', None, 'with-update.nup', True), ('base.nup', None, 'update-only-ok.nup', True),
+              ('base.nsp', 'prod.keys', 'with-update.nup', True), ('base.nup', None, 'base.nup', False),
+              ('base.nup', None, 'other.nup', False), ('base.nup', None, 'format2.nup', False),
+              ('base.nup', None, 'update.nsp', False)]
 
     def python(dump, keys, update):
         out = io.StringIO()
         try:
             with contextlib.redirect_stdout(out):
-                builder.check_keys(keys)
+                if keys:
+                    builder.check_keys(keys)
         except SystemExit:
             return out.getvalue().strip().replace('[Builder] ERROR: ', '')
         return builder.check_dump(dump, keys, update)
 
     p = lambda n: n and os.path.join(tmp, n)   # noqa: E731
     with open(os.path.join(tmp, 'cases.txt'), 'w', encoding='utf-8', newline='\n') as f:
-        f.writelines(f'{p(d)}\t{p(k)}\t{p(u) or "-"}\n' for d, k, u, _ in cases)
+        f.writelines(f'{p(d)}\t{p(k) or "-"}\t{p(u) or "-"}\n' for d, k, u, _ in cases)
     r = subprocess.run([exe, 'inputs', os.path.join(tmp, 'cases.txt')], capture_output=True, text=True, timeout=120)
     got = [ln.split('\t', 1)[1] for ln in r.stdout.splitlines() if ln.startswith('INPUTS\t')]
+    packed = [ln.split('\t', 1)[1] == '1' for ln in r.stdout.splitlines() if ln.startswith('PACKED\t')]
     fails = 0 if len(got) == len(cases) else 1
     if fails:
         print(f'inputs: {len(got)} answers for {len(cases)} cases\n{r.stdout}{r.stderr}')
@@ -148,6 +221,11 @@ def check_inputs(exe, tmp):
         fails += not right
         print(f'inputs: {d} + {k}' + (f' + update {u}' if u else '') + f': {"ok" if right else "FAIL"} '
               f'{cs[:110] if right else f"C# {cs!r} / Python {py!r}"}')
+    # Setup locks the copy on for an NSZ / XCZ, a renamed one too, as builder.py's compressed_dump forces it
+    want = [builder.compressed_dump(p(d)) for d, _, _, _ in cases]
+    same = packed == want and want.count(True) >= 6
+    fails += not same
+    print(f'inputs: compressed dumps (Setup locks the copy): {"ok" if same else f"FAIL C# {packed} / Python {want}"}')
     print(f'inputs: {len(cases)} cases, {"all agree" if not fails else f"{fails} FAIL"}')
     return 1 if fails else 0
 

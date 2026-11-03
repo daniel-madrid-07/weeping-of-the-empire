@@ -16,6 +16,7 @@ that ships with Windows (.NET Framework 4.x).
         -> Builder.exe in the repository root (builds the clone it sits in with the PC's own tools)
 
 The tag must exist on the public repository before the exe is handed out: Setup fetches exactly that tag.
+Both carry the window's languages, text/<code>.json (Builder.cs class L; test_text.py checks them).
 """
 import argparse
 import hashlib
@@ -148,18 +149,55 @@ def cs_string(s):
     return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
+def tag_commit(repo, tag):
+    """The commit the tag names on the public repository (an annotated tag: the commit it points at), or None when the
+    tag is not there (yet)"""
+    r = subprocess.run(['git', 'ls-remote', f'https://github.com/{repo}.git', f'refs/tags/{tag}', f'refs/tags/{tag}^{{}}'],
+                       capture_output=True, text=True)
+    refs = dict(reversed(ln.split('\t')) for ln in r.stdout.splitlines() if '\t' in ln)
+    sha = refs.get(f'refs/tags/{tag}^{{}}') or refs.get(f'refs/tags/{tag}')
+    return sha if not r.returncode and sha and re.fullmatch(r'[0-9a-f]{40}', sha) else None
+
+
+def release_commit(repo, tag, given):
+    """The commit Setup builds (Release.Commit: it refuses fetched source that is another, from GitHub or from a download
+    kit, which may not be the player's own). The release order builds the Setup before the tag is public, so --commit
+    (the audited public commit) is the normal way; the public tag stands in when it is already there, and when both
+    are, they must agree. release_publish checks the pushed tag against the exe's version string (<tag>+<commit>) once
+    more."""
+    if given and not re.fullmatch(r'[0-9a-f]{40}', given.lower()):
+        sys.exit(f'--commit {given}: a full 40-digit commit id is needed')
+    public = tag_commit(repo, tag)
+    if given and public and given.lower() != public:
+        sys.exit(f'--commit {given} is not the commit {tag} names on github.com/{repo} ({public})')
+    if not (given or public):
+        sys.exit(f'{tag} is not on github.com/{repo} yet: give --commit <the public commit release-audit audited> '
+                 '(Setup builds only that commit)')
+    return (given or public).lower()
+
+
+def text_resources():
+    """csc options that build the window's languages (text/<code>.json, Builder.cs class L) into the exe."""
+    text = os.path.join(HERE, 'text')
+    return [f'/resource:{os.path.join(text, f)},text.{f}' for f in sorted(os.listdir(text)) if f.endswith('.json')]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument('--tag', help='the public repository tag this Setup builds (e.g. v1.0.0)')
     g.add_argument('--builder', action='store_true', help='Builder.exe for the repository root')
     ap.add_argument('--repo', default=PUBLIC_REPO)
+    ap.add_argument('--commit', help='the public commit the tag will name (release-audit\'s audited one): Setup builds '
+                                     'the source it fetches only when it is this commit (default: the tag\'s, when it is '
+                                     'already on the public repository; both given: they must agree)')
     ap.add_argument('--product', default=PRODUCT)
     ap.add_argument('--out', default=REPO)
     ap.add_argument('--repin', action='store_true',
                     help='the zips differ from assets.json (a new toolset): pin them there to this tag (commit it, then tag)')
     a = ap.parse_args()
     pins = {key: dict(name='', tag='', sha256='') for key in SETUP_ASSETS}
+    commit = release_commit(a.repo, a.tag, a.commit) if a.tag else ''   # (Builder.exe builds its own clone: none)
     built = []
     with tempfile.TemporaryDirectory(prefix='make_setup_') as tmp:
         if a.tag:
@@ -199,7 +237,9 @@ def main():
                  'AssemblyDescription': f'{a.product} {what}: builds the game on this PC from your own console dump',
                  'AssemblyCompany': f'{a.product} project (open source)',
                  'AssemblyCopyright': f'Open source: github.com/{a.repo}', 'AssemblyVersion': ver,
-                 'AssemblyFileVersion': ver, 'AssemblyInformationalVersion': a.tag or 'main'}
+                 'AssemblyFileVersion': ver,
+                 # (<tag>+<commit>: the exe's Details say which source it builds; release_publish compares the pushed tag)
+                 'AssemblyInformationalVersion': f'{a.tag}+{commit}' if a.tag else 'main'}
         with open(rel, 'w', encoding='utf-8') as f:
             f.write('// written by make_setup.py\n'
                     + ''.join(f'[assembly: System.Reflection.{k}({cs_string(v)})]\n' for k, v in attrs.items())
@@ -208,6 +248,7 @@ def main():
                     f'    public const string Tag = {cs_string(a.tag or "main")};\n'
                     f'    public const string Repo = {cs_string(a.repo)};\n'
                     f'    public const string LlvmVersion = {cs_string(RELEASE_TOOLS["clang"])};\n'
+                    f'    public const string Commit = {cs_string(commit)};\n'
                     + ''.join(f'    public const string {k}Sha256 = {cs_string(v["sha256"])};\n'
                               f'    public const string {k}Asset = {cs_string(v["name"])};\n'
                               f'    public const string {k}Tag = {cs_string(v["tag"])};\n' for k, v in pins.items()) + '}\n')
@@ -218,7 +259,7 @@ def main():
             f.write(MANIFEST.format(name=re.sub(r'[^A-Za-z0-9.]', '', a.product.title()) + '.' + what, ver=ver))
         cmd = [CSC, '/nologo', '/target:winexe', '/optimize+', f'/out:{exe}', f'/win32manifest:{man}',
                '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.IO.Compression.dll',
-               '/r:System.IO.Compression.FileSystem.dll', os.path.join(HERE, 'Builder.cs'), rel]
+               '/r:System.IO.Compression.FileSystem.dll', os.path.join(HERE, 'Builder.cs'), rel] + text_resources()
         r = subprocess.run(cmd, capture_output=True, text=True)
         sys.stdout.write(r.stdout + r.stderr)
         if r.returncode:

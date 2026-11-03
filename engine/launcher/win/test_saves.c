@@ -7,6 +7,7 @@
 #include "saves.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_fail;
@@ -171,6 +172,48 @@ int main(void) {
     CHECK(saves_replace(base, bk) == 0);
     slot0(save, text, sizeof text);
     CHECK(!strcmp(text, "yuzu"));
+
+    /* links are skipped, other reparse points (OneDrive's cloud files: rival #374) are files and folders */
+    WIN32_FIND_DATAW fd = {0};
+    fd.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+    fd.dwReserved0 = IO_REPARSE_TAG_MOUNT_POINT;
+    CHECK(saves_is_link(&fd));
+    fd.dwReserved0 = IO_REPARSE_TAG_SYMLINK;
+    CHECK(saves_is_link(&fd));
+    fd.dwReserved0 = 0x9000601Au;   /* IO_REPARSE_TAG_CLOUD_6: a OneDrive folder */
+    CHECK(!saves_is_link(&fd));
+    fd.dwFileAttributes = FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+    CHECK(!saves_is_link(&fd));   /* a cloud file, online-only */
+    fd.dwFileAttributes = FILE_ATTRIBUTE_ARCHIVE;
+    fd.dwReserved0 = IO_REPARSE_TAG_SYMLINK;   /* (dwReserved0 means nothing without the attribute) */
+    CHECK(!saves_is_link(&fd));
+
+    /* a real junction in a save tree: not copied, and deleting the tree removes the link, not what it points at */
+    wchar_t jsrc[MAX_PATH], jdst[MAX_PATH], jcmd[3 * MAX_PATH];
+    fake_slot(L"junction\\src", 0, "linked", 1);
+    fake_slot(L"junction\\target", 0, "target", 1);
+    swprintf(jsrc, MAX_PATH, L"%ls\\junction\\src", g_root);
+    swprintf(jcmd, 3 * MAX_PATH, L"cmd /d /c mklink /J \"%ls\\link\" \"%ls\\junction\\target\" >nul", jsrc, g_root);
+    CHECK(_wsystem(jcmd) == 0);
+    swprintf(p, MAX_PATH, L"%ls\\link\\slot_00\\progress.sav", jsrc);
+    CHECK(exists(p));
+    swprintf(jdst, MAX_PATH, L"%ls\\junction\\dst", g_root);
+    CHECK(saves_copy_tree(jsrc, jdst) == 0);
+    swprintf(p, MAX_PATH, L"%ls\\slot_00\\progress.sav", jdst);
+    CHECK(exists(p));
+    swprintf(p, MAX_PATH, L"%ls\\link", jdst);
+    CHECK(!exists(p));
+    CHECK(saves_delete_tree(jsrc) == 0);
+    CHECK(!exists(jsrc));
+    swprintf(p, MAX_PATH, L"%ls\\junction\\target\\slot_00\\progress.sav", g_root);
+    CHECK(exists(p));
+
+    /* a read-only folder (as OneDrive and copies from an SD card leave them) is deleted too */
+    swprintf(p, MAX_PATH, L"%ls\\slot_00", jdst);
+    CHECK(SetFileAttributesW(p, FILE_ATTRIBUTE_READONLY));
+    CHECK(SetFileAttributesW(jdst, FILE_ATTRIBUTE_READONLY));
+    CHECK(saves_delete_tree(jdst) == 0);
+    CHECK(!exists(jdst));
 
     CHECK(saves_delete_tree(g_root) == 0);
     CHECK(!exists(g_root));

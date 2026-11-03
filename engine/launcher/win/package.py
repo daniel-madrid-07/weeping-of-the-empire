@@ -12,11 +12,17 @@ One folder <out>/TotK-PC-<YYYYMMDD-HHMM>-<commit9>/ (default out: <work>/release
     LEEME.txt           the player's guide, in Spanish (LEEME.txt next to this file)
 No game data goes in: the NSO images, the RomFS and our romfs overlay (files derived from the game's) stay in the
 work folder and player.txt points at them. Key: --key, else the newest built key with an exe and objects done.
-"""
+
+On Linux (linux-port, 2026-11-02) the same folder holds totk (ELF) instead of totk.exe, lib/libSDL3.so.0 (the exe's
+RUNPATH is $ORIGIN/lib; from build_deps.sh's prefix, NXR_LINUX_DEPS) and the launcher: launcher_linux.py with 'TotK
+Launcher', a shell script that runs it (python3); text files with LF line ends."""
 import argparse, datetime, json, os, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.environ.get('NXRECOMP_WORK', r'C:\nxrecomp-work')
+LINUX = sys.platform.startswith('linux')
+EXE = 'totk' if LINUX else 'totk.exe'
+NL = '\n' if LINUX else '\r\n'   # (player.txt, settings.ini and the guide: each system's own line ends)
 ENG = os.path.join(WORK, 'engine')
 ROMFS = os.path.join(WORK, 'extracted', 'v100', 'romfs')
 # the extraction's RomFS image, served in place when romfs_image_verify.py found it identical to ROMFS (romfs= stays the
@@ -69,7 +75,7 @@ def newest_key():
     best = None
     for k in os.listdir(os.path.join(ENG, 'game')):
         m = os.path.join(ENG, 'game', k, 'manifest.json')
-        exe = os.path.join(ENG, 'game', k, 'exe', 'totk.exe')
+        exe = os.path.join(ENG, 'game', k, 'exe', EXE)
         if not (os.path.exists(m) and os.path.exists(exe)):
             continue
         man = json.load(open(m))
@@ -148,6 +154,24 @@ def dirty_of(exe):
         return False
 
 
+def linux_launcher(tmp):
+    """the Linux folder's launcher (engine/launcher/linux/launcher_linux.py and its 'TotK Launcher' script) and the
+    SDL3 library the exe loads from lib/ (build_deps.sh's prefix: NXR_LINUX_DEPS, else <work>/linux-deps)"""
+    src = os.path.join(os.path.dirname(HERE), 'linux')
+    shutil.copy2(os.path.join(src, 'launcher_linux.py'), os.path.join(tmp, 'launcher_linux.py'))
+    script = os.path.join(tmp, 'TotK Launcher')
+    with open(script, 'w', newline='\n') as f:
+        f.write('#!/bin/sh\n# Tears of the Kingdom (nxrecomp): starts the game in this folder (launcher_linux.py)\n'
+                'here=$(cd "$(dirname "$0")" && pwd)\nexec python3 "$here/launcher_linux.py" "$here" "$@"\n')
+    os.chmod(script, 0o755)
+    deps = os.environ.get('NXR_LINUX_DEPS') or os.path.join(WORK, 'linux-deps')
+    sdl = os.path.join(deps, 'sdl3-install', 'lib', 'libSDL3.so.0')
+    if not os.path.isfile(sdl):
+        sys.exit(f'missing {sdl} (the SDL3 library the game loads; NXR_LINUX_DEPS: the Linux SDK\'s deps folder)')
+    os.makedirs(os.path.join(tmp, 'lib'))
+    shutil.copy2(os.path.realpath(sdl), os.path.join(tmp, 'lib', 'libSDL3.so.0'))   # (the file, not the symlink chain)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--key'); ap.add_argument('--out', default=os.path.join(WORK, 'release'))
@@ -186,7 +210,7 @@ def main():
         a.no_patch_sets = True
     overlay = os.path.abspath(a.overlay)
     # the key's own exe carries the runtime of the tree the key was built from; a newer runtime relinks against it
-    exe = os.path.abspath(a.exe) if a.exe else os.path.join(key_dir(key), 'exe', 'totk.exe')
+    exe = os.path.abspath(a.exe) if a.exe else os.path.join(key_dir(key), 'exe', EXE)
     commit = commit_of(exe, man, a.commit)
     dirty = dirty_of(exe)
     if not os.path.isdir(ROMFS) and romfs_image(ROMFS):
@@ -204,11 +228,14 @@ def main():
     if os.path.exists(tmp):
         shutil.rmtree(tmp)
     os.makedirs(tmp)
-    subprocess.run([sys.executable, '-I', os.path.join(HERE, 'build.py'), 'launcher', '--out', tmp], check=True)
-    for junk in ('TotK Launcher.pdb',):
-        if os.path.exists(os.path.join(tmp, junk)):
-            os.remove(os.path.join(tmp, junk))
-    shutil.copy2(exe, os.path.join(tmp, 'totk.exe'))
+    if LINUX:
+        linux_launcher(tmp)
+    else:
+        subprocess.run([sys.executable, '-I', os.path.join(HERE, 'build.py'), 'launcher', '--out', tmp], check=True)
+        for junk in ('TotK Launcher.pdb',):
+            if os.path.exists(os.path.join(tmp, junk)):
+                os.remove(os.path.join(tmp, junk))
+    shutil.copy2(exe, os.path.join(tmp, EXE))
     if version == '1.0.0' and os.path.exists(os.path.join(SEED, 'precompile.bin')):   # the launcher points TOTK_PRECOMPILE_SEED at it
         shutil.copytree(SEED, os.path.join(tmp, 'cache-seed'))
     else:
@@ -238,13 +265,13 @@ def main():
     lines = [f'img={man["img"]}', f'romfs={ROMFS}', f'overlay={overlay}', f'commit={commit}', f'key={key}',
              f'build={build_name(man)}', f'patches={man.get("patches") or "none"}', f'packaged={datetime.datetime.now().isoformat(timespec="seconds")}',
              'settings=settings.ini'] + ([] if version == '1.0.0' else [f'version={version}']) + (['beta=1'] if beta else []) + (['dirty=1'] if dirty else []) + ([f'release={a.release}'] if a.release else []) + ([f'release_repo={a.release_repo}'] if a.release_repo else []) + cpu_line(man) + ([f'import={IMPORT}'] if os.path.isdir(IMPORT) else []) + [f'env.{k}={v}' for k, v in env.items()]
-    open(os.path.join(tmp, 'player.txt'), 'w', encoding='utf-8', newline='\r\n').write('\n'.join(lines) + '\n')
-    open(os.path.join(tmp, 'settings.ini'), 'w', encoding='utf-8', newline='\r\n').write(SETTINGS)
+    open(os.path.join(tmp, 'player.txt'), 'w', encoding='utf-8', newline=NL).write('\n'.join(lines) + '\n')
+    open(os.path.join(tmp, 'settings.ini'), 'w', encoding='utf-8', newline=NL).write(SETTINGS)
     guide_file = guide_name()
     guide = open(os.path.join(HERE, guide_file), encoding='utf-8').read()
     guide = guide.replace('{commit}', commit[:9]).replace('{key}', key).replace('{build}', build_name(man)).replace('{img}', man['img']) \
                  .replace('{romfs}', ROMFS).replace('{overlay}', overlay)
-    open(os.path.join(tmp, guide_file), 'w', encoding='utf-8-sig', newline='\r\n').write(guide)
+    open(os.path.join(tmp, guide_file), 'w', encoding='utf-8-sig', newline=NL).write(guide)
     os.rename(tmp, dst)
     size = sum(os.path.getsize(os.path.join(dst, f)) for f in os.listdir(dst))
     log(f'{dst} ({size / 2**20:.0f} MB): key {key} ({build_name(man)}), commit {commit[:9]}, patches {man.get("patches") or "none"}')

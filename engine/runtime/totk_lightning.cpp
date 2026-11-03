@@ -25,7 +25,6 @@
 #include <cstring>
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (+8: 30 Hz ratio)
 constexpr u64 kFlags = 0x8, kCountdown = 0xa0, kOffset = 0xa4, kTarget = 0x98;
 constexpr u32 kFarBolt = 1, kFlash = 8;
 constexpr float kStrikeDelay = 90.0f;    // 0xa5fbf4: 3 s in 30 Hz units
@@ -58,8 +57,8 @@ void hook_f_a5f010(Ctx *__restrict c) {   // game::wm::LightningMgr::calc(this, 
         printf("[lightning] storm rolls %s\n", v ? "per 30 Hz of game time" : "per frame, as the game (TOTK_LIGHTNING=0)");
         return v;
     }();
-    const u64 m = c->x[0], arg = c->x[1], fd = totk_global(kFrameDelta);
-    const float r = on && totk_ptr_ok(m) && totk_ptr_ok(arg) && totk_ptr_ok(fd) ? ldf32(fd + 8) : 1.0f;
+    const u64 m = c->x[0], arg = c->x[1], fd = totk_frame_delta();
+    const float r = on && totk_ptr_ok(m) && totk_ptr_ok(arg) && totk_ptr_ok(fd) ? totk_frame_ratio(fd) : 1.0f;
     if (!(r > 0.01f && r < 1.0f)) { f_a5f010_orig(c); return; }
     const float before = ldf32(m + kCountdown);
     const u64 offset = ld64(m + kOffset);

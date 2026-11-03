@@ -51,10 +51,10 @@ static const char* kUserDir = env_dir("TOTK_USERDATA", "C:/totk/userdata");
 // (read at its first use, the game's first RomFS open, not in static init: totk_engine_boot may point it at the layout
 // overlay for the canvas's shape, the graphics.aspect_ratio)
 static const std::string& overlay_dir() { static const std::string d = env_dir("TOTK_OVERLAY", "C:/totk/overlay/romfs"); return d; }   // tools/rstb_slack.py writes here (U9)
-// Skip the opening (user 2026-10-15): while on, overlay/skip_opening/romfs (tools/make_skip_opening.py: the opening's
+// Skip the opening (user 2026-10-15): while on, the skip_opening set (games/totk/overlays build_skip_opening: the opening's
 // event flow jumps straight to its own end-of-prologue chain -> Great Sky Island wake-up) is served before the romfs.
-// TOTK_SKIP_OPENING=1 starts with it on; F2 / the pad's Minus toggles it on the title screen (hle_hid.cpp).
-static const std::string kSkipDir = getenv("TOTK_SKIP_DIR") ? getenv("TOTK_SKIP_DIR") : "C:/totk/overlay/skip_opening/romfs";
+// TOTK_SKIP_OPENING=1 starts with it on; F2 / the pad's Minus toggles it on the title screen (hle_hid.cpp). Where the
+// set is: skip_dir() below.
 #else
 // Linux: no drive letters. TOTK_ROMFS = the extracted romfs (default <exe dir>/data/romfs), TOTK_USERDATA = saves / cache
 // (default $XDG_DATA_HOME/totk-recomp/userdata), TOTK_OVERLAY = LayeredFS-style replacement files (default <exe dir>/data/overlay/romfs,
@@ -70,6 +70,7 @@ static const char* kRomDir  = kRomStr.c_str();
 static const char* kUserDir = kUserStr.c_str();
 static const std::string& overlay_dir() { static const std::string d = env_or("TOTK_OVERLAY", std::string(rt_posix_exe_dir()) + "/data/overlay/romfs"); return d; }
 static const std::string kSkipDir = env_or("TOTK_SKIP_DIR", std::string(rt_posix_exe_dir()) + "/data/overlay/skip_opening/romfs");
+static const std::string& skip_dir() { return kSkipDir; }
 #endif
 extern "C" { volatile int g_skip_opening = 0, g_title_phase = 1, g_in_opening = 0; volatile uint64_t g_in_opening_since = 0; }
 extern "C" { volatile int g_title_stage = 0; }   // the title's stage (TitleScene_*) is loading or up (hle_vi.cpp TOTK_TITLE_FPS)
@@ -84,11 +85,37 @@ static std::unordered_map<std::string, std::string> g_mounts;       // name -> h
 static bool g_trace_fs = getenv("TOTK_TRACE_FS") != nullptr;
 static int g_open_logged;
 static std::atomic<u64> g_rd_bytes{0}, g_rd_calls{0}, g_opens_ok{0}, g_rd_ns{0};
+static std::atomic<u64> g_wr_bytes{0};   // bytes the guest wrote (a slow save is not a stall: rt_main.cpp's stall report)
 
 #ifdef _WIN32
 static std::wstring widen(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
     std::wstring w(n ? n - 1 : 0, 0); MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n); return w;
+}
+// The skip-the-opening set (above): TOTK_SKIP_DIR, else the skip_opening folder beside the overlay's. tools/engine/build.py
+// overlay writes <engine>/overlay/romfs and <engine>/overlay/skip_opening side by side, and the launcher's TOTK_OVERLAY
+// (player.txt overlay=) names the first; an aspect layout's romfs-aspect-<w>x<h> is beside it too. Public #65: nothing
+// set TOTK_SKIP_DIR on Windows, so the old default below was looked at, which no install has: the setting showed On and
+// the opening played. A build of another game version keeps that default: the set is 1.0.0's opening flow. Read at its
+// first use, as overlay_dir() (totk_engine_boot may set TOTK_OVERLAY first).
+static const std::string& skip_dir() {
+    static const std::string d = [] {
+        const char* v = getenv("TOTK_SKIP_DIR");
+        if (v && *v) return std::string(v);
+#if !defined(TOTK_GAME_VERSION) || TOTK_GAME_VERSION == 100
+        const char* o = getenv("TOTK_OVERLAY");
+        std::string ov = o ? o : "";
+        while (!ov.empty() && (ov.back() == '/' || ov.back() == '\\')) ov.pop_back();
+        const size_t cut = ov.find_last_of("/\\");
+        if (cut != std::string::npos) {
+            const std::string s = ov.substr(0, cut) + "/skip_opening";
+            const DWORD at = GetFileAttributesW(widen(s).c_str());
+            if (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY)) return s;
+        }
+#endif
+        return std::string("C:/totk/overlay/skip_opening/romfs");
+    }();
+    return d;
 }
 // another process holds the file (sync client, antivirus, Explorer preview): retry, then TargetLocked (review N11)
 static bool host_locked(DWORD e) { return e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION || e == ERROR_ACCESS_DENIED; }
@@ -1333,9 +1360,26 @@ enum { kByPort = -1 };   // rom_replacement's *who for a port file; a user mod's
 // "[fs] ..." lines (host_path_ours; the mods' file count passes false). No other side effects.
 static bool rom_replacement(const std::string& rel, bool user, std::string* out, int* who, bool log) {
     auto hit = [&](const std::string& p, int w) { *out = p; if (who) *who = w; return true; };
-    if (g_skip_opening && replacement_exists(kSkipDir, rel)) {
-        if (log) printf("[fs] skip-opening overlay %s\n", (kSkipDir + rel).c_str());
-        return hit(kSkipDir + rel, kByPort);
+#if !(defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100)
+    // Brazilian Portuguese on 1.0.0 (lang-ptbr; pc_lang.cpp): the game stays en-US and opens its message archive (USen);
+    // when the texts are Portuguese, the USpt archive Setup made from the player's own 1.4.3 update (mals.py: USen's
+    // members and labels, the update's texts; in our overlay) is served in its place, else the English one with a line
+    static const bool pt = !strcmp(pc_lang_text(), "pt-BR");
+    static const std::string kPt = "/Mals/USpt.Product.100.sarc.zs", kSfx = ".Product.100.sarc.zs";
+    if (pt && rel.rfind("/Mals/", 0) == 0 && rel.size() > kSfx.size() &&
+        !rel.compare(rel.size() - kSfx.size(), kSfx.size(), kSfx) && rel != kPt) {
+        const bool have = rom_replacement(kPt, false, out, who, false);
+        static std::atomic<int> said{0};
+        if (log && !said.exchange(1))
+            printf(have ? "[lang] Português (Brasil): %s served in place of %s\n"
+                        : "[lang] Português (Brasil): no Portuguese texts (Setup makes them from the 1.4.3 update given "
+                          "to it; %s missing): %s stays English\n", have ? out->c_str() : kPt.c_str(), rel.c_str());
+        if (have) return true;
+    }
+#endif
+    if (g_skip_opening && replacement_exists(skip_dir(), rel)) {
+        if (log) printf("[fs] skip-opening overlay %s\n", (skip_dir() + rel).c_str());
+        return hit(skip_dir() + rel, kByPort);
     }
     // TOTK_MODS: our RomFS sets (totk_engine.c puts them here), first listed wins
     static const std::vector<std::string> sets = mod_dirs("TOTK_MODS", "mod");
@@ -1382,6 +1426,9 @@ static bool host_path_ours(const char* p, std::string* out) {
     std::string rel = s.substr(k + 1);
     if (it->second == kRomDir && rel.find("Event/EventFlow/OpeningEvent.bfevfl") != std::string::npos) {
         printf("[fs] OpeningEvent opened at present %llu: skip opening %s\n", (unsigned long long)nvn_present_count(), g_skip_opening ? "ON" : "OFF");
+        if (g_skip_opening && !replacement_exists(skip_dir(), rel))   // (#65: say why the opening plays anyway)
+            printf("[fs] skip the opening is on, but its set is not at %s: the opening plays (tools/engine/build.py "
+                   "overlay builds it beside the overlay's folder; TOTK_SKIP_DIR names another place)\n", skip_dir().c_str());
         g_title_phase = 0;
     }
     if (it->second == kRomDir && (rel.rfind("/Banc/NormalStage/", 0) == 0 || rel.rfind("/Bake/Scene/", 0) == 0)) {
@@ -1718,8 +1765,9 @@ static bool same_bytes(const std::wstring& a, const std::wstring& b) {
     CloseHandle(x);
     return same;
 }
-// The new directory dst gets work's tree; files equal to those in committed are hard links to them (reparse points,
-// which the game cannot make, are skipped). With `copied`, copies are not flushed and their paths are collected.
+// The new directory dst gets work's tree; files equal to those in committed are hard links to them (links, which the
+// game cannot make, are skipped: save_link; OneDrive's cloud files are copied). With `copied`, copies are not flushed
+// and their paths are collected.
 static bool snap_tree(const std::wstring& work, const std::wstring& committed, const std::wstring& dst,
                       std::vector<std::wstring>* copied = nullptr) {
     if (!CreateDirectoryW(dst.c_str(), nullptr)) return false;
@@ -1727,7 +1775,7 @@ static bool snap_tree(const std::wstring& work, const std::wstring& committed, c
     if (f == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND;
     bool ok = true;
     do {
-        if (!wcscmp(e.cFileName, L".") || !wcscmp(e.cFileName, L"..") || (e.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        if (!wcscmp(e.cFileName, L".") || !wcscmp(e.cFileName, L"..") || save_link(e)) continue;
         std::wstring w = work + L"\\" + e.cFileName, c = committed + L"\\" + e.cFileName, d = dst + L"\\" + e.cFileName;
         if (e.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ok = snap_tree(w, c, d, copied);
         else if (same_bytes(w, c) && CreateHardLinkW(d.c_str(), c.c_str(), nullptr)) ok = true;
@@ -1742,7 +1790,7 @@ static bool copy_tree(const std::wstring& src, const std::wstring& dst) {   // (
     if (f == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND;
     bool ok = true;
     do {
-        if (!wcscmp(e.cFileName, L".") || !wcscmp(e.cFileName, L"..") || (e.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        if (!wcscmp(e.cFileName, L".") || !wcscmp(e.cFileName, L"..") || save_link(e)) continue;
         std::wstring s = src + L"\\" + e.cFileName, d = dst + L"\\" + e.cFileName;
         ok = (e.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? copy_tree(s, d) : copy_flushed(s, d);
     } while (ok && FindNextFileW(f, &e));
@@ -2989,6 +3037,7 @@ static void count_read(u64 n, u64 ns) {
                (unsigned long long)g_rd_calls.load(), (unsigned long long)g_opens_ok.load(), (GetTickCount64() - t0) / 1000.0);
 }
 extern "C" unsigned long long hle_fs_read_bytes(void) { return g_rd_bytes.load(std::memory_order_relaxed); }   // ([hitch] log)
+extern "C" unsigned long long hle_fs_write_bytes(void) { return g_wr_bytes.load(std::memory_order_relaxed); }   // (the stall report)
 // bytes, reads, opens and the wall time spent in reads, summed over threads (rt_main.cpp's TOTK_LOADTRACE timeline)
 extern "C" void hle_fs_read_stats(unsigned long long out[4]) {
     out[0] = g_rd_bytes.load(std::memory_order_relaxed); out[1] = g_rd_calls.load(std::memory_order_relaxed);
@@ -2996,10 +3045,13 @@ extern "C" void hle_fs_read_stats(unsigned long long out[4]) {
 }
 // hle_os_mem.cpp (TOTK_ALIAS_SOFT_WW): ReadFile into a read-only alias-window page fails instead of faulting
 extern "C" void alias_soft_io(const void* ptr, size_t len, int begin);
+extern "C" void sync_guard_io(const void* ptr, size_t len, int begin);   // (LARECOMP_SYNC_GUARD: the same for its read-only pages)
 static u64 host_pread(HFile* f, s64 off, void* buf, u64 size) {
     const auto t_start = std::chrono::steady_clock::now();
     u64 done = 0;
 #ifdef _WIN32
+    const u64 io_size = size;   // (size shrinks to what a packed file has)
+    sync_guard_io(buf, io_size, 1);
     alias_soft_io(buf, size, 1);
     if (f->packed) {   // the file's bytes in the RomFS pack, clipped to its size
         u64 n = off < 0 || (u64)off >= f->pk_size ? 0 : std::min<u64>(size, f->pk_size - (u64)off);
@@ -3023,7 +3075,9 @@ static u64 host_pread(HFile* f, s64 off, void* buf, u64 size) {
 #endif
     }
 #ifdef _WIN32
-    alias_soft_io(buf, size, 0);
+    alias_soft_io(buf, io_size, 0);   // (the range begin registered: a packed read cut at the file's end ended with a shorter one
+                                      // and never matched, so its pages stayed out of re-arming and the in-flight table filled up)
+    sync_guard_io(buf, io_size, 0);
 #endif
     if (f->patch && done) {   // the glyph bank's bytes in this range
         const FilePatch& p = *f->patch;
@@ -3068,6 +3122,7 @@ HLE_AS(fs_WriteFile, "_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOpt
 #ifdef _WIN32
     OVERLAPPED ov{}; u64 o = c->x[1]; ov.Offset = (DWORD)o; ov.OffsetHigh = (DWORD)(o >> 32);
     DWORD n = 0; BOOL ok = WriteFile(f->h, (void*)c->x[2], (DWORD)c->x[3], &n, &ov);
+    g_wr_bytes += n;
     c->x[0] = ok && n == c->x[3] ? kOk : kUnsupported;
 #else
     u64 done = 0, want = c->x[3];
@@ -3077,6 +3132,7 @@ HLE_AS(fs_WriteFile, "_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOpt
         if (n <= 0) break;
         done += (u64)n;
     }
+    g_wr_bytes += done;
     c->x[0] = done == want ? kOk : kUnsupported;
 #endif
 }

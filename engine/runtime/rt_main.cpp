@@ -10,6 +10,8 @@ extern "C" void hle_fs_index_romfs_early(void);   // hle_fs.cpp: the RomFS pack'
 extern "C" void ui_window_init(void);   // nvn/vulkan/device.c (prepare mode: the device without the game)
 extern "C" int vk_prepare(void);        // nvn/vulkan/exec.c (prepare mode)
 extern "C" void pc_input_keys_restore(void);   // pc_input.cpp: the accessibility hotkeys back (the boot's end: no atexit)
+void pc_discord_start();                        // pc_discord.cpp: the "Discord status" row's saved choice
+extern "C" void pc_safe_mode_env(void);         // pc_settings.cpp: graphics.safe_mode
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
@@ -232,6 +234,7 @@ void rt_call_indirect(Ctx* c, u64 t) {
     rt_trap(c, t, "indirect call to unknown target");
 }
 static thread_local Ctx* t_ctx;     // guest context of this host thread (crash reports, rt_fatal_guest)
+extern "C" bool rt_on_guest_thread(void) { return t_ctx != nullptr; }   // (hle_os_mem.cpp's sync guard: game threads may wait)
 // Fatal error from host code (NVN layer etc.): message + the current guest thread's x29 backtrace.
 extern "C" [[noreturn]] void rt_fatal_guest(const char* msg) {
     fflush(stdout);
@@ -346,7 +349,7 @@ static u64 guest_fn_of(u64 rip) {      // guest offset; sdk functions are tagged
         for (u64 i = 0; i < g_s_ftab_count; i++) g_fnaddr.push_back({ (u64)g_s_ftab_init[i].fn, g_s_ftab_init[i].off | (1ull << 40) });
         std::sort(g_fnaddr.begin(), g_fnaddr.end());
     }
-    auto it = std::upper_bound(g_fnaddr.begin(), g_fnaddr.end(), std::make_pair(rip, ~0ull));
+    auto it = std::upper_bound(g_fnaddr.begin(), g_fnaddr.end(), std::make_pair(rip, (u64)~0ull));
     return it == g_fnaddr.begin() ? ~0ull : std::prev(it)->second;
 }
 
@@ -451,6 +454,14 @@ extern "C" void pc_fault_guard(int) {}   // (pc.h) no __try here
 // could fault again), and a C++ exception is left to whoever catches it (the unhandled filter reports it otherwise).
 static char g_crash_text[16 << 10];
 static size_t g_crash_len;
+extern "C" void os_crash_thread_line(char* out, size_t n);   // hle_os_thread.cpp: the crashing guest thread
+extern "C" bool oe_host_paused(void);   // hle_oe.cpp: the host holds the game (focus loss): no presents, not a stall
+extern "C" unsigned long long hle_fs_read_bytes(void);   // hle_fs.cpp: file bytes read so far (a load)
+extern "C" unsigned long long hle_fs_write_bytes(void);  // hle_fs.cpp: file bytes the guest wrote (a save)
+extern "C" uint64_t vk_exec_passes_total(void);         // nvn/vulkan/exec.c: render passes so far
+extern "C" int vk_precompile_cold_active(void);         // exec.c: the first-start shader pass
+extern "C" int vk_precompile_warmup_active(void);       // exec.c: TOTK_WARMUP until "play now"
+extern "C" void os_crash_thread_stack(u64* lo, u64* hi);      // ... and its guest stack (0 / 0: unknown)
 static void crash_say(const char* fmt, ...) {
     char b[1024];
     va_list ap; va_start(ap, fmt); int n = vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
@@ -462,6 +473,8 @@ static void crash_say(const char* fmt, ...) {
 static thread_local bool t_prof_unwind;   // (prof_unwind) a fault now belongs to the profiler's __except, not here
 static thread_local int t_fault_guard;    // (pc_fault_guard, pc.h) an access violation belongs to the caller's __except
 extern "C" void pc_fault_guard(int on) { t_fault_guard += on ? 1 : -1; }
+extern "C" int vk_precompile_crashed(u64 *key);   // nvn/vulkan/exec.c
+extern "C" int vk_shader_crashed(char *msg, int n);   // nvn/vulkan/exec.c
 static LONG WINAPI on_crash(EXCEPTION_POINTERS* ep) {
     auto* er = ep->ExceptionRecord;
     if (er->ExceptionCode < 0xC0000000u || t_prof_unwind) return EXCEPTION_CONTINUE_SEARCH;
@@ -490,6 +503,21 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS* ep) {
             gf >> 40 == 1 ? "s" : "f", gf & 0xFFFFFFFFFFull, er->NumberParameters > 1 ? (u64)er->ExceptionInformation[1] : 0ull,
             g_stage, g_stage_idx);
     crash_say("[crash] exe+%llx  in HLE: %s\n", rip - (u64)GetModuleHandleW(nullptr), t_hle_cur ? t_hle_cur : "(none: generated code)");
+    {   // (the stage above is global: this is the thread that crashed, #51)
+        char tl[160];
+        os_crash_thread_line(tl, sizeof tl);
+        crash_say("[crash] guest thread: %s\n", tl);
+    }
+    {   // (a shader pre-build of this thread in the driver: skipped at the next start, nvn/vulkan/exec.c; public #34)
+        u64 qk = 0;
+        static const char *const kn[4] = {"compute program", "program", "pipeline", "archive program"};
+        const int kind = vk_precompile_crashed(&qk);
+        if (kind >= 0)
+            crash_say("[crash] in a shader pre-build (%s %016llx): the next start on this GPU and driver skips it "
+                      "(cache/precompile_stuck.txt)\n", kn[kind & 3], qk);
+        char sm[256];   // (a program's driver build on this thread, the game's or a pre-build's: which shader, and its next form)
+        if (vk_shader_crashed(sm, sizeof sm)) crash_say("[crash] %s\n", sm);
+    }
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters > 1) {   // what the faulting page is
         MEMORY_BASIC_INFORMATION mi{};
         u64 fa = (u64)er->ExceptionInformation[1];
@@ -502,11 +530,26 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS* ep) {
         for (int i = 0; i < 31; i++) crash_say("x%-2d=%016llx%s", i, c->x[i], i % 4 == 3 ? "\n" : "  ");
         crash_say("  sp=%016llx tpidr=%016llx\n", c->sp, c->tpidr);
         u64 fp = c->x[29];      // guest backtrace (x29 frame chain on the guest stack)
-        for (int i = 0; i < 24 && fp >= c->sp && fp < c->sp + (256ull << 20) && !(fp & 7); i++) {
-            u64 nfp = *(u64*)fp;
-            crash_say("[crash]   #%-2d lr=%llx\n", i, *(u64*)(fp + 8));
-            if (nfp <= fp) break;
+        // the first 24 frames, then the last 8 (where the thread came from: its job / worker loop and entry; #51's chain
+        // was cut at 24 inside the AI recursion)
+        // (within the thread's own guest stack when it is known, so a corrupt chain cannot fault in here; else the old
+        // 256 MB window above sp)
+        u64 lo = 0, hi = 0;
+        os_crash_thread_stack(&lo, &hi);
+        if (!(hi > lo && c->sp >= lo && c->sp < hi)) lo = c->sp, hi = c->sp + (256ull << 20);
+        if (lo < c->sp) lo = c->sp;
+        u64 tail[8]; int n = 0;
+        for (; n < 4096 && fp >= lo && fp + 16 <= hi && !(fp & 7); n++) {
+            u64 nfp = *(u64*)fp, lr = *(u64*)(fp + 8);
+            if (n < 24) crash_say("[crash]   #%-2d lr=%llx\n", n, lr);
+            else tail[n & 7] = lr;
+            if (nfp <= fp) { n++; break; }
             fp = nfp;
+        }
+        if (n > 24) {
+            const int from = n - 8 > 24 ? n - 8 : 24;
+            if (from > 24) crash_say("[crash]   ... %d frames ...\n", from - 24);
+            for (int i = from; i < n; i++) crash_say("[crash]   #%-2d lr=%llx\n", i, tail[i & 7]);
         }
     }
     fflush(stderr);
@@ -1251,6 +1294,7 @@ int main(int argc, char** argv) {
 #endif
     pc_crash_install();   // nxrecomp: TOTK_PC_CRASH=1 crash reports + minidumps, from here on (on_crash comes later)
     fleet_apply();        // (before anything reads the variables it sets)
+    pc_safe_mode_env();   // pc_settings.cpp: graphics.safe_mode's renderer switches (likewise, over every row's)
     // Idle priority class by default: test runs shared the PC with the user's video playback and made its audio crackle
     // (user 2026-10-14). TOTK_PRIORITY=normal opts out (e.g. for clean perf measurements) and sets the normal class
     // outright: a child inherits BELOW_NORMAL / IDLE from its parent, so "not lowered" still meant a game at the builds'
@@ -1452,32 +1496,61 @@ int main(int argc, char** argv) {
     // TOTK_STALL_DUMP=<ms> (stall hunting, present's menu / save bursts): when no frame is presented for <ms> after the
     // first 600 presents, print the HLE call every guest thread sits in, then sample them for 1 s (the [prof] lines; with
     // TOTK_PROF_STACKS=2 wall stacks in profwall.txt, host frames included: a file wait shows its exe caller). 8 stalls.
-    if (const char* w = getenv("TOTK_STALL_DUMP"); w && atoi(w) > 0)
+    // Unset, it is on for players too (public #52: a freeze in play left no report; Linux has device.c's hang watch,
+    // Windows had nothing): 10 s without a present or a file access, the HLE line only (no sampling), at most 3 reports;
+    // never while the host holds the game (focus loss with pause_unfocused). TOTK_STALL_DUMP=0: off.
+    const char* stall_env = getenv("TOTK_STALL_DUMP");
+    const int stall_ms = stall_env && *stall_env ? atoi(stall_env) : 10000;
+    if (stall_ms > 0)
         CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
-            const u64 lim = (u64)(uintptr_t)p;
+            const u64 lim = (u64)(uintptr_t)p >> 8, reports = (u64)(uintptr_t)p & 0x7f;
+            // (the 1 s of [prof] samples suspends every guest thread and resolves modules / builds strings while they are
+            // suspended: a suspended thread holding the loader or heap lock would hang the reporter and leave the game
+            // frozen for good. Only an explicit TOTK_STALL_DUMP samples, after the line is flushed.)
+            const bool sample = ((uintptr_t)p & 0x80) != 0;
             // (TOTK_STALL_START=1: also before the first 600 presents: a start-up that never presents)
             static const bool from_start = getenv("TOTK_STALL_START") && atoi(getenv("TOTK_STALL_START")) != 0;
-            u64 last = renderer_present_count(), t = GetTickCount64();
-            for (int n = 0; n < 8;) {
+            // (the unbiased clock: a sleep / hibernate is not counted; a loop step that still took over a second, a
+            // debugger stop, restarts the clock)
+            auto now_ms = [] { ULONGLONG t100; QueryUnbiasedInterruptTime(&t100); return (u64)(t100 / 10000); };
+            u64 last = renderer_present_count(), t = now_ms(), prev = t;
+            // (not a stall, the clock restarts: the host holds the game; the first-start shader pass or TOTK_WARMUP runs;
+            // the game reads or writes files: a load whose screen does not present, a slow save. Render passes going on
+            // are only reported: a shader build the frame waits for shows there.)
+            unsigned long long reads = hle_fs_read_bytes(), writes = hle_fs_write_bytes();
+            uint64_t passes = vk_exec_passes_total();
+            for (u64 n = 0; n < reports;) {
                 Sleep(10);
-                u64 c = renderer_present_count(), now = GetTickCount64();
-                if (c != last || (c < 600 && !from_start)) { last = c; t = now; continue; }
+                const u64 c = renderer_present_count(), now = now_ms();
+                const unsigned long long r = hle_fs_read_bytes(), w = hle_fs_write_bytes();
+                const bool jumped = now - prev > 1000;
+                prev = now;
+                if (c != last || (c < 600 && !from_start) || oe_host_paused() || r != reads || w != writes || jumped ||
+                    vk_precompile_cold_active() || vk_precompile_warmup_active()) {
+                    last = c; t = now; reads = r; writes = w; passes = vk_exec_passes_total();
+                    continue;
+                }
                 if (now - t < lim) continue;
                 {
                     std::lock_guard<std::mutex> l(g_threads_mtx);
-                    printf("[stall] no present for %llu ms after present %llu; guest threads:", (unsigned long long)(now - t), (unsigned long long)c);
+                    printf("[stall] no present and no file access for %llu ms after present %llu (%llu render passes in that "
+                           "time); guest threads:", (unsigned long long)(now - t), (unsigned long long)c,
+                           (unsigned long long)(vk_exec_passes_total() - passes));
                     for (auto& g : g_threads)
                         if (const char* cur = g.hle_cur ? *g.hle_cur : nullptr) printf(" %lu:%s", g.tid, cur);
                     printf("\n");
                 }
-                profile_threads(50, 20);
                 fflush(stdout);
+                if (sample) {
+                    profile_threads(50, 20);
+                    fflush(stdout);
+                }
                 n++;
                 while (renderer_present_count() == c) Sleep(10);
-                last = renderer_present_count(); t = GetTickCount64();
+                last = renderer_present_count(); t = prev = now_ms();
             }
             return 0;
-        }, (LPVOID)(uintptr_t)atoi(w), 0, nullptr);
+        }, (LPVOID)((uintptr_t)stall_ms << 8 | (stall_env && *stall_env ? 0x80u | 8u : 3u)), 0, nullptr);
 #endif
 #ifdef TOTK_PGO_GEN
     // PGO instrumented build (mkninja TOTK_PGO=gen): write the profile at TOTK_PGO_DUMP seconds (default 150), since test
@@ -1528,6 +1601,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     if (const char* h = getenv("TOTK_HITCH_STACKS"); h && *h && *h != '0') { g_hitch_on = true; std::thread(hitch_thread).detach(); }
 #endif
+    pc_discord_start();   // pc_discord.cpp: the saved "Discord status" choice (opt-in)
     if (const char* w = getenv("TOTK_PROF"))          // TOTK_PROF=<s>[,<s>...]: sample every guest thread for ~3 s (TOTK_PROF_LEN) at those times
         CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
             const char* s = (const char*)p;

@@ -59,6 +59,15 @@ static uint64_t readable_len(uint64_t addr, uint64_t len) {
     if (rgen != g_rc_gen) { memset(rc, 0, sizeof rc); rgen = g_rc_gen; }
     for (int i = 0; i < 8; i++) if (addr >= rc[i].lo && addr + len <= rc[i].hi) return len;
     uint64_t done = 0;
+#ifndef _WIN32
+    // (Linux: one byte of each page through rt_posix_readable's pipe probe, which faults with EFAULT and no signal; the
+    //  readable head ends at the first page that is not. Pages, as VirtualQuery's regions: protection is per page)
+    while (done < len) {
+        const uint64_t a = addr + done, page_end = (a | 4095) + 1;
+        if (!rt_posix_readable(a, 1)) break;
+        done += page_end - a < len - done ? page_end - a : len - done;
+    }
+#else
     while (done < len) {
         MEMORY_BASIC_INFORMATION mi;
         if (!VirtualQuery((const void *)(uintptr_t)(addr + done), &mi, sizeof mi)) break;
@@ -67,6 +76,7 @@ static uint64_t readable_len(uint64_t addr, uint64_t len) {
         uint64_t end = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize - (addr + done);
         done += end < len - done ? end : len - done;
     }
+#endif
     return done;
 }
 static uint64_t fnv(const void *p, uint64_t n) {   // (word-wise: the byte loop made a capture frame take seconds)
@@ -351,6 +361,34 @@ static void finish(void) {
 // A capture is game data (shader code, constants, vertex data) and can grow large: never inside a git work tree
 // (refused when the target's folder or one above it holds.git), not with less than LARECOMP_CAPTURE_MIN_FREE_GB (45)
 // free on its drive, and finished cleanly at LARECOMP_CAPTURE_MAX_MB (1024; 0: no cap). NULL = fine, else why not.
+#ifndef _WIN32
+#include <sys/statvfs.h>
+static const char *capture_path_refused(const char *path, char *why, size_t n) {
+    char full[MAX_PATH], dir[MAX_PATH], g[MAX_PATH + 8];
+    snprintf(dir, sizeof dir, "%s", path);   // (the file need not exist yet: its folder's real path)
+    char *sl = strrchr(dir, '/');
+    if (sl) *sl = 0; else snprintf(dir, sizeof dir, ".");
+    if (!realpath(dir, full)) { snprintf(why, n, "no full path"); return why; }
+    snprintf(dir, sizeof dir, "%s", full);
+    for (;;) {
+        struct stat st;
+        snprintf(g, sizeof g, "%s/.git", dir);
+        if (stat(g, &st) == 0) { snprintf(why, n, "inside the git work tree %s (game data stays out of repos)", dir); return why; }
+        char *s = strrchr(dir, '/');
+        if (!s || s == dir) break;
+        *s = 0;
+    }
+    struct statvfs fs;
+    const char *e = getenv("LARECOMP_CAPTURE_MIN_FREE_GB");
+    uint64_t min_gb = e ? strtoull(e, NULL, 10) : 45, avail = 0;
+    if (statvfs(full, &fs) == 0) avail = (uint64_t)fs.f_bavail * fs.f_frsize;
+    if (avail && avail < (min_gb << 30)) {
+        snprintf(why, n, "%.1f GB free on its drive, under %llu GB", avail / 1073741824.0, (unsigned long long)min_gb);
+        return why;
+    }
+    return NULL;
+}
+#else
 static const char *capture_path_refused(const char *path, char *why, size_t n) {
     char full[MAX_PATH], dir[MAX_PATH];
     if (!GetFullPathNameA(path, sizeof full, full, NULL)) { snprintf(why, n, "no full path"); return why; }
@@ -373,6 +411,7 @@ static const char *capture_path_refused(const char *path, char *why, size_t n) {
     }
     return NULL;
 }
+#endif
 static uint64_t capture_max_bytes(void) {
     static int64_t cap = -1;
     if (cap < 0) { const char *e = getenv("LARECOMP_CAPTURE_MAX_MB"); cap = (int64_t)(e ? strtoull(e, NULL, 10) : 1024) << 20; }

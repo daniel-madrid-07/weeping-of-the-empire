@@ -56,5 +56,7 @@ enum PcMacroId {
                      // (the draw), counted in g_bow_held so on foot / in the air the context is AIM, the release shoots
     MAC_RECIPE_HISTORY,     // "H" in the pause menu: the pad's Y on the Food tab (pause sub 5), its "View history"
                             // elsewhere nothing (Y is Sort)
+    MAC_THROW,       // G on foot (public #36): VK 12 held (the weapon's throw: hold aims, the release throws); carrying
+                     // something (verb 44) at the press, the pad R's whole set, VK 11 | 12 | 14 (a carried object's throw)
     MAC_COUNT
 };

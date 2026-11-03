@@ -11,6 +11,8 @@
   in our own words, with no instructions, text or names from the game. The builder checks each entry against your own
   copy and leaves that hook out, with a line in the log, when it does not match. `.gitignore` refuses the game's file
   formats.
+- **Save-format tables** (`engine/launcher/win/savever_data.h`): hashes, counts and sizes of the game's save files, so
+  that the launcher can carry your own saves between game versions. No game data: no names, values or file contents.
 - **Your own copy only.** The builder needs what you dump from your own console: the game (version 1.0.0), the keys
   file and, optionally, the firmware (only its Korean and Chinese fonts are used; without it a Windows font stands
   in). On your PC it decrypts and extracts the game with your keys,

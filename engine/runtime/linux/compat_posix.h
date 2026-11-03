@@ -14,5 +14,7 @@
 #define SDL_WaitEventTimeout totk_wait_event
 #define SDL_SetWindowTitle totk_set_window_title
 #define SDL_SavePNG totk_save_png
+// nvn/vulkan/pc_overlay_vk.c names its pipeline `pipe`, which is unistd.h's pipe(2) here (declared above, via windows.h)
+#define pipe pc_overlay_vk_pipe
 typedef struct SDL_Surface SDL_Surface;
 bool totk_save_png(SDL_Surface *s, const char *path);

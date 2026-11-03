@@ -21,9 +21,9 @@ Most of the code was written by AI coding agents directed by one developer, who 
 
 - **Frame rate:** 30 to 240 (40 and 45 for a PC that cannot hold 60, and the usual monitor rates 60, 75, 90, 120, 144, 165, 180, 200, 240) or unlocked, up to your monitor's refresh rate (240 fps at most), at the game's real speed.
 - **Measured on one PC only** (Ryzen 7 9800X3D + RTX 5080, developer build, 2560x1440 window, 2133x1200 render, one run per place): 116.2-119.7 fps average at the 120 cap, 159.1-178.4 unlocked. Builds made by Setup get a list of the developer build's shaders instead of its full shader cache (the difference is not measured), so expect the same or lower. [Full table, and what is not measured](#performance-measured).
-- **Display:** any resolution, ultrawide, borderless or exclusive fullscreen; VRR and HDR options (not measured); NVIDIA DLSS super resolution on RTX cards and DLSS frame generation on RTX 40 / 50 series (both optional), FSR 1, SMAA.
-- **Controls:** keyboard and mouse with PC prompts in the game; Xbox, PlayStation and Switch controllers; settings window in game (F10).
-- **Limits today:** game version 1.0.0 only, and a save from a later version may not load. Windows only. Dedicated AMD and Intel cards are not measured. First visits can stutter while shaders are built.
+- **Display:** any resolution, ultrawide, borderless or exclusive fullscreen; VRR and HDR options (not measured); colour profiles (Vivid, Brighter dark tones, Custom); upscaling and frame generation as options: NVIDIA DLSS / DLAA on RTX cards with DLSS frame generation x2-x4 on RTX 40 / 50, AMD FSR 3.1 upscaling and frame generation on any GPU, FSR 1, SMAA. Setup downloads the DLSS files itself: nothing to copy by hand.
+- **Controls:** keyboard and mouse with PC prompts in the game; Xbox, PlayStation and Switch controllers; settings window in game (F10). Every key and every setting: [CONTROLS.md](CONTROLS.md), [SETTINGS.md](SETTINGS.md).
+- **Limits today:** game version 1.0.0; a save from 1.1.x, 1.2.x or 1.4.x is converted to 1.0.0 when you import it (the original is kept). Windows only. Dedicated AMD and Intel cards are not measured. First visits can stutter while shaders are built.
 
 To hear about new releases, use Watch > Custom > Releases. Later game versions are being worked on; there is no date.
 
@@ -35,8 +35,8 @@ and send how it runs on your hardware, with the log, as a
 ## Install in 3 steps
 
 1. **Download** the Setup exe from the [latest release](https://github.com/daniel-madrid-07/weeping-of-the-empire/releases/latest) and run it (no administrator rights needed). Setup is not code-signed, so Windows SmartScreen may warn the first time. Its SHA-256 is in the release notes.
-2. **Drop in your files:** your dump of the game, version 1.0.0 (`.nsp` or `.xci`), and your `prod.keys`. Pick a folder on an NTFS drive with about 15 GB free (Setup says if it needs more) and press **Install**.
-3. **Wait once, then play.** Setup downloads the tools it needs, an optimisation profile (made by running the game on the developer's PC: function names and how often their branches ran) and a list of the shaders the game used there (hashes and render states; see [LEGAL.md](LEGAL.md) for both), decrypts and recompiles the game on your PC, and puts a shortcut on your desktop. Setup's own estimate is 30 to 60 minutes. One full install of an earlier version took about 33 minutes on a 16-thread CPU with 62 GB of RAM while other work was running, and its folder peaked at about 39 GB. Since v0.1.8 the game reads its data straight from your dump instead of a 17 GB copy, so keep the dump where it is: if you move it, the game asks you to pick it again. With the dump on a USB, removable or network drive, or with **Copy the game files** ticked in Setup, the data is copied instead (17 GB more) and the dump can then go. An install from an earlier version keeps its copy; untick **Copy the game files** to free those 17 GB (the dump then has to stay). The install then holds a key made from your keys (see [LEGAL.md](LEGAL.md)): do not share the install folder. Internet is needed during the install. If it stops, press Install again and it continues where it stopped.
+2. **Drop in your files:** your dump of the game, version 1.0.0 (`.nsp` or `.xci`; a compressed `.nsz` / `.xcz` works too, its game data is copied out once: 17 GB more; so does an unencrypted `.nup`, which needs no `prod.keys`), and your `prod.keys`. Pick a folder on an NTFS drive with about 15 GB free (Setup says if it needs more) and press **Install**.
+3. **Wait once, then play.** Setup downloads the tools it needs, an optimisation profile (made by running the game on the developer's PC: function names and how often their branches ran) and a list of the shaders the game used there (hashes and render states; see [LEGAL.md](LEGAL.md) for both), decrypts and recompiles the game on your PC, and puts two shortcuts on your desktop: the game, and *Weeping of the Empire - Settings*, which opens the settings window before the game starts (holding Ctrl while you start the game does the same). Setup's own estimate is 30 to 60 minutes. One full install of an earlier version took about 33 minutes on a 16-thread CPU with 62 GB of RAM while other work was running, and its folder peaked at about 39 GB. Since v0.1.8 the game reads its data straight from your dump instead of a 17 GB copy, so keep the dump where it is: if you move it, the game asks you to pick it again. With the dump on a USB, removable or network drive, or with **Copy the game files** ticked in Setup, the data is copied instead (17 GB more) and the dump can then go. An install from an earlier version keeps its copy; untick **Copy the game files** to free those 17 GB (the dump then has to stay). The install then holds a key made from your keys (see [LEGAL.md](LEGAL.md)): do not share the install folder. Internet is needed during the install. If it stops, press Install again and it continues where it stopped.
 
 Optional: your console's firmware, for its own Korean and Chinese fonts. Without it, Korean and Chinese text uses a
 Windows font for that language, or English on a Windows that has none.
@@ -82,20 +82,22 @@ numbers are welcome: use the
 | | |
 |---|---|
 | **Frame rate** | 30 to 240 (30, 40, 45, 60, 75, 90, 120, 144, 165, 180, 200, 240) or unlocked (up to your monitor's refresh rate, 240 fps at most), with the game running at its real speed |
-| **Display** | Any window size and render resolution, ultrawide, borderless or exclusive fullscreen, VRR, HDR |
-| **Upscaling** | NVIDIA DLSS super resolution on RTX cards and DLSS frame generation on RTX 40 / 50 series (both optional), FSR 1, SMAA |
-| **Controls** | Keyboard and mouse made for a PC, with keyboard and mouse glyphs in the game's prompts; Xbox, PlayStation and Switch controllers |
-| **Settings** | In-game settings window (F10): graphics, controls, audio and the game's options |
+| **Display** | Any window size and render resolution, ultrawide 21:9 / 32:9, triple-screen 48:9 and 16:10 (F10 > Graphics > Game patches > Aspect ratio; from v0.1.9 it follows your window's shape by default), borderless or exclusive fullscreen, VRR, HDR |
+| **Upscaling** | NVIDIA DLSS super resolution and DLAA on RTX cards, DLSS frame generation x2 / x3 / x4 on RTX 40 / 50 series, AMD FSR 3.1 upscaling and frame generation on any GPU, FSR 1, SMAA, all optional. Setup downloads NVIDIA's DLSS files itself (pinned by hash), so there is nothing to copy by hand |
+| **Colour** | The game's own colours by default; Vivid, Brighter dark tones, or Custom brightness, contrast, saturation and gamma (F10 > Graphics > Colour) |
+| **Controls** | Keyboard and mouse made for a PC, with keyboard and mouse glyphs in the game's prompts, gameplay and menu keys rebindable; Xbox, PlayStation and Switch controllers, back paddles of an Xbox Elite or DualSense Edge. Default keys: [CONTROLS.md](CONTROLS.md) |
+| **Settings** | In-game settings window (F10): graphics, controls, audio and the game's options, most applying at once, with a help line for each row. Every row: [SETTINGS.md](SETTINGS.md) |
 | **Mods** | RomFS mods made for emulators or the Switch, in a `mods` folder next to the game (see the FAQ); order and on / off in F10 > Mods; ExeFS code patches (.ips / .pchtxt) and Atmosphere cheats (F10 > Cheats) |
-| **Saves** | Import from an emulator or a console backup; automatic backups. A save from a later game version may not load |
+| **Saves** | Import from an emulator or a console backup; automatic backups. Saves of later game versions (1.1.x, 1.2.x, 1.4.x) are converted to 1.0.0 on import, the original kept in the backups |
 | **Updates** | Run a newer release's Setup on the same folder: it rebuilds only what changed and keeps saves and settings |
+| **Setup's languages** | English, Spanish, Russian, Portuguese (Brazil) and Simplified Chinese, following Windows' display language (`--lang=ru` and so on picks one) |
 
 Speed-ups are meant to leave the image exactly as it was; features that change the image (DLSS, FSR, frame
 generation) are options.
 
 ## Status and known limits
 
-- Only version **1.0.0** of the game is supported.
+- Version **1.0.0** of the game is supported (FAQ: [Which game versions work?](#faq)).
 - Made for **Windows 10 / 11**. Linux and Steam Deck through Proton: experimental, not tested on Linux / Steam Deck
   yet ([Linux and Steam Deck](#linux-and-steam-deck-proton-experimental)).
 - First visits can stutter while shaders are built (above).
@@ -139,13 +141,14 @@ processor time per frame than on Windows. Setup puts no shortcut on the desktop 
 
 ## Requirements
 
-- **Your own files:** the game, version 1.0.0 (`.nsp` or `.xci`, title `0100F2C0115B6000`) and your `prod.keys`;
-  optionally your console's firmware, for its Korean and Chinese fonts.
+- **Your own files:** the game, version 1.0.0 (`.nsp`, `.xci`, `.nsz`, `.xcz` or `.nup`, title `0100F2C0115B6000`) and your `prod.keys` (not for a `.nup`: its files are unencrypted; the firmware's fonts still need them);
+  optionally your console's firmware, for its Korean and Chinese
+  fonts.
 - **CPU** with AVX2 (Intel Haswell / AMD Zen or newer) for the build we have tested. Processors with SSE4.2 but
   without AVX2 (Intel Sandy / Ivy Bridge, AMD FX, many Pentium / Celeron) get a compatible build that the Builder picks
   by itself; a player confirmed it on a Pentium G4600 (no AVX); expect low fps on such processors.
   Reports welcome. Setup refuses processors without SSE4.2. **GPU** with a current Vulkan 1.3 driver.
-- **8 GB of RAM** (16 GB recommended: the build runs fewer compiles at once on less).
+- **RAM:** 8 GB recommended minimum (tested by simulation only), 16 GB recommended; less is allowed but untested.
 - **About 15 GB free** on an NTFS drive (the game's data stays in your dump: keep the dump where it is), about 30 GB
   when Setup copies the data out of the dump (a dump on a USB drive, or the window's "Copy the game files"); and an
   internet connection during the install.
@@ -166,8 +169,11 @@ integrated Radeon (RDNA2) of the Ryzen 7 9800X3D: it reaches the world and plays
 (1600x900 scene) or 31.2 fps (800x450), far below any gaming card. Dedicated AMD and Intel cards are not measured yet.
 Please report how it runs.
 
-**Why only version 1.0.0?** The patches and the recompiled code are tied to that version's code. Later versions are
-being worked on; there is no date.
+**How do I play ultrawide (21:9, 32:9) or 16:10?** F10 > Graphics > Game patches > **Aspect ratio**. Choices: **The window's** (the game takes the shape of your window or monitor: 16:10, 21:9 or 32:9; any other shape keeps 16:9), **16:9** (the game's own picture, with bars on a wider screen), or a fixed **16:10**, **21:9** or **32:9**. The change applies at the next start. From v0.1.9 the default is **The window's**, and a saved 16:9 switches to it once (pick 16:9 again to keep it); before v0.1.9 a 21:9 or 32:9 screen showed the game with bars at the sides until you changed it. If you move or resize the window to another shape, the game tells you to restart for it (F10 > Restart the game now). The first start on a new shape prepares its layout (about 30 s, once); Setup already prepares the shapes of your monitors. Two rows next to it set where the HUD sits on a wide screen and how real-time cutscenes are framed. All rows: [SETTINGS.md](SETTINGS.md#graphics--game-patches).
+
+**Which game versions work?** 1.0.0. The patches and the recompiled code are tied to that version's code; other
+versions are not supported yet (1.4.3 is being finished). A save from 1.1.x, 1.2.x or 1.4.x can be imported: it is
+converted to 1.0.0 (the original is kept).
 
 **Is my keys file safe?** Setup passes it to the build as a path. It is never printed, copied or uploaded, and the
 whole build runs on your PC.
@@ -186,9 +192,9 @@ files do not need their own. Mods must be for version 1.0.0; the port's own file
 over a mod's. No mods ship with the port. The full guide (layouts, F10 > Mods, why a mod is not used):
 [MODS.md](MODS.md).
 
-**Do code patches (.ips, .pchtxt) and cheats work?** Yes, for version 1.0.0: a mod's `exefs` folder (or the SD card's
-`atmosphere\exefs_patches\<name>`) and its `cheats\082CE09B06E33A12.txt` (Atmosphere format; a folder holding only
-that file is a cheats mod too). The game is recompiled
+**Do code patches (.ips, .pchtxt) and cheats work?** Yes, with files made for 1.0.0: a mod's `exefs` folder (or the SD card's `atmosphere\exefs_patches\<name>`) and its
+`cheats\082CE09B06E33A12.txt` (Atmosphere format; a folder holding only that file
+is a cheats mod too). The game is recompiled
 ahead of time, so a patch that changes code needs the game built again with it: when the mods' code patches change,
 the game closes, rebuilds itself with Setup's tools (about 3 minutes; only the changed parts compile again) and starts
 again. A patch that changes only data applies at once. A patch that changes code the port already changes (the frame

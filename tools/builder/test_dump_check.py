@@ -72,5 +72,33 @@ said('two tickets that disagree', builder.check_dump(put('twotik.nsp', syn.parti
 for msg in ('FS header hash mismatch', 'Unsupported NCA key area'):
     said(f'"{msg}"', builder.dump_problem('the dump', msg), 'could not be read correctly', 'dump prod.keys again', 'damaged')
 
+# NSZ / XCZ (nsz's .ncz, pipeline/nx/ncz.py): they open, are copied out (compressed_dump, by name or by content), and a
+# damaged one or an update one is said plainly
+nsz = put('game.nsz', syn.game_image('nsp', compress='solid'))
+check('a good nsz opens', builder.check_dump(nsz, keys) == '')
+check('a good xcz opens', builder.check_dump(put('game.xcz', syn.game_image('xci', compress=14)), keys) == '')
+check('a ticketed nsz opens', builder.check_dump(put('managed.nsz', syn.game_image('nsp', managed=True, compress=16)),
+                                                 keys) == '')
+check('an nsz is compressed', builder.compressed_dump(nsz))
+check('a renamed nsz is compressed', builder.compressed_dump(put('renamed.nsp', syn.game_image('nsp', compress='solid'))))
+check('an nsp is not', not builder.compressed_dump(nsp))
+check('the extensions are game files', all(builder.GAME_EXT.count(x) == 1 for x in ('.nsp', '.xci', '.nsz', '.xcz')))
+bad = bytearray(syn.game_image('nsp', compress='solid'))
+bad[bad.find(b'NCZSECTN')] ^= 1
+said('an ncz without its header', builder.check_dump(put('bad.nsz', bytes(bad)), keys), 'is not a complete', 'NCZSECTN')
+full = syn.game_image('nsp', compress=14)
+said('a short nsz copy', builder.check_dump(put('short.nsz', full[:len(full) - 3000]), keys), 'not a complete')
+# NUP (pipeline/nx/nup.py, unencrypted): opens without any keys file, and with one; a renamed one is one too
+from pipeline.tests.nupwrite import nup  # noqa: E402
+good_nup = nup([dict(title_id=syn.TITLE, exefs={'main': b'm', 'main.npdm': b'n'}, romfs={'a.txt': b'alpha'})])
+nupf = put('game.nup', good_nup)
+check('a nup opens without keys', builder.check_dump(nupf, None) == '')
+check('a nup opens with keys too', builder.check_dump(nupf, keys) == '')
+check('a renamed nup is a nup, compressed', builder.nup_dump(put('nup.nsp', good_nup)) and builder.compressed_dump(nupf))
+said('a nup of another game', builder.check_dump(put('other.nup', nup([dict(title_id=0x0100000000001000, exefs={'main': b'm',
+     'main.npdm': b'n'}, romfs={'a': b'a'})])), None), "is not Tears of the Kingdom's base game")
+said('a nup of a newer format', builder.check_dump(put('v2.nup', good_nup[:3] + b'\x02' + good_nup[4:]), None),
+     'is a NUP this Setup cannot read', 'format 2')
+
 print('all passed' if not fails else f'FAILED: {fails}')
 sys.exit(1 if fails else 0)

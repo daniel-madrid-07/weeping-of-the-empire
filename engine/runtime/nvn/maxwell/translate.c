@@ -109,6 +109,7 @@ typedef struct {
     uint32_t ssf_slots;   // texture slots those fetches use (each gets an ssf<slot>() helper)
     bool nodiscard;   // LARECOMP_NO_DISCARD (=1: every shader, =<fs hash hex>: that fragment shader): KIL emits nothing
     bool kil_demote;  // a KIL became GLSL demote (needs GL_EXT_demote_to_helper_invocation in this shader's header)
+    bool uses_quad;   // a quad swap (SHFL.BFLY by 1 / 2 / 3, wave-safe fragment form): GL_KHR_shader_subgroup_quad in its header
     bool minpc;       // GLSL fragment pc loop runs only the lanes at the subgroup's lowest pc (GL_KHR_shader_subgroup_arithmetic)
     bool use_imap;    // fragment: SPH input map read (LARECOMP_NO_IMAP=1: every input perspective, the old behaviour)
     uint8_t imap[32]; // SPH ps.imap_generic_vector: 2 bits per component, 1 constant, 2 perspective, 3 screen-linear
@@ -123,6 +124,7 @@ typedef struct {
     bool gmem_coherent;   // LARECOMP_GMEM_COHERENT=1 and a cache-bypassing LDG / STG or a MEMBAR.GL / .SYS: gmem_ / gdev_ coherent volatile
     bool soft_f64;        // F64 ops emitted as soft_f64.h calls on uint64_t (maxwell_soft_f64): the library goes in the header
     bool uses_d16q;       // depth-compare references rounded to D16 where the texture is D16 (d16q(), d16_ref_on)
+    bool uses_f2iq;       // F2I sources with a NaN made 0 (f2iq(), f2i_nan_on)
     int soft_n;           // cascade compares emitted as nxsoft<slot>() (soft_shadow_pct); soft_twin[slot] = its raw-depth
     int8_t soft_twin[32]; // binding + 1 (the same texture without the compare: the blocker search reads its depth)
 } Ctx;
@@ -328,6 +330,16 @@ extern bool maxwell_nvidia;
 static int d16_ref_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("LARECOMP_D16_REF"); v = e ? *e == '1' : !maxwell_nvidia; }
+    return v;
+}
+// F2I / F2U of a NaN: Maxwell writes 0. The GLSL form clamps first, and clamp / int() of a NaN are undefined: AMD's min
+// / max drop the NaN, so clamp(NaN, lo, hi) is hi (INT_MAX, 65535,...). UltraTears v0.3.0: "Flickering fog on AMD: the
+// shader translator now gives Maxwell's results where Vulkan leaves a result undefined", finding 4. Off NVIDIA the
+// source goes through f2iq(), a NaN -> 0 by its bits (an isnan() a driver may fold without SignedZeroInfNanPreserve,
+// AMD's do) NVIDIA's GLSL unchanged. LARECOMP_F2I_NAN=1 everywhere, =0 never.
+static int f2i_nan_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("LARECOMP_F2I_NAN"); v = e ? *e == '1' : !maxwell_nvidia; }
     return v;
 }
 // TOTK_SOFT_SHADOWS=<percent> (graphics.soft_shadows, restart; 0 = the game's look): fragment-shader compares of a
@@ -1395,7 +1407,39 @@ static void emit_tmml(Ctx *c, uint64_t w) {
     sp(&c->body, "    }\n");
 }
 
-// ------------------------------------------------------------------ instruction translation
+// ------------------------------------------------------------------ instruction translation A predicated implicit-LOD
+// sample in a fragment shader (TEX / TEXS / TMML under @P; public #39, Arc B580 water: TotK's four forward water shaders
+// sample t2 / t6 under a per-pixel predicate): its GLSL is a sample inside a non-uniform `if`, where implicit
+// derivatives are undefined (a driver may take them from inactive lanes: a random mip at the region's edges), while
+// Maxwell's predicated TEX still gets them from the whole quad. Every operand is computed for every pixel before it, so
+// the sample moves out of the `if` and only its register writes stay under it: the same values wherever the driver gave
+// the quad's derivatives anyway. Off by default (maxwell_tex_hoist, device.c, LARECOMP_TEX_PRED_HOIST=1): 3485 of the
+// archive's 8474 FS change, and the hoisted samples fetch for every pixel the predicate skipped. Called with the guard
+// and the instruction's text emitted since gpos; true: rewritten, guard closed.
+static bool tex_hoist(Ctx *c, size_t gpos) {
+    if (!maxwell_tex_hoist || !c->glsl || c->stage != STAGE_FRAGMENT || !c->body.buf || c->fail) return false;
+    char *g = c->body.buf + gpos;   // "  if (<pred>) {\n", then write_tex_result's one block or anything else
+    static const char blk[] = "    { float4 t = ";
+    char *nl = strchr(g, '\n');
+    if (!nl || strncmp(g, "  if (", 6) || strncmp(nl + 1, blk, sizeof blk - 1)) return false;
+    char *call = nl + 1 + sizeof blk - 1, *cend = strstr(call, ";\n");
+    if (!cend) return false;
+    char *rest = cend + 2;   // the register writes, then the block's "    }\n"
+    const size_t rl = strlen(rest);
+    if (rl < 6 || strcmp(rest + rl - 6, "    }\n") || strstr(rest, "    { ")) return false;
+    *cend = 0;
+    const bool implicit = strstr(call, "texture(t") || strstr(call, "textureQueryLod(");
+    *cend = ';';
+    if (!implicit) return false;
+    Str n = {0};
+    sp(&n, "%.*s;\n%.*s", (int)(cend - (nl + 1)), nl + 1, (int)(nl + 1 - g), g);   // the sample, then the guard
+    sp(&n, "%.*s  }\n    }\n", (int)(rl - 6), rest);                               // its writes; guard and block closed
+    c->body.len = gpos;
+    c->body.buf[gpos] = 0;
+    sp(&c->body, "%s", n.buf);
+    free(n.buf);
+    return true;
+}
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
     c->cur_pc = pc;
@@ -1413,6 +1457,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     }
     bool guarded = !(pr == PT && !prn);
     if (pr == PT && prn) return;  // @!pt: never executes
+    const size_t gpos = c->body.len;   // (tex_hoist: where this instruction's text starts)
     if (guarded) sp(&c->body, "  if (%s) {\n", P(pr, prn));
 
 #define OPM(val, mask) ((w & (uint64_t)(mask)) == (uint64_t)(val))
@@ -1721,6 +1766,12 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         else if (bits(w, 10, 2) == 1) sprintf(srcv, "float(as_type<half2>(%s)[%d])", B(false), (int)bits(w, 41, 1));
         else strcpy(srcv, F(B(true)));
         const char *x = NA(srcv, bits(w, 45, 1), bits(w, 49, 1));
+        char xq[1100];
+        if (c->glsl && f2i_nan_on()) {   // (NaN -> 0 as Maxwell: f2i_nan_on)
+            snprintf(xq, sizeof xq, "f2iq(%s)", x);
+            x = xq;
+            c->uses_f2iq = true;
+        }
         int rnd = (int)bits(w, 39, 2);
         bool sgn = bits(w, 12, 1), i16 = bits(w, 8, 2) == 1;
         static const char *const rf[] = {"rint", "floor", "ceil", "trunc"};
@@ -2232,7 +2283,19 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         } else if (c->glsl && maxwell_wave_safe) {   // (within the lane's 32-lane half; up / down past its edge: own value)
             c->info->uses_subgroup = true;
             const char *id = "gl_SubgroupInvocationID";
-            if (mode == 0) sprintf(t, "subgroupShuffle(%s, (%s & ~31u) | (uint(%s) & 31u))", R(a), id, bv);
+            // A butterfly by 1 / 2 / 3 in a fragment shader stays in the lane's quad: the quad swap, whose neighbour is
+            // defined for helper invocations too (a general shuffle only promises the active lanes, and a pixel's quad
+            // neighbour past a triangle edge is a helper). TotK's cave shaders build their own texture gradients this way
+            // (SHFL + FSWZADD -> TXD: 18 FS, public #39's cave patches on Arc). The same values wherever the helpers took
+            // part in the shuffle. LARECOMP_QUAD_SWAP=0: the shuffle (old).
+            static int qswap = -1;
+            if (qswap < 0) qswap = !(getenv("LARECOMP_QUAD_SWAP") && !strcmp(getenv("LARECOMP_QUAD_SWAP"), "0"));
+            const unsigned ql = bits(w, 28, 1) ? (unsigned)bits(w, 20, 5) : 0;
+            if (mode == 3 && qswap && c->stage == STAGE_FRAGMENT && ql >= 1 && ql <= 3) {
+                static const char *const qs[4] = {NULL, "subgroupQuadSwapHorizontal", "subgroupQuadSwapVertical", "subgroupQuadSwapDiagonal"};
+                c->uses_quad = true;
+                sprintf(t, "%s(%s)", qs[ql], R(a));
+            } else if (mode == 0) sprintf(t, "subgroupShuffle(%s, (%s & ~31u) | (uint(%s) & 31u))", R(a), id, bv);
             else if (mode == 1) sprintf(t, "subgroupShuffle(%s, (%s & 31u) >= uint(%s) ? %s - uint(%s) : %s)", R(a), id, bv, id, bv, id);
             else if (mode == 2) sprintf(t, "subgroupShuffle(%s, (%s & 31u) + uint(%s) < 32u ? %s + uint(%s) : %s)", R(a), id, bv, id, bv, id);
             else sprintf(t, "subgroupShuffle(%s, %s ^ (uint(%s) & 31u))", R(a), id, bv);
@@ -2473,7 +2536,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         fail(c, "unknown instruction %016llx at %#x", (unsigned long long)w, pc);
     }
     (void)op13;
-    if (guarded) sp(&c->body, "  }\n");
+    if (guarded && !tex_hoist(c, gpos)) sp(&c->body, "  }\n");
 }
 
 // ------------------------------------------------------------------ program assembly
@@ -2768,6 +2831,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     const char *kil_ext = c->kil_demote && c->minpc ? "#extension GL_EXT_demote_to_helper_invocation : require\n#extension GL_KHR_shader_subgroup_arithmetic : require\n"
                           : c->kil_demote ? "#extension GL_EXT_demote_to_helper_invocation : require\n"
                           : c->minpc ? "#extension GL_KHR_shader_subgroup_arithmetic : require\n" : "";
+    char ext_q[256];   // (only shaders with a quad swap: every other shader's text, and so its caches, stays as it was)
+    if (c->uses_quad) { snprintf(ext_q, sizeof ext_q, "%s#extension GL_KHR_shader_subgroup_quad : require\n", kil_ext); kil_ext = ext_q; }
     const char *pre = prelude_text();
     if (c->trace) sp(&s, "#version 460\n#extension GL_EXT_debug_printf : enable\n%s%s", kil_ext, pre + strlen("#version 460\n"));
     else if (*kil_ext) sp(&s, "#version 460\n%s%s", kil_ext, pre + strlen("#version 460\n"));
@@ -2797,6 +2862,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     if (c->uses_d16q)   // (rscale[1 + i].z: texture i is D16, exec.c stage_set)
         sp(&s, "float d16q(float r, int i) { return rscale[1 + i].z != 0.0f ? floor(clamp(r, 0.0f, 1.0f) * 65535.0f + 0.5f) / 65535.0f : r; }\n");
+    if (c->uses_f2iq)
+        sp(&s, "float f2iq(float v) { return (floatBitsToUint(v) & 0x7FFFFFFFu) > 0x7F800000u ? 0.0f : v; }\n");
     // exec.c LARECOMP_SNAP_MARK: the variant of a fragment shader that also marks the tiles it writes (feedback snapshots)
     const bool smark = stage == STAGE_FRAGMENT && !dbg && key && key->snap_mark && c->glsl;
     if (smark) {
@@ -3105,6 +3172,7 @@ static bool brx_targets(const uint64_t *code, size_t i, size_t end, uint8_t *mar
 // play hours. So the flat plan stays the default there and the VS below (code hash = FNV-1a of the 0x200 bytes after the
 // 0x30 header, exec.c prog_code_hash) take the pc loop.
 bool maxwell_nvidia;
+bool maxwell_tex_hoist;   // (device.c: LARECOMP_TEX_PRED_HOIST=1; tex_hoist)
 static const uint64_t nv_pcloop_vs[] = {0x49c2e0dcab7071d4ull};   // (fs d4201cbc: grass layer, Hyrule surface)
 static bool nv_pcloop(const uint8_t *blob, size_t max_size, int stage) {
     if (!maxwell_nvidia || stage != STAGE_VERTEX || max_size <= 0x30) return false;

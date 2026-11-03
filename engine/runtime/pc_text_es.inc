@@ -150,8 +150,14 @@ PC_ES("While a D-pad quick menu is held open (weapons, shields, items, bows), ea
       "Mientras mantienes abierto un menú rápido de la cruceta (armas, escudos, objetos, arcos), cada paso de la rueda avanza una posición.")
 PC_ES("Map with the mouse",
       "Mapa con el ratón")
-PC_ES("On the map the mouse moves it as the left stick does (the reticle stays at the centre), the wheel zooms, a left click places a pin or stamp and a right click goes back.",
-      "En el mapa, el ratón lo mueve como el stick izquierdo (la mira se queda en el centro), la rueda hace zoom, el clic izquierdo pone un marcador o sello y el clic derecho vuelve atrás.")
+PC_ES("On the map the mouse moves the map under the reticle (it stays at the centre) as far as the pointer would move, the wheel zooms, a left click places a pin or stamp and a right click goes back.",
+      "En el mapa, el ratón mueve el mapa bajo la mira (que se queda en el centro) tanto como se movería el puntero, la rueda hace zoom, el clic izquierdo pone un marcador o sello y el clic derecho vuelve.")
+PC_ES("Map cursor sensitivity",
+      "Sensibilidad del cursor del mapa")
+PC_ES("How far the map moves for the mouse's motion: 1 = as far as the desktop pointer would move on the screen, 2 = twice as far.",
+      "Cuánto se mueve el mapa con el movimiento del ratón: 1 = tanto como se movería el puntero del escritorio en la pantalla, 2 = el doble.")
+PC_ES("How far the map moves under the reticle for the mouse's motion: 1 = like the desktop pointer, 2 = twice as far.",
+      "Cuánto se mueve el mapa bajo la mira con el movimiento del ratón: 1 = como el puntero del escritorio, 2 = el doble.")
 PC_ES("Menu keys",
       "Teclas de menú")
 PC_ES("In the pause menu and the Purah Pad: Esc goes back, PageUp / PageDown (and the wheel in the pause menu) switch tabs, and in the pause menu clicks select (left) and go back (right).",
@@ -296,6 +302,8 @@ PC_ES("Compiling shaders %d %%",
       "Compilando shaders %d %%")
 PC_ES("Loading shaders %d %%",
       "Cargando shaders %d %%")
+PC_ES("(paused: low memory)",
+      "(en pausa: poca memoria)")
 PC_ES("Windows runs your monitor at %lu Hz: set it to %lu Hz in Settings > Display > Advanced display",
       "Windows usa tu monitor a %lu Hz: ponlo a %lu Hz en Configuración > Pantalla > Pantalla avanzada")
 PC_ES("Movement",
@@ -624,8 +632,8 @@ PC_ES("Console layout",
       "Como en consola")
 PC_ES("Language",
       "Idioma")
-PC_ES("TOTK_LANG: the game's texts and voices' subtitles, and the PC settings' own texts (English, Spanish, Russian, Simplified Chinese; Brazilian Portuguese on a Portuguese Windows). Automatic: Windows' display language if the game has it, else English.",
-      "TOTK_LANG: los textos del juego y los subtítulos de las voces, y los propios textos de los ajustes de PC (inglés, español, ruso, chino simplificado; portugués de Brasil con un Windows en portugués). Automático: el idioma de Windows si el juego lo tiene; si no, inglés.")
+PC_ES("TOTK_LANG: the game's texts and voices' subtitles, and the PC settings' own texts (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' display language if the game has it, else English.",
+      "TOTK_LANG: los textos del juego y los subtítulos de las voces, y los propios textos de los ajustes de PC (inglés, español, ruso, portugués de Brasil, chino simplificado). Português (Brasil): los textos de la 1.4.3; con la 1.0.0 necesitan la actualización 1.4.3 dada al Setup (si no, inglés); las voces siguen en inglés. Automático: el idioma de Windows si el juego lo tiene; si no, inglés.")
 PC_ES("Automatic (Windows' language)",
       "Automático (idioma de Windows)")
 PC_ES("English (US)",
@@ -646,6 +654,8 @@ PC_ES("Italiano",
       "Italiano")
 PC_ES("Nederlands",
       "Nederlands")
+PC_ES("Português (Brasil)",
+      "Português (Brasil)")
 PC_ES("Russian",
       "Ruso")
 PC_ES("Japanese",
@@ -808,6 +818,12 @@ PC_ES("Unlocked (monitor rate)",
       "Sin límite (frecuencia del monitor)")
 PC_ES("Unlocked, steady (a rate it can hold)",
       "Sin límite, estable (una tasa que pueda mantener)")
+PC_ES("Steady's lowest rate",
+      "Mínimo del modo estable")
+PC_ES("TOTK_STEADY_FLOOR. Frame rate Steady only: the lowest rate it holds. 20 or 15 keep a PC that cannot hold 30 even (3 or 4 refreshes a frame on 60 Hz).",
+      "TOTK_STEADY_FLOOR. Solo con la tasa de fotogramas Estable: la tasa más baja que mantiene. 20 o 15 mantienen regular un PC que no llega a 30 (3 o 4 refrescos por fotograma a 60 Hz).")
+PC_ES("30 (default)",
+      "30 (predeterminado)")
 PC_ES("Perf overlay (F9)",
       "Panel de rendimiento (F9)")
 PC_ES("Fps, 1% low and the frame-time graph.",
@@ -852,6 +868,8 @@ PC_ES("1% low",
       "1% mín.")
 PC_ES("worst",
       "peor")
+PC_ES("real",
+      "reales")
 PC_ES("Render resolution",
       "Resolución de render")
 PC_ES("TOTK_RES_SCALE, of the game's 1600 x 900. Applies at once.",
@@ -862,8 +880,8 @@ PC_ES("Follow the window height",
       "Según la altura de la ventana")
 PC_ES("Native-resolution interface",
       "Interfaz a resolución nativa")
-PC_ES("TOTK_OUT_SCALE: above 1080p, menus, text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched. Applies at once.",
-      "TOTK_OUT_SCALE: por encima de 1080p, menús, textos y HUD dibujados a la resolución de la ventana en vez de los 1920 x 1080 del juego estirados. Se aplica al momento.")
+PC_ES("TOTK_OUT_SCALE: above 1080p, menus, text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched. Off by default: at some resolutions it can show broken text (being fixed). Applies at once.",
+      "TOTK_OUT_SCALE: por encima de 1080p, menús, textos y HUD dibujados a la resolución de la ventana en vez de los 1920 x 1080 del juego estirados. Desactivado por defecto: con algunas resoluciones puede mostrar texto roto (en arreglo). Se aplica al momento.")
 PC_ES("Off (fixed size)",
       "No (tamaño fijo)")
 PC_ES("On, never below 90 %",
@@ -1020,6 +1038,21 @@ PC_ES("Texture LOD bias",
       "Sesgo de LOD de texturas")
 PC_ES("TOTK_LOD_BIAS: below 0 is sharper. Applies at once.",
       "TOTK_LOD_BIAS: por debajo de 0, más nítido. Se aplica al momento.")
+PC_ES("Compact textures (low VRAM)",
+      "Texturas compactas (poca VRAM)")
+PC_ES("LARECOMP_ASTC_BC3: the game's textures kept in a quarter of the video memory (BC3), with slightly softer "
+      "colour detail. Automatic: on only for graphics cards with 4 GB or less. Takes effect at the next start.",
+      "LARECOMP_ASTC_BC3: las texturas del juego ocupan una cuarta parte de la memoria de vídeo (BC3), con el detalle "
+      "de color algo más suave. Automático: activado solo en tarjetas gráficas de 4 GB o menos. Se aplica en el "
+      "siguiente inicio.")
+PC_ES("Automatic (on with 4 GB of VRAM or less)",
+      "Automático (activado con 4 GB de VRAM o menos)")
+PC_ES("For graphics cards with 4 GB of video memory or less: the textures take a quarter of the memory, so the game "
+      "no longer runs out of it (stutters, blurry or late textures). Fine colour detail gets a little softer. "
+      "Automatic turns it on only on such cards.",
+      "Para tarjetas gráficas con 4 GB de memoria de vídeo o menos: las texturas ocupan una cuarta parte de la "
+      "memoria, así el juego ya no se queda sin ella (tirones, texturas borrosas o que tardan en aparecer). El "
+      "detalle fino de color queda algo más suave. Automático lo activa solo en esas tarjetas.")
 PC_ES("Scene upscaler",
       "Reescalador de la escena")
 PC_ES("TOTK_SCENE_UPSCALE. Applies at once.",
@@ -1056,6 +1089,10 @@ PC_ES("TOTK_PC_CRASH: a report and a minidump per crash.",
       "TOTK_PC_CRASH: un informe y un minidump por cada cierre inesperado.")
 PC_ES("Automatic updates",
       "Actualizaciones automáticas")
+PC_ES("Discord status",
+      "Estado en Discord")
+PC_ES("Shows \"Playing\" and the time played on your Discord profile while Discord runs. Nothing else is sent.",
+      "Muestra \"Jugando\" y el tiempo de juego en tu perfil de Discord mientras Discord está abierto. No se envía nada más.")
 PC_ES("Checks GitHub for a newer version when the game starts (at most once a day); asks first if the update rebuilds "
       "the game.",
       "Al iniciar el juego (como mucho una vez al día), busca en GitHub una versión más reciente; pregunta antes si la "
@@ -1260,6 +1297,10 @@ PC_ES("Shadow resolution",
       "Resolución de sombras")
 PC_ES("Multiplier of the shadow map's width and height (2 = sharper, 4x the memory).",
       "Multiplicador del ancho y el alto del mapa de sombras (2 = más nítidas, 4x la memoria).")
+PC_ES("Near shadow reach",
+      "Alcance de las sombras cercanas")
+PC_ES("Multiplier of how far the sun's sharpest shadow cascades reach (1 = the game's: the first two hand over 32 m and 64 m away, where the change in sharpness shows as a line, mostly at 4K). 2 moves those lines to 64 m and 128 m; the far shadows stay. The same shadow map then covers more ground, so near shadows get softer by that factor: raise Shadow resolution with it. Costs a little GPU and CPU (more objects drawn into the near shadow maps).",
+      "Multiplicador de hasta dónde llegan las cascadas de sombras más nítidas del sol (1 = el del juego: las dos primeras dan paso a las siguientes a 32 m y 64 m, donde el cambio de nitidez se ve como una línea, sobre todo en 4K). 2 lleva esas líneas a 64 m y 128 m; las sombras lejanas no cambian. El mismo mapa de sombras cubre entonces más terreno, así que las sombras cercanas se suavizan en esa proporción: sube la Resolución de sombras a la vez. Cuesta algo de GPU y CPU (se dibujan más objetos en los mapas de sombras cercanas).")
 PC_ES("Sun shadow map size",
       "Tamaño del mapa de sombras del sol")
 PC_ES("The game's: the sun's shadow map shrinks and grows with the area its cascades cover, so near the ground foliage shadows turn coarse, and every size change moves the shadow texels (leaf shadows jump instead of sliding). Fixed: always the largest size the game picks (times the shadow resolution), steady and sharper; costs some GPU.",
@@ -1292,16 +1333,16 @@ PC_ES("Game patches",
       "Parches del juego")
 PC_ES("Aspect ratio",
       "Relación de aspecto")
-PC_ES("The window's: on a 16:10, 21:9 or 32:9 window or monitor the game draws a canvas of that shape at start (1920x1200, 3440x1440 or 5120x1440), the HUD laid out for it: 21:9 and 32:9 a wider view, 16:10 a taller one (the same height of view, a little less at the sides). Other shapes, and 16:9, keep the game's 16:9 picture. 16:10 / 21:9 / 32:9: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9 and 32:9 are heavier than the window's own shape: the whole canvas is drawn, then shown smaller). Needs the game patches' RomFS sets (TOTK_PATCH_SETS) and the overlay's layout for that shape. At the next start: the canvas and the game files laid out for it are chosen as the game starts. Setup prepares the layouts of this PC's monitors' shapes; another shape's are made at the start after you pick it (about 30 s, once).",
-      "Forma de la ventana: en una ventana o monitor 16:10, 21:9 o 32:9, el juego dibuja al iniciarse un lienzo con esa forma (1920x1200, 3440x1440 o 5120x1440), con la interfaz adaptada: 21:9 y 32:9 una vista más amplia, 16:10 una más alta (la misma altura de vista, algo menos a los lados). Las demás formas, y 16:9, mantienen la imagen 16:9 del juego. 16:10 / 21:9 / 32:9: ese lienzo sea cual sea la ventana (en otra forma se muestra entero, con bandas; 21:9 y 32:9 pesan más que la forma de la propia ventana: se dibuja el lienzo entero y luego se muestra más pequeño). Requiere los conjuntos RomFS de los parches del juego (TOTK_PATCH_SETS) y la disposición del overlay para esa forma. Se aplica al siguiente inicio: el lienzo y los archivos del juego adaptados a él se eligen al arrancar el juego. El instalador prepara las disposiciones de las formas de los monitores de este PC; las de otra forma se crean al iniciar después de elegirla (unos 30 s, una vez).")
-PC_ES("HUD position (21:9, 32:9)",
-      "Posición del HUD (21:9, 32:9)")
-PC_ES("Where the HUD goes on a 21:9 or 32:9 canvas: at the screen's edges, or in the middle 16:9 (closer to the eyes on a very wide screen). Menus are the same either way. Nothing changes at 16:9. At the next start: the game loads its interface layouts once, as it starts.",
-      "Dónde va el HUD en un lienzo 21:9 o 32:9: en los bordes de la pantalla o en el centro 16:9 (más a la vista en una pantalla muy ancha). Los menús son iguales en ambos casos. En 16:9 no cambia nada. Se aplica al siguiente inicio: el juego carga los diseños de la interfaz una sola vez, al arrancar.")
-PC_ES("Cutscenes (21:9, 32:9)",
-      "Cinemáticas (21:9, 32:9)")
-PC_ES("On a 21:9 or 32:9 canvas, real-time cutscenes and conversations: wide like the rest of the game, or the original 16:9 framing with bars at the sides (for a scene that looks odd at the edges). Pre-rendered movies are 16:9 video: always shown in the middle with bars.",
-      "En un lienzo 21:9 o 32:9, las cinemáticas en tiempo real y las conversaciones: panorámicas como el resto del juego, o con el encuadre 16:9 original y bandas a los lados (para una escena que se vea rara en los bordes). Los vídeos pregrabados son 16:9: siempre se muestran en el centro con bandas.")
+PC_ES("The window's: on a 16:10, 21:9, 32:9 or 48:9 window or monitor the game draws a canvas of that shape at start (1920x1200, 3440x1440, 5120x1440 or 7680x1440), the HUD laid out for it: 21:9, 32:9 and 48:9 a wider view, 16:10 a taller one (the same height of view, a little less at the sides). Other shapes, and 16:9, keep the game's 16:9 picture. 16:10 / 21:9 / 32:9 / 48:9: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9, 32:9 and 48:9 are heavier than the window's own shape: the whole canvas is drawn, then shown smaller). Needs the game patches' RomFS sets (TOTK_PATCH_SETS) and the overlay's layout for that shape. At the next start: the canvas and the game files laid out for it are chosen as the game starts. Setup prepares the layouts of this PC's monitors' shapes; another shape's are made at the start after you pick it (about 30 s, once).",
+      "Forma de la ventana: en una ventana o monitor 16:10, 21:9, 32:9 o 48:9, el juego dibuja al iniciarse un lienzo con esa forma (1920x1200, 3440x1440, 5120x1440 o 7680x1440), con la interfaz adaptada: 21:9, 32:9 y 48:9 una vista más amplia, 16:10 una más alta (la misma altura de vista, algo menos a los lados). Las demás formas, y 16:9, mantienen la imagen 16:9 del juego. 16:10 / 21:9 / 32:9 / 48:9: ese lienzo sea cual sea la ventana (en otra forma se muestra entero, con bandas; 21:9, 32:9 y 48:9 pesan más que la forma de la propia ventana: se dibuja el lienzo entero y luego se muestra más pequeño). Requiere los conjuntos RomFS de los parches del juego (TOTK_PATCH_SETS) y la disposición del overlay para esa forma. Se aplica al siguiente inicio: el lienzo y los archivos del juego adaptados a él se eligen al arrancar el juego. El instalador prepara las disposiciones de las formas de los monitores de este PC; las de otra forma se crean al iniciar después de elegirla (unos 30 s, una vez).")
+PC_ES("HUD position (21:9, 32:9, 48:9)",
+      "Posición del HUD (21:9, 32:9, 48:9)")
+PC_ES("Where the HUD goes on a 21:9, 32:9 or 48:9 canvas: at the screen's edges, or in the middle 16:9 (closer to the eyes on a very wide screen). Menus are the same either way. Nothing changes at 16:9. At the next start: the game loads its interface layouts once, as it starts. Automatic (the default): in the middle on 48:9, at the edges otherwise.",
+      "Dónde va el HUD en un lienzo 21:9, 32:9 o 48:9: en los bordes de la pantalla o en el centro 16:9 (más a la vista en una pantalla muy ancha). Los menús son iguales en ambos casos. En 16:9 no cambia nada. Se aplica al siguiente inicio: el juego carga los diseños de la interfaz una sola vez, al arrancar. Automático (predeterminado): en el centro en 48:9 y en los bordes en los demás.")
+PC_ES("Cutscenes (21:9, 32:9, 48:9)",
+      "Cinemáticas (21:9, 32:9, 48:9)")
+PC_ES("On a 21:9, 32:9 or 48:9 canvas, real-time cutscenes and conversations: wide like the rest of the game, or the original 16:9 framing with bars at the sides (for a scene that looks odd at the edges). Pre-rendered movies are 16:9 video: always shown in the middle with bars.",
+      "En un lienzo 21:9, 32:9 o 48:9, las cinemáticas en tiempo real y las conversaciones: panorámicas como el resto del juego, o con el encuadre 16:9 original y bandas a los lados (para una escena que se vea rara en los bordes). Los vídeos pregrabados son 16:9: siempre se muestran en el centro con bandas.")
 PC_ES("Texture cache",
       "Caché de texturas")
 PC_ES("Multiplier of the game's texture cache (fewer blurry textures when turning back; 490 MiB more per step). Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: the game sizes its memory once, as it starts.",
@@ -1512,8 +1553,8 @@ PC_ES("The resolution the 3D scene is drawn at, against the game's own. Higher i
       "La resolución a la que se dibuja la escena 3D, respecto a la del juego. Más alta es más nítida y cuesta mucha más GPU; más baja es más rápida y más borrosa. 100 % es la nativa.")
 PC_ES("Lowers the 3D resolution only when the GPU falls behind, never below the floor chosen, to hold the frame rate. Off keeps the picture sharp all the time; On is smoother on a slower GPU.",
       "Baja la resolución 3D solo cuando la GPU se queda atrás, nunca por debajo del mínimo elegido, para mantener los FPS. Desactivada, la imagen siempre es nítida; activada, va más fluido en una GPU más lenta.")
-PC_ES("Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the game's 1080p stretched. Sharper text for a little GPU.",
-      "Por encima de 1080p, los menús, los textos y el HUD se dibujan a la resolución de la ventana en vez de estirar los 1080p del juego. Texto más nítido a cambio de un poco de GPU.")
+PC_ES("Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the game's 1080p stretched. Sharper text for a little GPU. Off by default for now: at some resolutions it can show broken text (being fixed).",
+      "Por encima de 1080p, los menús, los textos y el HUD se dibujan a la resolución de la ventana en vez de estirar los 1080p del juego. Texto más nítido a cambio de un poco de GPU. Desactivado por defecto de momento: con algunas resoluciones puede mostrar texto roto (en arreglo).")
 PC_ES("Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR: any GPU. All cost some GPU; Off is the game's own.",
       "Escala la escena 3D con un escalador temporal que construye el detalle a lo largo de varios fotogramas. DLSS: solo NVIDIA RTX; DLAA: DLSS a resolución completa, la mejor imagen a cambio de más GPU. FSR: cualquier GPU. Todos cuestan algo de GPU; desactivado es lo del juego.")
 PC_ES("Generated frames between the real ones make motion look smoother, but the game itself does not run faster and input latency rises a little. DLSS x2: RTX 40 and newer, x3 and x4: RTX 50; FSR x2: any GPU. Best when the game already runs well.",
@@ -1560,12 +1601,12 @@ PC_ES("Your monitor's peak brightness in nits, so highlights are neither clipped
       "El brillo máximo de tu monitor en nits, para que las luces no se recorten ni queden apagadas. Usa el valor que indica el monitor.")
 PC_ES("How bright ordinary white (menus, the sky) is in HDR. Raise it if the picture looks dim, lower it if it is too bright.",
       "Cuánto brilla el blanco normal (menús, el cielo) en HDR. Súbelo si la imagen se ve apagada, bájalo si brilla demasiado.")
-PC_ES("Wide screens: The window's draws a 21:9 or 32:9 picture with a wider view on such a window or monitor; 16:9 keeps the game's own. A wider picture costs more GPU.",
-      "Pantallas anchas: La de la ventana dibuja una imagen 21:9 o 32:9 con más campo de visión en esa ventana o monitor; 16:9 mantiene la del juego. Una imagen más ancha cuesta más GPU.")
-PC_ES("On 21:9 or 32:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a very wide screen). Nothing changes at 16:9.",
-      "En 21:9 o 32:9: el HUD en los bordes de la pantalla, o en el centro 16:9 (más fácil de ver en una pantalla muy ancha). En 16:9 no cambia nada.")
-PC_ES("On 21:9 or 32:9: real-time cutscenes wide like the rest of the game, or the original 16:9 with bars at the sides.",
-      "En 21:9 o 32:9: las cinemáticas en tiempo real anchas como el resto del juego, o en el 16:9 original con barras a los lados.")
+PC_ES("The window's (the default): on a 16:10, 21:9, 32:9 or 48:9 window or monitor the picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9: that shape whatever the window. A new shape's layouts are made at its first start (about 30 s, once). A wider picture costs more GPU.",
+      "La de la ventana (predeterminado): en una ventana o monitor 16:10, 21:9, 32:9 o 48:9 la imagen toma esa forma, 21:9, 32:9 y 48:9 con más campo de visión; las demás formas, 16:9 entre ellas, mantienen la del juego. 16:9 / 16:10 / 21:9 / 32:9 / 48:9: esa forma sea cual sea la ventana. Las interfaces de una forma nueva se preparan en su primer arranque (unos 30 s, una vez). Una imagen más ancha exige más a la GPU.")
+PC_ES("On 21:9, 32:9 or 48:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a very wide screen). Nothing changes at 16:9. Automatic (the default): the middle on 48:9, the edges otherwise.",
+      "En 21:9, 32:9 o 48:9: el HUD en los bordes de la pantalla, o en el centro 16:9 (más fácil de ver en una pantalla muy ancha). En 16:9 no cambia nada. Automático (predeterminado): el centro en 48:9 y los bordes en los demás.")
+PC_ES("On 21:9, 32:9 or 48:9: real-time cutscenes wide like the rest of the game, or the original 16:9 with bars at the sides.",
+      "En 21:9, 32:9 o 48:9: las cinemáticas en tiempo real anchas como el resto del juego, o en el 16:9 original con barras a los lados.")
 PC_ES("Widens or narrows the camera's view (1 = the game's). Wider shows more of the world and costs some GPU and CPU.",
       "Abre o cierra el campo de visión de la cámara (1 = el del juego). Más ancho muestra más mundo y cuesta algo de GPU y CPU.")
 PC_ES("More memory for textures: fewer blurry textures when you turn around, for about 490 MiB of video memory per step.",
@@ -1574,6 +1615,8 @@ PC_ES("More grass, flowers and pebbles. Higher looks fuller and costs GPU and CP
       "Más hierba, flores y piedrecitas. Más alto se ve más lleno y cuesta GPU y CPU.")
 PC_ES("Sharper shadows: 2 doubles the shadow map's width and height, for 4x its memory and more GPU.",
       "Sombras más nítidas: 2 duplica el ancho y el alto del mapa de sombras, con 4 veces su memoria y más GPU.")
+PC_ES("Moves the lines where the sun's sharp near shadows hand over to coarser ones further away (1 = the game's, 2 = twice as far). Near shadows get a little softer: raise Shadow resolution with it. Costs a little GPU and CPU.",
+      "Aleja las líneas donde las sombras nítidas cercanas del sol pasan a otras más bastas (1 = el del juego, 2 = el doble de lejos). Las sombras cercanas se suavizan un poco: sube la Resolución de sombras a la vez. Cuesta algo de GPU y CPU.")
 PC_ES("Fixed keeps the sun's shadow map at its largest size: steadier, sharper leaf shadows for some GPU. The game's changes its size with the view.",
       "Fijo deja el mapa de sombras del sol en su tamaño mayor: sombras de hojas más estables y nítidas a cambio de algo de GPU. El del juego cambia de tamaño con la vista.")
 PC_ES("How far the sharp shadows reach. Higher looks better in the distance and costs GPU.",
@@ -1654,12 +1697,18 @@ PC_ES("A pad's motion controls (aiming, some puzzles). Off ignores the gyro.",
       "Los controles por movimiento de un mando (apuntar, algunos puzles). Desactivados, se ignora el giroscopio.")
 PC_ES("How far motion aim turns for a turn of the pad: 1 = the pad's own, 2 = twice as far.",
       "Cuánto gira la puntería por movimiento por cada giro del mando: 1 = lo del mando, 2 = el doble.")
+PC_ES("How light rumbles feel next to strong ones: below 1 light ones come through stronger, above 1 only strong ones do. 1 = the game's own.",
+      "Cómo se notan las vibraciones suaves frente a las fuertes: por debajo de 1 las suaves llegan más fuertes, por encima de 1 solo las fuertes. 1 = lo del juego.")
+PC_ES("Xbox One / Series pads: the trigger motors buzz with the game's rumble. Off by default (the Switch pad has none).",
+      "Mandos Xbox One / Series: los motores de los gatillos vibran con la vibración del juego. Desactivado por defecto (el mando de Switch no los tiene).")
+PC_ES("How fast the right stick turns the camera: 1 = the game's own, 2 = twice as fast. The mouse keeps its own sensitivity.",
+      "Lo rápido que gira la cámara con el stick derecho: 1 = lo del juego, 2 = el doble de rápido. El ratón mantiene su propia sensibilidad.")
 PC_ES("How far the left stick must move before it counts. Raise it if Link moves with the stick at rest; lower it for finer steps. 0 = the pad's own.",
       "Cuánto tiene que moverse la palanca izquierda antes de contar. Súbelo si Link se mueve con la palanca en reposo; bájalo para pasos más finos. 0 = lo del mando.")
 PC_ES("How far the right stick must move before it counts. Raise it if the camera turns with the stick at rest; lower it for finer aiming. 0 = the pad's own.",
       "Cuánto tiene que moverse la palanca derecha antes de contar. Súbelo si la cámara gira con la palanca en reposo; bájalo para apuntar con más precisión. 0 = lo del mando.")
-PC_ES("The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Simplified Chinese; Brazilian Portuguese on a Portuguese Windows). Automatic: Windows' language if the game has it, else English.",
-      "Los textos y subtítulos del juego, y los de estos ajustes (inglés, español, ruso, chino simplificado; portugués de Brasil con un Windows en portugués). Automático: el idioma de Windows si el juego lo tiene; si no, inglés.")
+PC_ES("The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' language if the game has it, else English.",
+      "Los textos y subtítulos del juego, y los de estos ajustes (inglés, español, ruso, portugués de Brasil, chino simplificado). Português (Brasil): los textos de la 1.4.3; con la 1.0.0 necesitan la actualización 1.4.3 dada al Setup (si no, inglés); las voces siguen en inglés. Automático: el idioma de Windows si el juego lo tiene; si no, inglés.")
 PC_ES("A new game skips the opening and starts on the Great Sky Island. F2 or Minus on the title screen also switch it.",
       "Una partida nueva se salta la introducción y empieza en la Gran isla de los albores. F2 o Menos en la pantalla de título también lo cambian.")
 PC_ES("Docked (default) or handheld: handheld renders at the Switch's lower handheld resolution (faster, blurrier).",
@@ -1678,8 +1727,14 @@ PC_ES("Point at a setting, or move to it, to see what it does.",
       "Señala un ajuste, o muévete hasta él, para ver qué hace.")
 PC_ES("Applies when the game starts again.",
       "Se aplica al volver a iniciar el juego.")
-PC_ES("The most frames per second the game shows. Higher is smoother and costs more GPU and CPU; 30 is the Switch's. Unlocked follows the monitor's refresh rate (240 at most); steady holds a rate the scene can keep.",
-      "El máximo de fotogramas por segundo que muestra el juego. Más es más fluido y cuesta más GPU y CPU; 30 es el de la Switch. Sin límite sigue la frecuencia del monitor (240 como mucho); estable se queda en una cifra que la escena aguanta.")
+PC_ES("The most frames per second the game shows. Higher is smoother and costs more GPU and CPU; 30 is the Switch's. Unlocked follows the monitor's refresh rate (240 at most); steady holds a rate the scene can keep. For an even picture pick a cap that divides the refresh rate (30 or 60 on 60 Hz, 40 on 120 Hz), or turn VRR on. Steam Deck: 60 (OLED: 90) at first; if it is not held, lower it to 40 with the screen at 40 Hz (Quick Access > Performance).",
+      "El máximo de fotogramas por segundo que muestra el juego. Más es más fluido y cuesta más GPU y CPU; 30 es el de la Switch. Sin límite sigue la frecuencia del monitor (240 como mucho); estable se queda en una cifra que la escena aguanta. Para una imagen uniforme, elige un límite que divida la frecuencia del monitor (30 o 60 a 60 Hz, 40 a 120 Hz) o activa VRR. Steam Deck: 60 (OLED: 90) al principio; si no se mantiene, bájalo a 40 con la pantalla a 40 Hz (Acceso rápido > Rendimiento).")
+PC_ES("Frame rate \"Unlocked, steady\" only: the lowest rate it holds. 30 (default) suits most PCs. On one that cannot hold 30, 20 or 15 show every frame for the same time (3 or 4 refreshes on 60 Hz) instead of an uneven 15-20.",
+      "Solo con la tasa de fotogramas «Sin límite, estable»: la tasa más baja que mantiene. 30 (predeterminado) va bien en la mayoría de los PC. En uno que no llega a 30, 20 o 15 muestran cada fotograma el mismo tiempo (3 o 4 refrescos a 60 Hz) en lugar de unos 15-20 irregulares.")
+PC_ES("%d fps on this %d Hz monitor shows frames unevenly (one refresh, then two). Even: %s, steady, VRR on, or the monitor at %d Hz or a multiple (Steam Deck: Quick Access > Performance).",
+      "%d fps en este monitor de %d Hz muestran los fotogramas de forma desigual (un refresco, luego dos). Uniforme: %s, estable, VRR activado, o el monitor a %d Hz o un múltiplo (Steam Deck: Acceso rápido > Rendimiento).")
+PC_ES("uneven",
+      "desigual")
 PC_ES("Colour adjustment of the game's picture (not these menus). Off shows the game's own colours and costs nothing; Vivid is livelier; Brighter dark tones lightens caves, the Depths and nights; Custom uses the four rows below.",
       "Ajuste de color de la imagen del juego (no de estos menús). Desactivado muestra los colores del juego y no cuesta nada; Vivos da colores más vivos; Tonos oscuros más claros aclara cuevas, el Subsuelo y las noches; Personalizado usa las cuatro filas de abajo.")
 PC_ES("Custom only: makes every colour brighter or darker; 0 is the game's.",
@@ -1706,3 +1761,23 @@ PC_ES("Could not copy.",
       "No se pudo copiar.")
 PC_ES("With the walk key held (Alt in the PC layout), how far the movement keys push the stick: lower walks slower; 1 is as without the key.",
       "Con la tecla de caminar pulsada (Alt en la distribución de PC), cuánto empujan la palanca las teclas de movimiento: menos camina más despacio; 1 es como sin la tecla.")
+PC_ES("Safe mode (if the game crashes)",
+      "Modo seguro (si el juego se cierra)")
+PC_ES("For a game that crashes or hangs: the renderer without its faster paths, DLSS, FSR and frame generation, and without the driver paths some GPUs crash in. Slower. At the next start.",
+      "Para un juego que se cierra o se cuelga: el renderizador sin sus caminos más rápidos, sin DLSS, FSR ni generación de fotogramas y sin los caminos del controlador con los que fallan algunas GPU. Más lento. Al siguiente arranque.")
+PC_ES("Wide picture: F10 > Restart the game now to use %s",
+      "Imagen panorámica: F10 > Reiniciar el juego ahora para usar %s")
+PC_ES("The window changed shape: F10 > Restart the game now to fit it",
+      "La ventana cambió de forma: F10 > Reiniciar el juego ahora para ajustarla")
+PC_ES("Safe mode is on: DLSS, FSR and frame generation stay off",
+      "Modo seguro activado: DLSS, FSR y la generación de fotogramas siguen desactivados")
+PC_ES("Frame generation mode",
+      "Modo de generación de fotogramas")
+PC_ES("Smooth (matched to the refresh)",
+      "Suave (ajustado a la frecuencia)")
+PC_ES("Maximum fps",
+      "Máximos fps")
+PC_ES("TOTK_FG_PACE. Smooth: the frames shown match the monitor (real ones at the cap divided by the multiplier). Maximum fps: the real frames as without frame generation and the multiplier's generated ones after each, past the refresh rate, with VRR too (mailbox, else immediate, which can tear; the panel may leave VRR; TOTK_FG_MAX_VRR_FIFO=1 keeps VRR's FIFO).",
+      "TOTK_FG_PACE. Suave: los fotogramas mostrados van al ritmo del monitor (los reales al límite dividido por el multiplicador). Máximos fps: los fotogramas reales como sin generación de fotogramas y los generados del multiplicador tras cada uno, por encima de la frecuencia de refresco, también con VRR (mailbox, si no immediate, que puede producir tearing; el monitor puede salir de VRR; TOTK_FG_MAX_VRR_FIFO=1 mantiene el FIFO de VRR).")
+PC_ES("Smooth keeps the frames shown in step with the monitor's refresh. Maximum fps adds the generated frames to every real frame the PC makes, even past the refresh rate: more frames than the screen shows (the fps readout counts them all), for VRR panels or low latency; Smooth looks steadier on a fixed refresh. With V-sync off the picture can tear.",
+      "Suave mantiene los fotogramas mostrados al ritmo del refresco del monitor. Máximos fps suma los fotogramas generados a cada fotograma real que hace el PC, incluso por encima de la frecuencia de refresco: más fotogramas de los que muestra la pantalla (el contador de fps los cuenta todos), para monitores VRR o baja latencia; Suave se ve más estable con una frecuencia fija. Con la sincronización vertical desactivada la imagen puede cortarse.")

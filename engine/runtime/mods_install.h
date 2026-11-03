@@ -110,6 +110,11 @@ static int mi_part(const wchar_t *n) {   /* a folder name that is a mod's part, 
            mi_hex16(n, wcslen(n)) || mi_romfs_top(n);
 }
 static int mi_dots(const wchar_t *n) { return !wcscmp(n, L".") || !wcscmp(n, L".."); }
+/* A link (symbolic link, junction: a name-surrogate reparse point) is never followed; other reparse points are files
+ * and folders, OneDrive's cloud files above all (a mod folder in OneDrive would otherwise install empty) */
+static int mi_link(const WIN32_FIND_DATAW *fd) {
+    return (fd->dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && IsReparseTagNameSurrogate(fd->dwReserved0);
+}
 
 /* where: 1 in a RomFS part, 2 in an exefs part, 3 in a cheats folder, 0 not known yet */
 static void mi_walk(const wchar_t *dir, int depth, int where, int parent_contents, MiScan *s) {
@@ -123,7 +128,7 @@ static void mi_walk(const wchar_t *dir, int depth, int where, int parent_content
         const wchar_t *n = fd.cFileName;
         if (mi_dots(n)) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;   /* (links: not followed) */
+            if (mi_link(&fd)) continue;   /* (links: not followed) */
             int w = where;
             if (mi_ieq(n, L"romfs") || mi_ieq(n, L"romfslite")) w = 1;
             else if (mi_ieq(n, L"exefs") || mi_ieq(n, L"exefs_patches")) w = 2;
@@ -173,13 +178,13 @@ static void mi_rmtree(const wchar_t *dir) {
             if (mi_dots(fd.cFileName)) continue;
             wchar_t *p = mi_join(dir, fd.cFileName);
             if (!p) continue;
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) mi_rmtree(p);
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !mi_link(&fd)) mi_rmtree(p);
             else { SetFileAttributesW(p, FILE_ATTRIBUTE_NORMAL); if (!DeleteFileW(p)) RemoveDirectoryW(p); }
             free(p);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    RemoveDirectoryW(dir);
+    if (!RemoveDirectoryW(dir)) { SetFileAttributesW(dir, FILE_ATTRIBUTE_NORMAL); RemoveDirectoryW(dir); }   /* (a read-only folder) */
 }
 static int mi_copytree(const wchar_t *src, const wchar_t *dst, int depth) {
     WIN32_FIND_DATAW fd;
@@ -191,7 +196,7 @@ static int mi_copytree(const wchar_t *src, const wchar_t *dst, int depth) {
     if (h == INVALID_HANDLE_VALUE) return 1;   /* (nothing to copy) */
     int ok = 1;
     do {
-        if (mi_dots(fd.cFileName) || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;   /* (links: not followed) */
+        if (mi_dots(fd.cFileName) || mi_link(&fd)) continue;   /* (links: not followed) */
         wchar_t *a = mi_join(src, fd.cFileName), *b = mi_join(dst, fd.cFileName);
         ok = a && b && ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? mi_copytree(a, b, depth + 1) : CopyFileW(a, b, TRUE) != 0);
         free(a);

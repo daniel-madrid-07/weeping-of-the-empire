@@ -20,12 +20,19 @@
 #include "../third_party/imgui/imgui.h"
 #include <windows.h>
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
 #include <float.h>
 #include <intrin.h>
+#ifndef _WIN32
+#include <SDL3/SDL_clipboard.h>
+#include <sys/utsname.h>
+#include "linux/plat_posix.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +40,7 @@
 // the fps readout (fps_readout below)
 extern "C" int shim_fps_overlay_mode(void);                 // shim_win.c: 0 off, 1 minimal, 2 detailed
 extern "C" uint64_t vk_fps_readout_stats(float out[4]);     // device.c: fps, frame ms, 1% low fps, worst ms
+extern "C" uint64_t vk_frames_shown(uint64_t *generated);   // device.c: frames handed to the window, real (+ generated)
 bool pc_ui_font(const char *name, std::vector<uint8_t> *otf);   // pc_ui_font.cpp
 
 namespace {
@@ -65,6 +73,7 @@ void hardware_lines(char *cpu, size_t cn, char *gpu, size_t gn, char *disp, size
         const char *b = brand;
         while (*b == ' ') b++;
         int cores = 0;
+#ifdef _WIN32
         DWORD len = 0;
         GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
         std::vector<uint8_t> buf(len);
@@ -75,6 +84,24 @@ void hardware_lines(char *cpu, size_t cn, char *gpu, size_t gn, char *disp, size
         MEMORYSTATUSEX ms = {sizeof ms};
         const double gb = GetPhysicallyInstalledSystemMemory(&kb) && kb ? kb / (1024.0 * 1024.0)
                           : GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0) : 0;
+#else
+        // cores: distinct (package, core) pairs of the online CPUs; threads: the CPUs this process may run on
+        std::vector<std::pair<int, int>> seen;
+        const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        for (long i = 0; i < ncpu; i++) {
+            char path[96];
+            int pk = -1, co = -1;
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/topology/physical_package_id", i);
+            if (FILE *f = fopen(path, "r")) { if (fscanf(f, "%d", &pk) != 1) pk = -1; fclose(f); }
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/topology/core_id", i);
+            if (FILE *f = fopen(path, "r")) { if (fscanf(f, "%d", &co) != 1) co = -1; fclose(f); }
+            if (co >= 0 && std::find(seen.begin(), seen.end(), std::make_pair(pk, co)) == seen.end()) seen.push_back({pk, co});
+        }
+        cores = (int)seen.size();
+        cpu_set_t cs;
+        const unsigned long threads = sched_getaffinity(0, sizeof cs, &cs) == 0 ? (unsigned long)CPU_COUNT(&cs) : (unsigned long)ncpu;
+        const double gb = (double)sysconf(_SC_PHYS_PAGES) * (double)sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0 * 1024.0);
+#endif
         snprintf(once, sizeof once, pc_tr("Processor: %s, %d cores, %lu threads. Memory: %.0f GB."), *b ? b : pc_tr("unknown"), cores,
                  threads, gb);
     }
@@ -95,6 +122,7 @@ void hardware_lines(char *cpu, size_t cn, char *gpu, size_t gn, char *disp, size
 // or redirected profile folder either.
 // player.txt of the package (next to totk.exe): release=, commit=, version=, dirty=; "" when absent
 std::string package_field(const char *name) {
+#ifdef _WIN32
     wchar_t exe[MAX_PATH];
     const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
     if (!n || n >= MAX_PATH) return "";
@@ -102,6 +130,9 @@ std::string package_field(const char *name) {
     if (!slash) return "";
     wcscpy(slash + 1, L"player.txt");
     FILE *f = _wfopen(exe, L"r");
+#else
+    FILE *f = fopen((std::string(rt_posix_exe_dir()) + "/player.txt").c_str(), "r");
+#endif
     if (!f) return "";
     char line[1024];
     std::string out;
@@ -121,6 +152,7 @@ std::string system_info() {
     t += rel.empty() ? std::string(commit.empty() ? ", development build" : "") : ", " + rel;
     if (!commit.empty()) t += ", commit " + commit.substr(0, 9) + (package_field("dirty") == "1" ? " (dirty)" : "");
     t += ", game " + (ver.empty() ? std::string("1.0.0") : ver) + "\n";
+#ifdef _WIN32
     typedef LONG(WINAPI * RtlGetVersionFn)(OSVERSIONINFOW *);
     OSVERSIONINFOW os = {sizeof os};
     if (auto f = (RtlGetVersionFn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"); f && !f(&os)) {
@@ -128,6 +160,23 @@ std::string system_info() {
         snprintf(b, sizeof b, "Windows %s, build %lu\n", os.dwBuildNumber >= 22000 ? "11" : "10", os.dwBuildNumber);
         t += b;
     }
+#else
+    {   // the distribution's name (os-release) and the kernel
+        std::string distro = "Linux";
+        if (FILE *f = fopen("/etc/os-release", "r")) {
+            char line[256];
+            while (fgets(line, sizeof line, f))
+                if (!strncmp(line, "PRETTY_NAME=", 12)) {
+                    distro = line + 12;
+                    while (!distro.empty() && (distro.back() == '\n' || distro.back() == '"')) distro.pop_back();
+                    if (!distro.empty() && distro[0] == '"') distro.erase(0, 1);
+                }
+            fclose(f);
+        }
+        struct utsname u;
+        t += distro + (uname(&u) == 0 ? std::string(", kernel ") + u.release : std::string()) + " (native)\n";
+    }
+#endif
     char cpu[256], gpu[320], disp[384];
     hardware_lines(cpu, sizeof cpu, gpu, sizeof gpu, disp, sizeof disp);
     t += std::string(cpu) + "\n" + gpu + "\n" + (disp[0] ? std::string(disp) + "\n" : "");
@@ -146,6 +195,9 @@ std::string system_info() {
     return pc_mask_user(t);
 }
 bool copy_text(const std::string &utf8) {
+#ifndef _WIN32
+    return SDL_SetClipboardText(utf8.c_str());
+#else
     const int n = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
     HGLOBAL h = n > 0 ? GlobalAlloc(GMEM_MOVEABLE, n * sizeof(wchar_t)) : nullptr;
     if (!h) return false;
@@ -157,6 +209,7 @@ bool copy_text(const std::string &utf8) {
     CloseClipboard();
     if (!ok) GlobalFree(h);
     return ok;
+#endif
 }
 
 // Restart the game. The window closes as with its X (shim_win.c saves a pending settings change, device.c's exit path
@@ -486,117 +539,140 @@ void perf_window() {
     ImGui::End();
 }
 
-// ---- The fps readout (F3, display.fps_readout / fps_position / fps_size) In the game's HUD language: the game's own
-// UI font (Rodin NTLG, read from the player's RomFS by pc_ui_font.cpp, never shipped; the overlay's font if it cannot
-// be), a dark slab with a teal hairline, the number in the Zonai mint with a soft teal glow. Drawn over the image only
-// while on (pc_overlay_build: nothing at all when off). Minimal: "60 fps". Detailed: and the frame time, the 1% low and
-// the worst gap (device.c vk_fps_readout_stats).
+// ---- The fps readout (F3, display.fps_readout / fps_position / fps_size) In the game's own HUD style: the game's
+// text font (nintendo NTLG DB, else Rodin NTLG B, read from the player's RomFS by pc_ui_font.cpp, never shipped; the
+// overlay's font if neither can be), white digits with a thin dark outline and a soft shadow, no box, a small FPS
+// label on the number's baseline, inside the HUD-safe margin. With frame generation the number is every frame shown
+// (real + generated) and a smaller "real N" line under it (device.c vk_frames_shown). Drawn over the image only while
+// on. Minimal: the number. Detailed: and the frame time, the 1% low and the worst gap (device.c vk_fps_readout_stats).
 
 namespace fps_ui {   // tokens
-constexpr ImU32 kSlab = IM_COL32(10, 22, 24, 150);      // near-black, the teal's cast
-constexpr ImU32 kHair = IM_COL32(34, 117, 129, 190);    // the ring's shadow teal (app icon)
-constexpr ImU32 kMint = IM_COL32(128, 236, 196, 255);   // the Zonai mint, lifted for text on the slab
-constexpr ImU32 kGlow = IM_COL32(52, 170, 160, 40);     // one tap of the number's glow
-constexpr ImU32 kBone = IM_COL32(222, 226, 214, 235);   // values, the unit
-constexpr ImU32 kMuted = IM_COL32(140, 168, 162, 255);  // labels
+constexpr ImU32 kText = IM_COL32(250, 250, 246, 255);   // the HUD's white
+constexpr ImU32 kEdge = IM_COL32(0, 0, 0, 150);         // its thin dark outline (eight taps)
+constexpr ImU32 kShade = IM_COL32(0, 0, 0, 70);         // and soft drop shadow (two taps)
+constexpr ImU32 kQuiet = IM_COL32(222, 224, 218, 235);  // the label, the second line, the detailed rows
 constexpr float kNumber[3] = {22, 30, 40};              // the number's size at 1080p: small, medium, large
-constexpr float kUnit = 0.55f, kRow = 0.5f, kLead = 1.35f;   // of the number's size
-constexpr float kPadX = 0.5f, kPadY = 0.32f, kGap = 0.18f, kRadius = 0.28f, kMargin = 18;
+constexpr float kLabel = 0.42f, kRow = 0.46f, kLead = 1.3f;   // of the number's size
+constexpr float kEdgeW = 0.045f, kShadeX = 0.05f, kShadeY = 0.07f;   // of the size drawn
+constexpr float kMarginX = 54, kMarginY = 40;           // the HUD-safe margin at 1080p (the HUD's own corner icons)
 }  // namespace fps_ui
 
-std::vector<uint8_t> g_font_b, g_font_m;   // the game's Rodin NTLG bold / medium (kept: the atlas reads them)
-std::atomic<int> g_font_state{0};          // 0 not asked, 1 reading, 2 read, 3 none (the overlay's font)
-ImFont *g_fps_bold, *g_fps_medium;
+std::vector<uint8_t> g_font_b;          // the game's HUD text font (kept: the atlas reads it)
+std::atomic<int> g_font_state{0};       // 0 not asked, 1 reading, 2 read, 3 none (the overlay's font)
+ImFont *g_fps_font;
 
 void fps_fonts() {   // before NewFrame: read the first time the readout shows, off the present thread
     int st = g_font_state.load();
     if (st == 0 && g_font_state.compare_exchange_strong(st, 1))
         std::thread([] {
-            const bool ok = pc_ui_font("ninP_RodinNTLG-B_DH_003_subset", &g_font_b) &&
-                            pc_ui_font("ninP_RodinNTLG-M_DH_003_subset", &g_font_m);
-            printf("[pc-overlay] fps readout font: %s\n", ok ? "the game's (Rodin NTLG)" : "not in the RomFS, the overlay's");
+            const char *name = "nintendo_NTLG-DB_DH_002";   // (the game's main text font: the HUD's clock and labels)
+            bool ok = pc_ui_font(name, &g_font_b);
+            if (!ok) ok = pc_ui_font(name = "ninP_RodinNTLG-B_DH_003_subset", &g_font_b);
+            printf("[pc-overlay] fps readout font: %s\n", ok ? name : "not in the RomFS, the overlay's");
             g_font_state.store(ok ? 2 : 3);
         }).detach();
-    if (g_font_state.load() == 2 && !g_fps_bold) {
+    if (g_font_state.load() == 2 && !g_fps_font) {
         ImFontConfig c;
         c.FontDataOwnedByAtlas = false;
-        snprintf(c.Name, sizeof c.Name, "Rodin NTLG B");
-        g_fps_bold = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(g_font_b.data(), (int)g_font_b.size(), 0.0f, &c);
-        if (g_fps_bold) merge_lang_font(0.0f);   // (the labels in Russian or Chinese)
-        snprintf(c.Name, sizeof c.Name, "Rodin NTLG M");
-        g_fps_medium = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(g_font_m.data(), (int)g_font_m.size(), 0.0f, &c);
-        if (g_fps_medium) merge_lang_font(0.0f);
-        if (!g_fps_bold || !g_fps_medium) {
-            g_fps_bold = g_fps_medium = nullptr;
-            g_font_state.store(3);
-        }
+        snprintf(c.Name, sizeof c.Name, "HUD text");
+        g_fps_font = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(g_font_b.data(), (int)g_font_b.size(), 0.0f, &c);
+        if (g_fps_font) merge_lang_font(0.0f);   // (the labels in Russian or Chinese)
+        else g_font_state.store(3);
     }
+}
+
+// Text in the HUD's style at p (its top left): the shadow, the outline, then the white
+void hud_text(ImDrawList *dl, ImFont *f, float size, ImVec2 p, ImU32 col, const char *t) {
+    using namespace fps_ui;
+    const float e = std::max(1.0f, kEdgeW * size);
+    for (const float s : {0.6f, 1.0f})
+        dl->AddText(f, size, ImVec2(p.x + kShadeX * size * s, p.y + kShadeY * size * s), kShade, t);
+    for (int i = 0; i < 8; i++) {
+        const float a = i * 0.7853982f;
+        dl->AddText(f, size, ImVec2(p.x + e * cosf(a), p.y + e * sinf(a)), kEdge, t);
+    }
+    dl->AddText(f, size, p, col, t);
 }
 
 void fps_readout(uint32_t w, uint32_t h) {
     using namespace fps_ui;
     const int mode = shim_fps_overlay_mode();
     if (!mode || g_font_state.load() < 2) return;   // (the first frames while the font is read: nothing yet)
-    static float st[4];
+    static float st[4], gen, real;
     static uint64_t seen = ~0ull;
     static int corner, size;   // the settings, read again with each new set of numbers (every 0.5 s)
     const uint64_t n = vk_fps_readout_stats(st);
     if (n != seen) {
         seen = n;
+        // frames handed to the window since the last set of numbers: real and generated (DLSS-G and FSR FG, hdr)
+        static uint64_t r0, g0;
+        static auto t0 = std::chrono::steady_clock::now();
+        uint64_t g1 = 0;
+        const uint64_t r1 = vk_frames_shown(&g1);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double dt = std::chrono::duration<double>(t1 - t0).count();
+        if (dt > 0.05 && r0 && r1 >= r0 && g1 >= g0) gen = (float)((g1 - g0) / dt), real = (float)((r1 - r0) / dt);
+        else gen = 0;
+        r0 = r1, g0 = g1, t0 = t1;
         const char *c = pc_settings_get("display.fps_position"), *z = pc_settings_get("display.fps_size");
         corner = !c ? 0 : !strcmp(c, "top_left") ? 1 : !strcmp(c, "bottom_right") ? 2 : !strcmp(c, "bottom_left") ? 3 : 0;
         size = !z ? 0 : !strcmp(z, "medium") ? 1 : !strcmp(z, "large") ? 2 : 0;
     }
     if (!n) return;   // (no numbers yet: the first half second)
-    ImFont *fb = g_fps_bold ? g_fps_bold : ImGui::GetFont(), *fm = g_fps_medium ? g_fps_medium : ImGui::GetFont();
+    ImFont *f = g_fps_font ? g_fps_font : ImGui::GetFont();
     float k = h / 1080.0f;
     k = k < 0.75f ? 0.75f : k > 3.0f ? 3.0f : k;
-    const float N = kNumber[size] * k, U = N * kUnit, R = N * kRow;
-    char num[16], unit[16], rows[3][2][32];
-    snprintf(num, sizeof num, "%.0f", st[0]);
-    snprintf(unit, sizeof unit, "%s", pc_tr("fps"));
+    const float N = kNumber[size] * k, L = N * kLabel, R = N * kRow;
+    const bool fg = gen > 0.5f;
+    char num[16], label[16], sub[48], rows[3][2][48];
+    snprintf(num, sizeof num, "%.0f", fg ? real + gen : st[0]);
+    snprintf(label, sizeof label, "%s", pc_tr("fps"));
+    for (char *q = label; *q; q++)  // (FPS ASCII only, so a UTF-8 translation stays whatever the locale)
+        if ((unsigned char)*q < 0x80) *q = (char)toupper((unsigned char)*q);
+    snprintf(sub, sizeof sub, "%s %.0f", pc_tr("real"), real);
     const int nrows = mode == 2 ? 3 : 0;
     if (nrows) {
-        snprintf(rows[0][0], 32, "%s", pc_tr("frame"));
-        snprintf(rows[0][1], 32, "%.1f ms", st[1]);
-        snprintf(rows[1][0], 32, "%s", pc_tr("1% low"));
-        if (st[2] > 0) snprintf(rows[1][1], 32, "%.0f %s", st[2], unit);
-        else snprintf(rows[1][1], 32, "--");   // (collecting: under 100 frames since it was turned on)
-        snprintf(rows[2][0], 32, "%s", pc_tr("worst"));
-        snprintf(rows[2][1], 32, "%.0f ms", st[3]);
+        // (with frame generation these are measured between real frames, so they say so)
+        auto name = [&](char *out, const char *what) {
+            if (fg) snprintf(out, 48, "%s (%s)", what, pc_tr("real"));
+            else snprintf(out, 48, "%s", what);
+        };
+        name(rows[0][0], pc_tr("frame"));
+        snprintf(rows[0][1], sizeof rows[0][0], "%.1f ms", st[1]);
+        name(rows[1][0], pc_tr("1% low"));
+        if (st[2] > 0) snprintf(rows[1][1], sizeof rows[0][0], "%.0f", st[2]);
+        else snprintf(rows[1][1], sizeof rows[0][0], "--");   // (collecting: under 100 frames since it was turned on)
+        name(rows[2][0], pc_tr("worst"));
+        snprintf(rows[2][1], sizeof rows[0][0], "%.0f ms", st[3]);
     }
-    // the number's box keeps the width of three digits, so the slab does not change size with the number
-    const float wn = std::max(fb->CalcTextSizeA(N, FLT_MAX, 0, "000").x, fb->CalcTextSizeA(N, FLT_MAX, 0, num).x);
-    const float wu = fm->CalcTextSizeA(U, FLT_MAX, 0, unit).x;
-    float wl = 0, wv = 0;
+    // the number keeps the width of three digits, so nothing beside it moves with the number
+    const float wn = std::max(f->CalcTextSizeA(N, FLT_MAX, 0, "000").x, f->CalcTextSizeA(N, FLT_MAX, 0, num).x);
+    const float wl = f->CalcTextSizeA(L, FLT_MAX, 0, label).x, gap = 0.18f * N;
+    float wr = fg ? f->CalcTextSizeA(R, FLT_MAX, 0, sub).x : 0, wk = 0, wv = 0;
     for (int i = 0; i < nrows; i++) {
-        wl = std::max(wl, fm->CalcTextSizeA(R, FLT_MAX, 0, rows[i][0]).x);
-        wv = std::max(wv, fm->CalcTextSizeA(R, FLT_MAX, 0, rows[i][1]).x);
+        wk = std::max(wk, f->CalcTextSizeA(R, FLT_MAX, 0, rows[i][0]).x);
+        wv = std::max(wv, f->CalcTextSizeA(R, FLT_MAX, 0, rows[i][1]).x);
     }
     const float head = N * 0.78f;   // the number line: about the digits' height
-    const float iw = std::max(wn + 0.22f * N + wu, nrows ? wl + 0.8f * N + wv : 0.0f);
-    const float ih = head + (nrows ? kGap * N + nrows * R * kLead : 0.0f);
-    const float pw = iw + 2 * kPadX * N, ph = ih + 2 * kPadY * N, m = kMargin * k;
-    const float x0 = corner == 1 || corner == 3 ? m : w - pw - m, y0 = corner < 2 ? m : h - ph - m;
+    const float bw = std::max({wn + gap + wl, wr, nrows ? wk + 0.6f * N + wv : 0.0f});
+    const float bh = head + (fg ? 0.25f * N + R : 0.0f) + (nrows ? 0.25f * N + nrows * R * kLead : 0.0f);
+    const bool right = corner == 0 || corner == 2;
+    const float x0 = right ? w - kMarginX * k - bw : kMarginX * k, y0 = corner < 2 ? kMarginY * k : h - kMarginY * k - bh;
     ImDrawList *dl = ImGui::GetForegroundDrawList();
-    const float rad = kRadius * N, hair = std::max(1.0f, floorf(k));
-    dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + pw, y0 + ph), kSlab, rad);
-    dl->AddRect(ImVec2(x0 + hair / 2, y0 + hair / 2), ImVec2(x0 + pw - hair / 2, y0 + ph - hair / 2), kHair, rad, 0, hair);
-    // the number, right-aligned in its box, on a glow of eight taps round it at two radii; its digits' top at the padding
-    const float asc = fb->GetFontBaked(N)->Ascent, bx = x0 + kPadX * N, ny = y0 + kPadY * N - (asc - head);
-    const ImVec2 np(bx + wn - fb->CalcTextSizeA(N, FLT_MAX, 0, num).x, ny);
-    for (float r : {0.05f * N, 0.1f * N})
-        for (int i = 0; i < 8; i++) {
-            const float a = i * 0.7853982f;
-            dl->AddText(fb, N, ImVec2(np.x + r * cosf(a), np.y + r * sinf(a)), kGlow, num);
-        }
-    dl->AddText(fb, N, np, kMint, num);
-    // the unit on the number's baseline
-    dl->AddText(fm, U, ImVec2(bx + wn + 0.22f * N, ny + asc - fm->GetFontBaked(U)->Ascent), kBone, unit);
-    float y = y0 + kPadY * N + head + kGap * N;
+    // the number (right-aligned in its three digits) and the label on its baseline, flush with the margin's side
+    const float asc = f->GetFontBaked(N)->Ascent, ny = y0 - (asc - head);
+    const float lx = right ? x0 + bw - wl : x0 + wn + gap, nx = right ? lx - gap - f->CalcTextSizeA(N, FLT_MAX, 0, num).x
+                                                                     : x0 + wn - f->CalcTextSizeA(N, FLT_MAX, 0, num).x;
+    hud_text(dl, f, N, ImVec2(nx, ny), kText, num);
+    hud_text(dl, f, L, ImVec2(lx, ny + asc - f->GetFontBaked(L)->Ascent), kQuiet, label);
+    float y = y0 + head + 0.25f * N;
+    if (fg) {   // "real 95" under it, on the same side
+        hud_text(dl, f, R, ImVec2(right ? x0 + bw - wr : x0, y), kQuiet, sub);
+        y += R + 0.25f * N;
+    }
     for (int i = 0; i < nrows; i++, y += R * kLead) {
-        dl->AddText(fm, R, ImVec2(bx, y), kMuted, rows[i][0]);
-        dl->AddText(fm, R, ImVec2(bx + iw - fm->CalcTextSizeA(R, FLT_MAX, 0, rows[i][1]).x, y), kBone, rows[i][1]);
+        hud_text(dl, f, R, ImVec2(x0 + bw - wk - 0.6f * N - wv, y), kQuiet, rows[i][0]);
+        hud_text(dl, f, R, ImVec2(x0 + bw - f->CalcTextSizeA(R, FLT_MAX, 0, rows[i][1]).x, y), kText, rows[i][1]);
     }
 }
 
@@ -729,6 +805,30 @@ void note_help(const pc_setting *d) {
     if (ImGui::IsItemFocused() || ImGui::IsItemActive()) g_help_focus = d;
 }
 
+// The frame rate's hint (rival parity; their advice "pick a cap that divides your refresh rate, or turn on VRR"): a
+// number cap that neither divides the game window's monitor refresh nor is a multiple of it, VRR off, shows its frames
+// for one refresh, then two (40 at 60 Hz). The row's values that do are offered. A 59.94 Hz mode reads 59: 60 counts
+// too. true with the hint written.
+bool fps_uneven(const pc_setting *d, const char *cap, char *hint, size_t n) {
+    if (strcmp(d->key, "display.fps_cap")) return false;
+    const int fps = atoi(cap);
+    const char *vrr = pc_settings_get("display.vrr");
+    pcd_caps c;
+    const HWND hw = g_hwnd.load();
+    if (fps <= 0 || (vrr && !strcmp(vrr, "on")) || !hw ||
+        !pcd_caps_cached(MonitorFromWindow(hw, MONITOR_DEFAULTTONEAREST), &c) || c.hz < 24)
+        return false;
+    auto even = [&](int f) { return c.hz % f == 0 || f % c.hz == 0 || (c.hz + 1) % f == 0 || f % (c.hz + 1) == 0; };
+    if (even(fps)) return false;
+    std::string ok;
+    for (int i = 0; d->values[i]; i++)
+        if (const int v = atoi(d->values[i]); v > 0 && v <= c.hz + 1 && even(v)) ok += (ok.empty() ? "" : " / ") + std::string(d->values[i]);
+    snprintf(hint, n, pc_tr("%d fps on this %d Hz monitor shows frames unevenly (one refresh, then two). Even: %s, "
+                            "steady, VRR on, or the monitor at %d Hz or a multiple (Steam Deck: Quick Access > "
+                            "Performance)."), fps, c.hz, ok.empty() ? "-" : ok.c_str(), fps);
+    return true;
+}
+
 // One registry row (pc_settings.h): label, then a combo (choice rows) or a slider, then its state
 void setting_row(const pc_setting_view &s) {
     const pc_setting *d = s.def;
@@ -775,29 +875,44 @@ void setting_row(const pc_setting_view &s) {
     if (s.overridden) {   // (short: the column fits "at next start"; "this run (NX_SET_)" was cut off at 1080p)
         ImGui::TextDisabled("%s", pc_tr("this run"));
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", pc_tr("Set by NX_SET_ for this run only; not saved."));
-    } else if (s.restart_pending) ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.3f, 1.0f), "%s", pc_tr("at next start"));
-    else if (d->flags & PC_SET_RESTART) ImGui::TextDisabled("%s", pc_tr("restart"));
+    } else if (s.restart_pending) {
+        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.3f, 1.0f), "%s", pc_tr("at next start"));
+    } else if (char hint[512]; fps_uneven(d, s.value, hint, sizeof hint)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.3f, 1.0f), "%s", pc_tr("uneven"));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", hint);
+    } else if (d->flags & PC_SET_RESTART) {
+        ImGui::TextDisabled("%s", pc_tr("restart"));
+    }
     ImGui::PopID();
 }
 
 float g_footer_h = 0;   // settings_window's lines under the tabs, as measured last frame
+float g_help_h = 0;     // help_box's height, as measured last frame (more than 3 lines: the frame rate's hint)
 
 // The help line of the row in focus (note_help), under the page's rows: what the row does, better looking or faster,
 // its cost (pc_help.cpp, else the row's own help), and whether it waits for the next start (its PC_SET_RESTART flag, so
-// it follows a row made live)
+// it follows a row made live); the frame rate's hint when its cap shows unevenly (fps_uneven)
 void help_box() {
     const pc_setting *d = g_help_hover ? g_help_hover : g_help_focus ? g_help_focus : g_help_shown;
     g_help_hover = g_help_focus = nullptr;
     g_help_shown = d;
+    const float y0 = ImGui::GetCursorPosY();
     ImGui::Separator();
     const char *text = d ? pc_setting_help(d->key) : nullptr;
     if (d && !text) text = d->help;
+    char hint[512], cap[64];
     if (!d || !text) {
         ImGui::TextDisabled("%s", pc_tr("Point at a setting, or move to it, to see what it does."));
-        return;
+    } else {
+        ImGui::TextWrapped("%s", pc_tr(text));
+        if (d->flags & PC_SET_RESTART) ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.3f, 1.0f), "%s", pc_tr("Applies when the game starts again."));
+        if (pc_settings_copy(d->key, cap, sizeof cap) && fps_uneven(d, cap, hint, sizeof hint)) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.78f, 0.3f, 1.0f));
+            ImGui::TextWrapped("%s", hint);
+            ImGui::PopStyleColor();
+        }
     }
-    ImGui::TextWrapped("%s", pc_tr(text));
-    if (d->flags & PC_SET_RESTART) ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.3f, 1.0f), "%s", pc_tr("Applies when the game starts again."));
+    g_help_h = ImGui::GetCursorPosY() - y0;
 }
 
 void settings_page(const char *page) {
@@ -811,7 +926,7 @@ void settings_page(const char *page) {
         if (!seen) sections.push_back(s.def->section);
     }
     // the rows scroll above the help line (three lines of text) and the window's own lines under the tabs
-    const float help_h = ImGui::GetTextLineHeightWithSpacing() * 3 + ImGui::GetStyle().ItemSpacing.y * 2;
+    const float help_h = std::max(ImGui::GetTextLineHeightWithSpacing() * 3 + ImGui::GetStyle().ItemSpacing.y * 2, g_help_h);
     ImGui::BeginChild("##rows", ImVec2(0, -(help_h + g_footer_h)));
     for (const char *section : sections) {
         ImGui::SeparatorText(pc_tr(section));

@@ -12,7 +12,7 @@ enum {
     QOP_VIEWPORT, QOP_SCISSOR, QOP_BLENDC, QOP_DBIAS, QOP_DBIAS_EN, QOP_DTEST, QOP_DWRITE, QOP_DCMP, QOP_STEST, QOP_SOP, QOP_SCMASK,
     QOP_SWMASK, QOP_SREF, QOP_CULL, QOP_FRONT, QOP_TOPO, QOP_RESTART, QOP_BEGINR, QOP_ENDR, QOP_BARRIER, QOP_CPBUF, QOP_CPIMG,
     QOP_CPB2I, QOP_CPI2B, QOP_BLIT, QOP_RESOLVE, QOP_CLRCOL, QOP_CLRDS, QOP_CLRATT, QOP_QRESET, QOP_TS, QOP_FBL, QOP_SUBMIT,
-    QOP_SETW, QOP_QBEGIN, QOP_QEND, QOP_MARK, QOP_FILL
+    QOP_SETW, QOP_QBEGIN, QOP_QEND, QOP_MARK, QOP_FILL, QOP_CHECKPOINT
 };
 typedef struct { uint32_t op, size; VkCommandBuffer cb; } QHdr;   // size: whole record, header included
 static uint8_t *q_buf;
@@ -276,6 +276,11 @@ void q_mark(PFN_vkCmdWriteBufferMarkerAMD fn, VkCommandBuffer cb, VkPipelineStag
     if (!vkq_enabled()) { fn(cb, st, buf, off, v); return; }
     QREC(QOP_MARK, cb, QMark); a->fn = fn; a->buf = buf; a->off = off; a->st = st; a->v = v; q_commit();
 }
+typedef struct { PFN_vkCmdSetCheckpointNV fn; const void *m; } QCheckpoint;
+void q_checkpoint(PFN_vkCmdSetCheckpointNV fn, VkCommandBuffer cb, const void *marker) {
+    if (!vkq_enabled()) { fn(cb, marker); return; }
+    QREC(QOP_CHECKPOINT, cb, QCheckpoint); a->fn = fn; a->m = marker; q_commit();
+}
 void q_vkCmdEndRendering(VkCommandBuffer cb) {
     if (!vkq_enabled()) { (vkCmdEndRendering)(cb); return; }
     q_alloc(QOP_ENDR, cb, 0); q_commit();
@@ -397,7 +402,9 @@ static void q_submit(const QSub *a) {
                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = a->n, .pCommandBufferInfos = cbs,
                         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    vk_queue_lock();   // (the FG present thread may present on this queue: device.c g_queue_shared)
     VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+    vk_queue_unlock();
     if (sr == VK_ERROR_DEVICE_LOST) { vk_devlost_dump(); hang_report(vk_completed_seq() + 1); hang_checkpoints(); }
     VK_CHECK(sr);
 }
@@ -553,6 +560,7 @@ static void q_exec(const QHdr *h) {
     case QOP_SUBMIT: q_submit((const QSub *)p); break;
     case QOP_SETW: q_setw((const QSetW *)p); break;
     case QOP_FILL: { const QFill *a = p; (vkCmdFillBuffer)(cb, a->b, a->off, a->size, a->v); break; }
+    case QOP_CHECKPOINT: { const QCheckpoint *a = p; a->fn(cb, a->m); break; }
     default: FATAL("[vkq] bad record op %u\n", h->op);
     }
 }

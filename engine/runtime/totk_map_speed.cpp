@@ -23,19 +23,36 @@
 // 1) for the call and restores it after (the image is mapped read-write; the table is read only there), so the step,
 // the crossed-points walk after it (0xf10610..) and the end clamp all see the Switch's step per 30 Hz of game time.
 // The pause timer +0xbb8 already counts dt. gen.py --hook f0fdec; TOTK_MAP_SPEED=0 turns it off too.
+//
+// The mouse on the map: hle_hid's mouse_read hands its raw counts here (totk_map_mouse_add) instead of the left stick, and
+// this hook, before the original, moves the target by them as a desktop pointer would (totk_map_mouse.h: one count = one
+// screen pixel at sensitivity 1, through the layout's scale at the zoom's current rate +0x2bc), clamped to Hyrule's maps;
+// the original then eases the view there and clamps as it does for the stick. No fps term: the counts are taken once,
+// whatever the frame rate. Only while the move's prerequisites hold (the snap flag clear, the rate placed and in range,
+// the window's size known); otherwise mouse_read keeps the stick emulation (pc_mouse_stick_counts). TOTK_MAP_MOUSE=0: the
+// stick emulation always.
 #include "rt.h"
 #include "totk_globals.h"
+#include "totk_map_mouse.h"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+
+extern "C" bool pc_mouse_client_size(int* w, int* h);   // pc_mouse.cpp: the game window's client area (false: none)
 
 namespace {
-constexpr u64 kFrameDelta = 0x45577c0;   // GOT slot of the frame-delta setter's object (totk_pc_vk.cpp kTimeScale)
-constexpr u64 kRatio = 8;                // its 30 Hz ratio, the map's dt
-constexpr u64 kTarget = 0x2c8, kVelocity = 0x2e0, kSnap = 0xc1c;
-constexpr u64 kPathSteps = 0x37897fc, kPathSpeed = 0xbb4, kZoom = 0x2b4;   // the Hero's Path step table, its indexes
+// (the snap flag and the path speed through totk_field: 1.4.3 moved that part of the screen by 0x90, +0xcac / +0xc44;
+// the target, velocity and zoom stay)
+constexpr u64 kTarget = 0x2c8, kVelocity = 0x2e0;
+constexpr u64 kSnap = totk_field(MapScreen, 0xc1c);
+constexpr u64 kPathSteps = 0x37897fc, kPathSpeed = totk_field(MapScreen, 0xbb4), kZoom = 0x2b4;   // the step table, its indexes
+
+constexpr u64 kRate = totk_field(MapScreen, 0x2bc);   // the zoom's current (eased) rate
 
 float rdf(u64 a) { return ldf32(a); }
 void wrf(u64 a, float v) {
@@ -43,7 +60,71 @@ void wrf(u64 a, float v) {
     memcpy(&w, &v, 4);
     st32(a, w);
 }
+// The mouse's counts not yet applied (input thread -> the map's move), the hook's last frame, the sensitivity row
+std::mutex g_mm_lock;
+double g_mm_x, g_mm_y;
+std::atomic<long long> g_mm_seen{-1000000};   // ms on the steady clock
+std::atomic<float> g_mm_speed{-1.0f};
+long long now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+bool mouse_direct_on() {
+    static const bool on = [] { const char *e = getenv("TOTK_MAP_MOUSE"); return !e || strcmp(e, "0"); }();
+    return on;
+}
+float mouse_speed() {
+    float k = g_mm_speed.load(std::memory_order_relaxed);
+    if (k < 0) {
+        const char *e = getenv("TOTK_MOUSE_MAP_SPEED");
+        k = e && *e && atof(e) > 0 ? (float)atof(e) : 1.0f;
+        g_mm_speed.store(k, std::memory_order_relaxed);
+    }
+    return k;
+}
+// The counts into the target, before the original's move (it eases the view there and clamps as for the stick)
+void mouse_apply(u64 scr) {
+    if (!mouse_direct_on() || !totk_field_known(MapScreen, 0x2bc) || ld8(scr + kSnap) != 0) return;
+    int cw = 0, ch = 0;
+    const float rate = rdf(scr + kRate);
+    float dx = 0, dz = 0;
+    if (!pc_mouse_client_size(&cw, &ch) || !totk_map_mouse_step(1, 1, 1, cw, ch, rate, &dx, &dz)) return;
+    const long long now = now_ms();
+    // (live: mouse_read hands its counts here; after a pause, e.g. The map closed and quickly opened again, the counts
+    // gathered since the last run are dropped rather than applied as one jump)
+    const bool fresh = now - g_mm_seen.exchange(now, std::memory_order_relaxed) <= 250;
+    double cx, cy;
+    {
+        std::lock_guard<std::mutex> l(g_mm_lock);
+        cx = fresh ? g_mm_x : 0, cy = fresh ? g_mm_y : 0;
+        g_mm_x = g_mm_y = 0;
+    }
+    if ((cx == 0 && cy == 0) || !totk_map_mouse_step(cx, cy, mouse_speed(), cw, ch, rate, &dx, &dz)) return;
+    wrf(scr + kTarget, totk_map_mouse_clamp(rdf(scr + kTarget) + dx, 6000.0f));
+    wrf(scr + kTarget + 4, totk_map_mouse_clamp(rdf(scr + kTarget + 4) + dz, 5000.0f));
+    static int logs;
+    if (logs < 5 && ++logs)
+        printf("[map-mouse] %.0f, %.0f counts -> %.1f, %.1f world (rate %.3f, client %d x %d, sensitivity %.2f)\n", cx, cy,
+               dx, dz, rate, cw, ch, mouse_speed());
+}
 }  // namespace
+
+// hle_hid.cpp mouse_read on the map (input thread): the counts this read took. True while the map's move takes them
+// (it ran in the last 250 ms with its prerequisites): the caller then sets no stick from the mouse.
+extern "C" bool totk_map_mouse_add(double cx, double cy) {
+    if (!mouse_direct_on() || now_ms() - g_mm_seen.load(std::memory_order_relaxed) > 250) {
+        std::lock_guard<std::mutex> l(g_mm_lock);
+        g_mm_x = g_mm_y = 0;   // (nothing stale for the next time the map takes them)
+        return false;
+    }
+    std::lock_guard<std::mutex> l(g_mm_lock);
+    g_mm_x += cx, g_mm_y += cy;
+    return true;
+}
+// controls.mouse_map_speed (hle_hid.cpp's row, live)
+extern "C" void totk_map_mouse_speed_set(const char *v) {
+    g_mm_speed.store(v && *v && atof(v) > 0 ? (float)atof(v) : 1.0f, std::memory_order_relaxed);
+}
 
 // The step's scale, or 1 to leave the move as the original made it (pure: tools/oracle/test_map_speed.py mirrors it).
 extern "C" float totk_map_step_scale(float dt, float vel, float dx, float dz, int snap_before) {
@@ -73,14 +154,15 @@ void hook_f_f15364(Ctx *__restrict c) {   // UIMapScreen's per-frame move (this)
         return v;
     }();
     const u64 scr = c->x[0];
-    if (!on || !totk_ptr_ok(scr)) return f_f15364_orig(c);
+    if (totk_ptr_ok(scr) && totk_field_known(MapScreen, 0xc1c)) mouse_apply(scr);
+    if (!on || !totk_ptr_ok(scr) || !totk_field_known(MapScreen, 0xc1c)) return f_f15364_orig(c);
     const float tx = rdf(scr + kTarget), tz = rdf(scr + kTarget + 4);
     const int snap = ld8(scr + kSnap) != 0;
     f_f15364_orig(c);
-    const u64 fd = totk_global(kFrameDelta);
+    const u64 fd = totk_frame_delta();
     if (!totk_ptr_ok(fd)) return;
     const float nx = rdf(scr + kTarget), nz = rdf(scr + kTarget + 4);
-    const float k = totk_map_step_scale(rdf(fd + kRatio), rdf(scr + kVelocity), nx - tx, nz - tz, snap);
+    const float k = totk_map_step_scale(rdf(fd + totk_field(TimeScale, 0x8)), rdf(scr + kVelocity), nx - tx, nz - tz, snap);
     if (k == 1.0f) return;
     wrf(scr + kTarget, tx + (nx - tx) * k);
     wrf(scr + kTarget + 4, tz + (nz - tz) * k);
@@ -109,9 +191,10 @@ void hook_f_f0fdec(Ctx *__restrict c) {   // UIMapScreen's Hero's Path player (t
         const char *e = getenv("TOTK_MAP_SPEED");
         return !e || strcmp(e, "0");
     }();
-    const u64 scr = c->x[0], fd = totk_global(kFrameDelta);
-    const float dt = totk_ptr_ok(fd) ? rdf(fd + kRatio) : 1.0f;
-    if (!on || !totk_main_known(kPathSteps) || !totk_ptr_ok(scr) || !(dt > 0.01f && dt < 1.0f))
+    const u64 scr = c->x[0], fd = totk_frame_delta();
+    const float dt = totk_ptr_ok(fd) ? rdf(fd + totk_field(TimeScale, 0x8)) : 1.0f;
+    if (!on || !totk_main_known(kPathSteps) || !totk_field_known(MapScreen, 0xbb4) || !totk_ptr_ok(scr) ||
+        !(dt > 0.01f && dt < 1.0f))
         return f_f0fdec_orig(c);
     const u64 e = totk_hero_path_step_addr(totk_main(kPathSteps), ld32(scr + kPathSpeed), ld32(scr + kZoom));
     const u32 saved = e < totk_main(kPathSteps) + 48 ? ld32(e) : 0;   // speed 3 reads past the 3 rows (zeros)

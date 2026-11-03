@@ -114,6 +114,20 @@ static thread_local u64 t_tls[kTlsSlots];
 static std::atomic<unsigned long> g_main_tid{0};
 // hle_hid.cpp (the PC scheme's guest call for the Jump / Sprint option): the host id of the game's main thread
 extern "C" unsigned long os_main_thread_tid(void) { return g_main_tid.load(); }
+// rt_main.cpp's crash report: which guest thread crashed (its name, priority and core mask; the stage line is global).
+// No allocation: it runs in the exception handler.
+extern "C" void os_crash_thread_line(char* out, size_t n) {
+    const HThread* t = t_self;
+    if (!t) { snprintf(out, n, "none (a host thread of the runtime)"); return; }
+    snprintf(out, n, "'%s' prio %d ideal core %d core mask %llx entry %llx", t->name.empty() ? "?" : t->name.c_str(), t->prio,
+             t->core, (unsigned long long)t->core_mask, (unsigned long long)t->fn);
+}
+// ...and its guest stack, so the report's frame walk stays inside it (0 / 0: not a guest thread, or not known)
+extern "C" void os_crash_thread_stack(u64* lo, u64* hi) {
+    const HThread* t = t_self;
+    *lo = t && t->stack_size ? t->stack : 0;
+    *hi = t && t->stack_size ? t->stack + t->stack_size : 0;
+}
 void os_register_main_thread(Ctx* c, u64 stack_lo, u64 stack_size) {
     u64 tt = (u64)_aligned_malloc(0x200, 16); memset((void*)tt, 0, 0x200);   // guest-visible nn::os::ThreadType
     HThread* t = g_threads.get(tt);

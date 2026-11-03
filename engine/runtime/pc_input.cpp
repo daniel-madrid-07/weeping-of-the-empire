@@ -25,8 +25,7 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
-#include <windows.h>
+#include <windows.h>   // (Linux: runtime/linux/windows.h)
 extern "C" int hid_vk_from_name(const char *name);   // hle_hid.cpp: the bindings' key names
 extern "C" void *shim_window_hwnd(void);             // shim_win.c: the game window
 extern "C" void osd_toast(const char *text, int ms); // hle_osd.cpp: the bottom-left notice line
@@ -756,7 +755,9 @@ bool press(int16_t r, int input, uint64_t now) {
     const Row &row = kRows[r];
     glyph_intent_press(row, g_last_ctx);
     if (row.kind == 'E') pc_external_check(g_last_ctx, input);   // (the audit's runtime half, 4.29's map click)
-    static int logs;
+    // (200 lines per context: one cap for all let on foot's attacks and sprints use it up before a scene, and public
+    // #64's log had no line for the keys pressed in its events)
+    static int logs[PCX_COUNT];
     static uint64_t chain_until;   // a menu hotkey's chain (PCOP_MENU_GOTO) may still run: another key stops it (4.25 3c)
     bool done = false;
     if (chain_until && row.op != PCOP_MENU_GOTO) {
@@ -771,7 +772,7 @@ bool press(int16_t r, int input, uint64_t now) {
     if (row.kind == 'G' && vk_live())   // (the hook's latch: a press shorter than a game frame still counts once)
         if (auto t = g_vbtn_tap.load()) t(row_vk(row));
     const PcMacroOps *m = row.kind == 'M' ? macro_start(r, input) : nullptr;
-    if (!route_log() && logs++ < 200)
+    if (!route_log() && g_last_ctx >= 0 && g_last_ctx < PCX_COUNT && logs[g_last_ctx]++ < 200)
         printf("[pc] %s: %s%s\n", kCtxNames[g_last_ctx], row.action, done ? " (menu op)" : row.kind == 'M' && !m ? " (macro not registered)" : "");
     return done;
 }
@@ -1090,6 +1091,11 @@ extern "C" unsigned pc_glyph_sig_in(int set) {
 // key held or tapped opens their dialogs over the game) off while the window is in front, only where the feature itself
 // is off, without SPIF_UPDATEINIFILE (the session's setting, not the profile's); put back as they were at a focus loss,
 // at exit and before a crash report.
+#ifndef _WIN32
+// (Linux: no such hotkeys reach a game window; GNOME's Sticky Keys shortcut is the desktop's, off by default)
+extern "C" void pc_input_keys_restore(void) {}
+extern "C" void pc_input_focus(bool) {}
+#else
 namespace {
 std::mutex g_acc_mu;
 bool g_acc_saved;
@@ -1136,6 +1142,7 @@ extern "C" void pc_input_focus(bool focused) {
     static int logs;
     if (logs++ < 10) printf("[pc] in front: %d accessibility hotkeys off (Sticky / Toggle / Filter Keys)\n", off);
 }
+#endif
 
 bool pc_ctx_force(const char *name) {
     if (!strcmp(name, "auto")) { g_forced = -1; return true; }
@@ -1497,8 +1504,30 @@ void pc_route(const PcRouteIn &in, PcRouteOut *out) {
                 g_phys_prev[t.key] = false;
             }
     }
+    // The front end: on the title and its save list, while the game is still at its title (in.front_end), E is a second
+    // Enter. The router reads the two as one key, so a press of either, or of both together, is one confirm, and E
+    // itself routes nothing there (the menus' tab_next on E has no tabs to switch in the save list). The dialogs keep
+    // their own rows (confirm: E and Enter; one press per action, row_held below), and in the game the save list's E is
+    // the menus' again.
+    const int e_vk = in.front_end && (c == PCX_TITLE || c == PCX_SAVES) ? input_from_name("e") : 0;
+    const int front_e = e_vk > 0 && e_vk < 256 && e_vk != VK_RETURN ? e_vk : 0;
+    auto phys = [&](int k) { return in.down(k, in.user) && !g_stk_eaten[k]; };
     auto is_down = [&](int k) {
-        return k > 0 && k < 256 && ((in.down(k, in.user) && !g_stk_eaten[k]) || k == g_stk.key || toggle_holds(c, k));
+        if (front_e && k == front_e) return false;
+        return k > 0 && k < 256 &&
+               (phys(k) || (front_e && k == VK_RETURN && phys(front_e)) || k == g_stk.key || toggle_holds(c, k));
+    };
+    // Another key of the same row already held (E and Enter both bound to a dialog's confirm): this key's press is that
+    // action held, not pressed again. Kinds that fire at the press only (P, O, F); a held kind (H / G) just stays held,
+    // a macro or a tap keeps its key's own run. Only where a double confirm was: the title, the save lists, dialogs,
+    // choices, the loading screen and events
+    const bool one_press = c == PCX_TITLE || c == PCX_SAVES || c == PCX_DIALOGUE || c == PCX_CHOICE || c == PCX_LOADING ||
+                           c == PCX_CUTSCENE;
+    auto row_held = [&](int16_t r, int k) {
+        if (!one_press || r < 0 || (kRows[r].kind != 'P' && kRows[r].kind != 'O' && kRows[r].kind != 'F')) return false;
+        for (int o = 1; o < 256; o++)
+            if (o != k && g_keys[o].down && !g_keys[o].dead && g_keys[o].row == r) return true;
+        return false;
     };
     // the presses queued in a transition (or a quickmenu's close), played in the settled context c
     auto replay_queued = [&]() {
@@ -1678,7 +1707,10 @@ void pc_route(const PcRouteIn &in, PcRouteOut *out) {
             s = KeyState();
             s.down = true;
             s.row = g_t.route[c][k];
-            if (s.row >= 0) g_op_done[k] = press(s.row, k, in.now_ms);
+            if (s.row >= 0 && row_held(s.row, k)) {
+                if (route_log()) { char b[16]; printf("[pc] pc_route: %s %s down -> %s already held by another key: no second press\n",
+                                                      kCtxNames[c], input_id(k, b, sizeof b), kRows[s.row].action); }
+            } else if (s.row >= 0) g_op_done[k] = press(s.row, k, in.now_ms);
             if (undecided(s)) { s.trow = s.row; s.at = in.now_ms; }
         } else if (!d) {
             // (a T key let go before its hold started: the tap; a read late past kTapMs still counts it, as no hold ran)
@@ -2323,8 +2355,8 @@ namespace {
 enum KeyWord { KW_SPACE, KW_SHIFT, KW_CTRL, KW_ALT, KW_TAB, KW_ENTER, KW_ESC, KW_BACK, KW_UP, KW_DOWN, KW_LEFT, KW_RIGHT,
                KW_LMB, KW_RMB, KW_MMB, KW_X1, KW_X2, KW_WUP, KW_WDOWN, KW_CAPS, KW_INS, KW_DEL, KW_HOME, KW_END, KW_PGUP,
                KW_PGDN, KW_NUM, KW_COUNT };
-// en, es, fr, de, it, nl, ru, ja, ko, zh-Hans, zh-Hant (KW_NUM: "%d" for the digit)
-const char *const kKeyWords[11][KW_COUNT] = {
+// en, es, fr, de, it, nl, ru, ja, ko, zh-Hans, zh-Hant, pt (Brazilian Portuguese, lang-ptbr) (KW_NUM: "%d" for the digit)
+const char *const kKeyWords[12][KW_COUNT] = {
     {"Space", "Shift", "Ctrl", "Alt", "Tab", "Enter", "Esc", "Backspace", "Up", "Down", "Left", "Right", "Left Click",
      "Right Click", "Middle Click", "Mouse 4", "Mouse 5", "Wheel Up", "Wheel Down", "Caps Lock", "Insert", "Delete", "Home",
      "End", "Page Up", "Page Down", "Numpad %d"},
@@ -2357,7 +2389,10 @@ const char *const kKeyWords[11][KW_COUNT] = {
      "Page Down", "小键盘%d"},
     {"空白鍵", "Shift", "Ctrl", "Alt", "Tab", "Enter", "Esc", "退格", "上", "下", "左", "右", "滑鼠左鍵", "滑鼠右鍵",
      "滑鼠中鍵", "滑鼠4", "滑鼠5", "滾輪上", "滾輪下", "Caps Lock", "Insert", "Delete", "Home", "End", "Page Up",
-     "Page Down", "數字鍵%d"}};
+     "Page Down", "數字鍵%d"},
+    {"Espaço", "Shift", "Ctrl", "Alt", "Tab", "Enter", "Esc", "Backspace", "Cima", "Baixo", "Esquerda", "Direita",
+     "Clique esquerdo", "Clique direito", "Clique do meio", "Mouse 4", "Mouse 5", "Roda para cima", "Roda para baixo",
+     "Caps Lock", "Insert", "Delete", "Home", "End", "Page Up", "Page Down", "Teclado num. %d"}};
 int lang_index(const char *lang) {
     if (!lang) return 0;
     char l[16] = {};
@@ -2365,6 +2400,7 @@ int lang_index(const char *lang) {
     if (!strncmp(l, "zh", 2)) return strstr(l, "hant") || strstr(l, "tw") || strstr(l, "hk") ? 10 : 9;
     static const char *const two[] = {"en", "es", "fr", "de", "it", "nl", "ru", "ja", "ko"};
     for (int i = 0; i < 9; i++) if (!strncmp(l, two[i], 2)) return i;
+    if (!strncmp(l, "pt", 2)) return 11;
     return 0;
 }
 }  // namespace
@@ -2500,60 +2536,4 @@ extern "C" bool pc_bind_ctl(const char *line) {
     }
     return false;
 }
-#else
-// (Linux: the SDL path keeps its fixed table; nothing routes yet)
-extern "C" int pc_ctx(void) { return PCX_WORLD; }
-extern "C" const char *pc_ctx_name(int) { return "world"; }
-extern "C" bool pc_ctx_is_ui(int) { return false; }
-extern "C" bool pc_scheme_on(void) { return false; }
-extern "C" void pc_menu_ops_register(bool (*)(int, int)) {}
-extern "C" int pc_glyph_vk(int) { return 0; }
-extern "C" unsigned pc_glyph_sig(void) { return 0; }
-extern "C" int pc_quickmenu_sub(void) { return 0; }
-extern "C" bool pc_quickmenu_closing(void) { return false; }
-extern "C" int pc_glyph_vk_in(int, int) { return 0; }
-extern "C" unsigned pc_glyph_sig_in(int) { return 0; }
-extern "C" int pc_glyph_game_set(void) { return PCX_WORLD; }
-extern "C" void pc_glyph_intent(int, int) {}
-extern "C" bool pc_glyph_intent_active(void) { return false; }
-extern "C" bool pc_glyph_qm_strip(void) { return false; }
-extern "C" void pc_glyph_kick_register(void (*)(void)) {}
-extern "C" int pc_glyph_audit(int) { return 0; }
-extern "C" uint16_t pc_glyph_gameplay_cp(uint16_t cp) { return cp; }   // (Windows: hle_fs.cpp's, next to the glyph bank)
-extern "C" unsigned pc_glyph_gameplay_epoch(void) { return 0; }
-extern "C" uint16_t pc_glyph_cp_in(int, uint16_t cp) { return cp; }
-extern "C" unsigned pc_glyph_epoch_in(int) { return 0; }
-bool pc_ctx_force(const char *) { return false; }
-int pc_ctx_decide(bool, bool, uint32_t, int, int) { return PCX_WORLD; }
-extern "C" void pc_ctx_ui(uint32_t, uint32_t) {}
-extern "C" int pc_ui_sub(void) { return -1; }
-extern "C" void pc_input_focus(bool) {}
-extern "C" void pc_input_gameplay_set(const char *) {}
-extern "C" void pc_quickmenu_feed_register(bool (*)(double, double, int, int)) {}
-extern "C" void pc_input_keys_restore(void) {}
-extern "C" void pc_ctx_player(uint32_t, uint8_t) {}
-extern "C" void pc_ctx_player_map_register(int (*)(uint32_t, uint8_t)) {}
-extern "C" uint32_t pc_ctx_player_flags(void) { return 0; }
-extern "C" uint8_t pc_ctx_ability(void) { return 0; }
-extern "C" void pc_vbtn_writer_register(void (*)(uint64_t), void (*)(uint64_t)) {}
-void pc_macro_register(int, const PcMacroOps *) {}
-void pc_ctx_player_fake(bool, uint32_t, uint8_t) {}
-void pc_route(const PcRouteIn &, PcRouteOut *out) { *out = PcRouteOut(); }
-#endif
 
-#ifndef _WIN32
-// Rebinding (pc_input.h, stage 3): Windows only so far (the SDL path routes nothing); every call says so.
-extern "C" int pc_bind_set(int, const char *, int, int, PcBindChange *, int) { return PCB_NOT_READY; }
-extern "C" int pc_bind_get(int, const char *, int *, int, unsigned *flags) {
-    if (flags) *flags = 0;
-    return PCB_NOT_READY;
-}
-extern "C" int pc_bind_reset(int, const char *, PcBindChange *, int) { return PCB_NOT_READY; }
-extern "C" int pc_bind_actions(int, void (*)(const char *, unsigned, void *), void *) { return PCB_NOT_READY; }
-extern "C" int pc_bind_refused(const char *, int *, const char **, int) { return 0; }
-extern "C" bool pc_input_capture_begin(unsigned) { return false; }
-extern "C" int pc_input_capture_poll(void) { return -1; }
-extern "C" void pc_input_capture_cancel(void) {}
-extern "C" const char *pc_key_name(int, const char *) { return ""; }
-extern "C" bool pc_bind_ctl(const char *) { return false; }
-#endif

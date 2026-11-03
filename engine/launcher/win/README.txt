@@ -33,6 +33,10 @@ F10 opens the PC settings window, also in the middle of a game (with a controlle
 - Audio: volume.
 - Game: skip the intro, pause when the window loses focus, saves, screenshots (F12) and crash reports.
 Changes are saved at once. Some need a restart of the game (the window says so).
+Every row and every default key, explained:
+    https://github.com/daniel-madrid-07/weeping-of-the-empire/blob/main/SETTINGS.md
+    https://github.com/daniel-madrid-07/weeping-of-the-empire/blob/main/CONTROLS.md
+    https://github.com/daniel-madrid-07/weeping-of-the-empire/blob/main/MODS.md (mods, code patches and cheats)
 The game's own Options screen (System > Options) shows the main PC settings too, in sections (Display: window mode and
 resolution, fullscreen resolution, frame rate, the FPS counter; Graphics: render resolution...). To show only the
 game's own options, add the line env.TOTK_OPTIONS_MENU=0 at the end of player.txt.
@@ -99,7 +103,10 @@ Saves menu (Shift while opening the launcher):
   console's SD card). The current save is backed up first.
 - Restore a backup (the current save is backed up first).
 - Make a backup now.
-This is version 1.0.0 of the game: a save from a later version (1.1, 1.2...) may not load.
+Import a save converts a save of a later game version (1.1.x, 1.2.x, 1.4.x) to 1.0.0: what 1.0.0 doesn't have
+(flags and settings of later updates) is left out, and the slot pictures are made smaller. The original, not
+converted, is kept in the backups ("imported original"). A save with data the converter doesn't know (a modified
+save, or a version after 1.4.x) is refused with the reason, and nothing changes.
 
 
 5. IF SOMETHING GOES WRONG

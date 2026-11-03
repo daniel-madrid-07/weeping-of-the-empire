@@ -41,6 +41,8 @@ typedef struct {
     bool maint5;  // VK_KHR_maintenance5 enabled (device.c: unwritten point sizes are 1.0)
     bool maint8;  // VK_KHR_maintenance8 enabled: vkCmdCopyImage between depth and matching colour formats (textures.c)
     bool view2d_of_3d;  // VK_EXT_image_2d_view_of_3d enabled: sampled 2D views of a 3D texture's slice (textures.c vk_view)
+    bool dbias_unorm, dbias_exact;   // VK_EXT_depth_bias_control FORCE_UNORM (+ depthBiasExact): D24's bias unit on D32F (exec.c)
+    PFN_vkCmdSetDepthBias2EXT set_bias2;
     bool astc_ldr;   // textureCompressionASTC_LDR enabled: ASTC images are created natively (textures.c), else decoded to RGBA8
     bool fill_nonsolid, dual_src_blend, depth_clamp;  // core features the device has (device.c; exec.c falls back without)
     bool storage_ext;   // shaderStorageImageExtendedFormats (contact.c: the B10G11R11 scene colour as a storage image)
@@ -54,6 +56,7 @@ typedef struct {
     bool mem_budget;  // VK_EXT_memory_budget enabled: per-heap budget / usage readable (device.c [vram], residency)
     bool checkpoints;  // VK_NV_device_diagnostic_checkpoints: exec.c marks every GPU operation (hang reports)
     bool amd_marker;   // VK_AMD_buffer_marker: the same marks as top / bottom-of-pipe writes into a host buffer (exec.c)
+    bool draw_marks;   // either of them on every draw too (LARECOMP_CHECKPOINTS=draw, or the last start lost this GPU: device.c)
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
@@ -100,11 +103,13 @@ typedef struct TexBackend {
     uint8_t scale_kind;  // (scalable) 1 = 16:9 target (TOTK_RES_SCALE), 2 = square depth target = shadow map (TOTK_SHADOW_SCALE)
     uint64_t touched_frame, frame_cleared;
     uint32_t level_gen;
-    float sx, sy;
+    float sx, sy;        // (scalable) host / guest: the kind's scale, or a shadow rung's own ratio (textures.c shadow_rung)
+    float nsx, nsy;      // (scalable) the kind's scale when the image was made (what a live setting change is checked against)
     void *pending_rgba;  // host-produced pixels (video) waiting to be uploaded on the render thread
     uint32_t pending_w, pending_h, pending_stride;
     uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
     bool astc_srgb;
+    bool astc_bc3;       // ... and then encoded to BC3 (graphics.compact_textures, low VRAM: textures.c astc_bc3_on)
     int tp;              // runtime/nvn/texpatch.c: 0 not checked yet, -1 none, else known UI texture + 1
     uint32_t tp_gen;     // texpatch_generation() it was last uploaded with
     int reg;  // slot in textures.c's live list + 1 (a reboot destroys them all)
@@ -141,8 +146,8 @@ void vk_depth_twin_copy(VkCommandBuffer cb, TexBackend *b);  // after a pass int
 void vk_writeback_flush(void);  // textures.c: rendered CPU-movable textures' texels -> their guest storage (end of execute)
 void vk_cpu_read_begin(void);  // textures.c: pass begin: drops notes of a pass that never ended (a device reset)
 void vk_cpu_read_note(NvnTexture *t, TexBackend *b);  // textures.c: pass begin, colour target t: a CPU-read target?
-void vk_cpu_read_flush(VkCommandBuffer cb);  // textures.c: after the pass (outside it): their texels -> guest storage, no wait
-bool vk_gmem_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off);  // exec.c: guest range in the imported heap
+void vk_cpu_read_flush(VkCommandBuffer cb);  // textures.c: after the pass (outside it): their texels -> our staging, no wait
+void vk_cpu_read_serve(uint64_t addr, uint64_t size);   // objects.c, the game's pool invalidate: staged texels -> guest storage
 TexBackend *vk_render_backend(NvnTexture *t);  // the image a pass on t really draws into (t's own, or its block shadow)
 
 uint32_t vk_render_epoch(void);   // textures.c: +1 each time the render scale changes (after renderer_get_scale has it)
@@ -168,7 +173,8 @@ void vk_views_forget(TexBackend *b);  // drop (deferred) the cached views of an 
 uint64_t vk_frame_counter(void);
 // device.c backend_present's split, this frame (exec.c's hitch line resets it): submits, FG pacing, the frame slot's fence
 // (GPU-bound), image acquire, swapchain re-creation, the pacer's wait (cap / game interval), the present call and its limits
-enum { PR_SUBMIT, PR_FG, PR_SLOT, PR_ACQ, PR_RECREATE, PR_PACE, PR_PRESENT, PR_N };
+// (PR_PRESENT's parts: vkq_drain, the swapchain lock's wait, vkQueuePresentKHR, vk_present_done's latency limits)
+enum { PR_SUBMIT, PR_FG, PR_SLOT, PR_ACQ, PR_RECREATE, PR_PACE, PR_PRESENT, PR_DRAIN, PR_LOCK, PR_QPRESENT, PR_LIMITS, PR_N };
 extern uint64_t g_pr_ns[PR_N];
 extern bool g_pr_paused;
 
@@ -207,6 +213,7 @@ typedef struct VkTemporalInputs {
     VkNgxImage color, depth, mv, out, bias;
     float jx, jy, mv_sx, mv_sy;
     bool reset, depth_inverted;
+    bool hdr;   // color is linear HDR (TOTK_DLSS_HDR, before the game's tonemap), else the tonemapped scene
     double view_to_clip[4][4], clip_to_prev_clip[4][4];
     float near_, far_, fovy, aspect;
     uint64_t frame;
@@ -232,7 +239,10 @@ bool vk_ngx_sr_on(void);   // TOTK_DLSS=sr and NGX up
 bool vk_ngx_sr_frame_jitter(uint64_t frame, uint32_t render_w, uint32_t out_w, float *jx, float *jy);
 bool vk_ngx_sr_upscale(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, TexBackend *out, uint64_t frame,
                        bool flip_y, bool zminus);
-bool vk_ngx_fg_on(void);                                   // TOTK_DLSS=fg / fgtest
+bool vk_ngx_sr_hdr_on(void);   // TOTK_DLSS_HDR=1 and SR can run: SR on the linear HDR scene before the game's tonemap
+uint64_t vk_ngx_sr_hdr_frame(void);   // the frame it last ran (or was tried) on: the upscale pass leaves it to the game
+bool vk_ngx_sr_hdr(VkCommandBuffer cb, TexBackend *scene, TexBackend *depth, uint64_t frame, bool flip_y, bool zminus);
+bool vk_ngx_fg_on(void);                                  // TOTK_DLSS=fg / fgtest
 int vk_ngx_fg_frames(void);                                // generated frames per real one asked (0: FG off)
 void vk_ngx_fg_set_active(int n);                          // the pacer's count for now (1..vk_ngx_fg_frames())
 int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b);    // backend_present: b = the frame's final image; returns how
@@ -260,8 +270,14 @@ void vk_swapchain_life_unlock(void);
 void vk_present_done(uint64_t frame, uint64_t id, uint64_t seq, VkResult r, uint64_t t_submit, uint64_t t_paced);
 void vk_present_skipped(uint64_t frame);                     // a frame not shown (held / minimised)
 bool vk_present_queue_wanted(void);                          // TOTK_FG_PRESENT_THREAD=1 (device.c: a second queue for it)
-void vk_present_queue_init(VkQueue q);                       // FG present thread (present.c) on this queue (NULL: none)
+void vk_present_queue_init(VkQueue q, bool shared);          // FG present thread (present.c) on this queue (NULL: none;
+                                                             // shared: g_vk.queue itself, 'Maximum fps' only)
+void vk_queue_lock(void);                                    // g_vk.queue's host access while the FG present thread shares it
+void vk_queue_unlock(void);                                  // (device.c; no-op otherwise)
 bool vk_present_queue_on(void);                              // DLSS-G on and the thread there: presents go through it
+bool vk_fg_max(void);                                        // FG 'Maximum fps' (TOTK_FG_PACE=max, the F10 row; device.c)
+void vk_set_fg_max(bool on);                                 // (pc_dlss.cpp: the row live)
+bool vk_fg_max_free(void);                                   // and the VRR row off (no present waits for a vblank)
 void vk_present_queue_push(uint32_t img, VkSemaphore wait, uint64_t id, uint64_t frame, uint64_t seq, uint64_t t_submit,
                            int kind, int k, int n);          // instead of vkQueuePresentKHR (kind 0 other, 1 real, 2 generated k of n)
 void vk_present_queue_drain(void);                           // before a swapchain re-create / vkDeviceWaitIdle

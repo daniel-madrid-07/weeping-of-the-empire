@@ -31,6 +31,7 @@
 #include "guest/guest.h"   // (design A's hook: guest calls on eui's thread)
 #include "pc_settings.h"
 #include "totk_menu_cursor.h"
+#include "totk_tab_walk.h"     // the tab walk's presses (walk_step)
 #if __has_include("pc_input.h")
 #include "totk_player_state.h"   // (TPS_HORSE: totk_controls_page_set)
 #include "totk_globals.h"        // (totk_global: the controls page's riding fields)
@@ -78,11 +79,16 @@ const pc_setting kRows[] = {
      "1", kOffOn, kOffOnNames, 0, 0, 0, 0, "TOTK_MENU_CURSOR", nullptr, apply, nullptr, nullptr},
 };
 [[maybe_unused]] const bool g_rows = (pc_settings_add(kRows, 1), true);
+bool mc_fields_known();   // (kMcFieldsKnown, below the field list; true where the cursor has no Windows side)
+#ifndef _WIN32
+bool mc_fields_known() { return true; }
+#endif
 
 bool enabled() {
 #ifdef TOTK_BETA_OFF_PC_MENUS
     return false;   // (a beta of another game version without eui::UIController::updateState's hook)
 #endif
+    if (!mc_fields_known()) return false;   // (another version's table without every eui / ui2d field)
     int on = g_on.load();
     if (on < 0) {
         const char* e = getenv("TOTK_MENU_CURSOR");
@@ -103,24 +109,100 @@ constexpr u64 kScreenMgr = totk_main(0x4640010);   // eui::ScreenMgr::sInstance
 #else
 #define SCREEN_MGR() rd<u64>(kScreenMgr)
 #endif
+// The value at another main address the same way: 0 where another version's porter could not place it
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+#define MAIN_U64(off) (totk_main_known_rt(off) ? rd<u64>(totk_main(off)) : 0ull)
+#else
+#define MAIN_U64(off) rd<u64>(totk_main(off))
+#endif
 
-// eui::ScreenMgr, BoxCursorMgr, BoxCursorControl
-constexpr u64 kSmBoxCursorMgr = 0x3f8, kBmControls = 0x28, kCtlActive = 0x58, kCtlReserved = 0x60;
-// eui::Screen
-constexpr u64 kScrDrawInfo = 0x60, kScrLayout = 0x28, kScrNodes = 0x80, kScrActive = 0x148, kScrReserved = 0x150, kScrState = 0x16e,
-              kScrRequest = 0x175;
+// Every guest struct offset below is a 1.0.0 offset through totk_field (totk_version.h), so another version's table maps
+// it or leaves it unknown; kMcFieldsKnown, after the list, turns the whole cursor off unless each one is placed. A fixed
+// sub-member inside one field (a size's height, a matrix element) is that field + its distance. eui::ScreenMgr,
+// BoxCursorMgr, BoxCursorControl
+constexpr u64 kSmBoxCursorMgr = totk_field(ScreenMgr, 0x3f8), kSmCount = totk_field(ScreenMgr, 0x8),
+              kSmScreens = totk_field(ScreenMgr, 0x10), kBmScreenIndex = totk_field(BoxCursorMgr, 0x14),
+              kBmControls = totk_field(BoxCursorMgr, 0x28), kCtlActive = totk_field(BoxCursorControl, 0x58),
+              kCtlReserved = totk_field(BoxCursorControl, 0x60);
+// eui::Screen (its box-cursor node list: a sead OffsetList at +0x80, its node-to-link offset 0x14 into it); a sead
+// list node's next
+constexpr u64 kScrDrawInfo = totk_field(EuiScreen, 0x60), kScrLayout = totk_field(EuiScreen, 0x28),
+              kScrNodes = totk_field(EuiScreen, 0x80),
+              kScrActive = totk_field(EuiScreen, 0x148), kScrReserved = totk_field(EuiScreen, 0x150),
+              kScrState = totk_field(EuiScreen, 0x16e), kScrRequest = totk_field(EuiScreen, 0x175);
+constexpr u64 kListNext = totk_field(SeadListNode, 0x8);
 constexpr u8 kScrOpened = 2;
-// eui::BoxCursorNode, AnimButton (ButtonBase)
-constexpr u64 kNodeButton = 0x18, kNodeScreen = 0x20, kBtnLayout = 0x20, kBtnFlags = 0x40, kBtnHitPane = 0x58,
-              kBtnCursorPane = 0x60;
+// eui::BoxCursorNode, AnimButton (ButtonBase), and the vtable slots called (isDecidable, Down)
+constexpr u64 kNodeButton = totk_field(BoxCursorNode, 0x18), kNodeScreen = totk_field(BoxCursorNode, 0x20),
+              kNodeVtDecidable = totk_field(BoxCursorNodeVt, 0x30), kBtnLayout = totk_field(AnimButton, 0x20),
+              kBtnFlags = totk_field(AnimButton, 0x40), kBtnHitPane = totk_field(AnimButton, 0x58),
+              kBtnCursorPane = totk_field(AnimButton, 0x60), kBtnVtDown = totk_field(AnimButtonVt, 0x38);
 constexpr u32 kBtnUsable = 0x20010;   // both set: active and enabled (ButtonGroup::Update's test)
 // nn::ui2d::DrawInfo (eui::DrawInfoEx): the projection (4 x 4) and view (3 x 4) matrices the screen is drawn with
-constexpr u64 kDiProj = 0x10, kDiView = 0x50;
-// nn::ui2d::Layout (eui::LayoutEx): its size (the bflyt's) and name
-constexpr u64 kLytRoot = 0x18, kLytSize = 0x28, kLytName = 0x30;
+constexpr u64 kDiProj = totk_field(Ui2dDrawInfo, 0x10), kDiView = totk_field(Ui2dDrawInfo, 0x50);
+// nn::ui2d::Layout (eui::LayoutEx): its root pane, size (the bflyt's), name, and the animation state byte
+constexpr u64 kLytRoot = totk_field(Ui2dLayout, 0x18), kLytSize = totk_field(Ui2dLayout, 0x28),
+              kLytName = totk_field(Ui2dLayout, 0x30), kLytAnimState = totk_field(Ui2dLayout, 0x91);
 // nn::ui2d::Pane
-constexpr u64 kPaneParent = 0x18, kPaneChildren = 0x20, kPaneSize = 0x50, kPaneFlag = 0x58, kPaneAlpha = 0x59,
-              kPaneBase = 0x5b, kPaneMtx = 0x70, kPaneName = 0xb0;
+constexpr u64 kPaneParent = totk_field(Ui2dPane, 0x18), kPaneChildren = totk_field(Ui2dPane, 0x20),
+              kPaneSize = totk_field(Ui2dPane, 0x50), kPaneFlag = totk_field(Ui2dPane, 0x58),
+              kPaneAlpha = totk_field(Ui2dPane, 0x59), kPaneBase = totk_field(Ui2dPane, 0x5b),
+              kPaneMtx = totk_field(Ui2dPane, 0x70), kPaneName = totk_field(Ui2dPane, 0xb0);
+// the screens and controls read by name: the pouch's action window, the shortcut strip and wheel (mc-strip.md,
+// mc-wheel.md), the recipe card's parts, Autobuild's draft list (mc-sysctl.md 1), the ride state behind GOT
+// 0x4558440 (mc-sysctl.md 2), the UI module's controller and its button words / right stick, ControllerModule's slots
+constexpr u64 kPouchActionWindow = totk_field(UIPouchScreen, 0x1f0), kActionWindowLayout = totk_field(ActionWindowParts, 0x20);
+constexpr u64 kShortCutParts = totk_field(UIShortCutScreen, 0x1a8), kShortCutCategory = totk_field(UIShortCutScreen, 0x1b8),
+              kPartsSlideList = totk_field(ShortCutParts, 0x50), kPartsLabel = totk_field(ShortCutParts, 0x148);
+constexpr u64 kSlWindowHi = totk_field(SlideListControl, 0x40), kSlWindowLo = totk_field(SlideListControl, 0x50),
+              kSlCount = totk_field(SlideListControl, 0x88), kSlIndex = totk_field(SlideListControl, 0x8c),
+              kSlSnap = totk_field(SlideListControl, 0x98), kSlWindowFlags = totk_field(SlideListControl, 0xbc),
+              kSlFlags = totk_field(SlideListControl, 0xbe), kSlRequest = totk_field(SlideListControl, 0xc3);
+constexpr u64 kWheelCircleIndex = totk_field(UIShortCutMainItemScreen, 0x23c),
+              kWheelAbilityMap = totk_field(UIShortCutMainItemScreen, 0x270);
+constexpr u64 kRecipeCards = totk_field(UIRecipeCardScreen, 0x1a0), kRecipeHistory = totk_field(UIRecipeCardScreen, 0x1a8),
+              kRecipePartLayout = totk_field(RecipePart, 0x20);
+constexpr u64 kAbBorn = totk_field(UIAutoBuilderScreen, 0x1b8), kAbBtnHeight = totk_field(UIAutoBuilderScreen, 0x230),
+              kAbHeaderHeight = totk_field(UIAutoBuilderScreen, 0x234), kAbCapacity = totk_field(UIAutoBuilderScreen, 0x240),
+              kAbRows = totk_field(UIAutoBuilderScreen, 0x248), kAbCount = totk_field(UIAutoBuilderScreen, 0x250),
+              kAbScroll = totk_field(UIAutoBuilderScreen, 0x254), kAbInfoPanel = totk_field(UIAutoBuilderScreen, 0x264),
+              kBornFrame = totk_field(BornObject, 0x20), kAbRowMode = totk_field(AutoBuilderRow, 0x8),
+              kAbRowIndex = totk_field(AutoBuilderRow, 0xc);
+constexpr u64 kRideStateRide = totk_field(RideState, 0x67a), kRideStateKind = totk_field(RideState, 0x6b8);
+constexpr u64 kUiModController = totk_field(UIModule, 0x198), kCmSlot0 = totk_field(ControllerModule, 0xa0),
+              kCmSlot1 = totk_field(ControllerModule, 0xa8), kCmSlot2 = totk_field(ControllerModule, 0xb0),
+              kUcTrigger = totk_field(UIController, 0x8), kUcRelease = totk_field(UIController, 0xc),
+              kUcHold = totk_field(UIController, 0x114), kUcStickX = totk_field(UIController, 0x128),
+              kUcStickY = totk_field(UIController, 0x12c);
+constexpr u64 kPouchSlideListF = totk_field(UIPouchScreen, 0x1e0), kSlideElementsF = totk_field(PouchTabList, 0x58),
+              kElemLayoutF = totk_field(PaneScrollElement, 0x20), kTbFields[] = {
+                  totk_field(TextBox, 0xd8), totk_field(TextBox, 0x110), totk_field(TextBox, 0x112),
+                  totk_field(TextBox, 0x114), totk_field(TextBox, 0x5c), totk_field(ScalableFontTextBoxEx, 0x168),
+                  totk_field(SystemActionGuideScreen, 0x1b8), totk_field(ActionGuideDiagram, 0x68)};
+// Every field above placed (1.0.0: always): otherwise the cursor stands down whole (enabled(), the frame, the
+// UIController hook after the original), as the field table's other users do; one gate, since its reads chain screen to
+// node to button to pane and a half-placed chain would read garbage
+constexpr bool kMcFieldsKnown = [] {
+    for (const u64 f : {kSmBoxCursorMgr, kSmCount, kSmScreens, kBmScreenIndex, kBmControls, kCtlActive, kCtlReserved,
+                        kScrDrawInfo, kScrLayout, kScrNodes, kScrActive, kScrReserved, kScrState, kScrRequest, kListNext,
+                        kNodeButton, kNodeScreen, kBtnLayout, kBtnFlags, kBtnHitPane, kBtnCursorPane, kDiProj, kDiView, kLytRoot, kLytSize, kLytName, kLytAnimState, kPaneParent,
+                        kPaneChildren, kPaneSize, kPaneFlag, kPaneAlpha, kPaneBase, kPaneMtx, kPaneName,
+                        kPouchActionWindow, kActionWindowLayout, kShortCutParts, kShortCutCategory, kPartsSlideList,
+                        kPartsLabel, kSlWindowHi, kSlWindowLo, kSlCount, kSlIndex, kSlSnap, kSlWindowFlags, kSlFlags,
+                        kSlRequest, kWheelCircleIndex, kWheelAbilityMap, kRecipeCards, kRecipeHistory, kRecipePartLayout,
+                        kAbBorn, kAbBtnHeight, kAbHeaderHeight, kAbCapacity, kAbRows, kAbCount, kAbScroll, kAbInfoPanel,
+                        kBornFrame, kAbRowMode, kAbRowIndex, kRideStateRide, kRideStateKind, kUiModController, kCmSlot0,
+                        kCmSlot1, kCmSlot2, kUcTrigger, kUcRelease, kUcHold, kUcStickX, kUcStickY, kPouchSlideListF,
+                        kSlideElementsF, kElemLayoutF})
+        if (f == TOTK_FIELD_UNKNOWN) return false;
+    for (const u64 f : kTbFields)
+        if (f == TOTK_FIELD_UNKNOWN) return false;
+    return true;
+}();
+bool mc_fields_known() { return kMcFieldsKnown; }
+// The two vtable slots press_down calls (a slot moves when the class gains a virtual), apart: unplaced, press_down
+// declines and a click is the UI controller's A, the rest of the cursor on
+constexpr bool kVcallsKnown = kNodeVtDecidable != TOTK_FIELD_UNKNOWN && kBtnVtDown != TOTK_FIELD_UNKNOWN;
 
 template <class T> T rd(u64 a) {
     T v;
@@ -251,7 +333,7 @@ template <class F> void for_nodes(u64 scr, int* count, F&& f) {
     const u64 head = scr + kScrNodes;
     const s32 off = rd<s32>(head + 0x14);
     if (off < 0 || off > 0x40) return;
-    for (u64 link = rd<u64>(head + 8); link != head; link = rd<u64>(link + 8)) {
+    for (u64 link = rd<u64>(head + kListNext); link != head; link = rd<u64>(link + kListNext)) {
         if (!ptr_ok(link) || ++*count > 512) return;
         const u64 node = link - (u64)off, btn = rd<u64>(node + kNodeButton);
         if (ptr_ok(btn) && !f(node, btn)) return;
@@ -474,7 +556,7 @@ void dump_nodes(u64 scr) {
     const s32 off = rd<s32>(head + 0x14);
     if (off < 0 || off > 0x40) return;
     int i = 0;
-    for (u64 link = rd<u64>(head + 8); link != head && ptr_ok(link) && i < 24; link = rd<u64>(link + 8), i++) {
+    for (u64 link = rd<u64>(head + kListNext); link != head && ptr_ok(link) && i < 24; link = rd<u64>(link + kListNext), i++) {
         const u64 node = link - (u64)off, btn = rd<u64>(node + kNodeButton);
         const u64 pane = ptr_ok(btn) ? rd<u64>(btn + kBtnHitPane) : 0;
         if (!ptr_ok(pane)) { printf("[menu-cursor]   node %d %#llx: button %#llx, no hit pane\n", i, (unsigned long long)node, (unsigned long long)btn); continue; }
@@ -511,8 +593,11 @@ void layout_name(u64 scr, char* out, size_t n) {
 // (index = the tab: Armor, Bow, Shield, Weapon, Material, Food, SpecialParts, KeyItem, System), each +0x20 the
 // icon's parts layout, whose root pane (nn::ui2d::Layout +0x18) is the Pa_Category pane. The current tab: PouchMgr
 // (through the GOT entry main+0x455db58) +0x18c.
-constexpr u64 kPouchSlideList = 0x1e0, kSlideElements = 0x58, kElemLayout = 0x20;
-constexpr u64 kPouchMgrGot = totk_main(0x455db58), kPouchActiveTab = 0x18c;
+constexpr u64 kPouchSlideList = totk_field(UIPouchScreen, 0x1e0), kSlideElements = totk_field(PouchTabList, 0x58),
+              kElemLayout = totk_field(PaneScrollElement, 0x20);
+// (PouchMgr's fields through the version table: 1.4.3 keeps both; a diagnostic build that cannot place one reads no
+// tab / not holding)
+constexpr u64 kPouchActiveTab = totk_field(PouchMgr, 0x18c);   // (PouchMgr: the global behind GOT main+0x455db58)
 bool is_pouch(u64 scr) {   // (cached by the screen and its layout: a freed screen's address can come back as another)
     // (no screen, e.g. focus_now in the frame the pouch closes, with a tab walk still on: v0.1.7 crashed reading 0x28)
     if (!ptr_ok(scr)) return false;
@@ -613,11 +698,15 @@ void dump_tabs(u64 pouch) {
 }
 // The stored current tab (PouchMgr::getActiveTab also skips invalid tabs upward; a press moves to a valid one), -1
 // if PouchMgr is not there
+// PouchMgr (0: not there)
+u64 pouch_mgr() {
+    const u64 got = MAIN_U64(0x455db58);
+    if (!ptr_ok(got)) return 0;
+    const u64 mgr = rd<u64>(got);
+    return game_object(mgr) ? mgr : game_object(got) ? got : 0;
+}
 int active_tab() {
-    const u64 got = rd<u64>(kPouchMgrGot);
-    if (!ptr_ok(got)) return -1;
-    u64 mgr = rd<u64>(got);
-    if (!game_object(mgr)) mgr = game_object(got) ? got : 0;
+    const u64 mgr = totk_field_known(PouchMgr, 0x18c) ? pouch_mgr() : 0;
     if (!mgr) return -1;
     const s32 t = rd<s32>(mgr + kPouchActiveTab);
     return t >= 0 && t <= 8 ? t : -1;
@@ -627,8 +716,18 @@ int active_tab() {
 // (+0x20) -> LayoutEx +0x91 mAnimState non-zero, the game's own test
 bool pouch_popup_open(u64 pouch) {
     if (!ptr_ok(pouch)) return false;
-    const u64 win = rd<u64>(pouch + 0x1f0), lyt = ptr_ok(win) ? rd<u64>(win + 0x20) : 0;
-    return ptr_ok(lyt) && rd<u8>(lyt + 0x91) != 0;
+    const u64 win = rd<u64>(pouch + kPouchActionWindow), lyt = ptr_ok(win) ? rd<u64>(win + kActionWindowLayout) : 0;
+    return ptr_ok(lyt) && rd<u8>(lyt + kLytAnimState) != 0;
+}
+
+// Link holds materials (the pouch's Hold): PouchMgr +0x1ce8, the held count 0..5. Then the holding panel (A Add, X
+// Stop holding) shows, and only the pad's A adds the focused material; the button's own Down (a click's confirm) does
+// not (public #36). Read at a click.
+constexpr u64 kPouchHeldCount = totk_field(PouchMgr, 0x1ce8);
+bool pouch_holding() {
+    const u64 mgr = totk_field_known(PouchMgr, 0x1ce8) ? pouch_mgr() : 0;
+    const s32 n = mgr ? rd<s32>(mgr + kPouchHeldCount) : 0;
+    return n >= 1 && n <= 5;
 }
 
 // ---- the menu screen in front (totk_menu_cursor.h), for the context
@@ -685,7 +784,7 @@ int quick_of(u64 scr, const char* nm) {
     if (!ptr_ok(root) || !pane_shown(root)) return -1;
     if (wheel) return TMS_QM_WHEEL;
     if (build) return TMS_QM_AUTOBUILD;
-    const s32 cat = rd<s32>(scr + 0x1b8);
+    const s32 cat = rd<s32>(scr + kShortCutCategory);
     return cat == 1 ? TMS_QM_SHIELD : cat == 2 ? TMS_QM_ARROW : cat == 3 ? TMS_QM_MATERIAL : TMS_QM_WEAPON;
 }
 void census(u64 now) {
@@ -693,8 +792,8 @@ void census(u64 now) {
     static int lines;
     const u64 sm = SCREEN_MGR();
     if (!game_object(sm)) return;
-    const s32 n = rd<s32>(sm + 0x8);
-    const u64 arr = rd<u64>(sm + 0x10);
+    const s32 n = rd<s32>(sm + kSmCount);
+    const u64 arr = rd<u64>(sm + kSmScreens);
     if (n <= 0 || n > 1024 || !ptr_ok(arr)) return;
     char list[1024];
     size_t len = 0;
@@ -779,8 +878,9 @@ bool verbose();
 // part 0x44fcd00, every T_* text box 0x44fd0b0, and Pa_GuideSpecial_00's T_Icon_00 / T_Guide_00 0x44fc2c8, a second
 // text box class; mc-ui2d.md's 0x40ea488 / 0x40e9e90 matched no pane)
 constexpr u64 kVtParts = totk_main(0x44fcd00), kVtTextBox = totk_main(0x44fd0b0), kVtTextBox2 = totk_main(0x44fc2c8);
-constexpr u64 kTbBuf = 0xd8, kTbCap = 0x110, kTbLen = 0x112, kTbBits = 0x114, kTbFlagEx = 0x5c;
-constexpr u64 kTbRegState = 0x168;   // eui::ScalableFontTextBoxEx (the 0x44fd0b0 class): its glyph registration state
+constexpr u64 kTbBuf = totk_field(TextBox, 0xd8), kTbCap = totk_field(TextBox, 0x110), kTbLen = totk_field(TextBox, 0x112),
+              kTbBits = totk_field(TextBox, 0x114), kTbFlagEx = totk_field(TextBox, 0x5c);
+constexpr u64 kTbRegState = totk_field(ScalableFontTextBoxEx, 0x168);   // eui::ScalableFontTextBoxEx (the 0x44fd0b0 class): its glyph registration state
 // One record per slot written: the game's original, what was written and at which epoch. A record is trusted only
 // while its slot still holds what was written, and a screen's records go when the census no longer sees it
 // Opened. No record (the table full): written, but not redone. (epoch: its set's; tick: the pass it was written
@@ -796,7 +896,7 @@ struct GlyphPass { int gi; unsigned epoch; int budget, panes, swapped; u16 first
 // keeps the world's. The type is the diagram part's (screen +0x1b8 -> +0x68), written before the callouts' texts on
 // the focus frame. The callout is the pane name's last number + 1 (T_Icon2_01, T_Icon3_01, T_Icon3NoIn_01: callout
 // 2), so every callout layout of a page maps alike.
-constexpr u64 kSagDiagram = 0x1b8, kDiagramType = 0x68;
+constexpr u64 kSagDiagram = totk_field(SystemActionGuideScreen, 0x1b8), kDiagramType = totk_field(ActionGuideDiagram, 0x68);
 #ifdef PC_HAS_GLYPH_CP_IN
 struct GlyphCtxRow { s32 type; int callout; int set; };
 constexpr GlyphCtxRow kGlyphCtx[] = {
@@ -834,7 +934,7 @@ void glyph_textbox(u64 tb, GlyphPass& gp) {
 #ifdef PC_HAS_GLYPH_GAME_SET
     if (gp.gi == 2) {  // (the fields the page's own refresh 0x1001a84a4c reads)
         const u64 g = totk_global(0x4558440);
-        const int ride = ptr_ok(g) ? rd<u8>(g + 0x67a) : -1, kind = ptr_ok(g) ? rd<s32>(g + 0x6b8) : 0;
+        const int ride = ptr_ok(g) ? rd<u8>(g + kRideStateRide) : -1, kind = ptr_ok(g) ? rd<s32>(g + kRideStateKind) : 0;
         set = totk_controls_page_set(ride, kind, pc_glyph_game_set(), totk_player_state());
     }
     // (debounced: a context held under 100 ms, ~3 frames, is not drawn, so a 1-frame GLIDE at a jump or an AIM edge
@@ -980,7 +1080,7 @@ void sub_label_textbox(u64 tb, const char* part) {
     const u16 cap = rd<u16>(tb + kTbCap), len = rd<u16>(tb + kTbLen);
     if (!ptr_ok(buf) || len >= cap || cap > 2048 || len >= 64) return;
     const u64 g = totk_global(0x4558440);
-    if (!ptr_ok(g) || rd<u8>(g + 0x67a) != 0) return;   // (another page, or unreadable: the game's text)
+    if (!ptr_ok(g) || rd<u8>(g + kRideStateRide) != 0) return;   // (another page, or unreadable: the game's text)
     u16 cur[64];
     for (u16 i = 0; i < len; i++) cur[i] = rd<u16>(buf + 2ull * i);
     const unsigned epoch = pc_glyph_epoch_in(PCX_WORLD);
@@ -1083,8 +1183,8 @@ void glyph_walk(u64 pane, int gi, bool in_part, int depth, GlyphPass& gp, const 
 #ifdef PC_HAS_GLYPH_CP_IN
     else if (in_part && text && gi == 2 && pane_name_is(pane, "T_GuideOne")) sub_label_textbox(pane, part);
 #endif
-    for (u64 n = rd<u64>(pane + kPaneChildren + 8); ptr_ok(n) && n != pane + kPaneChildren && gp.budget > 0;
-         n = rd<u64>(n + 8))
+    for (u64 n = rd<u64>(pane + kPaneChildren + kListNext); ptr_ok(n) && n != pane + kPaneChildren && gp.budget > 0;
+         n = rd<u64>(n + kListNext))
         glyph_walk(n - 8, gi, in_part, depth + 1, gp, part);
 }
 void glyph_pass() {
@@ -1115,8 +1215,8 @@ void glyph_pass() {
         const bool all = !strcmp(ds, "*");
         if (!all || n++ % 30 == 0) {
             const u64 sm = SCREEN_MGR();
-            const s32 cnt = game_object(sm) ? rd<s32>(sm + 0x8) : 0;
-            const u64 arr = game_object(sm) ? rd<u64>(sm + 0x10) : 0;
+            const s32 cnt = game_object(sm) ? rd<s32>(sm + kSmCount) : 0;
+            const u64 arr = game_object(sm) ? rd<u64>(sm + kSmScreens) : 0;
             for (s32 i = 0; i < cnt && i < 1024 && ptr_ok(arr); i++) {
                 const u64 scr = rd<u64>(arr + 8ull * i);
                 if (!game_object(scr) || rd<u8>(scr + kScrState) != kScrOpened) continue;
@@ -1218,12 +1318,12 @@ u64 open_screen(const char* name);
     const u64 scr = open_screen("RecipeCard_00");
     if (!scr) return -1;
     auto part_up = [&](u64 off) {
-        const u64 part = rd<u64>(scr + off), lyt = ptr_ok(part) ? rd<u64>(part + 0x20) : 0,
+        const u64 part = rd<u64>(scr + off), lyt = ptr_ok(part) ? rd<u64>(part + kRecipePartLayout) : 0,
                   root = ptr_ok(lyt) ? rd<u64>(lyt + kLytRoot) : 0;
         return ptr_ok(root) && (rd<u8>(root + kPaneFlag) & 1) && rd<u8>(root + kPaneAlpha);
     };
-    if (part_up(0x1a8)) return TMS_RECIPE_HISTORY;
-    return part_up(0x1a0) ? TMS_RECIPE_CARDS : -1;
+    if (part_up(kRecipeHistory)) return TMS_RECIPE_HISTORY;
+    return part_up(kRecipeCards) ? TMS_RECIPE_CARDS : -1;
 }
 void update_menu_screen(const u64 focus_screen) {
     static ULONGLONG menu_seen;
@@ -1514,12 +1614,12 @@ void take_tasks(ULONGLONG now, UiTask* run, int* nrun, UiTask* drop, int* ndrop)
 // (the caller keeps waiting, within its 400 ms); -1: the button cannot take Down (its flags).
 int press_down(u64 node, int target) {
     const u64 btn = rd<u64>(node + kNodeButton);
-    if (!ptr_ok(btn) || (rd<u32>(btn + kBtnFlags) & 0x14) != 0x14) return -1;
+    if (!kVcallsKnown || !ptr_ok(btn) || (rd<u32>(btn + kBtnFlags) & 0x14) != 0x14) return -1;
     const u64 sm = SCREEN_MGR(), bm = game_object(sm) ? rd<u64>(sm + kSmBoxCursorMgr) : 0;
-    if (!ptr_ok(bm) || rd<s32>(bm + 0x14) != -1) return 0;
+    if (!ptr_ok(bm) || rd<s32>(bm + kBmScreenIndex) != -1) return 0;
     Ctx* const c = guest_bridge::tl_ctx;
-    const u64 nvt = rd<u64>(node), dec = ptr_ok(nvt) ? rd<u64>(nvt + 0x30) : 0;
-    const u64 bvt = rd<u64>(btn), down = ptr_ok(bvt) ? rd<u64>(bvt + 0x38) : 0;
+    const u64 nvt = rd<u64>(node), dec = ptr_ok(nvt) ? rd<u64>(nvt + kNodeVtDecidable) : 0;
+    const u64 bvt = rd<u64>(btn), down = ptr_ok(bvt) ? rd<u64>(bvt + kBtnVtDown) : 0;
     auto in_main = [](u64 f) { return f >= kMain && f < kMain + 0x6000000; };
     if (!c || !in_main(dec) || !in_main(down)) return -1;
     // isDecidable must be BoxCursorNode's own (main+0x11cd0fc) or an override the boots have seen: anything else (a
@@ -1564,65 +1664,40 @@ bool move_focus(const Focus& f, u64 node) {
     return true;
 }
 
-// A tab walk: L / R presses until a tab bar shows tab `to`. kind 0: the pause menu's pouch tabs (PouchMgr's tab);
-// kind 1: the Purah Pad's pages (the context's page, through a page switch's focus gap). Started by a tab icon's
-// click or the router's tab_goto; run by walk_step at every frame, also with the cursor off (the map page).
-struct Walk {
-    int to = -1, kind = 0, phase = 0, presses = 0, last = -1, dead = 0;
-    ULONGLONG at_ms = 0, t = 0, press_at = 0;
-};
-Walk g_walk;
+// A tab walk: L / R presses until a tab bar shows tab `to` (totk_tab_walk.h). kind 0: the pause menu's pouch tabs
+// (PouchMgr's tab); kind 1: the Purah Pad's pages (the context's page, through a page switch's focus gap). Started by
+// a tab icon's click or the router's tab_goto; run by walk_step at every frame, also with the cursor off (the map page).
+TabWalk g_walk;
 int walk_cur(int kind) {
     if (kind == 0) return active_tab();
     const uint32_t v = g_menu_screen.load(std::memory_order_relaxed), sc = v & 0xff, sub = v >> 8 & 0xff;
     return (sc == TMS_PURAH_PAD || sc == TMS_MAP) && sub < 5 ? (int)sub : -1;
 }
 void walk_start(int kind, int to, ULONGLONG now) {
-    g_walk = Walk{};
-    g_walk.to = to; g_walk.kind = kind; g_walk.at_ms = now; g_walk.last = walk_cur(kind);
+    g_walk.start(kind, to, walk_cur(kind), now);
     printf("[menu-cursor] walk to %s %d (now %d)\n", kind ? "page" : "tab", to, g_walk.last);
 }
-// The walk's L / R bits for this frame (HidNpadButton L 6 / R 7). One press (50 ms, then 50 ms released: over a frame
-// each at 30 fps; a tab bar steps one valid tab per press, on its trigger frame), the next as soon as the tab has
-// changed. It stops at the tab, after 12 presses or 4 s, when the tab bar is gone, or when two presses in a row changed
-// nothing in 400 ms each (an invalid tab: greyed, the game skips it; at a low frame rate a 50 ms press can fall between
-// two samples, hence one retry). The pouch's tabs do not wrap.
 u64 walk_step(const Focus& f, ULONGLONG now) {
-    Walk& w = g_walk;
-    if (w.to < 0) return 0;
-    const int cur = walk_cur(w.kind);
+    if (g_walk.to < 0) return 0;
+    const int to = g_walk.to, kind = g_walk.kind, cur = walk_cur(kind);
     // (the inventory closed mid-walk: no focus screen; v0.1.7 crash 11-02 15:25)
-    const bool there = w.kind == 0 ? f.screen && is_pouch(f.screen) : g_pad_open.load();
-    // (the Purah Pad's page reads -1 in a page switch's focus gap: wait, within the time limits)
-    const bool unknown = cur < 0 && w.kind == 1;
-    bool waiting = w.phase == 0 && w.presses > 0 && (cur == w.last || unknown);
-    if (waiting && !unknown && now - w.press_at >= 400 && w.dead < 1) { w.dead++; waiting = false; }
-    else if (!waiting && w.phase == 0) w.dead = 0;
-    if ((cur < 0 && !unknown) || !there || now - w.at_ms > 4000 || w.presses > 12 ||
-        (waiting && now - w.press_at >= (unknown ? 1000u : 400u))) {
-        if (cur != w.to) printf("[menu-cursor] walk: %s %d not reached (at %d)\n", w.kind ? "page" : "tab", w.to, cur);
-        w.to = -1;
-        return 0;
-    }
-    if (cur == w.to && w.phase != 1) { w.to = -1; return 0; }
-    if (w.phase == 0 && !waiting) { w.last = cur; w.phase = 1; w.t = w.press_at = now; w.presses++; }
-    u64 out = 0;
-    if (w.phase == 1) {
-        out = w.to > w.last ? (1u << 7) : (1u << 6);
-        if (now - w.t >= 50) { w.phase = 2; w.t = now; }
-    } else if (w.phase == 2 && now - w.t >= 50) {
-        w.phase = 0;
-    }
+    const bool there = kind == 0 ? f.screen && is_pouch(f.screen) : g_pad_open.load();
+    const bool transition = (g_menu_screen.load(std::memory_order_relaxed) & 0xff) == TMS_TRANSITION;
+    bool ended = false, reached = false;
+    const u64 out = g_walk.step(cur, there, transition, now, &ended, &reached);
+    if (ended && !reached) printf("[menu-cursor] walk: %s %d not reached (at %d)\n", kind ? "page" : "tab", to, cur);
     return out;
 }
 
 bool verbose();
 // An open screen by its layout's name (0: none)
 u64 open_screen(const char* name) {
+    if (!kMcFieldsKnown) return 0;   // (totk_menu_layout_focus calls it from outside the frame: an unplaced field is
+                                     // 0x7ffffff0, not 0)
     const u64 sm = SCREEN_MGR();
     if (!game_object(sm)) return 0;
-    const s32 n = rd<s32>(sm + 0x8);
-    const u64 arr = rd<u64>(sm + 0x10);
+    const s32 n = rd<s32>(sm + kSmCount);
+    const u64 arr = rd<u64>(sm + kSmScreens);
     for (s32 i = 0; i < n && i < 1024 && ptr_ok(arr); i++) {
         const u64 scr = rd<u64>(arr + 8ull * i);
         if (!game_object(scr) || rd<u8>(scr + kScrState) != kScrOpened) continue;
@@ -1672,8 +1747,8 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
     // UI updates past the close, also when another quickmenu opens straight after it
     if (sub != TMS_QM_WHEEL && (wx || wy)) {
         if (tick - closed_tick < 2) {
-            wr<float>(ui + 0x128, wx);
-            wr<float>(ui + 0x12c, wy);
+            wr<float>(ui + kUcStickX, wx);
+            wr<float>(ui + kUcStickY, wy);
         } else wx = wy = 0;
     }
     if (!quick || sub == TMS_QM_WHEEL || sub == TMS_QM_AUTOBUILD)
@@ -1691,7 +1766,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
         const u64 scr = open_screen("ShortCutMainItem_00");
         // A pad's right stick steers the wheel too: while it is out (the original copied it in), the notches' slot
         // yields and the next notch starts from the game's slot
-        const float px = rd<float>(ui + 0x128), py = rd<float>(ui + 0x12c);
+        const float px = rd<float>(ui + kUcStickX), py = rd<float>(ui + kUcStickY);
         if (px * px + py * py > 0.09f) target = -1, notches = 0, wx = wy = 0, mvx = mvy = 0, dx = dy = 0;
         // tests: TOTK_MC_TEST_QM_ABILITY=<wheel id, 6 Autobuild> picks its slot (mCircleAbilityMap +0x270)
         static const char* const test_ability = getenv("TOTK_MC_TEST_QM_ABILITY");
@@ -1700,10 +1775,10 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
             if (!told) {
                 told = true;
                 printf("[menu-cursor] quickmenu wheel: abilities by slot");
-                for (int i = 0; i < 8; i++) printf(" %d", rd<s32>(scr + 0x270 + 4ull * i));
+                for (int i = 0; i < 8; i++) printf(" %d", rd<s32>(scr + kWheelAbilityMap + 4ull * i));
                 printf("\n");
             }
-            for (int i = 0; i < 8; i++) if (rd<s32>(scr + 0x270 + 4ull * i) == atoi(t)) target = i;
+            for (int i = 0; i < 8; i++) if (rd<s32>(scr + kWheelAbilityMap + 4ull * i) == atoi(t)) target = i;
         }
         // A notch steps from the slot chosen last, or from the game's (mCurrentCircleIndex +0x23c), past the empty
         // slots; slot i points at pi/2 - i*pi/4, so the next slot is clockwise. A slot holds its fixed id 1..8 once
@@ -1711,13 +1786,13 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
         // of it, averaged over 2 frames, and keeps the last pick otherwise (mc-wheel.md 2): the slot's exact
         // direction is held on every update, so a notch lands on the 2nd frame. At most 8 notches are played, each
         // looks at most 8 slots, and with no valid slot the notch does nothing.
-        auto valid = [&](int i) { const s32 id = rd<s32>(scr + 0x270 + 4ull * i); return id >= 1 && id <= 8; };
+        auto valid = [&](int i) { const s32 id = rd<s32>(scr + kWheelAbilityMap + 4ull * i); return id >= 1 && id <= 8; };
         if (notches && scr) {
             mvx = mvy = 0;   // (a notch starts the mouse's direction afresh)
             const int dir = notches < 0 ? 1 : -1;   // (a notch up is +1: counter-clockwise)
             // The game's index is -1 at open until the equipped ability's slot is found, and can name a locked
             // slot: then the first notch lands on slot 0 going clockwise, 7 the other way
-            int s = target >= 0 ? target : rd<s32>(scr + 0x23c);
+            int s = target >= 0 ? target : rd<s32>(scr + kWheelCircleIndex);
             const bool from_valid = s >= 0 && s <= 7 && valid(s);
             if (!from_valid) s = dir > 0 ? 7 : 0;
             int n = notches < 0 ? -notches : notches, skipped = 0;
@@ -1741,7 +1816,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
             if (skipped && !told_skip) {
                 told_skip = true;
                 printf("[menu-cursor] quickmenu wheel: %d empty slot(s) skipped (ids", skipped);
-                for (int i = 0; i < 8; i++) printf(" %d", rd<s32>(scr + 0x270 + 4ull * i));
+                for (int i = 0; i < 8; i++) printf(" %d", rd<s32>(scr + kWheelAbilityMap + 4ull * i));
                 printf(")\n");
             }
             if (any) target = s;
@@ -1762,13 +1837,13 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
         if (target >= 0) {   // the slot's direction, full deflection, on the UI controller's right stick, every update
             const double a = 1.5707963 - target * 0.78539816;
             wx = (float)cos(a), wy = (float)sin(a);
-            wr<float>(ui + 0x128, wx);
-            wr<float>(ui + 0x12c, wy);
+            wr<float>(ui + kUcStickX, wx);
+            wr<float>(ui + kUcStickY, wy);
         }
         if (verbose()) {   // (the slot the wheel picked: UIShortCutMainItemScreen mCurrentCircleIndex +0x23c)
             static s32 slot = -2;
             const u64 scr = open_screen("ShortCutMainItem_00");
-            const s32 now_slot = scr ? rd<s32>(scr + 0x23c) : -2;
+            const s32 now_slot = scr ? rd<s32>(scr + kWheelCircleIndex) : -2;
             if (now_slot != slot)
                 printf("[menu-cursor] quickmenu wheel: stick (%.2f, %.2f) -> slot %d\n", wx, wy, now_slot);
             slot = now_slot;
@@ -1792,13 +1867,13 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
         // - +0x50 + bit 4] empty) move a box cursor, not a slide, and keep setPage; so does a step that wraps or leaves
         // that window.
         const u64 scr = open_screen("ShortCut_00");
-        const u64 parts = scr ? rd<u64>(scr + 0x1a8) : 0, ctrl = ptr_ok(parts) ? rd<u64>(parts + 0x50) : 0;
+        const u64 parts = scr ? rd<u64>(scr + kShortCutParts) : 0, ctrl = ptr_ok(parts) ? rd<u64>(parts + kPartsSlideList) : 0;
         // (the strip's items are 0.. mPageCount +0x88 - 1: setPage snaps to any of them and the release commits that
         // entry. [+0x50, +0x40 - +0x50 + mFlags bit 4] is only slide_step's clamp for a page slide, the scroll window:
         // a strip that shows all its items, the shields' or the bows' (6 with a "none" slot), walks below it, mc_qm9,
         // mc-strip.md's correction to section 2)
-        const s32 lo = 0, cur = ptr_ok(ctrl) ? rd<s32>(ctrl + 0x8c) : -1;
-        const s32 hi = ptr_ok(ctrl) ? rd<s32>(ctrl + 0x88) - 1 : -1;
+        const s32 lo = 0, cur = ptr_ok(ctrl) ? rd<s32>(ctrl + kSlIndex) : -1;
+        const s32 hi = ptr_ok(ctrl) ? rd<s32>(ctrl + kSlCount) - 1 : -1;
         const s32 count = hi - lo + 1;
         const bool usable = ptr_ok(ctrl) && lo >= 0 && count >= 1 && count <= 1024 && cur >= lo && cur <= hi;
         g_qm_strip_usable.store(usable, std::memory_order_relaxed);
@@ -1811,8 +1886,8 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
                    lo, hi, cur);
         if (usable && ctrl != st_ctrl) st_phase = 0, st_target = -1, st_ctrl = ctrl;
         auto step = [&](int dir) {   // (the game's own one-item slide)
-            wr<u8>(ctrl + 0xc3, (u8)(dir << 1));
-            wr<u8>(ctrl + 0xbe, (u8)(rd<u8>(ctrl + 0xbe) | 8));
+            wr<u8>(ctrl + kSlRequest, (u8)(dir << 1));
+            wr<u8>(ctrl + kSlFlags, (u8)(rd<u8>(ctrl + kSlFlags) | 8));
         };
         auto snap = [&](const char* why) {   // (setPage onto the target, with the slide's sound)
             StripSetPage(parts, (u32)st_target);
@@ -1828,10 +1903,10 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
 #endif
         if (fresh && usable) {
             const s32 base = st_phase ? st_target : cur;   // (notches on top of a pending step go on from its target)
-            const s32 wlo = rd<s32>(ctrl + 0x50);
-            const s32 whi = rd<s32>(ctrl + 0x40) - wlo + (s32)((rd<u32>(ctrl + 0xbc) >> 4) & 1);
+            const s32 wlo = rd<s32>(ctrl + kSlWindowLo);
+            const s32 whi = rd<s32>(ctrl + kSlWindowHi) - wlo + (s32)((rd<u32>(ctrl + kSlWindowFlags) >> 4) & 1);
             int to, pre;
-            const int plan = totk_strip_plan(cur, base, fresh, count, wlo, whi, rd<s32>(ctrl + 0x98) == -1, &to, &pre);
+            const int plan = totk_strip_plan(cur, base, fresh, count, wlo, whi, rd<s32>(ctrl + kSlSnap) == -1, &to, &pre);
             st_target = to, st_dir = fresh > 0 ? 1 : 0, st_wait = 0;
             if (plan == TOTK_STRIP_NONE) st_phase = 0;
             else if (plan == TOTK_STRIP_SET) snap("no slide here");
@@ -1841,7 +1916,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
                 printf("[menu-cursor] quickmenu strip %d: %+d notch(es), index %d -> %d of %d%s\n", sub, fresh, cur, to,
                        count, st_phase == 2 ? " (native step)" : st_phase == 1 ? " (setPage, then the native step)" : "");
         } else if (st_phase == 1 && usable) {
-            if (rd<s32>(ctrl + 0x98) == -1) step(st_dir), st_phase = 2, st_wait = 0;
+            if (rd<s32>(ctrl + kSlSnap) == -1) step(st_dir), st_phase = 2, st_wait = 0;
             else if (++st_wait > 3) snap("the snap still pending");
         } else if (st_phase == 2 && usable) {
             if (cur == st_target) st_phase = 0;
@@ -1849,7 +1924,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
         }
         if (scr && getenv("TOTK_MC_STRIP_DIAG")) {   // tests: where the strip keeps its focus (logged as it changes)
             const u64 sm = SCREEN_MGR(), bm = game_object(sm) ? rd<u64>(sm + kSmBoxCursorMgr) : 0;
-            const u64 slide = rd<u64>(scr + 0x1a8), slc = ptr_ok(slide) ? rd<u64>(slide + 0x50) : 0;
+            const u64 slide = rd<u64>(scr + kShortCutParts), slc = ptr_ok(slide) ? rd<u64>(slide + kPartsSlideList) : 0;
             u64 c[2] = {}, cs[2] = {};
             for (int i = 0; i < 2 && ptr_ok(bm); i++) {
                 const u64 ctl = rd<u64>(bm + kBmControls + 8ull * i);
@@ -1858,7 +1933,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
             }
             static u64 last[8];
             const u64 now_v[8] = {rd<u64>(scr + kScrActive), rd<u64>(scr + kScrReserved), c[0], cs[0], c[1], cs[1],
-                                  ptr_ok(slide) ? rd<u64>(slide + kScrActive) : 0, slc};
+                                  ptr_ok(slide) ? rd<u64>(slide + kPartsLabel) : 0, slc};
             if (memcmp(last, now_v, sizeof last)) {
                 memcpy(last, now_v, sizeof last);
                 printf("[menu-cursor] strip diag: scr active %#llx reserved %#llx | ctl0 %#llx (screen %#llx) ctl1 %#llx "
@@ -1895,13 +1970,13 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
     ab_age++;
     static const bool ab_direct = !(getenv("TOTK_MC_AB_DIRECT") && !strcmp(getenv("TOTK_MC_AB_DIRECT"), "0"));
     const u64 ab_scr = open_screen("AutoBuilder_00");
-    const u64 rows = ab_scr ? rd<u64>(ab_scr + 0x248) : 0;
-    const s32 count = ab_scr ? rd<s32>(ab_scr + 0x250) : 0, cap = ab_scr ? rd<s32>(ab_scr + 0x240) : 0;
-    const float btn = ab_scr ? rd<float>(ab_scr + 0x230) : 0, hdr = ab_scr ? rd<float>(ab_scr + 0x234) : 0;
+    const u64 rows = ab_scr ? rd<u64>(ab_scr + kAbRows) : 0;
+    const s32 count = ab_scr ? rd<s32>(ab_scr + kAbCount) : 0, cap = ab_scr ? rd<s32>(ab_scr + kAbCapacity) : 0;
+    const float btn = ab_scr ? rd<float>(ab_scr + kAbBtnHeight) : 0, hdr = ab_scr ? rd<float>(ab_scr + kAbHeaderHeight) : 0;
     const bool rows_ok = ptr_ok(rows) && count >= 1 && count <= cap && cap <= 4096 && btn > 0 && btn < 1000 &&
                          hdr > 0 && hdr < 1000;
-    auto row_mode = [&](int i) { return rd<s32>(rows + 0x14ull * i + 8); };
-    auto row_index = [&](int i) { return rd<s32>(rows + 0x14ull * i + 0xc); };   // (< 0: a header)
+    auto row_mode = [&](int i) { return rd<s32>(rows + 0x14ull * i + kAbRowMode); };
+    auto row_index = [&](int i) { return rd<s32>(rows + 0x14ull * i + kAbRowIndex); };   // (< 0: a header)
     auto row_scroll = [&](int to) { return totk_ab_row_scroll(rows, to, btn, hdr); };
     s32 index = -1, mode = 0;   // (updateImpl_ pre-fills the mode 0)
     int at = -1;
@@ -1913,17 +1988,17 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
         static int seen = -2;
         if (at != seen)
             printf("[menu-cursor] quickmenu autobuild: row %d (mode %d, draft %d), scroll target %.2f, formula %.2f "
-                   "(heights %.2f / %.2f)\n", at, mode, index, rd<float>(ab_scr + 0x254), at >= 0 ? row_scroll(at) : 0.f,
+                   "(heights %.2f / %.2f)\n", at, mode, index, rd<float>(ab_scr + kAbScroll), at >= 0 ? row_scroll(at) : 0.f,
                    btn, hdr);
         seen = at;
     }
     if (ab_direct && pending && ab_scr) {
-        if (rd<u8>(ab_scr + 0x264)) return pending = 0;   // (the info panel takes the input, as the game's own)
+        if (rd<u8>(ab_scr + kAbInfoPanel)) return pending = 0;   // (the info panel takes the input, as the game's own)
         // (the notches wait for the list: updateImpl_ takes input only once its born animation is at frame 0,
         // *(f32*)(*(screen + 0x1b8) + 0x20); unreadable, 10 UI updates. A gate that never clears (a frame that never
         // reads 0) gives way after 30 UI updates, so the list never stops answering)
-        const u64 born = rd<u64>(ab_scr + 0x1b8);
-        if (ptr_ok(born) ? rd<float>(born + 0x20) != 0.f : ab_age < 10) {
+        const u64 born = rd<u64>(ab_scr + kAbBorn);
+        if (ptr_ok(born) ? rd<float>(born + kBornFrame) != 0.f : ab_age < 10) {
             if (ab_age < 30) return 0;
             static bool told;
             if (!told && (told = true)) printf("[menu-cursor] autobuild: born gate not cleared, proceeding\n");
@@ -1934,7 +2009,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
             if (to != at) {
                 // (the scroll target only: the list eases +0x258 to it with the game's own animation, a burst too; the
                 // selection is the new row at once)
-                wr<float>(ab_scr + 0x254, row_scroll(to));
+                wr<float>(ab_scr + kAbScroll, row_scroll(to));
                 AbSelect(ab_scr, mode, index, to_mode, to_index, 0);
             }
             if (verbose())
@@ -2207,20 +2282,34 @@ extern "C" TotkChainOut totk_menu_chain_step(TotkChain* c, const TotkChainIn* in
     return o;
 }
 
+#ifndef _WIN32
+namespace {   // (the reader above is in the Windows-only part; these two row helpers are compiled everywhere)
+template <class T> T rd(u64 a) {
+    T v;
+    memcpy(&v, reinterpret_cast<const void*>(static_cast<uintptr_t>(a)), sizeof v);
+    return v;
+}
+// (the two the shared code below names from the Windows field list: the Autobuild row's draft index, and the field
+// table's verdict over the one field this side reads: another version's table may leave it unplaced, and the row
+// helpers would then read rows + TOTK_FIELD_UNKNOWN)
+constexpr u64 kAbRowIndex = totk_field(AutoBuilderRow, 0xc);
+constexpr bool kMcFieldsKnown = totk_field_known(AutoBuilderRow, 0xc);
+}  // namespace
+#endif
 // The Autobuild list's rows (UIAutoBuilderScreen +0x248: 0x14 each, +0xc the draft's index, < 0 a category header)
 extern "C" int totk_ab_target_row(uint64_t rows, int count, int at, int notches) {
     int to = at;
     for (int n = notches, i = at; n;) {   // (n rows the notches' way, past the headers, stopping at an end)
         i += n > 0 ? 1 : -1;
         if (i < 0 || i >= count) break;
-        if (rd<s32>(rows + 0x14ull * i + 0xc) < 0) continue;
+        if (rd<s32>(rows + 0x14ull * i + kAbRowIndex) < 0) continue;
         to = i, n -= n > 0 ? 1 : -1;
     }
     return to;
 }
 extern "C" float totk_ab_row_scroll(uint64_t rows, int to, float btn, float hdr) {   // (getDraftSlotHeight)
     float h = -hdr / 2, p = 0;
-    for (int i = 0; i <= to; i++) h += p = rd<s32>(rows + 0x14ull * i + 0xc) < 0 ? hdr : btn;
+    for (int i = 0; i <= to; i++) h += p = rd<s32>(rows + 0x14ull * i + kAbRowIndex) < 0 ? hdr : btn;
     return h - p / 2;
 }
 
@@ -2352,6 +2441,23 @@ extern "C" u64 totk_menu_cursor_frame(void) {
 #ifdef TOTK_BETA_OFF_PC_MENUS
     return 0;   // (a beta without the PC menus' hooks: nothing to read or drive)
 #endif
+#if defined(_WIN32) && defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    // Another version, once: the cursor's state for the 1.4.3 gate, and the main addresses it only compares (the
+    // TextBox / parts vtables, BoxCursorNode::isDecidable): unplaced, totk_main is the sentinel and the compare never
+    // matches, so ask each one (totk_main_known_rt logs "[totk] main+0x... not placed") instead of a silent 'not this
+    // class'
+    static const bool said = [] {
+        const u64 offs[] = {0x44fcd00, 0x44fd0b0, 0x44fc2c8, 0x11cd0fc};
+        int unplaced = 0;
+        for (const u64 o : offs) unplaced += !totk_main_known_rt(o);
+        printf("[menu-cursor] fields: %s; vcalls %s; compared addresses unplaced: %d of 4\n",
+               kMcFieldsKnown ? "all placed" : "not all placed (cursor off)", kVcallsKnown ? "placed" : "unplaced (A fallback)",
+               unplaced);
+        return true;
+    }();
+    (void)said;
+#endif
+    if (!kMcFieldsKnown) return 0;   // (a field table without every eui / ui2d field: nothing read)
 #ifdef _WIN32
     static std::atomic<u64> last{0};
     // Design A: eui's thread runs it all; the pad gets only the hook's Purah Pad page walk (L / R)
@@ -2541,6 +2647,7 @@ u64 frame(const Focus& f) {
         a_node = 0; a_from = 0;
         g_scroll_can.store(0);
         if (g_drag.on) drag_stop();
+        g_walk.gap(now);
         return 0;
     }
     // Hover follows the pointer's motion on the picture. For 200 ms after the cursor comes on the pointer is taken as
@@ -2786,8 +2893,11 @@ u64 frame(const Focus& f) {
             a_node = 0; a_dir = 0;
             if (logs < 400) { logs++; printf("[menu-cursor] arrow: D-pad pressed\n"); }
         } else if (f.screen && (rd<u64>(f.control + kCtlActive) == a_node || rd<u64>(f.screen + kScrActive) == a_node)) {
-            // On eui's thread the button's own Down; else (or if Down refuses) an A press
-            const int d = g_in_hook ? press_down(a_node, f.target) : -1;
+            // On eui's thread the button's own Down; else (or if Down refuses) an A press. Holding materials, always the
+            // A press: only the pad's A adds the item to the held ones (public #36)
+            const bool hold = g_in_hook && is_pouch(f.screen) && pouch_holding();
+            if (hold && logs < 400) { logs++; printf("[menu-cursor] confirm: holding materials, A (add)\n"); }
+            const int d = g_in_hook && !hold ? press_down(a_node, f.target) : -1;
             if (d > 0) {
                 if (logs < 400) { logs++; printf("[menu-cursor] confirm: Down sent\n"); }
                 a_node = 0;
@@ -2807,11 +2917,13 @@ u64 frame(const Focus& f) {
             if (logs < 400) { logs++; printf("[menu-cursor] click: the focus never reached the item, no A\n"); }
         }
     }
-    // The right button is not back in the menus, so a right click does nothing here. A only while a menu has the
-    // focus. A moment without focus (a submenu closing, a popup opening) ends a pulse: carried into the next screen
-    // it would be a press there. A pending A that has not started keeps its 400 ms wait.
+    // The right button is not back in the menus, so a right click does nothing here. A only while a menu has the focus.
+    // A moment without focus (a submenu closing, a popup opening) ends a pulse: carried into the next screen it would be
+    // a press there. A pending A that has not started keeps its 400 ms wait. A walk's press ends there too: the game
+    // sees L / R released (a tab switch's gap, totk_tab_walk.h)
     if (!f.screen) {
         if (a_from) a_node = 0, a_from = 0;
+        g_walk.gap(now);
         return 0;
     }
     u64 out = 0;
@@ -2838,16 +2950,16 @@ void mc_orig_stub(Ctx *__restrict) {}
 void hook_f_83e3f8(Ctx *__restrict c) {   // UIController::updateState(this, src)
     const u64 self = c->x[0], src = c->x[1];
     f_83e3f8_orig(c);
-    if (!ptr_ok(self)) return;
+    if (!kMcFieldsKnown || !ptr_ok(self)) return;
     // The shared UIController, by address: UIModule (main+0x4563120, the instance or the slot that holds it) +0x198
     // (the object, or a pointer to it). Another controller is left alone (logged once); if the module cannot be
     // read, the first controller seen.
     static u64 first;
     u64 ui = 0;
     {
-        u64 mod = rd<u64>(totk_main(0x4563120));
+        u64 mod = MAIN_U64(0x4563120);
         if (!game_object(mod) && ptr_ok(mod)) mod = rd<u64>(mod);
-        if (game_object(mod)) ui = self == mod + 0x198 || self == rd<u64>(mod + 0x198) ? self : 0;
+        if (game_object(mod)) ui = self == mod + kUiModController || self == rd<u64>(mod + kUiModController) ? self : 0;
         else { if (!first) first = self; ui = self == first ? self : 0; }
     }
     if (!ui) {
@@ -2868,12 +2980,12 @@ void hook_f_83e3f8(Ctx *__restrict c) {   // UIController::updateState(this, src
                "source %#llx)\n", (unsigned long long)self, (unsigned long long)src);
         // ControllerModule's custom controllers (sInstance; main +0xa0, all players +0xa8, combined +0xb0), to tell
         // which one is the BoxCursor's "UI" controller and which one gameplay reads
-        const u64 cm = rd<u64>(totk_main(0x46490c0));
+        const u64 cm = MAIN_U64(0x46490c0);
         if (ptr_ok(cm))
             printf("[menu-cursor]   ControllerModule (sInstance) controllers: main %#llx, all players %#llx, "
                    "combined %#llx\n",
-                   (unsigned long long)rd<u64>(cm + 0xa0), (unsigned long long)rd<u64>(cm + 0xa8),
-                   (unsigned long long)rd<u64>(cm + 0xb0));
+                   (unsigned long long)rd<u64>(cm + kCmSlot0), (unsigned long long)rd<u64>(cm + kCmSlot1),
+                   (unsigned long long)rd<u64>(cm + kCmSlot2));
     }
     g_hook_at.store(now);
     guest_bridge::Enter e(c);
@@ -2923,11 +3035,11 @@ void hook_f_83e3f8(Ctx *__restrict c) {   // UIController::updateState(this, src
     const u32 trig = want & ~prev, rel = prev & ~want;
     prev = want;
     if (!want && !rel) return;
-    wr<u32>(self + 0x114, rd<u32>(self + 0x114) | want);
-    wr<u32>(self + 0x08, rd<u32>(self + 0x08) | trig);
+    wr<u32>(self + kUcHold, rd<u32>(self + kUcHold) | want);
+    wr<u32>(self + kUcTrigger, rd<u32>(self + kUcTrigger) | trig);
     // The original derives release from last frame's hold, which held our bits: while we still hold them, that is
     // not a release; ours is the frame the press ends
-    wr<u32>(self + 0x0c, (rd<u32>(self + 0x0c) & ~want) | rel);
+    wr<u32>(self + kUcRelease, (rd<u32>(self + kUcRelease) & ~want) | rel);
 }
 #else
 // Elsewhere (Linux / Deck) the cursor is off, but a key with 83e3f8 in GEN_MAIN calls this hook: it only runs the

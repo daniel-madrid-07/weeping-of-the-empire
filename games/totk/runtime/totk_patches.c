@@ -17,11 +17,14 @@ static void (*g_post_oe)(uint32_t);
 static TotkSettings g_set;
 static uint64_t g_last_present_ns;
 static double g_step, g_smooth, g_debt;          /* the step written last, the EMA of the measured time, real - given */
+static double g_hitch_lag = -1;                  /* a lone hitch's lag until the next present decides it (-1: none) */
 static uint32_t g_pinned_us;                     /* atomic: diagnostics pin, 0 = measured */
 static int g_retarget;                           /* atomic: presents left in a frame-rate cap change's fast ramp */
 static int g_interval = 2;                       /* the game's present interval (realtime off) */
 static int g_hold = 1;                           /* atomic: totk_frame_step_hold (held until the engine says otherwise) */
 static int g_hold_frames, g_hold_clamped;        /* atomic: this hold's frames, and those shorter than its floor */
+static unsigned g_follow_opened;                 /* step follow windows opened (frame_step_next; the present thread) */
+static unsigned g_hitch_dropped;                 /* lone hitches not owed (frame_step_next; the present thread) */
 
 static uint64_t pack_size(unsigned w, unsigned h) { return (uint64_t)h << 32 | w; }
 
@@ -123,8 +126,15 @@ const char *totk_settings_from_env(TotkSettings *s) {
     if ((e = getenv("TOTK_SHADOW_RES")) && *e) {
         double f;
         char rest;
-        if (sscanf(e, "%lf%c", &f, &rest) != 1 || !(f == 0 || (f >= 0.5 && f <= 2))) return "TOTK_SHADOW_RES must be a multiplier between 0.5 and 2, or 0 (the game's own)";
+        if (sscanf(e, "%lf%c", &f, &rest) != 1 || !(f == 0 || (f >= 0.25 && f <= 2))) return "TOTK_SHADOW_RES must be a multiplier between 0.25 and 2, or 0 (the game's own)";
         s->shadow_scale = f == 1 ? 0.0f : (float)f;
+    }
+    if ((e = getenv("TOTK_SHADOW_REACH")) && *e) {
+        double f;
+        char rest;
+        if (sscanf(e, "%lf%c", &f, &rest) != 1 || !(f == 0 || (f >= 1 && f <= 4)))
+            return "TOTK_SHADOW_REACH must be a multiplier between 1 and 4 (the near shadow cascades' reach), or 0 (the game's own)";
+        s->shadow_reach = f == 1 ? 0.0f : (float)f;
     }
     if ((e = getenv("TOTK_SHADOW_FIXED")) && *e) {
         if (!strcmp(e, "1") || !strcmp(e, "on")) s->shadow_fixed = 1.0f;
@@ -223,6 +233,7 @@ const char *totk_patches_init(void *main_base, uint64_t main_span, const TotkSet
     put_f32(TOTK_DP_FOV_SCALE, s->fov_scale);
     put_f32(TOTK_DP_SHADOW_SCALE, s->shadow_scale);
     put_f32(TOTK_DP_SHADOW_FIXED, s->shadow_fixed);
+    put_f32(TOTK_DP_SHADOW_SPLIT, s->shadow_reach);
     __atomic_store_n((uint32_t *)(g_page + TOTK_DP_TEMP_UNIT), s->temp_unit, __ATOMIC_RELEASE);
     put_f32(TOTK_DP_LOD_SCALE, s->lod_scale);
     put_f32(TOTK_DP_ACTOR_LOD, s->actor_lod_scale);
@@ -235,12 +246,12 @@ const char *totk_patches_init(void *main_base, uint64_t main_span, const TotkSet
     else if (s->res_floor <= 0.0f) snprintf(dyn, sizeof dyn, "on (the game's own)");
     else snprintf(dyn, sizeof dyn, "on, floor %.0f %%", s->res_floor * 100.0);
     fprintf(stderr, "[totk] data page at %p: frame step %s, scene %ux%u, output %ux%u (swapchain %ux%u), aspect %.4f%s, "
-            "dynamic resolution %s, field of view x%.2f, shadow map x%.2f%s, LOD distance x%.2f\n",
+            "dynamic resolution %s, field of view x%.2f, shadow map x%.2f%s, near shadow reach x%.2f, LOD distance x%.2f\n",
             (void *)g_page, s->realtime ? "real time" : "shipping (present interval)", s->render_w, s->render_h,
             s->output_w, s->output_h, s->max_w, s->max_h, totk_aspect_current(),
             totk_aspect_current() == 0 ? " (the game's own 16:9)" : "", dyn, s->fov_scale > 0 ? s->fov_scale : 1.0,
             s->shadow_scale > 0 ? s->shadow_scale : 1.0, s->shadow_fixed ? " (fixed size)" : "",
-            s->lod_scale > 0 ? s->lod_scale : 1.0);
+            s->shadow_reach > 0 ? s->shadow_reach : 1.0, s->lod_scale > 0 ? s->lod_scale : 1.0);
     return NULL;
 }
 
@@ -298,9 +309,15 @@ void totk_frame_step_hold(int on) {
    ~0.5x and then paid the owed time back fast: motion slowed and sped up at every camera move, never at a steady 30; at 60 a dip to 55 still ran ~0.9x for ~0.3 s ("almost imperceptible").
    So FOLLOW_RUN presents in a row more than FOLLOW_RATIO above (or below) the EMA open the same fast window (an isolated hitch, or frames alternating around the mean, never do), with one
    difference: the time it lags stays owed, since nobody chose the new rate (the clock keeps real time), and the steady EMA is 0.1 (0.05 before): smaller drifts follow in ~10 frames, the
-   step's own jitter at a noisy steady rate grows from 1.5 % to 1.8 %. TOTK_STEP_FOLLOW=0: the 3 % ramp and the 0.05 EMA alone.*/
+   step's own jitter at a noisy steady rate grows from 1.5 % to 1.8 %. TOTK_STEP_FOLLOW=0: the 3 % ramp and the 0.05 EMA alone. A lone hitch is not owed (LEAD, v0.1.10): one frame over
+   HITCH_RATIO x the EMA, with no other in the HITCH_LONE s before it and the next frame back under FOLLOW_RATIO x the EMA, is a freeze the player already saw; repaying its lag gave ~2 s
+   at 1.03-1.05x after it (the v0.1.9 gate: the bow's first draw, a 117 ms present, owed 91 ms), a speed swing of its own. Its time is dropped (the game clock ends that much behind real
+   time) and it moves neither the EMA nor the step. Decided on the next present: if that one is long too, the drop is sustained and the hitch is owed as before, as are hitches closer
+   together than HITCH_LONE (repeating ones would otherwise slow the game for good). TOTK_STEP_HITCH=0: every hitch owed, as before.*/
 #define FOLLOW_RATIO 1.1
 #define FOLLOW_RUN 3
+#define HITCH_RATIO 2.0   /* (the gate's hitch: a frame at twice the mean or more) */
+#define HITCH_LONE 3.0
 static double frame_step_next(double real, double lo, double hi) {
     double dt = real < lo ? lo : real > hi ? hi : real;
     if (!(g_step > 0)) g_step = g_smooth = dt;
@@ -308,16 +325,35 @@ static double frame_step_next(double real, double lo, double hi) {
     static int settled;   /* fast-window presents in a row that were converged */
     static int follow;    /* presents left in a sustained rate change's fast window */
     static int run;       /* presents in a row measured above (> 0) or below (< 0) the EMA by FOLLOW_RATIO */
-    static int follow_on = -1;
+    static int follow_on = -1, hitch_on = -1;
+    static double pending_real, pending_dt;     /* (the lone hitch's measured and clamped time; its lag: g_hitch_lag) */
+    double pending = g_hitch_lag;
+    static double since = HITCH_LONE;           /* real time since the last hitch */
     if (follow_on < 0) { const char *e = getenv("TOTK_STEP_FOLLOW"); follow_on = !(e && !strcmp(e, "0")); }
+    if (hitch_on < 0) { const char *e = getenv("TOTK_STEP_HITCH"); hitch_on = !(e && !strcmp(e, "0")); }
     int left = __atomic_load_n(&g_retarget, __ATOMIC_RELAXED);
+    if (pending >= 0) {
+        if (dt > g_smooth * FOLLOW_RATIO) {   /* (not lone: owed, and in the EMA, as any other frame) */
+            g_debt += pending;
+            g_smooth += (pending_dt - g_smooth) * (follow_on ? 0.1 : 0.05);
+        } else {
+            const unsigned n = ++g_hitch_dropped;
+            if (n <= 20 || n % 100 == 0)
+                fprintf(stderr, "[totk] hitch not owed #%u: a %.1f ms frame against a %.2f ms mean (%.0f ms dropped)\n",
+                        n, pending_real * 1e3, g_smooth * 1e3, pending * 1e3);
+        }
+        g_hitch_lag = -1;
+    }
+    const int hitch = dt > g_smooth * HITCH_RATIO;
+    const int lone = hitch && hitch_on && since >= HITCH_LONE;
+    since = hitch ? 0 : since + real;
     if (follow_on && left <= 0 && follow <= 0) {
         int s = dt > g_smooth * FOLLOW_RATIO ? 1 : dt * FOLLOW_RATIO < g_smooth ? -1 : 0;
         run = s && (run > 0) == (s > 0) ? run + s : s;
         if (run >= FOLLOW_RUN || run <= -FOLLOW_RUN) {
-            static unsigned opened;   
+            const unsigned opened = ++g_follow_opened;
             follow = TOTK_RETARGET_PRESENTS, run = 0;
-            if (++opened <= 20 || opened % 100 == 0)
+            if (opened <= 20 || opened % 100 == 0)
                 fprintf(stderr, "[totk] step follow #%u: %.2f ms frames against a %.2f ms mean\n", opened, dt * 1e3,
                         g_smooth * 1e3);
         }
@@ -336,6 +372,9 @@ static double frame_step_next(double real, double lo, double hi) {
             g_debt += real - g_step;             /* (owed, as below) */
             follow = settled >= 3 ? 0 : follow - 1;
         }
+    } else if (lone) {
+        settled = 0;
+        g_hitch_lag = real - g_step, pending_real = real, pending_dt = dt;
     } else {
         settled = 0;
         g_smooth += (dt - g_smooth) * (follow_on ? 0.1 : 0.05);
@@ -344,7 +383,7 @@ static double frame_step_next(double real, double lo, double hi) {
     }
     if (g_debt > 0.5) g_debt = 0.5;           /* bounded (an interval switch 60 -> 30 owes ~0.25 s) */
     if (g_debt < -0.5) g_debt = -0.5;
-    /* (the repayment at most +-5 % of the step: a 200 ms hitch or a dip's lag comes back as a 1.05x stretch, not 1.2x) */
+    /* (the repayment at most +-5 % of the step: a hitch owed or a dip's lag comes back as a 1.05x stretch, not 1.2x) */
     double repay = g_debt * 0.02, most = g_smooth * 0.05;
     double step = g_smooth + (repay > most ? most : repay < -most ? -most : repay);
     if (step > g_step * up) step = g_step * up;
@@ -442,8 +481,71 @@ static void release_stale_mouse(uint32_t presents) {
         __atomic_compare_exchange_n(claimed, &one, 0u, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
 }
 
+/* The game's speed: every 2 s of realtime play, the game time given (each step for the interval that followed it) per
+   real second, its lowest and highest over the 0.25 s windows inside, the mean frame and step, the time still owed and
+   the follow windows opened and the lone hitches not owed since the last line. A step that lags a frame-rate change
+   shows as a 0.25 s window under ~0.95x and then one above ~1.05x (the owed time repaid); a lone hitch only as its own
+   window's dip (the freeze), with no faster window after it. A gap (over 0.25 s: a load) or a pinned step is not
+   counted, and the windows start again after it; the Switch timing (realtime off) logs nothing.*/
+static void log_game_speed(double real, double given, int skip) {
+    static double win_real, win_game, sub_real, sub_game, lo, hi;
+    static unsigned frames, follow_was, hitch_was;
+    if (skip) { win_real = win_game = sub_real = sub_game = 0, frames = 0; return; }
+    if (!frames) lo = 1e9, hi = 0, follow_was = g_follow_opened, hitch_was = g_hitch_dropped;
+    frames++, win_real += real, win_game += given, sub_real += real, sub_game += given;
+    if (sub_real >= 0.25) {
+        const double s = sub_game / sub_real;
+        if (s < lo) lo = s;
+        if (s > hi) hi = s;
+        sub_real = sub_game = 0;
+    }
+    if (win_real < 2.0) return;
+    fprintf(stderr, "[totk] game speed %.3fx over %.1f s (0.25 s windows %.2fx .. %.2fx), frames %.2f ms, step %.2f ms, "
+            "owed %+.0f ms, follow %u, hitches not owed %u\n", win_game / win_real, win_real, lo, hi,
+            win_real / frames * 1e3, win_game / frames * 1e3, g_debt * 1e3, g_follow_opened - follow_was,
+            g_hitch_dropped - hitch_was);
+    win_real = win_game = 0, frames = 0;   /* (the 0.25 s window under way goes on into the next line) */
+}
+
+/* The effectease patch's page values (per-frame sweep R5; sites_v100.py effectease), from the step the next frame runs
+   (the ratio just stored): for r in (0.01, 1) the game's 0.01-per-frame ease becomes 1 - 0.99^r, the Switch's time
+   constant, and its per-frame counts step by the 30 Hz ticks of game time the frames add up to (TOTK_DP_TICKS30 =
+   ticks - 1: -1 on most frames above 30 fps, 0 on the frame that completes a tick). At 30 fps and below, or with
+   TOTK_EFFECT_EASE=0, both are 0: the game's own k and step. */
+static void put_eases(void) {
+    static int on = -1;
+    static double acc;   /* (game time not yet counted as a tick, in 30 Hz frames) */
+    if (on < 0) {
+        const char *e = getenv("TOTK_EFFECT_EASE");
+        on = !e || strcmp(e, "0");
+        fprintf(stderr, "[totk] altitude effect fade / burst %s\n", on ? "in game time" : "in frames, as the game (TOTK_EFFECT_EASE=0)");
+    }
+    uint32_t bits = __atomic_load_n((uint32_t *)(g_page + TOTK_DP_FRAME_RATIO), __ATOMIC_ACQUIRE);
+    float r;
+    memcpy(&r, &bits, 4);
+    if (!on || !(r > 0.01f && r < 1.0f)) {
+        put_f32(TOTK_DP_EASE_K001, 0.0f);
+        __atomic_store_n((int32_t *)(g_page + TOTK_DP_TICKS30), 0, __ATOMIC_RELEASE);
+        acc = 0;
+        return;
+    }
+    double k = 1.0 - pow(1.0 - (double)0.01f, (double)r);
+    put_f32(TOTK_DP_EASE_K001, (float)(k < 0 ? 0 : k > 1 ? 1 : k));
+    acc += r;
+    const int ticks = (int)acc;
+    acc -= ticks;
+    __atomic_store_n((int32_t *)(g_page + TOTK_DP_TICKS30), ticks - 1, __ATOMIC_RELEASE);
+}
+
+static void frame_step_update(uint64_t now_ns);
+
 void totk_frame_step_update(uint64_t now_ns) {
     if (!g_page || !now_ns) return;
+    frame_step_update(now_ns);
+    put_eases();
+}
+
+static void frame_step_update(uint64_t now_ns) {
     uint32_t presents = __atomic_add_fetch((uint32_t *)(g_page + TOTK_DP_PRESENTS), 1u, __ATOMIC_ACQ_REL);
     release_stale_mouse(presents);
     log_scene_scale(now_ns);
@@ -455,11 +557,16 @@ void totk_frame_step_update(uint64_t now_ns) {
         return;
     }
     uint32_t pinned = __atomic_load_n(&g_pinned_us, __ATOMIC_RELAXED);
-    if (pinned) { g_last_present_ns = now_ns, g_step = pinned / 1e6, g_debt = 0; return; }   /* unpinned: ramp from it */
+    if (pinned) {   /* (unpinned: ramp from it) */
+        g_last_present_ns = now_ns, g_step = pinned / 1e6, g_debt = 0, g_hitch_lag = -1;
+        log_game_speed(0, 0, 1);
+        return;
+    }
     if (!g_last_present_ns || now_ns <= g_last_present_ns) { g_last_present_ns = now_ns; return; }
     double dt = (double)(now_ns - g_last_present_ns) * 1e-9;
     g_last_present_ns = now_ns;
-    if (dt > 0.25 || dt < 0.0005) { g_debt = 0; return; }   /* a gap: not owed, the step stays */
+    if (dt > 0.25 || dt < 0.0005) { g_debt = 0, g_hitch_lag = -1, log_game_speed(0, 0, 1); return; }   /* a gap: not owed, the step stays */
+    log_game_speed(dt, g_step, !(g_step > 0));
     double lo = g_set.min_frame_ms * 1e-3, hi = g_set.max_frame_ms * 1e-3;
     int hold = __atomic_load_n(&g_hold, __ATOMIC_RELAXED);
     int clamped = 0;
@@ -566,7 +673,7 @@ float totk_fov_current(void) {
 
 void totk_shadow_res_set(float scale) {
     if (!(scale > 0.0f) || scale == 1.0f) scale = 0.0f;   /* 0, 1, NaN, negatives: the game's own */
-    else if (scale < 0.5f) scale = 0.5f;
+    else if (scale < 0.25f) scale = 0.25f;   /* (integrated GPUs: 1/16 the memory; the game keeps each size >= 32, x8) */
     else if (scale > 2.0f) scale = 2.0f;   /* the game's pools are not grown: 2 = 4x the memory (review D3) */
     g_set.shadow_scale = scale;
     if (g_page) put_f32(TOTK_DP_SHADOW_SCALE, scale);
@@ -610,13 +717,19 @@ static const TotkSettingRow g_rows[] = {
      "and some cutscenes narrow or widen it, and the multiplier keeps their proportion. Wider costs some GPU and CPU "
      "(more of the world on screen).", TOTK_DP_FOV_SCALE, 1.0, 0.5, 2.0, 0.05, 0},
     {"graphics.shadow_resolution", "Graphics", "Shadow resolution",
-     "Multiplier of the shadow map's width and height (2 = sharper, 4x the memory).", TOTK_DP_SHADOW_SCALE, 1.0, 0.5,
-     2.0, 0.25, 0},
+     "Multiplier of the shadow map's width and height (2 = sharper, 4x the memory).", TOTK_DP_SHADOW_SCALE, 1.0, 0.25,
+     2.0, 0.25, 0},   /* (0.25: integrated GPUs, 1/16 the memory; the help text is a translation key, kept) */
     {"graphics.shadow_fixed", "Graphics", "Sun shadow map size",
      "The game's: the sun's shadow map shrinks and grows with the area its cascades cover, so near the ground foliage "
      "shadows turn coarse, and every size change moves the shadow texels (leaf shadows jump instead of sliding). Fixed: "
      "always the largest size the game picks (times the shadow resolution), steady and sharper; costs some GPU.",
      TOTK_DP_SHADOW_FIXED, 0.0, 0.0, 1.0, 1.0, 0},
+    {"graphics.shadow_reach", "Graphics", "Near shadow reach",
+     "Multiplier of how far the sun's sharpest shadow cascades reach (1 = the game's: the first two hand over 32 m and "
+     "64 m away, where the change in sharpness shows as a line, mostly at 4K). 2 moves those lines to 64 m and 128 m; "
+     "the far shadows stay. The same shadow map then covers more ground, so near shadows get softer by that factor: "
+     "raise Shadow resolution with it. Costs a little GPU and CPU (more objects drawn into the near shadow maps).",
+     TOTK_DP_SHADOW_SPLIT, 1.0, 1.0, 4.0, 0.25, 0},
     {"graphics.lod_distance", "Graphics", "Detail distance",
      "Multiplier of the distance at which models switch to lower detail (2 = full detail twice as far).",
      TOTK_DP_LOD_SCALE, 1.0, 0.5, 8.0, 0.25, 0},
@@ -695,7 +808,7 @@ uint64_t totk_output_extra_bytes(const TotkSettings *s) {
 
 int totk_layout_set(unsigned w, unsigned h, char name[64]) {
     /* the shapes games/totk/overlays builds by default (DEFAULT_ASPECTS): its layouts depend on the shape alone */
-    static const unsigned built[][2] = {{3440, 1440}, {5120, 1440}, {2560, 1600}};
+    static const unsigned built[][2] = {{3440, 1440}, {5120, 1440}, {7680, 1440}, {2560, 1600}};
     const double a = h ? (double)w / h : 0;
     if (a > 16.0 / 9.0 * 0.99 && a < 16.0 / 9.0 * 1.01) return 0;
     for (unsigned i = 0; i < sizeof built / sizeof built[0]; i++) {
