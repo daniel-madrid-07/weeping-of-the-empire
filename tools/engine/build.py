@@ -680,6 +680,33 @@ def key_of(img: str, root: str):
 
 
 # ---------------------------------------------------------------- game objects
+LINUX = sys.platform.startswith('linux')   # (v0.1.8.x has no Linux build; main defines it near the imports)
+
+
+def builder_alive(pid):
+    """the lock's holder still runs as a Python (a build.py): tasklist's output read as bytes, because the console code
+    page varies (on a Spanish Windows text=True raised UnicodeDecodeError in the reader thread, stdout came back None
+    and a Setup resumed after a stop failed at step 5 on the stale.lock); a pid reused by another program counts as
+    gone, else the build would wait on it forever"""
+    if not pid:
+        return False
+    if LINUX:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        try:
+            return 'python' in open(f'/proc/{pid}/comm').read().lower()
+        except OSError:
+            return True
+    out = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/FO', 'CSV', '/NH'], capture_output=True).stdout or b''
+    for line in out.splitlines():
+        f = [x.strip(b'"') for x in line.split(b'","')]
+        if len(f) > 1 and f[1] == str(pid).encode():
+            return f[0].lower().startswith(b'python')
+    return False
+
+
 class Lock:
     """one builder per key directory (a second one waits)"""
     def __init__(self, d):
@@ -696,9 +723,7 @@ class Lock:
                     pid = int(open(self.p).read() or 0)
                 except (OSError, ValueError):
                     pid = 0
-                alive = pid and subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH'], capture_output=True,
-                                               text=True).stdout.find(str(pid)) >= 0
-                if not alive:
+                if not builder_alive(pid):
                     os.remove(self.p); continue
                 log(f'waiting: another build (pid {pid}) holds {self.p}')
                 time.sleep(30)

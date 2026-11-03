@@ -1284,8 +1284,12 @@ static Frame cur_frame;
 
 // Acquire the next window image and begin rendering into it (cleared to `clear`). Returns false when there is
 // nothing to draw into (minimised window).
+static _Atomic int g_vk_closing;   // (exit_begin: the window is hidden; no presents, no swapchain recreation)
 bool vk_frame_begin(const float clear[4]) {
     cur_frame.ok = false;
+    // (closing: a hidden window can answer OUT_OF_DATE, and a recreation would race the exit thread's vkDeviceWaitIdle;
+    // nothing is drawn, as when minimised)
+    if (atomic_load(&g_vk_closing)) { atomic_store(&g_last_frame_ns, SDL_GetTicksNS()); return false; }
     int w, h;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     if (!w || !h) { atomic_store(&g_last_frame_ns, SDL_GetTicksNS()); return false; }  // minimised (not a hang)
@@ -1579,7 +1583,9 @@ void vk_frame_end(const char *shot_path) {
     }
     g_pr_ns[PR_PRESENT] += SDL_GetTicksNS() - t_paced;
     if (r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) vk_present_lost();
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) recreate_swapchain();
+    if ((r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) &&
+        !atomic_load(&g_vk_closing))
+        recreate_swapchain();
     cur_frame.ok = false;
     if (hdr_probe) { vk_wait_seq(seq); vk_present_hdr_probe_save(); }
     if (shot_path) {
@@ -2616,25 +2622,83 @@ static void *hang_watch(void *arg) {
 // Run last on the way out, after the GPU and the pipeline cache (pc_overlay.cpp: "Restart the game now" starts the
 // exe again here)
 void (*volatile g_vk_exit_hook)(void);
+// The step the exit is in (ui_run's deadline names it) and each step's time: "[exit] <step>: N ms"
+static const char *volatile g_exit_step = "starting";
+static _Atomic uint64_t g_exit_step_ns;   // (when g_exit_step began: ui_run's per-step limit)
+static uint64_t exit_step(const char *done, const char *next, uint64_t t) {
+    const uint64_t now = SDL_GetTicksNS();
+    if (done) LOG("[exit] %s: %.0f ms\n", done, (now - t) / 1e6);
+    fflush(stdout);
+    atomic_store(&g_exit_step_ns, now);   // (the time first, the name after it with release: ui_run reading a step's name
+    __atomic_store_n(&g_exit_step, next, __ATOMIC_RELEASE);   // also reads its start, never the step before's; 317-b)
+    return now;
+}
+static _Atomic int g_exit_once;
 static void quick_exit_handler(void) {
+    // (once: the close's exit thread and a later exit() / atexit on another thread do not both run it; the second waits
+    // for the first to end the process)
+    if (atomic_exchange(&g_exit_once, 1)) for (;;) SDL_Delay(1000);
     atomic_store(&g_exit_req_ns, SDL_GetTicksNS());
-    static int trace = -1;
-    if (trace < 0) trace = getenv("LARECOMP_VK_TRACE") != NULL;
-    if (trace) LOG("[vk] exit: waiting for the GPU\n");
+    uint64_t t = exit_step(NULL, "save publish wait", SDL_GetTicksNS());
+    extern bool hle_fs_save_publish_wait(unsigned ms);   // (hle_fs.cpp: a save being put in place finishes first, 2 s at most)
+    if (!hle_fs_save_publish_wait(2000)) LOG("[exit] a save publish is still under way: the next start finishes it\n");
+    t = exit_step("save publish wait", "present queue drain", t);
     if (g_vk.dev) {
         vk_present_queue_drain();
+        t = exit_step("present queue drained", "command recording drain", t);
         vkq_drain();
+        t = exit_step("command recording drained", "GPU idle wait", t);
         vkDeviceWaitIdle(g_vk.dev);
-        if (trace) LOG("[vk] exit: saving the pipeline cache\n");
-        vk_pipeline_cache_save();
+        t = exit_step("GPU idle", "pipeline cache save", t);
+        vk_pipeline_cache_save();   // (tmp file + one-step replace: an exit cut short leaves the previous cache)
+        t = exit_step("pipeline cache save", "exit hook", t);
     }
-    if (trace) LOG("[vk] exit: terminating\n");
     if (g_vk_exit_hook) g_vk_exit_hook();
+    t = exit_step("exit hook", "terminate", t);
     fflush(stdout);
     fflush(stderr);
 #if defined(_WIN32) || defined(__linux__)
     plat_terminate();
 #endif
+}
+// Closing the window: quick_exit_handler ran on this thread, the window's, so its messages waited for the GPU drain and
+// the pipeline cache save. Now the close hides the window and mutes the audio at once (settings were saved by the
+// WM_CLOSE itself, shim_win.c), the exit runs on its own thread while this one keeps pumping messages, and a step that
+// runs past its limit ends the process where it is: LARECOMP_EXIT_DEADLINE_MS (default 2000; 0 = none) for the drains,
+// LARECOMP_EXIT_SAVE_MS (default 20000) for the pipeline cache save (a 336 MB cache that grew since the periodic save;
+// cutting it would lose the pipelines just built, and the window is gone meanwhile), 3 s for a save publish under way
+// (hle_fs waits 2 s). The pipeline cache is a tmp file replaced in one step, so a save cut short leaves the previous file
+// (and its tmp is removed at a later start). The game's own save is not forced: a publish already under way gets its 2 s,
+// one cut short is finished at the next start.
+extern void hle_audio_set_master(float gain);
+static void *exit_thread(void *arg) {
+    (void)arg;
+    quick_exit_handler();
+    return NULL;
+}
+static uint64_t exit_ms_env(const char *name, double dflt) {
+    const char *e = getenv(name);
+    const double v = e && *e ? atof(e) : dflt;
+    return v > 0 ? (uint64_t)(v * 1e6) : 0;
+}
+static uint64_t exit_step_limit_ns(const char *step) {   // (0: no limit)
+    static uint64_t drain = UINT64_MAX, save;
+    if (drain == UINT64_MAX) { save = exit_ms_env("LARECOMP_EXIT_SAVE_MS", 20000); drain = exit_ms_env("LARECOMP_EXIT_DEADLINE_MS", 2000); }
+    if (!strcmp(step, "pipeline cache save")) return save;
+    if (!strcmp(step, "save publish wait")) return drain ? 3000000000ull : 0;
+    return drain;
+}
+static uint64_t exit_begin(void) {   // (window thread) the close's first moments; returns its time
+    const uint64_t t0 = SDL_GetTicksNS();
+    LOG("window closed\n");
+    atomic_store(&g_vk_closing, 1);
+    if (window) SDL_HideWindow(window);
+    hle_audio_set_master(0.0f);
+    exit_step("window hidden, audio muted", "exit thread start", t0);
+    pthread_t th;
+    if (pthread_create(&th, NULL, exit_thread, NULL)) quick_exit_handler();   // (no thread: here, as before)
+    pthread_detach(th);
+    return t0;
 }
 
 void ui_window_init(void) {
@@ -2697,19 +2761,38 @@ void backend_clear_window(void) {
 int ui_run(void) {
     ui_window_init();
     atomic_store(&ui_ready, true);
+    uint64_t closing = 0;   // (the close's time: no more input or window requests, the deadline counts from it)
     for (;;) {
-        if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
+        if (!closing && rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
         while (SDL_WaitEventTimeout(&e, 16)) {
             if (e.type == SDL_EVENT_QUIT) {
-                LOG("window closed\n");
                 // Not exit(): it ran static destructors under the still-running guest threads, so every close (Steam's
                 // SIGTERM, window X) crashed in HLE code (Deck runs A-E, R1-R3 of 2026-10-20: SIGSEGV / SIGABRT after
-                // "window closed") before the pipeline cache was saved. This waits for the GPU, saves, then _exit.
-                quick_exit_handler();
+                // "window closed") before the pipeline cache was saved. The exit thread waits for the GPU, saves, then
+                // ends the process; this thread goes on pumping the window's messages (exit_begin).
+                if (!closing) closing = exit_begin();
+                continue;
             }
+            if (closing) continue;
             if (menu_handle_event(&e)) continue;
             input_handle_event(&e);
+        }
+        if (closing) {
+            const char *step = __atomic_load_n(&g_exit_step, __ATOMIC_ACQUIRE);
+            const uint64_t lim = exit_step_limit_ns(step), since = atomic_load(&g_exit_step_ns), now = SDL_GetTicksNS();
+            if (lim && since && now - since > lim) {
+                LOG("[exit] still in '%s' after %.0f ms (%.0f ms after the close; LARECOMP_EXIT_DEADLINE_MS / _SAVE_MS): "
+                    "ending the process now\n", step, (now - since) / 1e6, (now - closing) / 1e6);
+                fflush(stdout);
+                fflush(stderr);
+#if defined(_WIN32) || defined(__linux__)
+                plat_terminate();
+#else
+                _exit(0);
+#endif
+            }
+            continue;
         }
         menu_apply_window_requests(window);
     }

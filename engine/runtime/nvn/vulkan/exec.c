@@ -29,6 +29,7 @@
 #include "spvz.h"   // (the SPIR-V cache's compressed entries: the precompile's last worker compacts old ones)
 #include "index_max.h"   // (draw_'s index scan)
 #include "present_color.h"   // (display.color: the colour adjustment's factors)
+#include "hostroom.h"   // (room on a host-visible heap: host_import's optional imports, ring_grow's chunk sizes)
 #include "vk.h"
 #include "../shim/las.h"  // TotK: was ../renderer.h
 #include "../shim/las.h"  // TotK: was ../../settings.h
@@ -234,6 +235,11 @@ static bool chunk_ab_on = true;
 // submission. A submission holding a FenceSync always copies back. LARECOMP_CHUNK_NO_CARRY=1: copy back at every
 // chunk.
 static bool g_chunk_submit;
+// The transient ring under host-memory pressure (ring_tight: ring_grow saw a chunk refused): ring_open = the bytes the open
+// submission took from it. ring_grow can only reuse a chunk the GPU finished, so from then on begin_pass submits at the
+// next pass boundary once the open submission holds half the ring (ring_open_high), as chunked submission does.
+static bool ring_tight;
+static uint64_t ring_open, ring_early_n;
 static uint64_t g_fence_seq_mark;
 static bool gdev_carry_ok(void);
 static void gdev_carry(uint64_t from, uint64_t to);
@@ -974,6 +980,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     if (carry) gdev_carry(this_seq, submit_seq + 1);
     cur_sub = (cur_sub + 1) % SUBS;
     chunk_draws = 0;
+    ring_open = 0;
     stat_flushes++;
     cum_submits++;
     ring_retire();
@@ -1166,6 +1173,11 @@ static int nchunks, active = -1;
 static uint64_t ring_peak, ring_made, ring_trim_n, ring_trim_bytes;   // ("[vram] slack" line)
 
 static int new_chunk(uint64_t size) {
+    // LARECOMP_VK_RING_REFUSE=1 (a check, the release gate's low-memory boot): every chunk past the first two refused, as
+    // on a full host heap, so ring_grow's waits / reuses and begin_pass's early submits run on any PC
+    static int refuse = -1;
+    if (refuse < 0) { const char *e = getenv("LARECOMP_VK_RING_REFUSE"); refuse = e && *e == '1'; }
+    if (refuse && nchunks >= 2) return -1;
     chunks = realloc(chunks, (nchunks + 1) * sizeof *chunks);
     Chunk *c = &chunks[nchunks];
     memset(c, 0, sizeof *c);
@@ -1182,7 +1194,7 @@ static int new_chunk(uint64_t size) {
     VmaAllocationCreateInfo ai = {.usage = chunk_host ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
     VmaAllocationInfo info;
-    VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &c->buf, &c->mem, &info));
+    if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &c->buf, &c->mem, &info) != VK_SUCCESS) return -1;   // (ring_grow: what next)
     if (nchunks == 0) LOG("[vk] transient ring chunks: memory type %u (%s)\n", info.memoryType, chunk_host ? "host, integrated GPU" : "device-local preferred");
     c->ptr = info.pMappedData;
     c->size = size;
@@ -1228,6 +1240,12 @@ static void ring_retire(void) {
     nchunks--;
     if (active > pick) active--;
 }
+// begin_pass (ring_tight only): the open submission holds half the ring's bytes or more
+static bool ring_open_high(void) {
+    uint64_t held = 0;
+    for (int i = 0; i < nchunks; i++) held += chunks[i].size;
+    return ring_open >= held / 2;
+}
 // device.c "[vram] slack" line: the ring's chunks now, its peak, chunks made, what ring_retire gave back
 uint64_t vk_ring_bytes(int *n, uint64_t *peak, uint64_t *made, uint64_t *trim_n, uint64_t *trim_bytes) {
     uint64_t b = 0;
@@ -1236,8 +1254,60 @@ uint64_t vk_ring_bytes(int *n, uint64_t *peak, uint64_t *made, uint64_t *trim_n,
     return b;
 }
 
+// No free chunk, and a new one refused: no host-visible type has room (sadyungboi 2026-11-02, GTX 1660 6 GB + 8 GB RAM,
+// driver 561.09: the guest heap and alias window imports filled heap 1, the 256 MB BAR heap was full, and a fast travel's
+// 64 MB chunk was FATAL at every load; hostroom.h). Smaller chunks first (hostroom_chunk_sizes); then, once the GPU
+// finished everything submitted, a finished chunk large enough (one the open list used: its shared guest copies dropped,
+// gcopy_drop); then the finished chunks too small for it freed, their memory back to the heap, and the sizes tried again.
+// FATAL only when none of that found the memory.
+static void gcopy_drop(VkBuffer buf);
+static int ring_grow(uint64_t size, bool keep_list) {
+    static int logged;
+    uint64_t sz[8];
+    const int n = hostroom_chunk_sizes(size, CHUNK_SIZE, sz, 8);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < n; i++) {
+            const int k = new_chunk(sz[i]);
+            if (k < 0) {
+                if (!ring_tight) LOG("[vk] transient ring: a %llu MB chunk refused: from now on a submission holding half the ring "
+                                     "goes to the GPU at the next pass boundary\n", (unsigned long long)(sz[i] >> 20));
+                ring_tight = true;
+                continue;
+            }
+            if ((i || pass) && logged++ < 8)
+                LOG("[vk] transient ring: no host-visible memory for a %llu MB chunk: %llu MB made%s\n",
+                    (unsigned long long)(sz[0] >> 20), (unsigned long long)(sz[i] >> 20), pass ? " after freeing finished chunks" : "");
+            return k;
+        }
+        if (pass) break;
+        vk_wait_seq(submit_seq);   // (everything submitted finished: its chunks are free again)
+        const uint64_t done = vk_completed_seq();
+        for (int i = 0; i < nchunks; i++)
+            if (chunks[i].seq <= done && chunks[i].size >= size) {
+                if (keep_list && chunks[i].seq >= exec_start_seq) gcopy_drop(chunks[i].buf);
+                if (logged++ < 8)
+                    LOG("[vk] transient ring: no host-visible memory for a %llu MB chunk: waited for the GPU, a finished one reused\n",
+                        (unsigned long long)(sz[0] >> 20));
+                return i;
+            }
+        for (int i = nchunks - 1; i >= 0; i--)
+            if (i != active && chunks[i].seq <= done) {
+                if (keep_list && chunks[i].seq >= exec_start_seq) gcopy_drop(chunks[i].buf);
+                ring_trim_n++;
+                ring_trim_bytes += chunks[i].size;
+                vmaDestroyBuffer(g_vk.vma, chunks[i].buf, chunks[i].mem);
+                memmove(&chunks[i], &chunks[i + 1], (size_t)(nchunks - i - 1) * sizeof *chunks);
+                nchunks--;
+                if (active > i) active--;
+            }
+    }
+    FATAL("[vk] transient ring: no host-visible memory for %llu KB, even after the GPU finished (%d chunks held): every "
+          "host-visible heap is full\n", (unsigned long long)(size >> 10), nchunks);
+}
+
 VkSpan vk_transient(uint64_t size, uint64_t align) {
     if (align < 16) align = 16;
+    ring_open += size;
     uint64_t pending = vk_pending_seq();
     if (active >= 0) {
         Chunk *c = &chunks[active];
@@ -1257,7 +1327,7 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
     bool keep_list = in_execute && chunk_limit();  // (guest_copy shares copies across the chunks of the list)
     for (int i = 0; i < nchunks; i++)
         if (i != active && chunks[i].seq <= done && chunks[i].size >= size && !(keep_list && chunks[i].seq >= exec_start_seq)) { pick = i; break; }
-    if (pick < 0) pick = new_chunk(size > CHUNK_SIZE ? size : CHUNK_SIZE);
+    if (pick < 0) pick = ring_grow(size, keep_list);
     active = pick;
     chunks[pick].used = size;
     chunks[pick].seq = pending;
@@ -1350,6 +1420,11 @@ static void vx_page_stats(uint64_t addr, uint64_t size, uint64_t pend) {
 static struct { uint64_t addr, size, seq, used; VkSpan span; } gcopy[GCOPY_TAB];
 static uint64_t gcopy_gen;  // bumped to drop every shared copy (guest memory written mid-list)
 static void guest_copy_flush(void) { gcopy_gen++; }
+// ring_grow reuses a finished chunk the open list copied into: its shared copies go (a later hit would read new data)
+static void gcopy_drop(VkBuffer buf) {
+    for (int i = 0; i < GCOPY_TAB; i++)
+        if (gcopy[i].span.buf == buf) gcopy[i].seq = 0;
+}
 static inline uint32_t gcopy_slot(uint64_t addr, uint64_t size) {
     uint64_t h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
     return (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
@@ -3690,6 +3765,12 @@ static void begin_pass(void) {
     if (prof) { prof_bp_end += prof_now() - bp_t0; prof_bp_n++; }
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
     else if (chunk_limit() && chunk_draws >= (uint32_t)chunk_limit()) { prof_chunks++; g_chunk_submit = true; renderer_submit(); g_chunk_submit = false; }
+    else if (ring_tight && ring_open_high()) {   // (host memory short: the ring's chunks back sooner, ring_tight)
+        if (!ring_early_n++) LOG("[vk] transient ring: first early submission (the open one held half the ring)\n");
+        g_chunk_submit = chunk_limit() != 0;   // (as chunked submission's when it is on; else a plain one)
+        renderer_submit();
+        g_chunk_submit = false;
+    }
     st.rt_dirty = false;
     if (st.rt.ncolor >= 4 && st.rt.color[0] && st.rt.color[0]->width > g_drs_w) { g_drs_w = st.rt.color[0]->width; g_drs_h = st.rt.color[0]->height; }
     uint64_t z0 = prof ? prof_now() : 0;
@@ -8520,6 +8601,45 @@ static void import_limits(void) {
 // host_import's last refusal was the allocation itself (vkAllocateMemory): only that one can depend on the size, so only
 // then does gmem_import retry smaller; its retries are quiet (g_imp_quiet), its own line says how they ended.
 static bool g_imp_fail_alloc, g_imp_quiet;
+// Live host imports by heap: the driver counts them against that heap, the allocator's books do not (hostroom.h).
+// host_import adds each one, imp_free takes it away (render thread and the alias import's thread: imp_mtx).
+static struct { VkDeviceMemory mem; uint64_t size; uint32_t heap; } imp_live[96];   // (GMEM_WIN_MAX + 16 replaced + AL_SL_MAX)
+static uint64_t imp_heap[VK_MAX_MEMORY_HEAPS];
+static pthread_mutex_t imp_mtx = PTHREAD_MUTEX_INITIALIZER;
+static void imp_add(VkDeviceMemory mem, uint64_t size, uint32_t heap) {
+    pthread_mutex_lock(&imp_mtx);
+    for (int i = 0; i < 96; i++)
+        if (!imp_live[i].mem) { imp_live[i].mem = mem, imp_live[i].size = size, imp_live[i].heap = heap; imp_heap[heap] += size; break; }
+    pthread_mutex_unlock(&imp_mtx);
+}
+static void imp_free(VkDeviceMemory mem) {   // (vkFreeMemory of an import)
+    pthread_mutex_lock(&imp_mtx);
+    for (int i = 0; i < 96; i++)
+        if (imp_live[i].mem == mem) { imp_heap[imp_live[i].heap] -= imp_live[i].size; imp_live[i].mem = VK_NULL_HANDLE; break; }
+    pthread_mutex_unlock(&imp_mtx);
+    vkFreeMemory(g_vk.dev, mem, NULL);
+}
+// Room on `heap` for an optional import, keeping LARECOMP_HOST_KEEP_MB (default 512) free: its size minus our imports
+// and allocations there, and the OS budget minus its usage (VK_EXT_memory_budget), the smaller (hostroom_left).
+// *ours, *keep: for the log line.
+static uint64_t host_room(uint32_t heap, uint64_t *ours, uint64_t *keep) {
+    static _Atomic uint64_t keep_b = ~0ull;
+    if (keep_b == ~0ull) { const char *e = getenv("LARECOMP_HOST_KEEP_MB"); keep_b = (e && *e ? strtoull(e, NULL, 0) : 512) << 20; }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+                                            .pNext = g_vk.mem_budget ? &bud : NULL};
+    vkGetPhysicalDeviceMemoryProperties2(g_vk.phys, &mp);
+    extern uint32_t vma_shim_heaps(VmaAllocator a, uint64_t *bytes, uint32_t *count, uint64_t *size, uint32_t *flags);   // shim_vma.c
+    uint64_t vb[VK_MAX_MEMORY_HEAPS] = {0}, vs[VK_MAX_MEMORY_HEAPS];
+    uint32_t vc[VK_MAX_MEMORY_HEAPS], vf[VK_MAX_MEMORY_HEAPS];
+    vma_shim_heaps(g_vk.vma, vb, vc, vs, vf);
+    pthread_mutex_lock(&imp_mtx);
+    *ours = imp_heap[heap] + vb[heap];
+    pthread_mutex_unlock(&imp_mtx);
+    *keep = keep_b;
+    return hostroom_left(mp.memoryProperties.memoryHeaps[heap].size, *ours, g_vk.mem_budget ? bud.heapBudget[heap] : 0,
+                         bud.heapUsage[heap], *keep);
+}
 static void import_fail_note(const char *step, VkResult r, uint64_t base, uint64_t size, uint32_t types) {
     static int n;
     if (g_imp_quiet || n++ >= 8) return;
@@ -8534,7 +8654,11 @@ static void import_fail_note(const char *step, VkResult r, uint64_t base, uint64
     LOG("[vk] host import %llx + %llu MB failed at %s: VkResult %d, memory types %#x%s (LARECOMP_GMEM_WINDOW=<MB>: windows)\n",
         (unsigned long long)base, (unsigned long long)(size >> 20), step, (int)r, types, ram);
 }
-static bool host_import(uint64_t base, uint64_t size, uint64_t *got, VkBuffer *pbuf, VkDeviceMemory *pmem) {
+// spare: an optional import (the alias window: data outside it is copied), cut to leave the heap's reserve free
+// (host_room), and the guest heap's committed part not imported yet (an alias import can run first, on its thread); the
+// guest heap's own (not optional: memory outside it reads zero in shaders) is only logged when it eats into the reserve.
+static uint64_t gmem_imported(void);
+static bool host_import(uint64_t base, uint64_t size, uint64_t *got, VkBuffer *pbuf, VkDeviceMemory *pmem, bool spare) {
     import_limits();
     g_imp_fail_alloc = false;
     if ((base | size) & (g_imp_align - 1)) {
@@ -8583,11 +8707,44 @@ static bool host_import(uint64_t base, uint64_t size, uint64_t *got, VkBuffer *p
         vkDestroyBuffer(g_vk.dev, buf, NULL);
         return false;
     }
+    VkPhysicalDeviceMemoryProperties mprops;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mprops);
+    const uint32_t type = (uint32_t)__builtin_ctz(types), heap = mprops.memoryTypes[type].heapIndex;
+    uint64_t ours, keep;
+    uint64_t room = host_room(heap, &ours, &keep);
+    if (spare) {
+        const uint64_t hs = kernel_heap_size() < HEAP_MAX ? kernel_heap_size() : HEAP_MAX, have = gmem_imported(), owed = hs > have ? hs - have : 0;
+        room = room > owed ? room - owed : 0;
+    }
+    if (size > room) {
+        const uint64_t cut = spare ? hostroom_cut(size, room, g_imp_align, 16ull << 20) : size;
+        static _Atomic int nlr;
+        char what[64] = "imported whole (the guest heap)";
+        if (spare) {
+            if (cut) snprintf(what, sizeof what, "cut to %llu MB", (unsigned long long)(cut >> 20));
+            else snprintf(what, sizeof what, "not imported (data there is copied)");
+        }
+        if (atomic_fetch_add(&nlr, 1) < 6)
+            LOG("[vk] host import %llx + %llu MB: heap %u (%llu MB) holds %llu MB of ours, %llu MB kept free for the ring "
+                "and the driver (LARECOMP_HOST_KEEP_MB): %s\n", (unsigned long long)base, (unsigned long long)(size >> 20), heap,
+                (unsigned long long)(mprops.memoryHeaps[heap].size >> 20), (unsigned long long)(ours >> 20),
+                (unsigned long long)(keep >> 20), what);
+        if (!cut) { vkDestroyBuffer(g_vk.dev, buf, NULL); return false; }
+        if (cut < size) {   // (the buffer again at the cut size: the memory types it takes do not depend on its size)
+            vkDestroyBuffer(g_vk.dev, buf, NULL);
+            bi.size = size = cut;
+            if ((br = vkCreateBuffer(g_vk.dev, &bi, NULL, &buf)) != VK_SUCCESS) {
+                import_fail_note("vkCreateBuffer", br, base, size, mp.memoryTypeBits);
+                return false;
+            }
+            if (got) *got = size;
+        }
+    }
     VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
                                             .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                             .pHostPointer = (void *)(uintptr_t)base};
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = size,
-                               .memoryTypeIndex = (uint32_t)__builtin_ctz(types)};
+                               .memoryTypeIndex = type};
     VkDeviceMemory mem;
     VkResult ar = vkAllocateMemory(g_vk.dev, &ai, NULL, &mem);
     if (ar != VK_SUCCESS) {
@@ -8603,10 +8760,9 @@ static bool host_import(uint64_t base, uint64_t size, uint64_t *got, VkBuffer *p
         vkFreeMemory(g_vk.dev, mem, NULL);
         return false;
     }
+    imp_add(mem, size, heap);
     static _Atomic int nlog;
     if (atomic_fetch_add(&nlog, 1) < 1) {
-        VkPhysicalDeviceMemoryProperties mprops;
-        vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mprops);
         const VkMemoryPropertyFlags f = mprops.memoryTypes[ai.memoryTypeIndex].propertyFlags;
         LOG("[vk] host import memory: type %u of the pointer's %#x / the buffer's %#x (%s%s%s%s)\n", ai.memoryTypeIndex,
             mp.memoryTypeBits, req.memoryTypeBits, f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local " : "",
@@ -8631,6 +8787,11 @@ static int gmem_ndead;
 static VkBuffer gmem_wbuf[GMEM_WIN_MAX];
 static VkDeviceMemory gmem_wmem[GMEM_WIN_MAX];
 static uint64_t gmem_wsize[GMEM_WIN_MAX];
+static uint64_t gmem_imported(void) {   // (host_import, maybe on the alias import's thread: a stale read only moves the reserve)
+    uint64_t b = gmem_size;
+    for (int k = 1; k < GMEM_WIN_MAX; k++) b += gmem_wsize[k];
+    return b;
+}
 static uint64_t gmem_asked;   // heap size the windows were last imported for (no retry until the heap grows past it)
 static void gmem_collect_dead(void) {
     if (!gmem_ndead) return;
@@ -8639,7 +8800,7 @@ static void gmem_collect_dead(void) {
     for (int i = 0; i < gmem_ndead; i++) {
         if (gmem_dead[i].seq > done) { gmem_dead[k++] = gmem_dead[i]; continue; }
         vkDestroyBuffer(g_vk.dev, gmem_dead[i].buf, NULL);
-        vkFreeMemory(g_vk.dev, gmem_dead[i].mem, NULL);
+        imp_free(gmem_dead[i].mem);
     }
     gmem_ndead = k;
 }
@@ -8673,13 +8834,13 @@ static bool gmem_import(uint64_t size) {
         const uint64_t have = k ? gmem_wsize[k] : gmem_size, gran = g_imp_align > 0x10000 ? g_imp_align : 0x10000;
         // (only a refused allocation: a refusal at the pointer's properties or the memory type depends on the base, not the
         // size)
-        bool ok = host_import(HEAP_BASE + (uint64_t)k * win, ws, &got, &buf, &mem);
+        bool ok = host_import(HEAP_BASE + (uint64_t)k * win, ws, &got, &buf, &mem, false);
         uint64_t low = ws;   // (the smallest size tried)
         for (uint64_t try_ = ws / 2 & ~(gran - 1); !ok && halve && g_imp_fail_alloc && try_ >= (256ull << 20) && try_ > have;
              try_ = try_ / 2 & ~(gran - 1)) {
             got = low = try_;
             g_imp_quiet = true;
-            ok = host_import(HEAP_BASE + (uint64_t)k * win, try_, &got, &buf, &mem);
+            ok = host_import(HEAP_BASE + (uint64_t)k * win, try_, &got, &buf, &mem, false);
             g_imp_quiet = false;
             if (ok) {
                 LOG("[vk] guest heap window %d: %llu MB refused, %llu MB imported: shader global memory past +%llu MB there reads "
@@ -9547,7 +9708,7 @@ static void *alias_import_main(void *a) {
     (void)a;
     uint64_t t0 = SDL_GetTicksNS();
     alias_imp_got = 0;
-    bool ok = host_import(g_alias_import_base + alias_imp_from, alias_imp_to - alias_imp_from, &alias_imp_got, &alias_imp_buf, &alias_imp_mem);
+    bool ok = host_import(g_alias_import_base + alias_imp_from, alias_imp_to - alias_imp_from, &alias_imp_got, &alias_imp_buf, &alias_imp_mem, true);
     alias_imp_ns = SDL_GetTicksNS() - t0;
     atomic_store(&alias_imp_done, ok && alias_imp_got ? 1 : -1);
     return NULL;
@@ -9577,7 +9738,7 @@ static void alias_import_kick(void) {   // (each execute, render thread: one com
             if (end > alias_imp_to) end = alias_imp_to;
             if (d > 0 && (end & ((1ull << MBLK_SH) - 1)) && end != g_alias_import_size) end &= ~((1ull << MBLK_SH) - 1);   // (cut by the device's limit)
             if (d > 0 && end > alias_imp_from) alias_slice_add(alias_imp_buf, alias_imp_mem, end);
-            else if (d > 0) { vkDestroyBuffer(g_vk.dev, alias_imp_buf, NULL); vkFreeMemory(g_vk.dev, alias_imp_mem, NULL); d = -1; }
+            else if (d > 0) { vkDestroyBuffer(g_vk.dev, alias_imp_buf, NULL); imp_free(alias_imp_mem); d = -1; }
             LOG("[vk] alias window import %llu -> %llu MB: %s in %.0f ms (%d imports)\n", (unsigned long long)(alias_imp_from >> 20),
                 (unsigned long long)(alias_imp_to >> 20), d > 0 ? "bound in place" : "failed, data past it copied", alias_imp_ns / 1e6, al_sl_n);
             al_grow = d > 0 ? 0 : -1;
@@ -9608,7 +9769,7 @@ static bool alias_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
         } else {
             upto = __atomic_load_n(&g_alias_import_committed, __ATOMIC_ACQUIRE);
             if (!upto) return false;   // (nothing committed yet: copied)
-            alias_state = g_vk.host_import && !getenv("LARECOMP_VK_NO_ALIAS_IMPORT") && host_import(base, upto, &got, &alias_buf, &alias_mem) ? 1 : -1;
+            alias_state = g_vk.host_import && !getenv("LARECOMP_VK_NO_ALIAS_IMPORT") && host_import(base, upto, &got, &alias_buf, &alias_mem, true) ? 1 : -1;
         }
         if (alias_state > 0) {   // (a cut import ends on a block edge: the next step starts there)
             uint64_t end = got < upto ? got : upto;
@@ -9616,7 +9777,7 @@ static bool alias_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
             if (end) alias_slice_add(alias_buf, alias_mem, end);
             else {
                 vkDestroyBuffer(g_vk.dev, alias_buf, NULL);
-                vkFreeMemory(g_vk.dev, alias_mem, NULL);
+                imp_free(alias_mem);
                 alias_buf = VK_NULL_HANDLE;
                 alias_mem = VK_NULL_HANDLE;
                 alias_state = -1;
@@ -10256,14 +10417,14 @@ void vk_exec_reset(void) {
     c1_persist_reset();
     if (gmem_buf) {
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
-        vkFreeMemory(g_vk.dev, gmem_mem, NULL);
+        imp_free(gmem_mem);
         gmem_buf = VK_NULL_HANDLE;
         gmem_mem = VK_NULL_HANDLE;
     }
     for (int k = 1; k < GMEM_WIN_MAX; k++)
         if (gmem_wbuf[k]) {
             vkDestroyBuffer(g_vk.dev, gmem_wbuf[k], NULL);
-            vkFreeMemory(g_vk.dev, gmem_wmem[k], NULL);
+            imp_free(gmem_wmem[k]);
             gmem_wbuf[k] = VK_NULL_HANDLE, gmem_wmem[k] = VK_NULL_HANDLE, gmem_wsize[k] = 0;
         }
     gmem_size = gmem_tried = gmem_asked = 0;
@@ -10271,13 +10432,13 @@ void vk_exec_reset(void) {
     alias_soft_pause();
     if (alias_state == 2 || al_grow == 1) {   // (an import still running on its thread: wait for it, then free what it made)
         pthread_join(alias_imp_thr, NULL);
-        if (atomic_load(&alias_imp_done) > 0) { vkDestroyBuffer(g_vk.dev, alias_imp_buf, NULL); vkFreeMemory(g_vk.dev, alias_imp_mem, NULL); }
+        if (atomic_load(&alias_imp_done) > 0) { vkDestroyBuffer(g_vk.dev, alias_imp_buf, NULL); imp_free(alias_imp_mem); }
     }
     alias_imp_ns = 0;
     al_grow = 0;
     for (int i = 0; i < al_sl_n; i++) {   // (alias_buf is the first)
         vkDestroyBuffer(g_vk.dev, al_sl_buf[i], NULL);
-        vkFreeMemory(g_vk.dev, al_sl_mem[i], NULL);
+        imp_free(al_sl_mem[i]);
         al_sl_buf[i] = VK_NULL_HANDLE;
         al_sl_mem[i] = VK_NULL_HANDLE;
     }

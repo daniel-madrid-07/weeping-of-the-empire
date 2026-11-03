@@ -2160,6 +2160,16 @@ static void commit_save() {
 static bool in_save(const std::string&) { return false; }   // (no save commits off Windows: writes go in place)
 struct SaveWrite { explicit SaveWrite(bool) {} };
 #endif
+// (device.c's exit thread, the window closed: a save publish under way gets up to ms to finish before the process ends;
+// one cut short is finished at the next start anyway, save_init. true: none left)
+extern "C" bool hle_fs_save_publish_wait(unsigned ms) {
+#ifdef _WIN32
+    return wait_publisher(ms);
+#else
+    (void)ms;
+    return true;
+#endif
+}
 // Handle tables: a fixed array of slots, reused through a free list. The guest's handle value is (generation << 32) |
 // (slot + 1), so a handle used after its Close does not reach the slot's next file. Lookups take no lock (the streaming
 // threads read concurrently); slot objects are recycled, never deleted, so a lookup racing a Close (a guest bug) touches

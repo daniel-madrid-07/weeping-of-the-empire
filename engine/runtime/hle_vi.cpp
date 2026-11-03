@@ -1005,7 +1005,10 @@ static void vi_pace_wait(int interval) {
     // refresh rate): pace on the clock (high-res timer); a late frame
     // (a quick menu, d-pad held: Switch timing below like at 60 fps, else its background goes black; 2026-10-17)
     if ((fps > 60 || (fps > 30 && fps < 60) || (video_pace && 60 % fps != 0)) && !g_dpad_switch_timing) {
-        if (vsync_display_mode() && pace_on_vblanks(fps)) return;
+        // (not with FG on a fixed refresh: its real frames pace on the rung ladder below, which steps down to a rate the
+        // game holds; the vblank count did not, and a game short of the 120-real target ran unpaced, its generated frames
+        // always late, x2 at 240 Hz)
+        if (!fg_steady && vsync_display_mode() && pace_on_vblanks(fps)) return;
         // Catch-up is limited to period / 16 (timer wake-up jitter): a frame that ends late moves the next deadline to its
         // own present + period. With the full catch-up a late frame (up to one period) let the next ones through without a
         // wait: in the 120-cap rounds (eop1024 Kakariko / Depths lightroot, 1080p) 15 % of presents came sooner than the
