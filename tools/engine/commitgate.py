@@ -6,7 +6,9 @@ behind it, the largest ones with a higher floor), so a build never takes Windows
 Everything after the first ' -- ' goes to CreateProcess exactly as ninja wrote it. --excl is accepted and ignored.
 While it waits it says so at once and then every minute, on stdout and in `commitgate.log` in the current directory.
 Env: NXR_COMMITGATE_GB overrides the floor (0 = no wait); NXR_COMMITGATE_MAX_MIN (default 90) bounds the wait: past
-it the step fails with exit code 75 instead of hanging the build. Exit code: the command's, or 75.
+it the step fails with exit code 75 instead of hanging the build, unless NXR_COMMITGATE_GO_ON=1, which runs the
+command anyway (one person's PC: the game objects go again with fewer at once if memory was the problem). Exit
+code: the command's, or 75.
 """
 import ctypes
 import os
@@ -46,6 +48,7 @@ def say(msg):
 def main():
     floor = float(os.environ.get('NXR_COMMITGATE_GB') or sys.argv[1])
     max_min = float(os.environ.get('NXR_COMMITGATE_MAX_MIN') or 90)
+    go_on = os.environ.get('NXR_COMMITGATE_GO_ON') == '1'   # (build.py, one person's PC: run after the bound)
     line = ctypes.windll.kernel32.GetCommandLineW
     line.restype = ctypes.c_wchar_p
     raw = line()
@@ -57,6 +60,10 @@ def main():
         if free >= floor:
             break
         if time.time() - t0 > max_min * 60:
+            if go_on:
+                say(f'[commitgate] {what}: going on after {max_min:g} min with free commit {free:.1f} GB < {floor:g} GB '
+                    '(NXR_COMMITGATE_GO_ON)')
+                break
             say(f'[commitgate] {what}: gave up after {max_min:g} min with free commit {free:.1f} GB < {floor:g} GB '
                 '(NXR_COMMITGATE_GB / NXR_COMMITGATE_MAX_MIN to change)')
             return GAVE_UP
