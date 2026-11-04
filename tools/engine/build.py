@@ -695,6 +695,8 @@ def dlss_dlls(force=False):
     force (`build.py dlss --force`): always. Never fails a build: offline or a download error leaves DLSS unavailable
     (the game runs without it) and Setup's next run, or `build.py dlss`, fetches them. DLLs already there are kept
     whatever the GPU. Returns what happened, for the log."""
+    if LINUX:   # (DLSS_DLLS are Windows DLLs, and the Linux build has no NGX yet, ngx.c: ~66 MB fetched for nothing)
+        return 'DLSS: not on Linux yet (nothing fetched)'
     dst = os.path.join(SIG, 'dlss')
     if all(os.path.isfile(os.path.join(dst, os.path.basename(p))) and
            sha256_file(os.path.join(dst, os.path.basename(p))) == want for p, want in DLSS_DLLS.items()):
@@ -709,6 +711,19 @@ def dlss_dlls(force=False):
     except (Exception, SystemExit) as e:
         return f'DLSS: not fetched ({e}): DLSS unavailable for now; Setup\'s next run fetches it'
     return 'DLSS: runtime DLLs fetched' + ('' if rtx else ' (GPUs unknown here)' if rtx is None else '')
+
+
+def ffx_dlls():
+    """FSR's runtime DLL (amd_fidelityfx_vk.dll) into <work>/engine/ffx (TOTK_FFX_DIR), optional: Setup's builder unpacks
+    the same files from our release asset first, so nothing is fetched there. Linux: nothing (a Windows DLL; ffx.c has
+    no runtime off Windows). Returns what happened, for the log."""
+    if LINUX:
+        return 'FidelityFX SDK: not on Linux (nothing fetched)'
+    try:
+        dlss_fetch(FFX_DLLS, os.path.join(SIG, 'ffx'), flat=True, url=FFX_URL, what='FidelityFX SDK')   # (TOTK_FFX_DIR)
+    except (Exception, SystemExit) as e:
+        return f'FidelityFX SDK: not fetched ({e}): FSR unavailable in this build'
+    return 'FidelityFX SDK: the runtime DLL is there'
 
 
 def cmd_dlss(a):
@@ -762,10 +777,7 @@ def snapshot(ref='HEAD') -> str:
         dlss_sdk(os.path.join(d, 'engine', 'third_party', 'dlss'))
         open(os.path.join(d, 'DONE'), 'w').close()
     log(dlss_dlls())   # the runtime DLLs: <work>/engine/dlss, NVIDIA RTX only, never fatal (TOTK_DLSS_DIR points there)
-    try:   # (optional: Setup's builder unpacks the same files from our release asset first, so nothing is fetched there)
-        dlss_fetch(FFX_DLLS, os.path.join(SIG, 'ffx'), flat=True, url=FFX_URL, what='FidelityFX SDK')   # (TOTK_FFX_DIR)
-    except (Exception, SystemExit) as e:
-        log(f'FidelityFX SDK: not fetched ({e}): FSR unavailable in this build')
+    log(ffx_dlls())
     log(f'sources: {ref} {c[:12]} -> {d}')
     return os.path.join(d, 'engine')
 

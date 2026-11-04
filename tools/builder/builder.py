@@ -987,7 +987,7 @@ FFX = pinned_asset('builder:FFX')
 
 
 def fsr_runtime(work, dry):
-    if not FFX or dry:
+    if not FFX or dry or LINUX:   # (a Windows DLL: the Linux build has no FidelityFX runtime, ffx.c)
         return
     import toolchain
     import zipfile
@@ -1715,10 +1715,10 @@ def main(argv=None):
             for f in glob.glob(os.path.join(work, 'engine', 'overlay', 'romfs-aspect-*.failed')):
                 os.remove(f)
         stamps.done(7, 'overlay', in7)
-    # DLSS's runtime DLLs (~66 MB): an NVIDIA RTX GPU only (build.py dlss_dlls), at every run, so an RTX card added
-    # later gets them at the next Setup; never stops Setup (offline: DLSS unavailable until a run that is online).
-    # Before step 8: package.py writes TOTK_DLSS_DIR only when the DLLs are there, and in8 says whether they are, so
-    # the run that fetches them packages again
+    # DLSS's runtime DLLs (~66 MB): an NVIDIA RTX GPU on Windows only (build.py dlss_dlls), at every run, so an RTX
+    # card added later gets them at the next Setup; never stops Setup (offline: DLSS unavailable until a run that is
+    # online). Before step 8: package.py writes TOTK_DLSS_DIR only when the DLLs are there, and in8 says whether
+    # they are, so the run that fetches them packages again
     ok, out_dlss = run('DLSS (NVIDIA RTX only)', [py, build, 'dlss'], env, a.dry_run, quiet=True, tolerate=True)
     if not a.dry_run:
         said = [ln.split('] ', 1)[-1] for ln in out_dlss.splitlines() if 'DLSS' in ln]

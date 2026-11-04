@@ -113,6 +113,67 @@ check('no SSE4.2 is a problem', len([p for p in host_linux.check_pc() if 'SSE4.2
 import builder  # noqa: E402
 check('hot list: Linux name', builder.HOT_NAME_LINUX.match('  _Z9f_1b4d760P3Ctx:').group(1), 'f_1b4d760')
 check('hot list: Windows name', builder.HOT_NAME.match('  ?f_1b4d760@@YAXPEIAUCtx@@@Z:').group(1), 'f_1b4d760')
+# Setup's step 8 on Linux fetches no FSR runtime (a Windows DLL; ffx.c has none off Windows)
+import types  # noqa: E402
+fetched_ffx, saved = [], (builder.LINUX, builder.FFX, sys.modules.get('toolchain'))
+sys.modules['toolchain'] = types.SimpleNamespace(download=lambda *a, **k: fetched_ffx.append(a))
+builder.LINUX, builder.FFX = True, {'tag': 'v0', 'name': 'ffx.zip', 'sha256': '0' * 64, 'size': 1}
+builder.fsr_runtime(tempfile.gettempdir(), False)
+builder.LINUX, builder.FFX = saved[0], saved[1]
+if saved[2] is not None:
+    sys.modules['toolchain'] = saved[2]
+else:
+    del sys.modules['toolchain']
+check('Linux Setup step 8: no FSR runtime download', fetched_ffx, [])
+
+# ---- the public tree's tools/heavy.py on Linux (Setup's step 1 runs the RomFS extraction through it; linux-test D#82:
+# AttributeError ctypes.windll): /proc/meminfo, no creationflags
+import importlib.util  # noqa: E402
+spec = importlib.util.spec_from_file_location('heavy_pub', os.path.join(REPO, 'tools', 'release', 'public', 'tools', 'heavy.py'))
+heavy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(heavy)
+with tempfile.TemporaryDirectory() as t:
+    heavy.LINUX, heavy.MEMINFO = True, os.path.join(t, 'meminfo')
+    open(heavy.MEMINFO, 'w').write('MemTotal:       8000000 kB\nMemFree:  300000 kB\nMemAvailable:   4194304 kB\n'
+                                   'SwapFree:  2097152 kB\n')
+    check('public heavy.py, Linux: free RAM = MemAvailable', round(heavy.free_gb(), 2), 4.0)
+    check('public heavy.py, Linux: free commit = MemAvailable + SwapFree', round(heavy.free_commit_gb(), 2), 6.0)
+    calls = []
+    heavy.subprocess = types.SimpleNamespace(call=lambda cmd, **kw: calls.append((cmd, kw)) or 0)
+    heavy.os = types.SimpleNamespace(name='posix', nice=os.nice if hasattr(os, 'nice') else None)
+    rc = heavy.main(['--prio', 'low', '--', 'true'])
+    check('public heavy.py, Linux: runs the command, niced, no creationflags', (rc, calls[0][0], sorted(calls[0][1]),
+          callable(calls[0][1]['preexec_fn'])), (0, ['true'], ['preexec_fn'], True))
+    heavy.MEMINFO = os.path.join(t, 'none')
+    check('public heavy.py, Linux: /proc/meminfo unreadable: no gate, no Windows call', heavy.free_gb(), float('inf'))
+
+# ---- Setup's step 1 on Linux (pipeline/build.py's romfs step: heavy(cmd) wraps the extraction), with ctypes.windll
+# gone as on Linux: the command runs as it is, through the RAM gate, never through tools/heavy.py (D#82). pipeline/build.py
+# needs cryptography + lz4 (it re-runs itself under the work venv otherwise): run this file with Setup's or the work
+# folder's venv Python for these two checks
+import ctypes, importlib.util as ilu  # noqa: E402
+saved_windll, saved_platform = getattr(ctypes, 'windll', None), sys.platform
+sys.path.insert(0, REPO)
+try:
+    if not (ilu.find_spec('cryptography') and ilu.find_spec('lz4')):
+        raise ImportError('cryptography / lz4')
+    if saved_windll is not None:
+        del ctypes.windll
+    sys.platform = 'linux'
+    import pipeline.build as pbuild  # noqa: E402
+    gated = []
+    pbuild.wait_for_ram = lambda log=print: gated.append(1)
+    cmd = [sys.executable, '-m', 'pipeline.extract', 'romfs', '--nsp', 'game.nsp', '--out', 'x']
+    check('Linux Setup step 1: the extraction runs as it is, not through tools/heavy.py', (pbuild.heavy(cmd), gated),
+          (cmd, [1]))
+    # (the RAM gate itself reads os.sysconf on Linux, pipeline/nx/common.py _memory_status: not there on Windows, so
+    #  not simulated here; the imports above, pipeline.build -> extract / nx, ran without windll)
+except ImportError as e:
+    print(f'SKIP Linux Setup step 1 ({e} not in this Python: run with a venv that has them)')
+finally:
+    sys.platform = saved_platform
+    if saved_windll is not None:
+        ctypes.windll = saved_windll
 
 print('all passed' if not fails else f'{fails} FAILED')
 sys.exit(1 if fails else 0)
