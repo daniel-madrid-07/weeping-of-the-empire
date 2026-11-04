@@ -721,13 +721,14 @@ static void create_device(void) {
     // VK_EXT_depth_range_unrestricted (optional): depth values outside [0,1] stay defined in D32_SFLOAT copies
     g_vk.depth_unrestricted = has_ext(ep, ne, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     if (g_vk.depth_unrestricted) ext[n_ext++] = VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME;
-    // VK_EXT_memory_priority + VK_EXT_pageable_device_local_memory (optional P1.1: the card full of other apps' memory,
-    // ours demoted to system RAM at 230k page faults/s, render targets as readily as textures unused for minutes): a
-    // residency priority on our device memory (shim_vma.c), so WDDM demotes blocks holding only sampled textures first.
-    // Pageable: the priority of a block follows what it holds (vkSetDeviceMemoryPriorityEXT). LARECOMP_MEM_PRIORITY=0:
-    // neither (every allocation at the OS default, as before).
+    // VK_EXT_memory_priority + VK_EXT_pageable_device_local_memory (optional P1.1: the card full of other apps' memory, ours
+    // demoted to system RAM at 230k page faults/s, render targets as readily as textures unused for minutes): a residency
+    // priority on our device memory (shim_vma.c), so WDDM demotes blocks holding only sampled textures first. Pageable: the
+    // priority of a block follows what it holds (vkSetDeviceMemoryPriorityEXT). OFF by default since v0.1.9.3 (public #86:
+    // on a 6 GB card, pageable memory plus a residency target above the OS budget swung after a fast travel, 14-30 fps;
+    // v0.1.9 had neither): LARECOMP_MEM_PRIORITY=1 turns both on.
     const char *mpe = getenv("LARECOMP_MEM_PRIORITY");
-    g_vk.mem_priority = has_ext(ep, ne, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) && !(mpe && *mpe == '0');
+    g_vk.mem_priority = has_ext(ep, ne, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) && mpe && *mpe == '1';
     g_vk.pageable = g_vk.mem_priority && has_ext(ep, ne, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
     if (g_vk.mem_priority) ext[n_ext++] = VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME;
     if (g_vk.pageable) ext[n_ext++] = VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME;
@@ -920,7 +921,7 @@ static void create_device(void) {
     }
     LOG("[vk] memory residency priority: %s\n", g_vk.pageable ? "on, per block as its contents change (VK_EXT_memory_priority + pageable_device_local_memory)"
         : g_vk.mem_priority ? "on, set when an allocation is made (VK_EXT_memory_priority)"
-        : mpe && *mpe == '0' ? "off (LARECOMP_MEM_PRIORITY=0)" : "off: not on this driver (VK_EXT_memory_priority)");
+        : !(mpe && *mpe == '1') ? "off (the default; LARECOMP_MEM_PRIORITY=1: on)" : "off: not on this driver (VK_EXT_memory_priority)");
     if (g_vk.dbias_unorm && !(have_dbc.depthBiasControl && have_dbc.leastRepresentableValueForceUnormRepresentation)) {
         g_vk.dbias_unorm = false;
         drop_ext(ext, &n_ext, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
