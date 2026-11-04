@@ -8,7 +8,8 @@ Linux game folder, in Python 3 (the standard library only: it runs from the AppI
 What the game gets, as on Windows (the folders follow the XDG base directories instead of %APPDATA% / %LOCALAPPDATA%):
     <data> = $XDG_DATA_HOME/nxrecomp/TotK-engine (~/.local/share/...): settings.ini, userdata (saves), mods, amiibo
     <cache> = $XDG_CACHE_HOME/nxrecomp/TotK-engine (~/.cache/...): run (the working folder: shader and pipeline caches),
-             crashes, logs (the last 8 game logs, totk-<time>.log)
+             crashes (crash-<time>-<pid>.txt: the game's crash report, out of its log), logs (the last 8 game logs,
+             totk-<time>.log)
     TOTK_USERDATA (userdata-v<n> for another game version, seeded once from 1.0.0's saves), TOTK_IMG / TOTK_ROMFS /
     TOTK_OVERLAY from player.txt, TOTK_PRIORITY=normal, TOTK_CRASH_DIR, TOTK_MODS_DIR (<game folder>/mods;<data>/mods),
     TOTK_AMIIBO_DIR, NXR_LAUNCHER_RESTART (the game's restart request), player.txt's env.* lines, TOTK_PRECOMPILE_SEED
@@ -35,6 +36,8 @@ GPU_UNSUPPORTED_CODE = 0x47505530 & 0xFF  # (the game said why)
 DUMP_LOST_CODE = 0x444D5030 & 0xFF        # (the dump went away during play; the game said so)
 KEEP_GAME_LOGS = 8
 KEEP_AUTO_BACKUPS = 10
+KEEP_CRASHES = 10    # (pc_crash.cpp's KEEP: the newest crash-*.txt)
+CRASH_CONTEXT = 40   # (the log lines before a crash report that go into its crash-*.txt: what the game was doing)
 EARLY_S = 20   # (launcher.c EARLY_MS: a failure this soon is the build's, and the previous folder is tried)
 RESTART_MAX, RESTART_WINDOW_S = 5, 60
 CLEARED = ('TOTK_', 'LARECOMP_', 'NX_', 'NXR_', 'NXRECOMP_')
@@ -175,7 +178,7 @@ def game_env(pkg, environ=None):
 
 
 def start(pkg, exe):
-    """one run: the game with its log, waited for; (exit code, log, seconds it ran)"""
+    """one run: the game with its log, waited for; (exit code, log, seconds it ran, its crash-*.txt or None)"""
     run, logs, env = game_env(pkg)
     data = user_dirs(env)[0]
     commit = player_values(pkg).get('commit', '')
@@ -201,7 +204,63 @@ def start(pkg, exe):
         say(f'starting {exe}, log {logp}')
         t0 = time.monotonic()
         p = subprocess.Popen([exe], cwd=run, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-        return p.wait(), logp, time.monotonic() - t0   # (code negative: the signal that ended it)
+        code = p.wait()   # (negative: the signal that ended it)
+    secs = time.monotonic() - t0
+    rep = None
+    if code not in (0, RESTART_CODE, GPU_UNSUPPORTED_CODE, DUMP_LOST_CODE):
+        rep = crash_report(logp, env['TOTK_CRASH_DIR'], code, p.pid, env, commit)
+        if rep:
+            say(f'crash report: {rep}')
+    return code, logp, secs, rep
+
+
+def last_fatal(logp):
+    """the game's last '[fatal] ...' line in its log (the reason it stopped by itself: the dump unreadable, no game
+    data, the GPU unsupported), without the tag; '' when there is none"""
+    try:
+        with open(logp, encoding='utf-8', errors='replace') as f:
+            lines = [ln.strip() for ln in f if ln.startswith('[fatal] ')]
+    except OSError:
+        return ''
+    return lines[-1][len('[fatal] '):] if lines else ''
+
+
+def crash_report(logp, crashes, code, pid, env, commit=''):
+    """the game's crash report as a file of its own, crash-<time>-<pid>.txt in <cache>/crashes (TOTK_CRASH_DIR): the
+    name pc_crash.cpp gives it on Windows, so a player attaches the same file on both. The game writes the report to
+    stderr, which is its log here (rt_main.cpp on_crash_signal: '[crash] signal ...' to the end, then exit 3); this takes
+    it from there with the CRASH_CONTEXT lines before it. Nothing else: no core dump, no memory (the key is not in the
+    log). The newest KEEP_CRASHES kept; TOTK_PC_CRASH=0 (player.txt's env.TOTK_PC_CRASH=0, as on Windows): none. The
+    file's path, or None (no report in the log: killed by a signal, closed with an error)."""
+    if env.get('TOTK_PC_CRASH', '').strip() == '0':
+        return None
+    try:
+        with open(logp, encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    at = next((i for i, ln in enumerate(lines) if ln.startswith('[crash] signal ')), None)
+    if at is None:
+        return None
+    os.makedirs(crashes, exist_ok=True)
+    out = os.path.join(crashes, f'crash-{datetime.datetime.now():%Y%m%d-%H%M%S}-{pid}.txt')
+    try:
+        with open(out, 'w', encoding='utf-8') as f:
+            f.write(f'Weeping of the Empire crash report (Linux)\ncommit: {commit or "?"}\nexit code: {code}\nlog: {logp}\n\n'
+                    f'--- the log before it (last {CRASH_CONTEXT} lines)\n')
+            f.writelines(lines[max(0, at - CRASH_CONTEXT):at])
+            f.write('\n--- the report\n')
+            f.writelines(lines[at:])
+    except OSError as e:
+        say(f'crash report not written ({e})')
+        return None
+    old = sorted(glob.glob(os.path.join(crashes, 'crash-*.txt')))
+    for p in old[:max(0, len(old) - KEEP_CRASHES)]:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    return out
 
 
 def incomplete(pkg):
@@ -229,7 +288,7 @@ def run_package(pkg):
     """play_package: the game, its restarts; 'early' when it failed in its first EARLY_S seconds"""
     times = []
     while True:
-        code, logp, secs = start(pkg, os.path.join(pkg, 'totk'))
+        code, logp, secs, rep = start(pkg, os.path.join(pkg, 'totk'))
         if code == RESTART_CODE:
             now = time.monotonic()
             times = [t for t in times if now - t < RESTART_WINDOW_S] + [now]
@@ -239,9 +298,15 @@ def run_package(pkg):
                 return 1
             say('the game asked for a restart')
             continue
-        if code in (0, GPU_UNSUPPORTED_CODE, DUMP_LOST_CODE):
+        if code in (GPU_UNSUPPORTED_CODE, DUMP_LOST_CODE):   # (the same low byte, 48: the game said why in its log;
+            why = last_fatal(logp)                            #  Windows shows a box, here the notice carries it)
+            if why:
+                tell(f'{why} (log: {logp})')
             return 0
-        tell((f'the game was ended by signal {-code}' if code < 0 else f'the game closed with code {code}') + f'; log: {logp}')
+        if code == 0:
+            return 0
+        tell((f'the game was ended by signal {-code}' if code < 0 else f'the game closed with code {code}') + f'; log: {logp}' +
+             (f'; crash report: {rep}' if rep else ''))
         return 'early' if secs < EARLY_S else 1
 
 

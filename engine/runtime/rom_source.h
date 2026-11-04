@@ -25,7 +25,11 @@
 #pragma comment(lib, "bcrypt.lib")
 #else
 #include <cpuid.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 #include <immintrin.h>
 #include <wmmintrin.h>
@@ -282,6 +286,41 @@ inline bool rom_source_load(const wchar_t* path, RomSource* s, std::string* why)
     if (text) {
         rom_source_detail::wipe(text, (size_t)sz.QuadPart);
         VirtualFree(text, 0, MEM_RELEASE);
+    }
+    return ok;
+}
+#else
+// (Linux, the same: the text read with read(2) straight into a page of its own, kept out of core dumps, parsed, zeroed
+// and unmapped; linux-test D#83: the Linux build had no dump reader, so no game file was found)
+inline bool rom_source_load(const char* path, RomSource* s, std::string* why) {
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { *why = "cannot read it"; return false; }
+    struct stat st;
+    char* text = nullptr;
+    size_t size = 0, got = 0;
+    bool ok = fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size < (1 << 20);
+    if (ok) {
+        size = ((size_t)st.st_size + 4095) / 4096 * 4096;
+        void* m = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ok = m != MAP_FAILED;
+        if (ok) {
+            text = (char*)m;
+            madvise(text, size, MADV_DONTDUMP);
+            while (got < (size_t)st.st_size) {
+                const ssize_t n = read(fd, text + got, (size_t)st.st_size - got);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                got += (size_t)n;
+            }
+            ok = got == (size_t)st.st_size;
+        }
+    }
+    close(fd);
+    if (!ok) *why = "cannot read it";
+    else ok = rom_source_parse(text, got, s, why);
+    if (text) {
+        rom_source_detail::wipe(text, size);
+        munmap(text, size);
     }
     return ok;
 }

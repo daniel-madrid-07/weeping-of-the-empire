@@ -101,8 +101,10 @@ PGO_TAG = {'off': '', 'gen': '-pgogen', 'use': '-pgo'}   # tree name / build dir
 
 
 def heavy(cmd, log=print):
-    """Without tools/heavy.py, fall back to the RAM gate."""
-    if HEAVY.exists():
+    """Without tools/heavy.py, fall back to the RAM gate; so on Linux too (tools/heavy.py is the Windows scheduler:
+    the AppImage's Setup died at step 1 in it, linux-test D#82; this process is already niced there,
+    below_normal_priority)."""
+    if HEAVY.exists() and sys.platform == 'win32':
         return [sys.executable, str(HEAVY), '--', *cmd]
     wait_for_ram(log=log)
     return list(cmd)

@@ -39,7 +39,7 @@ body:
     attributes:
       label: Log
       description: |
-        Attach the game's log: open `%LOCALAPPDATA%\nxrecomp\TotK-engine\logs` (paste it in Explorer's address bar) and drag the newest `totk-*.log` here. After a crash, also attach the newest `crash-*.txt` from the `crashes` folder next to it. Never attach the `.dmp` file next to it: it holds the game's memory; the `.txt` is enough. When an error box offers to open the log, that is the same file. For Setup: `setup.log` in your install folder. The logs hold no keys; the paths in them can show your Windows user name.
+        Attach the game's log: open `%LOCALAPPDATA%\nxrecomp\TotK-engine\logs` (paste it in Explorer's address bar) and drag the newest `totk-*.log` here. After a crash, also attach the newest `crash-*.txt` from the `crashes` folder next to it. Never attach the `.dmp` file next to it: it holds the game's memory; the `.txt` is enough. When an error box offers to open the log, that is the same file. For Setup: `setup.log` in your install folder. On Linux (the native AppImage): the newest `totk-*.log` from `~/.cache/nxrecomp/TotK-engine/logs`, and after a crash the newest `crash-*.txt` from `~/.cache/nxrecomp/TotK-engine/crashes` (both are written when the game is started with the AppImage's Play or `--play`; started another way, paste the terminal's output instead). The logs hold no keys; the paths in them can show your user name.
   - type: input
     id: version
     attributes:

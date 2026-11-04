@@ -157,3 +157,20 @@ def gpus():
     if nv:
         out.append(['nvidia', nv[0].strip()])
     return out
+
+
+def pc_line(environ=None):
+    """setup.log's 'PC:' line, so a tester's log says which Linux it came from (TRIAGE.md: nothing did): the distro
+    (/etc/os-release), the kernel, the desktop and session (X11 / Wayland), the GPUs' PCI ids and drivers (gpus())"""
+    e = os.environ if environ is None else environ
+    osr = dict(ln.split('=', 1) for ln in read('/etc/os-release').splitlines() if '=' in ln)
+    distro = osr.get('PRETTY_NAME', '').strip().strip('"') or 'unknown distribution'
+    kernel = read('/proc/sys/kernel/osrelease').strip() or '?'
+    desk = ' '.join(x for x in (e.get('XDG_CURRENT_DESKTOP', ''), e.get('XDG_SESSION_TYPE', '')) if x) or 'no desktop'
+    cards = []
+    for pci, drv in gpus():
+        # (NVRM's long first line, the proprietary 'Kernel Module 560.35.03' or the open modules' 'Open Kernel Module
+        # for x86_64 560.35.03': the version number itself)
+        m = re.search(r'\s(\d{3,}\.\d+(?:\.\d+)?)\s', drv + ' ') if pci == 'nvidia' else None
+        cards.append(f'NVIDIA {m.group(1)}' if m else f'{pci} {drv}'.strip())
+    return f'PC: {distro}, kernel {kernel}, {desk}, GPU {"; ".join(cards) or "none listed"}'

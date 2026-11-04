@@ -69,9 +69,22 @@ def below_normal_priority():
             pass
 
 
+MEMINFO = '/proc/meminfo'
+
+
 def _memory_status():
-    """(available, total) physical RAM in bytes, or None where it can't be read."""
+    """(available, total) physical RAM in bytes, or None where it can't be read. Linux: /proc/meminfo's MemAvailable,
+    page cache included (sysconf's SC_AVPHYS_PAGES is MemFree: after reading the 16 GB dump most RAM is cache, and the
+    RAM gate waited out its 120 s at every heavy job); sysconf where there is no /proc."""
     if sys.platform != 'win32':
+        try:
+            with open(MEMINFO, encoding='ascii', errors='replace') as f:
+                kb = {k.strip(): int(v.split()[0]) for k, _, v in (ln.partition(':') for ln in f) if v.split()[:1] and
+                      v.split()[0].isdigit()}
+            if 'MemAvailable' in kb and 'MemTotal' in kb:
+                return kb['MemAvailable'] * 1024, kb['MemTotal'] * 1024
+        except OSError:
+            pass
         try:
             page = os.sysconf('SC_PAGE_SIZE')
             return os.sysconf('SC_AVPHYS_PAGES') * page, os.sysconf('SC_PHYS_PAGES') * page

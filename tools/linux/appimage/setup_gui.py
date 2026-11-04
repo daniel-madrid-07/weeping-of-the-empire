@@ -136,7 +136,26 @@ def install_game(install, inputs, update, say, gui_pid=None):
         return rc
 
 
+def symlinks_ok(d):
+    """d's file system keeps symbolic links: this Python's copy (tools_python) and the build's own Python need them,
+    and FAT32, exFAT and a Windows drive seen from WSL have none (the e2e run of linux-test-v0.1.9.1: a traceback at
+    'copying Python' instead of a reason)"""
+    p = os.path.join(d, '.symlink-probe')
+    try:
+        if os.path.lexists(p):
+            os.remove(p)
+        os.symlink('setup.log', p)
+        os.remove(p)
+        return True
+    except OSError:
+        return False
+
+
 def _install(install, inputs, update, say, gui_pid):
+    if not symlinks_ok(install):
+        say(f'{install} is on a drive without symbolic links (FAT32, exFAT, or a Windows drive): choose a folder on a '
+            'Linux file system (ext4, btrfs, xfs), for example ~/Games/WeepingOfTheEmpire')
+        return 2
     py = tools_python(install, say)
     src = source(install, say)
     cmd = [py, '-E', '-s', os.path.join(src, 'tools', 'builder', 'builder.py'), *inputs, '--install', install]

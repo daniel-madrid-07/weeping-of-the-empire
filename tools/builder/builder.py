@@ -992,7 +992,7 @@ FFX = pinned_asset('builder:FFX')
 
 
 def fsr_runtime(work, dry):
-    if not FFX or dry:
+    if not FFX or dry or LINUX:   # (a Windows DLL: the Linux build has no FidelityFX runtime, ffx.c)
         return
     import toolchain
     import zipfile
@@ -1143,6 +1143,10 @@ def prepare_shaders(pkg, n, dry, cmd=None):
     elif rc == 2:
         say('shaders: nothing to prepare (no shader list or shader archive); the game builds each one the first time '
             'it is seen')
+    elif any('No available video device' in t for t in tail):   # (SDL_Init with no display: Setup run over SSH or in WSL)
+        say('shaders: not prepared here, no display (Setup ran outside a desktop session): the game builds each one the '
+            'first time it is seen (short hitches the first time you play an area); the next Setup run on the desktop '
+            'prepares them')
     else:
         say(f'shaders: not prepared (exit {rc}, {secs} s: {" | ".join(tail[-3:])}); the game builds each one the first '
             'time it is seen (short hitches the first time you play an area)')
@@ -1542,12 +1546,14 @@ def main(argv=None):
     fs = filesystem(work)
     if fs.upper().startswith('FAT') and a.until != 'tools':
         problems.append(f'{os.path.realpath(work)[:2]} is formatted {fs}, which cannot hold files over 4 GB (the game '
-                        'data has one of 17 GB): choose a folder on ' + ('an ext4, btrfs, xfs or exFAT drive' if LINUX
+                        'data has one of 17 GB): choose a folder on ' + ('an ext4, btrfs or xfs drive' if LINUX
                                                                            else 'an NTFS drive'))
     problems += check_pc()
     ram, _ = memory_gb()   # (no floor: under WARN_RAM_GB said, and Setup asked 'Continue anyway?' before this)
     cores = host_linux.cpu_count() if LINUX else os.cpu_count()   # (Linux: affinity and the cgroup's quota)
     game_jobs, rt_jobs = jobs_for(ram, cores or 2)
+    if LINUX:
+        say(host_linux.pc_line())
     say(f'{cores} cores, {ram:.0f} GB RAM: up to {game_jobs} compiles at once')
     if ram_warning(ram):
         say(ram_warning(ram))
@@ -1636,12 +1642,14 @@ def main(argv=None):
     # Windows font otherwise), so a firmware these keys cannot open is said and the build goes on (#26: keys dumped by
     # a tool older than the firmware lack its key_area_key_*_NN and the whole install stopped after the game's files)
     if fw and not fonts:
-        ok, out = run(f'1/{n} extract', [py, '-m', 'pipeline.build', '--nsp', game] + keyarg + ['--work', work,
-                                         '--steps', 'fonts,ready', '--firmware', fw] + common,
-                      env, a.dry_run, quiet=True, tolerate=True)
+        # (fw_out, not out: out is the game folder; the fonts step's text in it made step 8's --out that text, 'File
+        #  name too long', for every player whose firmware's fonts failed: linux-test D#83, v0.1.9 / v0.1.9.1 too)
+        ok, fw_out = run(f'1/{n} extract', [py, '-m', 'pipeline.build', '--nsp', game] + keyarg + ['--work', work,
+                                            '--steps', 'fonts,ready', '--firmware', fw] + common,
+                         env, a.dry_run, quiet=True, tolerate=True)
         if not ok:
-            why = next((ln.strip() for ln in reversed(out.splitlines()) if 'FAILED' in ln or 'Missing' in ln),
-                       (out.strip().splitlines() or ['no output'])[-1].strip())
+            why = next((ln.strip() for ln in reversed(fw_out.splitlines()) if 'FAILED' in ln or 'Missing' in ln),
+                       (fw_out.strip().splitlines() or ['no output'])[-1].strip())
             say(f'firmware: its fonts could not be read ({why}); the game is built without them: Korean and Chinese '
                 f'text uses a Windows font. With keys dumped from a console on that firmware (a key dumper that '
                 f'knows it), or another firmware, the next Install adds them')
@@ -1761,10 +1769,10 @@ def main(argv=None):
             for f in glob.glob(os.path.join(work, 'engine', 'overlay', 'romfs-aspect-*.failed')):
                 os.remove(f)
         stamps.done(7, 'overlay', in7)
-    # DLSS's runtime DLLs (~66 MB): an NVIDIA RTX GPU only (build.py dlss_dlls), at every run, so an RTX card added
-    # later gets them at the next Setup; never stops Setup (offline: DLSS unavailable until a run that is online).
-    # Before step 8: package.py writes TOTK_DLSS_DIR only when the DLLs are there, and in8 says whether they are, so
-    # the run that fetches them packages again
+    # DLSS's runtime DLLs (~66 MB): an NVIDIA RTX GPU on Windows only (build.py dlss_dlls), at every run, so an RTX
+    # card added later gets them at the next Setup; never stops Setup (offline: DLSS unavailable until a run that is
+    # online). Before step 8: package.py writes TOTK_DLSS_DIR only when the DLLs are there, and in8 says whether
+    # they are, so the run that fetches them packages again
     ok, out_dlss = run('DLSS (NVIDIA RTX only)', [py, build, 'dlss'], env, a.dry_run, quiet=True, tolerate=True)
     if not a.dry_run:
         said = [ln.split('] ', 1)[-1] for ln in out_dlss.splitlines() if 'DLSS' in ln]
