@@ -1,8 +1,9 @@
 # Mods
 
 The port loads RomFS mods (the game's data files) the way emulators and a modded Switch do, plus ExeFS code patches and
-Atmosphere cheats made for version 1.0.0, the version the port builds. No mods ship with the port: use mods you
-trust, made for 1.0.0.
+Atmosphere cheats made for the build you play: 1.0.0, or the 1.4.3 beta build with 1.4.3's own patch and cheat
+files (see the README's FAQ for those). No mods ship with the port: use mods you trust, made for the game version you
+play.
 
 ## Where mods go
 
@@ -11,7 +12,8 @@ Each mod is a folder of its own inside a `mods` folder. Two places are read:
 - `mods` next to the game (the folder with the launcher; the launcher creates it), and
 - `%APPDATA%\nxrecomp\TotK-engine\mods` (per Windows user).
 
-A mod with the same name in both is used from the game folder's.
+A mod with the same name in both is used from the game folder's. A **1.4.3 build** (beta) reads its own `mods-v143`
+folders in the same two places, so 1.0.0 mods and 1.4.3 mods never mix.
 
 A folder whose name starts with `_` or `.` is left out (a quick way to park a mod without deleting it).
 
@@ -25,8 +27,8 @@ You can copy a mod's folder in by hand, or let the game do it from the mod as yo
 - **Drop it on the launcher** (`TotK Launcher.exe` in the game folder, or the desktop shortcut) in Explorer: the mod is
   installed, a box says where it went, and the game starts as usual. Several mods can be dropped at once.
 
-Either way the mod is unpacked and checked first, then copied into the game folder's `mods`, in a folder named
-after it; a name already taken gets ` (2)`, ` (3)` and so on. It is not
+Either way the mod is unpacked and checked first, then copied into the game folder's `mods` (or `mods-v143` when its
+files are named for 1.4.3), in a folder named after it; a name already taken gets ` (2)`, ` (3)` and so on. It is not
 installed, and the reason is shown, when it has no `romfs`, `exefs` or `cheats` folder, when it is made for another
 game, or when it loads code of its own (`subsdk` / `main`, which a recompiled game cannot load). An archive Windows
 cannot open: unpack it yourself and use **Install a mod folder...**.
@@ -44,7 +46,7 @@ Any of these layouts works (names are not case-sensitive):
 | Zip unpacked into a folder of its own name | `mods\Better Rain\Better Rain\romfs\...` (one wrapper folder is looked through) |
 | TKMM's merged output | its folder, as it writes it |
 | Code patches (ExeFS) | `mods\60fps\exefs\*.ips` or `*.pchtxt` (also under `atmosphere\contents\0100F2C0115B6000\`), or the SD card's `mods\60fps\atmosphere\exefs_patches\<name>\*.ips` |
-| Cheats | `mods\My cheats\cheats\082CE09B06E33A12.txt` |
+| Cheats | `mods\My cheats\cheats\082CE09B06E33A12.txt` (1.4.3: `277178B7DBA1B6D4.txt`) |
 
 A whole emulator mods folder can be copied in as it is: yuzu's `load\0100F2C0115B6000` or Ryujinx's
 `mods\contents\0100f2c0115b6000`. Each mod inside it is listed on its own, with the place it came from under its name.
@@ -108,5 +110,5 @@ as "left to the port's own files".
 - Switch a mod off in F10 (or rename its folder to start with `_`) and start again to see if it is the cause.
 - The game's log (the newest `totk-*.log` in `%LOCALAPPDATA%\nxrecomp\TotK-engine\logs`) has a `[mods]` line per mod: on, off,
   or why it is not used, and which RomFS folder it serves.
-- A mod made for another version of the game can crash it or show wrong text even when its files load: use mods made for
-  1.0.0.
+- A mod made for another version of the game can crash it or show wrong text even when its files load: use mods for
+  1.0.0 with the 1.0.0 build and mods for 1.4.3 with a 1.4.3 build.

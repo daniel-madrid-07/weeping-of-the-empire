@@ -29,6 +29,7 @@ ROMFS = os.path.join(WORK, 'extracted', 'v100', 'romfs')
 # folder: the fallback for a path the image lacks, and what the launcher checks exists); boot.py's romfs_image()
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), 'tools', 'engine'))
 from romfs_image_verify import romfs_image  # noqa: E402
+import exekey  # noqa: E402
 OVERLAY = os.path.join(ENG, 'overlay', 'romfs')
 SEED = os.path.join(ENG, 'seed')  # the precompile seed: programs and pipelines built before the world
 # every program of the game's shader archives (tools/shader_pack.py, 18k programs): the engine's archive warm-up builds
@@ -175,6 +176,8 @@ def linux_launcher(tmp):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--key'); ap.add_argument('--out', default=os.path.join(WORK, 'release'))
+    ap.add_argument('--allow-untagged', action='store_true',
+                    help='package an exe with no key tag (linked before 11-03); a tag naming another key is refused anyway')
     ap.add_argument('--exe', help='a runtime relinked against the key (build.py runtime --key), instead of the exe built with the key')
     ap.add_argument('--commit', help='the commit --exe was built from (player.txt, folder name)')
     ap.add_argument('--release', help='the release tag this source is (player.txt release=: the launcher\'s '
@@ -211,6 +214,13 @@ def main():
     overlay = os.path.abspath(a.overlay)
     # the key's own exe carries the runtime of the tree the key was built from; a newer runtime relinks against it
     exe = os.path.abspath(a.exe) if a.exe else os.path.join(key_dir(key), 'exe', EXE)
+    if not a.exe and exekey.read(exe) is None:
+        # the key's own exe (game-var/<key>/exe) is that key's by construction; one linked before the tag existed (a
+        # player's step 5 reused on an update) gets it now instead of a refusal, which would stop his Setup at step 8
+        exekey.tag(exe, key)
+    why = '' if a.allow_untagged and exekey.read(exe) is None else exekey.refuse(exe, key)
+    if why:   # (an exe linked against another key than the one player.txt will name: 11-03's slot exe)
+        sys.exit(f'refused: {why}')
     commit = commit_of(exe, man, a.commit)
     dirty = dirty_of(exe)
     if not os.path.isdir(ROMFS) and romfs_image(ROMFS):

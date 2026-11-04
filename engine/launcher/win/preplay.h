@@ -11,7 +11,7 @@ int ini_get(const wchar_t *path, const char *key, char *out, size_t n);
 int ini_set(const wchar_t *path, const char *key, const char *value, const char *label);
 
 /* The dialog: a few of the game's rows (window, resolution scale, frame rate, upscaler, ...) on the settings.ini at
- * ini, in Spanish when es is 1, in Brazilian Portuguese when 2 (text_pt.h). note: a line above the rows (why it opened;
- * NULL none). defaults: the build's own settings file (player.txt settings=), which "Reset all settings" puts back
+ * ini, in Spanish when es is TR_ES (1), else in TR_PT / TR_RU / TR_ZH (text_tr.h; 0 English). note: a line above the
+ * rows (why it opened; NULL none). defaults: the build's own settings file (player.txt settings=), which "Reset all settings" puts back
  * (NULL: the file is removed, the game's defaults apply). 1: Play pressed (changes saved), 0: closed. */
 int preplay_dialog(const wchar_t *ini, const wchar_t *defaults, int es, const wchar_t *title, const wchar_t *note);

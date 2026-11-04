@@ -55,11 +55,24 @@ enum {
                                       (r in (0.01, 1)); 0 = the game's 0.01 (effectease) */
     TOTK_DP_TICKS30 = 224,         /* runtime s32: 30 Hz ticks of game time this frame - 1 (r < 1: 0 or -1); 0 = the game's
                                       one per frame (effectease) */
+    TOTK_DP_ABIL_LAT = 228,        /* runtime f32: the ability camera's LatStickScale (pitch) as its mode update last read
+                                      it, 0 = not seen yet (totk_ability_pitch.cpp; pc_mouse's ability gains) */
+    TOTK_DP_ABIL_LNG = 232,        /* runtime f32: its LngStickScale (yaw), the same way */
+    TOTK_DP_GRAB_X = 236,          /* runtime f32: Ultrahand's grab stick from the mouse, unclamped, before the invert
+                                      options (pc_mouse grab_stick; totk_grab_stick.cpp puts it into UltraHand::calcGrab) */
+    TOTK_DP_GRAB_Y = 240,          /* runtime f32: its Y */
+    TOTK_DP_GRAB_LIVE = 244,       /* runtime u32: TOTK_DP_PRESENTS when X / Y were written (0 = never): used for that present
+                                      and the next only */
+    TOTK_DP_GRAB_PX = 248,         /* runtime f32: calcGrab's stick exponent for X as it last read it (0 = not seen) */
+    TOTK_DP_GRAB_PY = 252,         /* runtime f32: ... for Y */
     /* platform's PlatPcPage (platform/include/platform/pc.h, 0x80 bytes): mouse totals, glyph style, overlay state.
        app binds it after totk_patches_init: plat_pc_page_bind(page + TOTK_DP_PC_OFFSET, sizeof(PlatPcPage)). */
     TOTK_DP_PC_OFFSET = 0x100,
     TOTK_DP_PC_SIZE = 0x80,
     TOTK_DP_PC_CLAIMED = TOTK_DP_PC_OFFSET + 0x64, /* PlatPcPage.guest_mouse_claimed: set by the mouse veneer (mouse) */
+    TOTK_DP_GRAB_ACK = 384,        /* runtime u32: TOTK_DP_PRESENTS at the last calcGrab that took the GRAB_X / _Y pair
+                                      (totk_grab_stick.cpp): pc_mouse drains its owed counts at the unclamped rate only
+                                      while this is recent (a key without the hook, or 1.4.3 unplaced, never writes it) */
 };
 
 /* The mouse veneer drops the motion of a step that comes more than this many presents after the previous one, and the

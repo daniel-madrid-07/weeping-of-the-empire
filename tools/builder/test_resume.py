@@ -4,7 +4,7 @@ A fake tree and fake steps (builder.main with run() and the PC checks replaced);
 
     python -I tools/builder/test_resume.py
 """
-import json, os, re, sys, tempfile, types
+import atexit, json, os, re, shutil, sys, tempfile, types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -20,6 +20,7 @@ def check(name, ok, detail=''):
 
 
 tmp = tempfile.mkdtemp(prefix='resume-')
+atexit.register(shutil.rmtree, tmp, True)   # (~11 MB a run, also when it fails: 14 runs had left 161 MB in %TEMP%)
 work, out = os.path.join(tmp, 'work'), os.path.join(tmp, 'game')
 dump, keys = os.path.join(tmp, 'game.nsp'), os.path.join(tmp, 'prod.keys')
 for p in (dump, keys):
@@ -31,14 +32,20 @@ skipset = os.path.join(work, 'engine', 'overlay', 'skip_opening')
 skipman = os.path.join(skipset, 'manifest.tsv')
 head = builder.subprocess.run(['git', '-C', builder.REPO, 'rev-parse', 'HEAD'], capture_output=True,
                               text=True).stdout.strip()
-state = {'fail_at': None, 'ran': [], 'lines': [], 'pkg': 0, 'prepared': 0, 'gpus': [['GPU A', '32.0.15.1']]}
+state = {'fail_at': None, 'ran': [], 'lines': [], 'pkg': 0, 'prepared': 0, 'gpus': [['GPU A', '32.0.15.1']], 'dlss': False}
 
 
 def key_json():
     return json.dumps({'key': 'K1', 'dir': kdir, 'img': 'IMG', 'built': os.path.exists(os.path.join(kdir, 'manifest.json'))})
 
 
-def fake_run(step, cmd, env, dry, beat=None, quiet=False, watch=None):
+def fake_run(step, cmd, env, dry, beat=None, quiet=False, watch=None, tolerate=False):
+    if step.startswith('DLSS'):   # (build.py dlss: the DLLs appear when state['dlss'] says this PC fetches them)
+        state['ran'].append('DLSS')
+        if state['dlss']:
+            os.makedirs(os.path.join(work, 'engine', 'dlss'), exist_ok=True)
+            open(os.path.join(work, 'engine', 'dlss', 'nvngx_dlss.dll'), 'w').write('dll')
+        return True, '[00:00:00] DLSS: ' + ('runtime DLLs fetched' if state['dlss'] else 'not fetched (no NVIDIA RTX GPU)')
     num = step.split('/')[0]
     what = 'key' if 'key' in cmd else 'game' if 'game' in cmd else step.split(' ', 1)[1]
     state['ran'].append(f'{num} {what}')
@@ -155,6 +162,14 @@ go()
 check('new driver: shaders again', state['ran'][-1:] == ['9 shaders'] and reused(8), str(state['ran']))
 go()
 check('then reused', reused(9) and '9 shaders' not in state['ran'], str(state['ran']))
+# 7b. an RTX card added later: the run that fetches DLSS's DLLs packages again (player.txt names TOTK_DLSS_DIR only
+# when they are there), before step 8; the next run reuses it
+state['dlss'] = True
+go()
+check('DLSS DLLs fetched this run: step 8 packages again (TOTK_DLSS_DIR), checked before it',
+      '8 package' in state['ran'] and state['ran'].index('DLSS') < state['ran'].index('8 package'), str(state['ran']))
+go()
+check('then step 8 reused', reused(8) and '8 package' not in state['ran'], str(state['ran']))
 # 8. the stamps file is broken: nothing is reused from it, nothing fails
 open(os.path.join(work, 'builder-steps.json'), 'w').write('{not json')
 rc = go()

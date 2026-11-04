@@ -55,6 +55,30 @@ int main(void) {
     CHECK(totk_settings_from_env(&e) != NULL, "bad TOTK_OUTPUT_RES refused");
     _putenv("TOTK_OUTPUT_RES=");
     _putenv("TOTK_RENDER_RES=");
+    {   /* Near shadow reach x Shadow distance held at 4 (public #69); the game's own (0) and 1 untouched */
+        _putenv("TOTK_SHADOW_DISTANCE=");
+        CHECK(totk_shadow_reach_slot(0.0f) == 0.0f && totk_shadow_reach_slot(4.0f) == 4.0f, "reach at the game's distance");
+        _putenv("TOTK_SHADOW_DISTANCE=2");
+        CHECK(totk_shadow_reach_slot(1.5f) == 1.5f && totk_shadow_reach_slot(3.0f) == 2.0f, "reach x distance 2: at most 2");
+        CHECK(totk_shadow_reach_slot(1.0f) == 1.0f && totk_shadow_reach_slot(0.0f) == 0.0f, "reach 1 / 0 with distance 2");
+        _putenv("TOTK_SHADOW_DISTANCE=4");
+        CHECK(totk_shadow_reach_slot(2.0f) == 0.0f, "reach with distance 4: the game's split (0)");
+        _putenv("TOTK_SHADOW_DISTANCE=250");   /* (a percentage) */
+        CHECK(fabsf(totk_shadow_reach_slot(4.0f) - 1.6f) < 1e-6f, "reach with distance 250 %%: at most 1.6");
+        _putenv("TOTK_SHADOW_DISTANCE=0.5");
+        CHECK(totk_shadow_reach_slot(4.0f) == 4.0f, "a shorter distance leaves the reach");
+        /* a canvas that is not 16:9: the distance the game gets is x2 (totk_engine.c's wide cap), so reach 2 stays */
+        _putenv("TOTK_SHADOW_DISTANCE=4");
+        _putenv("TOTK_OUTPUT_RES=5120x1440");
+        CHECK(totk_shadow_reach_slot(2.0f) == 2.0f && totk_shadow_reach_slot(3.0f) == 2.0f, "32:9, distance 4 -> 2: reach at most 2");
+        _putenv("TOTK_WIDE_SHADOW_CAP=0");
+        CHECK(totk_shadow_reach_slot(2.0f) == 0.0f, "32:9 without the wide cap: distance 4, reach none");
+        _putenv("TOTK_WIDE_SHADOW_CAP=");
+        _putenv("TOTK_OUTPUT_RES=3840x2160");
+        CHECK(totk_shadow_reach_slot(2.0f) == 0.0f, "16:9 4K, distance 4: reach none");
+        _putenv("TOTK_OUTPUT_RES=");
+        _putenv("TOTK_SHADOW_DISTANCE=");
+    }
     {   /* TOTK_TEMP_UNIT: c / f / empty, anything else refused */
         TotkSettings t;
         totk_settings_default(&t);
@@ -493,11 +517,18 @@ int main(void) {
     n = totk_overlay_sets(&o, names);
     CHECK(n == 2 && !strcmp(names[0], "aspect-2560x1600") && !strcmp(names[1], "output-1920x1200-scene-1600x1000"),
           "16:10 sets: %d %s %s", n, names[0], n > 1 ? names[1] : "");
+    /* 3:2 (graphics.aspect_ratio 3:2, Surface / Framework): the 2160x1440 layouts, the canvas's own output and scene sets */
+    o.output_w = o.max_w = 1920, o.output_h = o.max_h = 1280, o.render_w = 1620, o.render_h = 1080;
+    n = totk_overlay_sets(&o, names);
+    CHECK(n == 2 && !strcmp(names[0], "aspect-2160x1440") && !strcmp(names[1], "output-1920x1280-scene-1620x1080"),
+          "3:2 sets: %d %s %s", n, names[0], n > 1 ? names[1] : "");
     char lay[64] = "untouched";
     CHECK(totk_layout_set(2560, 1080, lay) && !strcmp(lay, "aspect-3440x1440"), "2560x1080 is 21:9's layout: %s", lay);
     CHECK(totk_layout_set(3840, 1080, lay) && !strcmp(lay, "aspect-5120x1440"), "3840x1080 is 32:9's layout: %s", lay);
     CHECK(totk_layout_set(7680, 1440, lay) && !strcmp(lay, "aspect-7680x1440"), "7680x1440 is 48:9's layout: %s", lay);
     CHECK(totk_layout_set(5760, 1080, lay) && !strcmp(lay, "aspect-7680x1440"), "5760x1080 is 48:9's layout: %s", lay);
+    CHECK(totk_layout_set(2256, 1504, lay) && !strcmp(lay, "aspect-2160x1440"), "2256x1504 is 3:2's layout: %s", lay);
+    CHECK(totk_layout_set(3000, 2000, lay) && !strcmp(lay, "aspect-2160x1440"), "3000x2000 is 3:2's layout: %s", lay);
     CHECK(totk_layout_set(1280, 1024, lay) && !strcmp(lay, "aspect-1280x1024"), "an unbuilt shape keeps its size: %s", lay);
     strcpy(lay, "untouched");
     CHECK(!totk_layout_set(2560, 1440, lay) && !strcmp(lay, "untouched"), "16:9 has no layout set");

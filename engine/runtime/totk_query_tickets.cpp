@@ -12,7 +12,7 @@
 //
 // The hook keeps the entries apart without knowing the capacity: after the original enqueue it checks each of the
 // new request's two entries against the request that last took that entry in this slot (a host-side table, checked
-// against the guest's own fields: state 1 queued, or 2 with +0x2c persistent; same slot; one of its entries). A taken
+// against the guest's own fields: state 1 queued or 2 delivered; same slot; one of its entries). A taken
 // entry is swapped for the next ticket from the game's own counter that no live request holds (at most [mgr+0x24]
 // tries; the pass has not looked at the request yet: +0x37 = 2). If every entry is taken the game's ticket stays.
 // Counters in the log: '[query-tickets] collisions avoided N / unavoidable M'. 1.0.0 only (another version: the
@@ -65,13 +65,13 @@ bool readable(u64 p, u64 n) {   // the guest heap at once, else the OS's view
 #endif
 }
 
-// o (the request that last took entry e of slot index si) still uses it: queued, or delivered and persistent
+// o (the request that last took entry e of slot index si) still uses it: queued, or delivered
 bool holds(u64 o, u64 self, u8 si, u32 e) {
     if (!o || o == self || !readable(o, kWait + 1)) return false;
     const u32 st = ld32(o + kState);
     if (st != 1 && st != 2) return false;
     if (ld8(o + kSlotIdx) != si || (ld8(o + kEntry0) != e && ld8(o + kEntry0 + 1) != e)) return false;
-    return st == 1 || ld8(o + kPersist);
+    return true;
 }
 
 bool enabled() {

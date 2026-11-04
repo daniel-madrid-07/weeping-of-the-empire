@@ -64,14 +64,15 @@ inline void amiibo_tag_info(const amiibo_tag &t, uint8_t out[0x58]) {
     memcpy(out + 0x24, &type, 4);
 }
 
-// nn::nfp::ModelInfo (0x40): character id (u16), variant, series, model number (u16), figure type; the two numbers in
-// the console's byte order (the tag stores them big-endian)
+// nn::nfp::ModelInfo (0x40): character id and variant in the tag's own byte order, series, the model number in the
+// console's (little-endian; the tag stores it big-endian), figure type. The character id went byte-swapped before
+// (rival v0.3.7's fix of the same, their #579 / #541: "could not tell figures of one character apart", tag c19b4bec
+// runtime/amiibo.c amiibo_get_model_info; the series / type places and the model's order were already as theirs)
 inline void amiibo_model_info(const amiibo_tag &t, uint8_t out[0x40]) {
     memset(out, 0, 0x40);
-    const uint16_t character = (uint16_t)(t.id[0] << 8 | t.id[1]), model = (uint16_t)(t.id[4] << 8 | t.id[5]);
-    memcpy(out, &character, 2);
-    out[2] = t.id[2];   // variant
-    out[3] = t.id[6];   // series
+    memcpy(out, t.id, 3);   // character id (2, as on the tag), variant
+    out[3] = t.id[6];       // series
+    const uint16_t model = (uint16_t)(t.id[4] << 8 | t.id[5]);
     memcpy(out + 4, &model, 2);
-    out[6] = t.id[3];   // figure type
+    out[6] = t.id[3];       // figure type
 }

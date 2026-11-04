@@ -54,6 +54,7 @@ typedef struct {
     bool sep_ds_layouts;  // Vulkan 1.2 separateDepthStencilLayouts enabled (textures.c: S8_UINT substitute)
     bool sampler_aniso, mirror_clamp;  // samplerAnisotropy / samplerMirrorClampToEdge enabled (textures.c samplers fall back)
     bool mem_budget;  // VK_EXT_memory_budget enabled: per-heap budget / usage readable (device.c [vram], residency)
+    bool mem_priority, pageable;  // VK_EXT_memory_priority / pageable_device_local_memory enabled (shim_vma.c priorities)
     bool checkpoints;  // VK_NV_device_diagnostic_checkpoints: exec.c marks every GPU operation (hang reports)
     bool amd_marker;   // VK_AMD_buffer_marker: the same marks as top / bottom-of-pipe writes into a host buffer (exec.c)
     bool draw_marks;   // either of them on every draw too (LARECOMP_CHECKPOINTS=draw, or the last start lost this GPU: device.c)
@@ -73,11 +74,16 @@ extern VkG g_vk;
 VkCommandBuffer vk_cmd(void);         // current command buffer (outside any rendering unless exec.c began one)
 VkCommandBuffer vk_upload_cmd(void);  // upload command buffer of the pending submission
 uint64_t vk_pending_seq(void);        // number the pending submission will get
+// textures.c: vmaCreateImage, and on out of device memory once the pool's relief and a second try (LARECOMP_OOM_RELIEF);
+// render thread only. `what` (printf) names the image in the log line.
+VkResult vk_image_create_relieved(const VkImageCreateInfo *ci, const VmaAllocationCreateInfo *ai, VkImage *img, VmaAllocation *mem,
+                                  const char *what, ...) __attribute__((format(printf, 5, 6)));
 uint64_t vk_completed_seq(void);
 void vk_wait_seq_at(uint64_t seq, const char *file, int line);   // (stats: GPU wait time per call site, "| waits")
 #define vk_wait_seq(seq) vk_wait_seq_at((seq), __FILE__, __LINE__)
 void vk_full_barrier(VkCommandBuffer cb);
 void vk_end_pass(void);
+bool vk_pass_open(void);   // (exec.c: a render pass is being recorded)
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra);  // submit + one more cb (present)
 
 // Transient GPU-visible memory that lives until the submission it was allocated for completes.
@@ -252,6 +258,8 @@ void vk_ngx_prepare(VkCommandBuffer cb, const TexBackend *b);   // backend_prese
 #define VK_NGX_FG_FSR 16   // vk_ngx_request: frame generation through FSR 3.1 (x2)
 float vk_ngx_scene_scale(float out_scale);   // totk_hooks.c output_scale: DLAA's render scale (0: the row's)
 void vk_ngx_request(int sr, int fg);   // the live rows (pc_dlss.cpp): SR 0 off / 1 DLSS / 2 FSR / 3 DLAA, FG 0 / DLSS generated frames / VK_NGX_FG_FSR (-1: unchanged)
+void vk_ngx_set_preset(const char *name);   // graphics.dlss_preset: "" NVIDIA's default, "k" / "j" presets K / J
+void vk_ngx_set_trails(int pct);       // graphics.dlss_trails: the bias-current-colour mask's strength, 0..100
 bool vk_ngx_sr_fxaa_bypass(VkCommandBuffer cb, TexBackend *src, TexBackend *dst);   // exec.c: the game's FXAA draw while SR runs
 void vk_ngx_fg_keep_hudless(VkCommandBuffer cb, TexBackend *out, uint64_t frame);   // the canvas right after the scene
                                                                                   // went in (outside a render pass)
@@ -272,7 +280,12 @@ void vk_present_skipped(uint64_t frame);                     // a frame not show
 bool vk_present_queue_wanted(void);                          // TOTK_FG_PRESENT_THREAD=1 (device.c: a second queue for it)
 void vk_present_queue_init(VkQueue q, bool shared);          // FG present thread (present.c) on this queue (NULL: none;
                                                              // shared: g_vk.queue itself, 'Maximum fps' only)
-void vk_queue_lock(void);                                    // g_vk.queue's host access while the FG present thread shares it
+bool vk_gpu_safe(void);                                      // safe GPU mode after repeated driver crashes (device.c)
+bool vk_gpu_safe_noopt(void);                                // and its second stage: the driver's optimizer off
+// The engine's own fixed pipelines, inside the shader quarantine's scope (exec.c; optimizer off after a driver crash)
+VkResult vk_engine_graphics_pipeline(const char *name, VkPipelineCache cache, VkGraphicsPipelineCreateInfo *pi, VkPipeline *out);
+VkResult vk_engine_compute_pipeline(const char *name, VkComputePipelineCreateInfo *ci, VkPipeline *out);
+void vk_queue_lock(void);                                  // g_vk.queue's host access while the FG present thread shares it
 void vk_queue_unlock(void);                                  // (device.c; no-op otherwise)
 bool vk_present_queue_on(void);                              // DLSS-G on and the thread there: presents go through it
 bool vk_fg_max(void);                                        // FG 'Maximum fps' (TOTK_FG_PACE=max, the F10 row; device.c)

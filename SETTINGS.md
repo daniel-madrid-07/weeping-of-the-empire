@@ -41,6 +41,8 @@ Your settings are kept in `%APPDATA%\nxrecomp\TotK-engine\settings.ini` and surv
 - **Upscaler**: Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR: any GPU. All cost some GPU; Off is the game's own.
 - **Frame generation**: Generated frames between the real ones make motion look smoother, but the game itself does not run faster and input latency rises a little. DLSS x2: RTX 40 and newer, x3 and x4: RTX 50; FSR x2: any GPU. Best when the game already runs well.
 - **Frame generation mode**: Smooth keeps the frames shown in step with the monitor's refresh. Maximum fps adds the generated frames to every real frame the PC makes, even past the refresh rate: more frames than the screen shows (the fps readout counts them all), for VRR panels or low latency; Smooth looks steadier on a fixed refresh. With V-sync off the picture can tear.
+- **DLSS model**: Which AI model DLSS and DLAA use. NVIDIA's default picks one for each quality. Preset K is the sharpest; preset J ghosts a little less behind moving things but flickers a little more. Changing it rebuilds DLSS once (a short pause).
+- **DLSS character trails**: Where something moved (Link, animals, a swung weapon), DLSS and DLAA can keep blending in older frames, which leaves faint trails, or trust the new frame, which removes them but can make those edges flicker a little. Fewest trails is the default.
 - **3D upscaler**: How the 3D scene is scaled up to the output: Bicubic (the port's) or FSR 1 (the game's own). Matters only below 100 % render resolution; either costs little.
 - **Scene upscaler**: The filter that scales the 3D scene when the render resolution is not 100 %: Catmull-Rom, or FSR 1 EASU (sharper edges). Either costs little.
 - **Window upscaler**: How the finished picture is scaled to the window: Bilinear, or FSR 1 for a window above 1080p (sharper). Costs little.
@@ -69,7 +71,7 @@ Your settings are kept in `%APPDATA%\nxrecomp\TotK-engine\settings.ini` and surv
 
 ## Graphics > Game patches
 
-- **Aspect ratio**: The window's (the default): on a 16:10, 21:9, 32:9 or 48:9 window or monitor the picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9: that shape whatever the window. A new shape's layouts are made at its first start (about 30 s, once). A wider picture costs more GPU. The window's is the default from v0.1.9; a saved 16:9 switches to it once (pick 16:9 again to keep it). If you move or resize the window to another shape, the game tells you to restart for it (F10 > Restart the game now).
+- **Aspect ratio**: The window's (the default): on a 3:2, 16:10, 21:9, 32:9 or 48:9 window or monitor the picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9 / 3:2: that shape whatever the window. A new shape's layouts are made at its first start (about 30 s, once). A wider picture costs more GPU. The window's is the default from v0.1.9; a saved 16:9 switches to it once (pick 16:9 again to keep it). If you move or resize the window to another shape, the game tells you to restart for it (F10 > Restart the game now).
 - **HUD position (21:9, 32:9, 48:9)**: On 21:9, 32:9 or 48:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a very wide screen). Nothing changes at 16:9. Automatic (the default): the middle on 48:9, the edges otherwise.
 - **Cutscenes (21:9, 32:9, 48:9)**: On 21:9, 32:9 or 48:9: real-time cutscenes wide like the rest of the game, or the original 16:9 with bars at the sides.
 - **Field of view**: Widens or narrows the camera's view (1 = the game's). Wider shows more of the world and costs some GPU and CPU.
@@ -77,7 +79,7 @@ Your settings are kept in `%APPDATA%\nxrecomp\TotK-engine\settings.ini` and surv
 - **Grass density**: More grass, flowers and pebbles. Higher looks fuller and costs GPU and CPU.
 - **Shadow resolution**: Sharper shadows: 2 doubles the shadow map's width and height, for 4x its memory and more GPU.
 - **Sun shadow map size**: Fixed keeps the sun's shadow map at its largest size: steadier, sharper leaf shadows for some GPU. The game's changes its size with the view.
-- **Near shadow reach**: Moves the lines where the sun's sharp near shadows hand over to coarser ones further away (1 = the game's, 2 = twice as far). Near shadows get a little softer: raise Shadow resolution with it. Costs a little GPU and CPU.
+- **Near shadow reach**: Moves the lines where the sun's sharp near shadows hand over to coarser ones further away (1 = the game's, 2 = twice as far). Near shadows get a little softer: raise Shadow resolution with it. Costs a little GPU and CPU. With Shadow distance above 1 the two multiplied stay at 4 at most, so at Shadow distance 4 this does nothing.
 - **Shadow distance**: How far the sharp shadows reach. Higher looks better in the distance and costs GPU.
 - **Fog distance**: Pushes the distance fog back: clearer far mountains. Higher shows more and costs some GPU.
 - **Detail distance**: How far models keep their full detail. Higher looks better in the distance and costs GPU and CPU.
@@ -120,7 +122,7 @@ Your settings are kept in `%APPDATA%\nxrecomp\TotK-engine\settings.ini` and surv
 - **Minimum movement key press**: How long a quick tap of W, A, S or D keeps Link moving, so he takes a step instead of sliding. 0 = off.
 - **Sprint toggle**: One press of the sprint key starts sprinting and the next stops it. Off: hold it, as on the Switch.
 - **Shield and target toggle**: One press of the shield / target key raises the shield and targets, the next lowers it. Off: hold it, as on the Switch.
-- **Ultrahand rotation step**: How much mouse movement turns an object one 45° step while R is held in Ultrahand or Autobuild. Lower turns sooner.
+- **Ultrahand rotation speed**: How fast moving the mouse sideways turns an object while R is held in Ultrahand or Autobuild (1x: as far as the camera turns). The wheel turns it vertically; moving the mouse up or down does not turn it.
 - **Face buttons**: A non-Nintendo pad's face buttons: by position (the Switch layout: the right button confirms) or by label (Xbox A confirms).
 - **Rumble strength**: Controller vibration: off, normal, or stronger (x2 to x4).
 - **Rumble curve**: How light rumbles feel next to strong ones: below 1 light ones come through stronger, above 1 only strong ones do. 1 = the game's own.
@@ -143,6 +145,6 @@ Your settings are kept in `%APPDATA%\nxrecomp\TotK-engine\settings.ini` and surv
 - **Crash reports**: After a crash, a report and a minidump are written to attach to a bug report. Nothing is sent anywhere.
 - **Automatic updates**: Checks GitHub for a newer version when the game starts (at most once a day); asks first if the update rebuilds the game.
 - **Safe mode (if the game crashes)**: For a game that crashes or hangs: the renderer without its faster paths, DLSS, FSR and frame generation, and without the driver paths some GPUs crash in. Slower. At the next start.
-- **Discord status**: Shows "Playing" and the time played on your Discord profile while Discord runs. Nothing else is sent.
+- **Discord status**: Shows "Playing", the time played and a "Join the community" button (the game's subreddit) on your Discord profile while Discord runs. Nothing else is sent.
 
 Rows not listed here (a few newer controller rows, the advanced ones) show their own help in F10.

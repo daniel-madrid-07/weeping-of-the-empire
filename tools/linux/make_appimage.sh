@@ -98,5 +98,6 @@ unset SOURCE_DATE_EPOCH
 # (no FUSE in a build root: appimagetool runs extracted; the runtime from the pinned file, not fetched by the tool)
 ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$DL/appimagetool" --no-appstream --runtime-file "$DL/runtime-x86_64-20251108" \
     "$APP" "$OUT/$NAME"
-sha256sum "$OUT/$NAME" | tee "$OUT/$NAME.sha256"
+# (the bare file name: a player checks the download with 'sha256sum -c <name>.sha256' in their own folder)
+(cd "$OUT" && sha256sum "$NAME") | tee "$OUT/$NAME.sha256"
 du -h "$OUT/$NAME"

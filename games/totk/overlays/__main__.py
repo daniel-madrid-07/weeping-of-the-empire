@@ -17,13 +17,14 @@ from pathlib import Path
 from . import (FAST_TRAVEL, SCENE_W, SCENE_H, RomFS, Zstd, build_base, build_fast_travel, build_fog, build_grass,
                build_output, build_shadow, build_skip_opening, parse_size)
 
-# 1440p and 4K 16:9; the ultrawide (21:9, 32:9, 48:9) and 16:10 canvases the aspect sets lay the UI out for, and 1920x1200, the
-# canvas graphics.aspect_ratio = 16:10 draws (games/totk/engine/totk_engine.c wide_canvas; its layouts are 2560x1600's).
-DEFAULT_OUTPUTS = '2560x1440,3840x2160,3440x1440,5120x1440,7680x1440,2560x1600,1920x1200'
-DEFAULT_ASPECTS = '3440x1440,5120x1440,7680x1440,2560x1600'
-# Render sizes for the output-<w>x<h>-scene-<w>x<h> sets; each output also gets a scene of its own size. 1600x1000:
-# the 16:10 canvas's scene.
-DEFAULT_SCENES = '1920x1080,2560x1440,3840x2160,1600x1000'
+# 1440p and 4K 16:9; the ultrawide (21:9, 32:9, 48:9), 16:10 and 3:2 canvases the aspect sets lay the UI out for, and
+# 1920x1200 / 1920x1280, the canvases graphics.aspect_ratio = 16:10 / 3:2 draw (games/totk/engine/totk_engine.c
+# wide_canvas; their layouts are 2560x1600's / 2160x1440's).
+DEFAULT_OUTPUTS = '2560x1440,3840x2160,3440x1440,5120x1440,7680x1440,2560x1600,1920x1200,1920x1280'
+DEFAULT_ASPECTS = '3440x1440,5120x1440,7680x1440,2560x1600,2160x1440'
+# Render sizes for the output-<w>x<h>-scene-<w>x<h> sets; each output also gets a scene of its own size. 1600x1000 /
+# 1620x1080: the 16:10 / 3:2 canvases' scenes.
+DEFAULT_SCENES = '1920x1080,2560x1440,3840x2160,1600x1000,1620x1080'
 
 
 def scene_pairs(outputs, scenes):

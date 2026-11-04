@@ -13,7 +13,7 @@
 #include <string.h>
 
 #include "preplay.h"
-#include "text_pt.h"
+#include "text_tr.h"
 
 /* ---- settings.ini */
 
@@ -152,7 +152,7 @@ static const Choice C_SHADER_WAIT[] = {
 
 static const Choice C_SAFE[] = {
     {"0", L"Off", L"Desactivado"},
-    {"1", L"On: slower, for a game that crashes or hangs", L"Activado: más lento, para un juego que se cierra o se cuelga"}, {0}};
+    {"1", L"On: slower, for a game that crashes or hangs", L"Activado: más lento, si el juego se cierra o se cuelga"}, {0}};
 
 static const Row ROWS[] = {
     {"display.window_mode", "borderless", "Window", L"Window", L"Ventana", C_WINDOW},
@@ -174,7 +174,7 @@ static struct {
     int es;   /* the texts: 0 English, 1 Spanish, 2 Brazilian Portuguese */
     char cur[NROWS][64];   /* each row's value in the file now (its default when absent) */
 } g_pp;
-#define PP(es_, en_) (g_pp.es == 1 ? (es_) : g_pp.es == 2 ? pt_of(en_) : (en_))   /* (2: text_pt.h) */
+#define PP(es_, en_) (g_pp.es == TR_ES ? (es_) : tr_of(g_pp.es, en_))   /* (TR_PT ...: text_tr.h) */
 
 static WORD *align4(WORD *p) { return (WORD *)(((ULONG_PTR)p + 3) & ~(ULONG_PTR)3); }
 static WORD *put_str(WORD *p, const wchar_t *s) {

@@ -760,16 +760,21 @@ static void texture_finalize_locked(void *arg) {
         g_zombies++;
         g_zombie_bytes += tegra_total_size(&t->layout);
         // The first 10, then one a minute (TotK finalizes 1,800-6,200 of these a second in play: one in 1,000 was 6 lines
-        // a second, a third of a 3-h log), and whenever the kept total doubles past 64 MB (VRAM watch)
+        // a second, a third of a 3-h log), and whenever the kept count doubles past 64. Kept objects are bounded by the
+        // pool slots naming them. The storage sum is the game's pool memory those dead objects described, reused and
+        // counted once per object, none of it held: it used to be the trigger and read like a runaway ("12026 kept, 65536
+        // MB", the 32:9 log, 2026-11-03).
         static int nlog;
-        static uint64_t next_mb = 64, next_ns;
-        bool big = g_zombie_bytes >= next_mb << 20;
-        if (big) next_mb *= 2;
+        static int next_n = 64;
+        static uint64_t next_ns;
+        bool big = g_zombies >= next_n;
+        if (big) next_n *= 2;
         const uint64_t now = plat_now_ns();
         if (nlog < 10 || now >= next_ns || big) {
             nlog += nlog < 10;
             next_ns = now + 60000000000ull;
-            LOG("[nvn] texture %p %ux%u f%#x addr %llx%s finalized while %d pool slots name it: object kept (%d kept, %.1f MB of storage)\n",
+            LOG("[nvn] texture %p %ux%u f%#x addr %llx%s finalized while %d pool slots name it: object kept (%d kept, host objects "
+                "only, their images freed; the guest storage they named: %.1f MB, not held)\n",
                 (void *)t, t->width, t->height, t->format, (unsigned long long)t->addr, t->zombie_gpu ? " (rendered)" : "", t->pool_refs,
                 g_zombies, g_zombie_bytes / 1048576.0);
         }

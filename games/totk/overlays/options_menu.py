@@ -56,7 +56,13 @@ ENTRIES = [
                   'de': 'Fenster, randlos oder exklusiv Vollbild.\nF11 / Alt+Enter: Fenster und zurück (PC).',
                   'it': 'Finestra, schermo intero senza bordi o\nesclusivo. F11 o Alt+Invio: finestra e\nritorno (PC).',
                   'pt': 'Janela, tela cheia sem bordas ou exclusiva.\n'
-                        'F11 ou Alt+Enter: modo janela e voltar (PC).'},
+                        'F11 ou Alt+Enter: modo janela e voltar (PC).',
+                  'ru': 'Окно, без рамки или полный экран.\n'
+                        'F11, Alt+Enter: в окно и назад (ПК).',
+                  'zhs': '窗口、无边框或独占全屏。\n'
+                         'F11/Alt+Enter：切换窗口（PC）',
+                  'zht': '視窗、無邊框或獨佔全螢幕。\n'
+                         'F11/Alt+Enter：切換（PC）'},
          choices=[{'en': 'Windowed', 'es': 'En ventana', 'fr': 'Fenêtré', 'de': 'Fenster', 'it': 'Finestra',
                    'nl': 'Venster', 'ru': 'В окне', 'ja': 'ウィンドウ', 'ko': '창', 'zhs': '窗口', 'zht': '視窗',
                    'pt': 'Em janela'},
@@ -81,7 +87,14 @@ ENTRIES = [
                   'it': 'La dimensione della finestra in modalità\nfinestra (PC). Senza bordi ed esclusivo\n'
                         'riempiono il monitor.',
                   'pt': 'O tamanho da janela no modo janela (PC).\n'
-                        'Sem bordas e exclusiva ocupam o monitor.'},
+                        'Sem bordas e exclusiva ocupam o monitor.',
+                  'ru': 'Размер окна в оконном режиме (ПК).\n'
+                        'Без рамки и полный экран занимают\n'
+                        'весь монитор.',
+                  'zhs': '窗口模式下的窗口大小（PC）。\n'
+                         '无边框和独占全屏占满显示器。',
+                  'zht': '視窗模式下的視窗大小（PC）。\n'
+                         '無邊框和獨佔全螢幕會佔滿螢幕。'},
          choices=[{'en': '1280 x 720 (default)', 'es': '1280 x 720 (por defecto)', 'fr': '1280 x 720 (par défaut)',
                    'de': '1280 x 720 (Standard)', 'it': '1280 x 720 (predefinita)', 'nl': '1280 x 720 (standaard)',
                    'ru': '1280 x 720 (по умолчанию)', 'ja': '1280 x 720 (標準)', 'ko': '1280 x 720 (기본)',
@@ -95,7 +108,13 @@ ENTRIES = [
                   'de': 'Wohin Vollbild geht und wo das Fenster\nstartet. Merken: der zuletzt genutzte\nMonitor (PC).',
                   'it': "Dove va lo schermo intero e dove si apre la\nfinestra. Ricorda: l'ultimo usato (PC).",
                   'pt': 'Onde abre a tela cheia e o início em janela.\n'
-                        'Lembrar: o último usado (PC).'},
+                        'Lembrar: o último usado (PC).',
+                  'ru': 'Где открываются полный экран и окно.\n'
+                        '«Запомнить»: последний монитор (ПК).',
+                  'zhs': '全屏和窗口启动所在的显示器。\n'
+                         '记住：上次游玩的那台（PC）。',
+                  'zht': '全螢幕和視窗啟動所在的螢幕。\n'
+                         '記住：上次遊玩的那台（PC）。'},
          choices=[{'en': 'Remember', 'es': 'Recordar', 'fr': 'Mémoriser', 'de': 'Merken', 'it': 'Ricorda',
                    'nl': 'Onthouden', 'ru': 'Запомнить', 'ja': '記憶する', 'ko': '기억', 'zhs': '记住', 'zht': '記住',
                    'pt': 'Lembrar'}]),
@@ -113,7 +132,16 @@ ENTRIES = [
                   'it': "La modalità del monitor a schermo intero\nesclusivo. Senza bordi e finestra usano\n"
                         'quella del desktop (PC).',
                   'pt': 'O modo do monitor em tela cheia exclusiva.\n'
-                        'Sem bordas e em janela mantêm o do desktop (PC).'},
+                        'Sem bordas e em janela mantêm o do desktop (PC).',
+                  'ru': 'Режим монитора в полном экране.\n'
+                        'Без рамки и окно оставляют режим\n'
+                        'рабочего стола (ПК).',
+                  'zhs': '独占全屏时显示器的模式。\n'
+                         '无边框和窗口保持桌面的\n'
+                         '模式（PC）。',
+                  'zht': '獨佔全螢幕時螢幕的模式。\n'
+                         '無邊框和視窗保持桌面的\n'
+                         '模式（PC）。'},
          choices=[DESKTOPS]),
     dict(type=111, key='display.exclusive_refresh',
          label={'en': 'Refresh rate', 'es': 'Frecuencia de refresco', 'fr': 'Fréquence de rafraîchissement',
@@ -130,7 +158,13 @@ ENTRIES = [
                   'it': "La frequenza a schermo intero esclusivo; se\nla risoluzione non l'ha, la più vicina sotto\n"
                         '(PC).',
                   'pt': 'A taxa em tela cheia exclusiva; se a resolução\n'
-                        'não a tem, vale a mais próxima abaixo (PC).'},
+                        'não a tem, vale a mais próxima abaixo (PC).',
+                  'ru': 'Частота в полном экране; если её нет\n'
+                        'у разрешения — ближайшая ниже (ПК).',
+                  'zhs': '独占全屏的刷新率；该分辨率\n'
+                         '没有时用较低的最近值（PC）。',
+                  'zht': '獨佔全螢幕的更新率；該解析度\n'
+                         '沒有時用較低的最近值（PC）。'},
          choices=[DESKTOPS]),
     dict(type=50, key='display.fps_cap',
          label={'en': 'Frame rate limit', 'es': 'Límite de FPS', 'fr': "Limite d'images par seconde",
@@ -150,7 +184,14 @@ ENTRIES = [
                         '(PC). Più alta costa prestazioni. Effetto\n'
                         'immediato.',
                   'pt': 'A taxa de quadros máxima do jogo (PC).\n'
-                        'Mais alta custa desempenho. Efeito imediato.'},
+                        'Mais alta custa desempenho. Efeito imediato.',
+                  'ru': 'Предел частоты кадров игры (ПК).\n'
+                        'Выше — больше нагрузка.\n'
+                        'Действует сразу.',
+                  'zhs': '游戏运行的最高帧率（PC）。\n'
+                         '越高越耗性能。立即生效。',
+                  'zht': '遊戲執行的最高影格率（PC）。\n'
+                         '越高越耗效能。立即生效。'},
          choices=[{'en': '30'}, {'en': '40'}, {'en': '45'}, {'en': '60'}, {'en': '75'}, {'en': '90'}, {'en': '120'},
                   {'en': '144'}, {'en': '165'}, {'en': '180'}, {'en': '200'}, {'en': '240'},
                   {'en': 'Unlocked', 'es': 'Sin límite', 'fr': 'Illimitée', 'de': 'Unbegrenzt', 'it': 'Illimitato',
@@ -178,7 +219,16 @@ ENTRIES = [
                         'tempo fotogramma, 1% minimo e il peggiore.',
                   'pt': 'Quadros por segundo sobre o jogo (PC). F3\n'
                         'mostra ou oculta. Detalhado adiciona o tempo\n'
-                        'de quadro, o 1% mínimo e o pior quadro.'},
+                        'de quadro, o 1% mínimo e o pior quadro.',
+                  'ru': 'Кадры в секунду поверх игры (ПК).\n'
+                        'F3 — показать или скрыть. Подробно:\n'
+                        'время кадра, 1% мин., худший кадр.',
+                  'zhs': '在游戏上显示帧率（PC）。F3\n'
+                         '显示或隐藏。详细：另加帧时间、\n'
+                         '1% 低帧和最差帧。',
+                  'zht': '在遊戲上顯示影格率（PC）。F3\n'
+                         '顯示或隱藏。詳細：另加影格\n'
+                         '時間、1% 低影格和最差影格。'},
          choices=[OFF,
                   {'en': 'Minimal', 'es': 'Mínimo', 'fr': 'Minimal', 'de': 'Minimal', 'it': 'Minimo', 'nl': 'Minimaal',
                    'ru': 'Минимум', 'ja': 'シンプル', 'ko': '간단히', 'zhs': '简洁', 'zht': '簡潔', 'pt': 'Mínimo'},
@@ -197,7 +247,14 @@ ENTRIES = [
                   'it': "L'angolo del contatore FPS (PC). In alto a\ndestra non copre i cuori né la mappa.",
                   'pt': 'O canto em que fica o contador de FPS (PC).\n'
                         'Superior direito não cobre os corações nem\n'
-                        'o mapa.'},
+                        'o mapa.',
+                  'ru': 'Угол экрана для счётчика FPS (ПК).\n'
+                        'Справа сверху не закрывает сердца\n'
+                        'и карту.',
+                  'zhs': '帧率显示所在的角落（PC）。\n'
+                         '右上角不会挡住心和地图。',
+                  'zht': '影格率顯示所在的角落（PC）。\n'
+                         '右上角不會擋住愛心和地圖。'},
          choices=[{'en': 'Top right', 'es': 'Arriba a la derecha', 'fr': 'En haut à droite', 'de': 'Oben rechts',
                    'it': 'In alto a destra', 'nl': 'Rechtsboven', 'ru': 'Вверху справа', 'ja': '右上',
                    'ko': '오른쪽 위', 'zhs': '右上', 'zht': '右上', 'pt': 'Superior direito'},
@@ -221,7 +278,13 @@ ENTRIES = [
                   'de': 'Die Größe der FPS-Anzeige (PC). Sie wächst\nmit dem Fenster, von 1080p bis 4K.',
                   'it': 'La dimensione del contatore FPS (PC).\nCresce con la finestra, da 1080p a 4K.',
                   'pt': 'O tamanho do contador de FPS (PC). Ele cresce\n'
-                        'com a janela, de 1080p a 4K.'},
+                        'com a janela, de 1080p a 4K.',
+                  'ru': 'Размер счётчика FPS (ПК). Растёт\n'
+                        'вместе с окном, от 1080p до 4K.',
+                  'zhs': '帧率显示的大小（PC）。随窗口\n'
+                         '从 1080p 到 4K 变大。',
+                  'zht': '影格率顯示的大小（PC）。隨視窗\n'
+                         '從 1080p 到 4K 變大。'},
          choices=[{'en': 'Small', 'es': 'Pequeño', 'fr': 'Petit', 'de': 'Klein', 'it': 'Piccolo', 'nl': 'Klein',
                    'ru': 'Маленький', 'ja': '小', 'ko': '작게', 'zhs': '小', 'zht': '小', 'pt': 'Pequeno'},
                   {'en': 'Medium', 'es': 'Mediano', 'fr': 'Moyen', 'de': 'Mittel', 'it': 'Medio', 'nl': 'Middel',
@@ -250,7 +313,16 @@ ENTRIES = [
                         'prestazioni; in parte al prossimo avvio.',
                   'pt': 'Ajusta juntas a resolução de renderização,\n'
                         'as sombras e o detalhe (PC). Mais alta custa\n'
-                        'desempenho; parte vale ao reiniciar o jogo.'},
+                        'desempenho; parte vale ao reiniciar o jogo.',
+                  'ru': 'Задаёт разрешение рендера, тени и\n'
+                        'детализацию (ПК). Выше — больше\n'
+                        'нагрузка; часть — со след. запуска.',
+                  'zhs': '同时设置渲染分辨率、阴影和\n'
+                         '细节（PC）。越高越耗性能；\n'
+                         '部分在下次启动时生效。',
+                  'zht': '同時設定渲染解析度、陰影和\n'
+                         '細節（PC）。越高越耗效能；\n'
+                         '部分在下次啟動時生效。'},
          choices=[{'en': 'Low', 'es': 'Baja', 'fr': 'Basse', 'de': 'Niedrig', 'it': 'Bassa', 'nl': 'Laag',
                    'ru': 'Низкие', 'ja': '低', 'ko': '낮음', 'zhs': '低', 'zht': '低', 'pt': 'Baixa'},
                   {'en': 'Medium', 'es': 'Media', 'fr': 'Moyenne', 'de': 'Mittel', 'it': 'Media', 'nl': 'Gemiddeld',
@@ -284,7 +356,16 @@ ENTRIES = [
                         'prestazioni. Si applica subito.',
                   'pt': 'A resolução em que a cena 3D é desenhada, em\n'
                         'relação à do jogo (PC). Mais alta custa\n'
-                        'desempenho. Efeito imediato.'},
+                        'desempenho. Efeito imediato.',
+                  'ru': 'Разрешение, в котором рисуется\n'
+                        '3D-сцена, от родного для игры (ПК).\n'
+                        'Выше — больше нагрузка. Сразу.',
+                  'zhs': '3D 场景的绘制分辨率，相对于\n'
+                         '游戏原本的（PC）。越高越耗\n'
+                         '性能。立即生效。',
+                  'zht': '3D 場景的繪製解析度，相對於\n'
+                         '遊戲原本的（PC）。越高越耗\n'
+                         '效能。立即生效。'},
          choices=[{'en': '67 %'}, {'en': '80 %'}, {'en': '90 %'},
                   {'en': '100 % (native)', 'es': '100 % (nativa)', 'fr': '100 % (native)', 'de': '100 % (nativ)',
                    'it': '100 % (nativa)', 'nl': '100 % (native)', 'ru': '100 % (исходное)', 'ja': '100 %（ネイティブ）',
@@ -314,7 +395,16 @@ ENTRIES = [
                         'Costa GPU. Si applica subito.',
                   'pt': 'Upscaling temporal da cena 3D (PC).\n'
                         'DLSS: só NVIDIA RTX; FSR: qualquer GPU.\n'
-                        'Usa um pouco da GPU. Efeito imediato.'},
+                        'Usa um pouco da GPU. Efeito imediato.',
+                  'ru': 'Временное масштабирование 3D (ПК).\n'
+                        'DLSS: только NVIDIA RTX; FSR: любой\n'
+                        'GPU. Нагружает GPU. Действует сразу.',
+                  'zhs': '3D 场景的时间性放大（PC）。\n'
+                         'DLSS 仅限 NVIDIA RTX，FSR\n'
+                         '任意 GPU。耗一些 GPU，立即生效。',
+                  'zht': '3D 時間性放大（PC），耗一些 GPU。\n'
+                         'DLSS 僅限 NVIDIA RTX；\n'
+                         'FSR 任何 GPU。立即生效。'},
          choices=[OFF, {'en': 'DLSS (NVIDIA RTX)', 'es': 'DLSS (NVIDIA RTX)',
                         'pt': 'DLSS (NVIDIA RTX)'}, {'en': 'DLAA (NVIDIA RTX)', 'es': 'DLAA (NVIDIA RTX)',
                                                                                 'pt': 'DLAA (NVIDIA RTX)'},
@@ -342,7 +432,16 @@ ENTRIES = [
                         'RTX 50; FSR x2: ogni GPU.',
                   'pt': 'Quadros gerados entre os reais (PC); adiciona\n'
                         'um pouco de latência. DLSS x2: RTX 40+,\n'
-                        'x3/x4: RTX 50; FSR x2: qualquer GPU.'},
+                        'x3/x4: RTX 50; FSR x2: qualquer GPU.',
+                  'ru': 'Кадры между реальными (ПК); немного\n'
+                        'задержки ввода. DLSS x2: RTX 40+,\n'
+                        'x3/x4: RTX 50; FSR x2: любой GPU.',
+                  'zhs': '在真实帧之间生成帧（PC），略增\n'
+                         '输入延迟。DLSS x2：RTX 40+；\n'
+                         'x3/x4：RTX 50；FSR x2：任意',
+                  'zht': '在真實影格間產生影格（PC）；略增\n'
+                         '輸入延遲。DLSS x2：RTX 40+；\n'
+                         'x3/x4 需 RTX 50；FSR 任何'},
          choices=[OFF, {'en': 'DLSS x2', 'es': 'DLSS x2', 'pt': 'DLSS x2'},
                   {'en': 'DLSS x3', 'es': 'DLSS x3', 'pt': 'DLSS x3'},
                   {'en': 'DLSS x4', 'es': 'DLSS x4', 'pt': 'DLSS x4'},
@@ -368,7 +467,16 @@ ENTRIES = [
                         'le proporzioni.',
                   'pt': 'Mais amplo mostra mais do mundo na tela (PC) e\n'
                         'custa um pouco de desempenho. A mira e as\n'
-                        'cinemáticas mantêm a proporção.'},
+                        'cinemáticas mantêm a proporção.',
+                  'ru': 'Шире — больше мира на экране (ПК),\n'
+                        'больше нагрузка. Прицел и ролики\n'
+                        'сохраняют пропорции.',
+                  'zhs': '越宽屏幕上的世界越多（PC），\n'
+                         '略耗性能。瞄准和过场动画\n'
+                         '保持原比例。',
+                  'zht': '越寬畫面上的世界越多（PC），\n'
+                         '略耗效能。瞄準和過場動畫\n'
+                         '保持原比例。'},
          choices=[{'en': f'{v:.2f}x' + (' (Normal)' if v == 1 else ''),
                    **{k: f'{v:.2f}x'.replace('.', ',') + (f' ({n})' if v == 1 else '')
                       for k, n in (('es', 'Normal'), ('fr', 'Normal'), ('de', 'Normal'), ('it', 'Normale'),
@@ -380,51 +488,70 @@ ENTRIES = [
          label={'en': 'Aspect ratio', 'es': 'Relación de aspecto', 'fr': "Format d'image", 'de': 'Seitenverhältnis',
                 'it': 'Proporzioni', 'nl': 'Beeldverhouding', 'ru': 'Соотношение сторон', 'ja': 'アスペクト比',
                 'ko': '화면 비율', 'zhs': '宽高比', 'zht': '長寬比', 'pt': 'Proporção de tela'},
-         caption={'en': 'On a 16:10, 21:9 or 32:9 screen the game\n'
-                        'fills it, HUD placed for it (PC). Wider\n'
+         caption={'en': 'On a 3:2, 16:10, 21:9, 32:9 or 48:9 screen the\n'
+                        'game fills it, HUD placed for it (PC). Wider\n'
                         'costs performance. Applies at next start.',
-                  'es': 'En pantallas 16:10, 21:9 o 32:9 el juego\n'
-                        'la llena, HUD adaptado (PC). Más ancha\n'
-                        'cuesta rendimiento. Al reiniciar el juego.',
-                  'fr': 'Sur un écran 16:10, 21:9 ou 32:9, le jeu\n'
-                        'le remplit, HUD adapté (PC). Plus large\n'
-                        'coûte en performances. Au redémarrage.',
-                  'de': 'Füllt 16:10-, 21:9- und 32:9-Bildschirme,\n'
-                        'HUD angepasst (PC). Breiter kostet\n'
-                        'Leistung. Gilt ab dem nächsten Start.',
-                  'it': 'Su schermi 16:10, 21:9 o 32:9 il gioco li\n'
-                        'riempie, HUD adattato (PC). Più largo\n'
-                        'costa prestazioni. Al prossimo avvio.',
-                  'pt': 'Em telas 16:10, 21:9 ou 32:9 o jogo ocupa toda\n'
-                        'a tela, com HUD adaptado (PC). Mais larga custa\n'
-                        'desempenho. Vale ao reiniciar o jogo.'},
+                  'es': 'En pantallas 3:2, 16:10, 21:9, 32:9 o 48:9 el\n'
+                        'juego la llena, HUD adaptado (PC). Más\n'
+                        'ancha cuesta rendimiento. Al reiniciar el juego.',
+                  'fr': 'Sur un écran 3:2, 16:10, 21:9, 32:9 ou 48:9,\n'
+                        'le jeu le remplit, HUD adapté (PC). Plus\n'
+                        'large coûte en performances. Au redémarrage.',
+                  'de': 'Füllt 3:2-, 16:10-, 21:9-, 32:9-, 48:9-\n'
+                        'Bildschirme, HUD angepasst (PC). Breiter\n'
+                        'kostet Leistung. Ab dem nächsten Start.',
+                  'it': 'Su schermi 3:2, 16:10, 21:9, 32:9 o 48:9 il\n'
+                        'gioco li riempie, HUD adattato (PC). Più\n'
+                        'largo costa prestazioni. Al prossimo avvio.',
+                  'pt': 'Em telas 3:2, 16:10, 21:9, 32:9 ou 48:9 o\n'
+                        'jogo ocupa toda a tela, com HUD adaptado (PC).\n'
+                        'Mais larga custa desempenho. Vale ao reiniciar.',
+                  'ru': '3:2, 16:10, 21:9, 32:9 и 48:9: игра\n'
+                        'заполняет экран, HUD под него (ПК).\n'
+                        'Шире — тяжелее. Со след. запуска.',
+                  'zhs': '3:2、16:10、21:9、32:9、\n'
+                         '48:9：铺满屏幕，HUD随之布局（PC）。\n'
+                         '越宽越耗性能。下次启动生效。',
+                  'zht': '3:2、16:10、21:9、32:9、\n'
+                         '48:9：填滿畫面，HUD隨之配置（PC）\n'
+                         '越寬越耗效能。下次啟動生效。'},
          choices=[{'en': '16:9'},
                   {'en': "Window's shape", 'es': 'Forma de la ventana', 'fr': 'Forme de la fenêtre',
                    'de': 'Fensterform', 'it': 'Forma della finestra', 'nl': 'Vorm van het venster', 'ru': 'Форма окна',
                    'ja': 'ウィンドウの形', 'ko': '창 모양', 'zhs': '窗口形状', 'zht': '視窗形狀', 'pt': 'Formato da janela'},
-                  {'en': '16:10'}, {'en': '21:9'}, {'en': '32:9'}, {'en': '48:9'}]),
+                  {'en': '16:10'}, {'en': '21:9'}, {'en': '32:9'}, {'en': '48:9'},
+                  {'en': '3:2'}]),   # (last: kWide's order, totk_engine.c k_wide_values)
     dict(type=128, key='graphics.hud_layout',   # the ultrawide HUD at the edges or in the middle 16:9 (totk_engine.c)
          label={'en': 'HUD position', 'es': 'Posición del HUD', 'fr': 'Position du HUD', 'de': 'HUD-Position',
                 'it': 'Posizione HUD', 'nl': 'HUD-positie', 'ru': 'Положение HUD', 'ja': 'HUDの位置', 'ko': 'HUD 위치',
                 'zhs': 'HUD 位置', 'zht': 'HUD 位置', 'pt': 'Posição do HUD'},
-         caption={'en': 'On a 21:9 or 32:9 screen: the HUD at the\n'
-                        'edges, or in the middle 16:9 (PC).\n'
-                        'Applies at the next start.',
-                  'es': 'En una pantalla 21:9 o 32:9: el HUD en los\n'
-                        'bordes o en el centro 16:9 (PC).\n'
-                        'Se aplica al reiniciar el juego.',
-                  'fr': 'Sur un écran 21:9 ou 32:9 : le HUD sur les\n'
-                        'bords ou au centre 16:9 (PC).\n'
-                        'Au prochain démarrage du jeu.',
-                  'de': 'Bei 21:9 und 32:9: HUD an den Rändern\n'
-                        'oder in der 16:9-Mitte (PC).\n'
-                        'Gilt ab dem nächsten Spielstart.',
-                  'it': 'Su uno schermo 21:9 o 32:9: HUD ai bordi\n'
-                        'o al centro 16:9 (PC).\n'
-                        'Al prossimo avvio del gioco.',
-                  'pt': 'Em telas 21:9 ou 32:9: o HUD nas bordas ou\n'
-                        'no centro 16:9 (PC).\n'
-                        'Vale ao reiniciar o jogo.'},
+         caption={'en': 'On 21:9, 32:9 or 48:9: the HUD at the edges\n'
+                        'or in the middle 16:9 (PC). Automatic: the\n'
+                        'middle on 48:9. Applies at the next start.',
+                  'es': 'En 21:9, 32:9 o 48:9: el HUD en los bordes o\n'
+                        'en el centro 16:9 (PC). Automático: centro\n'
+                        'en 48:9. Se aplica al reiniciar el juego.',
+                  'fr': 'En 21:9, 32:9 ou 48:9 : le HUD sur les bords\n'
+                        'ou au centre 16:9 (PC). Automatique : centre\n'
+                        'en 48:9. Au prochain démarrage du jeu.',
+                  'de': 'Bei 21:9, 32:9, 48:9: HUD an den Rändern\n'
+                        'oder in der 16:9-Mitte (PC). Automatisch:\n'
+                        'Mitte bei 48:9. Ab dem nächsten Start.',
+                  'it': 'Su 21:9, 32:9 o 48:9: HUD ai bordi o al\n'
+                        'centro 16:9 (PC). Automatico: centro su\n'
+                        '48:9. Al prossimo avvio del gioco.',
+                  'pt': 'Em telas 21:9, 32:9 ou 48:9: o HUD nas\n'
+                        'bordas ou no centro 16:9 (PC). Automático:\n'
+                        'centro em 48:9. Vale ao reiniciar o jogo.',
+                  'ru': 'На 21:9, 32:9 или 48:9: HUD по краям\n'
+                        'или в центре 16:9 (ПК). По умолчанию\n'
+                        'центр на 48:9. Со след. запуска.',
+                  'zhs': '21:9、32:9、48:9：HUD 在边缘\n'
+                         '或中间 16:9（PC）。自动：48:9\n'
+                         '时在中间。下次启动生效。',
+                  'zht': '21:9、32:9、48:9：HUD 靠邊\n'
+                         '或中間 16:9（PC）。自動：48:9\n'
+                         '時在中間。下次啟動生效。'},
          choices=[{'en': 'Automatic', 'es': 'Automático', 'fr': 'Automatique', 'de': 'Automatisch',
                    'it': 'Automatico', 'nl': 'Automatisch', 'ru': 'Автоматически', 'ja': '自動', 'ko': '자동',
                    'zhs': '自动', 'zht': '自動', 'pt': 'Automático'},
@@ -438,24 +565,33 @@ ENTRIES = [
          label={'en': 'Cutscenes', 'es': 'Cinemáticas', 'fr': 'Cinématiques', 'de': 'Zwischensequenzen',
                 'it': 'Filmati', 'nl': 'Tussenfilmpjes', 'ru': 'Ролики', 'ja': 'カットシーン', 'ko': '컷신',
                 'zhs': '过场动画', 'zht': '過場動畫', 'pt': 'Cinemáticas'},
-         caption={'en': 'On a 21:9 or 32:9 screen: cutscenes wide,\n'
-                        'or the original 16:9 framing with bars\n'
-                        '(PC). Videos are always 16:9.',
-                  'es': 'En una pantalla 21:9 o 32:9: cinemáticas\n'
+         caption={'en': 'On a 21:9, 32:9 or 48:9 screen: cutscenes\n'
+                        'wide, or the original 16:9 framing with\n'
+                        'bars (PC). Videos are always 16:9.',
+                  'es': 'En una pantalla 21:9, 32:9 o 48:9: cinemáticas\n'
                         'panorámicas o con el encuadre 16:9 original\n'
                         'y bandas (PC). Los vídeos siempre son 16:9.',
-                  'fr': 'Sur un écran 21:9 ou 32:9 : cinématiques\n'
-                        "larges, ou cadrage 16:9 d'origine avec\n"
-                        'bandes (PC). Les vidéos restent en 16:9.',
-                  'de': 'Bei 21:9 und 32:9: Sequenzen breit oder\n'
-                        'im originalen 16:9 mit Balken (PC).\n'
+                  'fr': 'En 21:9, 32:9 ou 48:9 : cinématiques larges,\n'
+                        "ou cadrage 16:9 d'origine avec bandes\n"
+                        '(PC). Les vidéos restent en 16:9.',
+                  'de': 'Bei 21:9, 32:9, 48:9: Sequenzen breit\n'
+                        'oder im originalen 16:9 mit Balken (PC).\n'
                         'Videos sind immer 16:9.',
-                  'it': 'Su uno schermo 21:9 o 32:9: filmati larghi\n'
-                        "o l'inquadratura 16:9 originale con bande\n"
+                  'it': 'Su 21:9, 32:9 o 48:9: filmati larghi o\n'
+                        "l'inquadratura 16:9 originale con bande\n"
                         '(PC). I video sono sempre 16:9.',
-                  'pt': 'Em telas 21:9 ou 32:9: cinemáticas amplas ou\n'
-                        'o enquadramento 16:9 original com barras\n'
-                        '(PC). Os vídeos são sempre 16:9.'},
+                  'pt': 'Em telas 21:9, 32:9 ou 48:9: cinemáticas\n'
+                        'amplas ou o enquadramento 16:9 original\n'
+                        'com barras (PC). Os vídeos são sempre 16:9.',
+                  'ru': 'На 21:9, 32:9 или 48:9: ролики\n'
+                        'широко или в исходном 16:9 с\n'
+                        'полосами (ПК). Видео всегда 16:9.',
+                  'zhs': '21:9、32:9、48:9：过场动画宽屏，\n'
+                         '或原本的 16:9 加黑边（PC）。\n'
+                         '视频总是 16:9。',
+                  'zht': '21:9、32:9、48:9：過場動畫\n'
+                         '寬螢幕，或原本的 16:9 加黑邊\n'
+                         '（PC）。影片總是 16:9。'},
          choices=[{'en': 'Wide', 'es': 'Panorámicas', 'fr': 'Larges', 'de': 'Breit', 'it': 'Larghi', 'nl': 'Breed',
                    'ru': 'Широкие', 'ja': 'ワイド', 'ko': '와이드', 'zhs': '宽屏', 'zht': '寬螢幕', 'pt': 'Amplas'},
                   {'en': '16:9'}]),
@@ -482,7 +618,16 @@ ENTRIES = [
                         '(PC). Si applica subito.',
                   'pt': 'Acima de 1080p, menus, textos e HUD são\n'
                         'desenhados na resolução da tela, mais\n'
-                        'nítidos (PC). Efeito imediato.'},
+                        'nítidos (PC). Efeito imediato.',
+                  'ru': 'Выше 1080p меню, текст и HUD\n'
+                        'рисуются в разрешении экрана, чётче\n'
+                        '(ПК). Действует сразу.',
+                  'zhs': '高于 1080p 时，菜单、文字和\n'
+                         'HUD 按屏幕分辨率绘制，更清晰\n'
+                         '（PC）。立即生效。',
+                  'zht': '高於 1080p 時，選單、文字和\n'
+                         'HUD 依螢幕解析度繪製，更清晰\n'
+                         '（PC）。立即生效。'},
          choices=[OFF, ON]),   # "" (the default since 2026-11-03, public #62) = off, "1" = on
     dict(type=53, key='controls.mouse_sensitivity',
          label={'en': 'Mouse sensitivity', 'es': 'Sensibilidad del ratón', 'fr': 'Sensibilité de la souris',
@@ -495,7 +640,13 @@ ENTRIES = [
                   'de': 'Wie schnell die Maus die Kamera dreht\nund zielt (PC).',
                   'it': 'La velocità con cui il mouse ruota la\ntelecamera e mira (PC).',
                   'pt': 'Quão rápido o mouse gira a câmera\n'
-                        'e mira (PC).'},
+                        'e mira (PC).',
+                  'ru': 'Как быстро мышь поворачивает камеру\n'
+                        'и целится (ПК).',
+                  'zhs': '鼠标转动镜头和瞄准的速度\n'
+                         '（PC）。',
+                  'zht': '滑鼠轉動鏡頭和瞄準的速度\n'
+                         '（PC）。'},
          choices=[{'en': v, **{k: v.replace('.', ',') for k in ('es', 'fr', 'de', 'it', 'nl', 'ru', 'pt')}}
                   for v in SENS]),
     dict(type=116, key='controls.mouse_aim_scale',
@@ -510,7 +661,13 @@ ENTRIES = [
                   'de': 'Skaliert die Maus bei gespanntem Bogen.\n1 = wie bei der Kamera (PC).',
                   'it': "Moltiplica la sensibilità del mouse mentre\ntendi l'arco. 1 = come la telecamera (PC).",
                   'pt': 'Escala o mouse enquanto o arco está esticado.\n'
-                        '1 = igual ao da câmera (PC).'},
+                        '1 = igual ao da câmera (PC).',
+                  'ru': 'Масштаб мыши, пока натянут лук.\n'
+                        '1 = как у камеры (ПК).',
+                  'zhs': '拉弓时鼠标的灵敏度倍数。\n'
+                         '1 = 与镜头相同（PC）。',
+                  'zht': '拉弓時滑鼠的靈敏度倍數。\n'
+                         '1 = 與鏡頭相同（PC）。'},
          choices=[{'en': v, **{k: v.replace('.', ',') for k in ('es', 'fr', 'de', 'it', 'nl', 'ru', 'pt')}}
                   for v in AIM]),
     dict(type=119, key='controls.key_min_hold_ms',  # the, live: the W / A / D tap slide
@@ -531,7 +688,16 @@ ENTRIES = [
                         'scivolare. 0 = disattivato (PC).',
                   'pt': 'Duração mínima de um toque rápido em WASD, para\n'
                         'que Link dê um passo em vez de deslizar.\n'
-                        '0 = desativado (PC).'},
+                        '0 = desativado (PC).',
+                  'ru': 'Сколько минимум длится короткое\n'
+                        'нажатие WASD, чтобы Линк сделал шаг,\n'
+                        'а не скользил. 0 = выкл. (ПК).',
+                  'zhs': '快速轻按 WASD 至少持续多久，\n'
+                         '让林克迈出一步而不是滑动。\n'
+                         '0 = 关闭（PC）。',
+                  'zht': '快速輕按 WASD 至少持續多久，\n'
+                         '讓林克邁出一步而不是滑動。\n'
+                         '0 = 關閉（PC）。'},
          choices=[OFF] + [{'en': f'{v} ms'} for v in range(10, 251, 10)]),
     dict(type=54, key='controls.glyphs',
          label={'en': 'Button icons', 'es': 'Iconos de botones', 'fr': 'Icônes des boutons', 'de': 'Tastensymbole',
@@ -543,7 +709,13 @@ ENTRIES = [
                   'de': 'Welchen Controller die Tastenbilder\nzeigen (PC). Sofort wirksam.',
                   'it': 'Il controller mostrato dalle immagini dei\npulsanti (PC). Effetto immediato.',
                   'pt': 'Qual controle os ícones dos botões mostram (PC).\n'
-                        'Efeito imediato.'},
+                        'Efeito imediato.',
+                  'ru': 'Какой контроллер на значках кнопок\n'
+                        '(ПК). Действует сразу.',
+                  'zhs': '按键图标显示哪种手柄（PC）。\n'
+                         '立即生效。',
+                  'zht': '按鍵圖示顯示哪種控制器（PC）。\n'
+                         '立即生效。'},
          choices=[{'en': 'Automatic', 'es': 'Automático', 'fr': 'Automatique', 'de': 'Automatisch',
                    'it': 'Automatico', 'nl': 'Automatisch', 'ru': 'Автоматически', 'ja': '自動', 'ko': '자동',
                    'zhs': '自动', 'zht': '自動', 'pt': 'Automático'},
@@ -569,7 +741,16 @@ ENTRIES = [
                         'Si applica al prossimo avvio del gioco.',
                   'pt': 'Rápida: a partida de Link ao viajar dura\n'
                         'cerca de 2,5 s a menos (PC).\n'
-                        'Vale ao reiniciar o jogo.'},
+                        'Vale ao reiniciar o jogo.',
+                  'ru': 'Быстрая: отправление Линка при\n'
+                        'перемещении примерно на 2,5 с короче\n'
+                        '(ПК). Со следующего запуска игры.',
+                  'zhs': '快速：林克传送时的出发过程\n'
+                         '约缩短 2.5 秒（PC）。\n'
+                         '下次启动游戏时生效。',
+                  'zht': '快速：林克傳送時的出發過程\n'
+                         '約縮短 2.5 秒（PC）。\n'
+                         '下次啟動遊戲時生效。'},
          choices=[{'en': 'Normal', 'es': 'Normal', 'fr': 'Normale', 'de': 'Normal', 'it': 'Normale', 'nl': 'Normaal',
                    'ru': 'Обычная', 'ja': '通常', 'ko': '보통', 'zhs': '正常', 'zht': '正常', 'pt': 'Normal'},
                   {'en': 'Fast', 'es': 'Rápida', 'fr': 'Rapide', 'de': 'Schnell', 'it': 'Rapida', 'nl': 'Snel',
@@ -591,7 +772,16 @@ ENTRIES = [
                         'conferma, clic destro torna indietro (PC).',
                   'pt': 'Mostra o ponteiro do mouse nos menus: ele\n'
                         'seleciona o que aponta; clique esquerdo\n'
-                        'confirma, clique direito volta (PC).'},
+                        'confirma, clique direito volta (PC).',
+                  'ru': 'Курсор мыши в меню: выбирает то, на\n'
+                        'что указывает; левый щелчок — OK,\n'
+                        'правый — назад (ПК).',
+                  'zhs': '在菜单中显示鼠标指针：指向即\n'
+                         '选中；左键确认，右键返回\n'
+                         '（PC）。',
+                  'zht': '在選單中顯示滑鼠指標：指向即\n'
+                         '選取；左鍵確認，右鍵返回\n'
+                         '（PC）。'},
          choices=[{'en': 'Off', 'es': 'No', 'fr': 'Non', 'de': 'Aus', 'it': 'No', 'nl': 'Uit', 'ru': 'Выкл.',
                    'ja': 'オフ', 'ko': '끔', 'zhs': '关', 'zht': '關', 'pt': 'Não'},
                   {'en': 'On', 'es': 'Sí', 'fr': 'Oui', 'de': 'An', 'it': 'Sì', 'nl': 'Aan', 'ru': 'Вкл.',
@@ -609,7 +799,14 @@ ENTRIES = [
                   'de': 'Aus: kein Warten auf den Bildschirm,\ngeringste Latenz, aber das Bild kann\nreißen (PC).',
                   'it': "Disattivata non attende lo schermo: latenza\nminima, ma l'immagine può strapparsi (PC).",
                   'pt': 'Desativada elimina a espera pela tela: menor\n'
-                        'latência, mas a imagem pode rasgar (PC).'},
+                        'latência, mas a imagem pode rasgar (PC).',
+                  'ru': 'Выкл. убирает ожидание экрана:\n'
+                        'меньше задержка, но возможны\n'
+                        'разрывы картинки (ПК).',
+                  'zhs': '关闭则不等待屏幕：延迟最低，\n'
+                         '但画面可能撕裂（PC）。',
+                  'zht': '關閉則不等待螢幕：延遲最低，\n'
+                         '但畫面可能撕裂（PC）。'},
          choices=[ON, OFF]),
     dict(type=58, key='display.vrr',   # present's
          label={'en': 'Variable refresh rate', 'es': 'Frecuencia variable (VRR)', 'fr': 'Fréquence variable (VRR)',
@@ -622,7 +819,14 @@ ENTRIES = [
                   'de': 'Für G-Sync- oder FreeSync-Monitore: Der\nBildschirm folgt der Bildrate (PC).',
                   'it': 'Per monitor G-Sync o FreeSync: lo schermo\nsegue la frequenza del gioco (PC).',
                   'pt': 'Para monitores G-Sync ou FreeSync: a tela\n'
-                        'acompanha a taxa de quadros do jogo (PC).'},
+                        'acompanha a taxa de quadros do jogo (PC).',
+                  'ru': 'Для монитора G-Sync или FreeSync:\n'
+                        'экран следует за частотой кадров\n'
+                        'игры (ПК).',
+                  'zhs': 'G-Sync 或 FreeSync 显示器：\n'
+                         '屏幕跟随游戏的帧率（PC）。',
+                  'zht': 'G-Sync 或 FreeSync 螢幕：\n'
+                         '畫面跟隨遊戲的影格率（PC）。'},
          choices=[OFF, ON]),
     dict(type=60, key='controls.gyro_scale',
          label={'en': 'Motion sensitivity', 'es': 'Sensibilidad del giroscopio', 'fr': 'Sensibilité du gyroscope',
@@ -635,7 +839,16 @@ ENTRIES = [
                   'de': 'Nur Bewegungssteuerung des Controllers:\nDrehung von Kamera und Zielen. Nicht die\nMaus (PC).',
                   'it': 'Solo giroscopio del controller: quanto\nruotano telecamera e mira. Non il mouse (PC).',
                   'pt': 'Só o giroscópio do controle: quanto ele gira a\n'
-                        'câmera e a mira. O mouse não é afetado (PC).'},
+                        'câmera e a mira. O mouse não é afetado (PC).',
+                  'ru': 'Только датчики движения геймпада:\n'
+                        'насколько они поворачивают камеру\n'
+                        'и прицел. Мышь не меняется (ПК).',
+                  'zhs': '仅限手柄体感操作：转动镜头和\n'
+                         '瞄准的幅度。鼠标不受影响\n'
+                         '（PC）。',
+                  'zht': '僅限控制器體感操作：轉動鏡頭\n'
+                         '和瞄準的幅度。滑鼠不受影響\n'
+                         '（PC）。'},
          choices=[{'en': v, **{k: v.replace('.', ',') for k in ('es', 'fr', 'de', 'it', 'nl', 'ru', 'pt')}}
                   for v in ('0.25', '0.5', '0.75', '1', '1.25', '1.5', '1.75', '2', '2.5', '3')]),
     dict(type=61, key='display.hdr',   # present's
@@ -648,7 +861,14 @@ ENTRIES = [
                   'de': 'Braucht Windows-HDR für diesen Monitor;\nsonst bleibt das Spiel SDR (PC).',
                   'it': 'Richiede HDR di Windows attivo per questo\nmonitor; altrimenti il gioco resta SDR (PC).',
                   'pt': 'Requer HDR do Windows ativado para este monitor;\n'
-                        'caso contrário, o jogo fica em SDR (PC).'},
+                        'caso contrário, o jogo fica em SDR (PC).',
+                  'ru': 'Нужен включённый HDR Windows для\n'
+                        'этого монитора; иначе игра в SDR\n'
+                        '(ПК).',
+                  'zhs': '需要为此显示器开启 Windows\n'
+                         'HDR，否则游戏保持 SDR（PC）。',
+                  'zht': '需要為此螢幕開啟 Windows\n'
+                         'HDR，否則遊戲保持 SDR（PC）。'},
          choices=[OFF, {'en': 'HDR10'}, {'en': 'scRGB'}]),
     dict(type=62, key='display.hdr_peak',   # present's
          label={'en': 'HDR peak brightness', 'es': 'Brillo máximo HDR', 'fr': 'Luminosité max. HDR',
@@ -659,7 +879,10 @@ ENTRIES = [
                   'es': 'El brillo máximo de la pantalla (PC).',
                   'fr': "La luminosité maximale de l'écran (PC).",
                   'de': 'Die Spitzenhelligkeit des Displays (PC).',
-                  'it': 'La luminosità massima dello schermo (PC).', 'pt': 'O brilho máximo da tela (PC).'},
+                  'it': 'La luminosità massima dello schermo (PC).', 'pt': 'O brilho máximo da tela (PC).',
+                  'ru': 'Пиковая яркость дисплея (ПК).',
+                  'zhs': '显示器的峰值亮度（PC）。',
+                  'zht': '螢幕的峰值亮度（PC）。'},
          choices=[{'en': f'{v} nits'} for v in (400, 500, 600, 700, 800, 1000, 1200, 1500, 2000, 2500, 3000, 4000)]),
     dict(type=63, key='display.hdr_paper',   # present's
          label={'en': 'HDR paper white', 'es': 'Blanco de papel HDR', 'fr': 'Blanc de référence HDR',
@@ -671,7 +894,10 @@ ENTRIES = [
                   'fr': 'La luminosité des blancs et tons moyens du\njeu (PC).',
                   'de': 'Wie hell die weißen Mitteltöne des Spiels\nsind (PC).',
                   'it': 'Quanto sono luminosi i bianchi e i toni medi\ndel gioco (PC).',
-                  'pt': 'Brilho dos brancos e tons médios do jogo (PC).'},
+                  'pt': 'Brilho dos brancos e tons médios do jogo (PC).',
+                  'ru': 'Яркость белых полутонов игры (ПК).',
+                  'zhs': '游戏白色中间调的亮度（PC）。',
+                  'zht': '遊戲白色中間調的亮度（PC）。'},
          choices=[{'en': f'{v} nits'} for v in (80, 100, 120, 140, 160, 180, 200, 220, 250, 300, 400, 500)]),
     dict(type=114, key='game.pause_unfocused',  # the row (hle_hid.cpp), live; hle_oe.cpp's hold
          label={'en': 'Pause when unfocused', 'es': 'Pausar al perder el foco', 'fr': 'Pause hors premier plan',
@@ -685,7 +911,16 @@ ENTRIES = [
                   'it': 'Il gioco si ferma, immagine e audio, finché\nla finestra non è davanti, poi riprende (PC).',
                   'pt': 'O jogo para, imagem e som, enquanto a janela\n'
                         'não estiver em primeiro plano, e continua de\n'
-                        'onde parou (PC).'},
+                        'onde parou (PC).',
+                  'ru': 'Игра замирает (картинка и звук),\n'
+                        'пока её окно не впереди, и\n'
+                        'продолжает с того же места (ПК).',
+                  'zhs': '游戏窗口不在前台时暂停画面\n'
+                         '和声音，回来后从原处继续\n'
+                         '（PC）。',
+                  'zht': '遊戲視窗不在前景時暫停畫面\n'
+                         '和聲音，回來後從原處繼續\n'
+                         '（PC）。'},
          choices=[OFF, ON]),
     dict(type=115, key='audio.mute_unfocused',  # pc_settings.cpp's row, live; hle_audio.cpp
          label={'en': 'Mute in the background', 'es': 'Silenciar en segundo plano', 'fr': 'Muet en arrière-plan',
@@ -698,7 +933,13 @@ ENTRIES = [
                   'de': 'Kein Ton, solange das Spielfenster nicht\nvorn ist; das Spiel läuft weiter (PC).',
                   'it': 'Niente audio finché la finestra del gioco\nnon è davanti; il gioco continua (PC).',
                   'pt': 'Sem som enquanto a janela do jogo não estiver\n'
-                        'em primeiro plano; o jogo continua (PC).'},
+                        'em primeiro plano; o jogo continua (PC).',
+                  'ru': 'Нет звука, пока окно игры не\n'
+                        'впереди; игра продолжает идти (ПК).',
+                  'zhs': '游戏窗口不在前台时静音；\n'
+                         '游戏继续运行（PC）。',
+                  'zht': '遊戲視窗不在前景時靜音；\n'
+                         '遊戲繼續執行（PC）。'},
          choices=[OFF, ON]),
     # the PC audio rows F10 had alone, all live; the volumes in 5 % steps
     dict(type=120, key='audio.volume',   # pc_settings.cpp's master gain
@@ -710,20 +951,32 @@ ENTRIES = [
                   'de': 'Der gesamte Ton des Spiels, zusätzlich\nzur Windows-Lautstärke (PC).',
                   'it': "Tutto l'audio del gioco, oltre al volume\ndi Windows (PC).",
                   'pt': 'Todo o som do jogo, somado ao volume\n'
-                        'do Windows (PC).'},
+                        'do Windows (PC).',
+                  'ru': 'Весь звук игры, поверх громкости\n'
+                        'Windows (ПК).',
+                  'zhs': '游戏的全部声音，在 Windows\n'
+                         '音量之上（PC）。',
+                  'zht': '遊戲的全部聲音，在 Windows\n'
+                         '音量之上（PC）。'},
          choices=VOLUME),
     dict(type=121, key='audio.music',   # hle_audio.cpp's music sub mix
          label={'en': 'Music', 'es': 'Música', 'fr': 'Musique', 'de': 'Musik', 'it': 'Musica', 'nl': 'Muziek',
                 'ru': 'Музыка', 'ja': '音楽', 'ko': '음악', 'zhs': '音乐', 'zht': '音樂', 'pt': 'Música'},
          caption={'en': 'The music alone (PC).', 'es': 'Solo la música (PC).', 'fr': 'La musique seule (PC).',
-                  'de': 'Nur die Musik (PC).', 'it': 'Solo la musica (PC).', 'pt': 'Só a música (PC).'},
+                  'de': 'Nur die Musik (PC).', 'it': 'Solo la musica (PC).', 'pt': 'Só a música (PC).',
+                  'ru': 'Только музыка (ПК).',
+                  'zhs': '仅音乐（PC）。',
+                  'zht': '僅音樂（PC）。'},
          choices=VOLUME),
     dict(type=122, key='audio.effects',   # hle_audio.cpp's effects sub mix
          label={'en': 'Effects', 'es': 'Efectos', 'fr': 'Effets', 'de': 'Effekte', 'it': 'Effetti', 'nl': 'Effecten',
                 'ru': 'Эффекты', 'ja': '効果音', 'ko': '효과음', 'zhs': '音效', 'zht': '音效', 'pt': 'Efeitos'},
          caption={'en': 'The sound effects alone (PC).', 'es': 'Solo los efectos de sonido (PC).',
                   'fr': 'Les effets sonores seuls (PC).', 'de': 'Nur die Soundeffekte (PC).',
-                  'it': 'Solo gli effetti sonori (PC).', 'pt': 'Só os efeitos sonoros (PC).'},
+                  'it': 'Solo gli effetti sonori (PC).', 'pt': 'Só os efeitos sonoros (PC).',
+                  'ru': 'Только звуковые эффекты (ПК).',
+                  'zhs': '仅音效（PC）。',
+                  'zht': '僅音效（PC）。'},
          choices=VOLUME),
     dict(type=123, key='audio.follow_device',   # hle_audio.cpp: to the new default device, a lost one recovered
          label={'en': 'Follow the Windows device', 'es': 'Seguir el dispositivo de Windows',
@@ -743,7 +996,16 @@ ENTRIES = [
                         'riavviare (PC).',
                   'pt': 'O som passa para os fones ao conectá-los ou\n'
                         'desconectá-los e volta após perder o\n'
-                        'dispositivo, sem reiniciar (PC).'},
+                        'dispositivo, sem reiniciar (PC).',
+                  'ru': 'Звук переходит на подключённые или\n'
+                        'отключённые наушники и возвращается\n'
+                        'без перезапуска (ПК).',
+                  'zhs': '插拔耳机时声音随之切换，设备\n'
+                         '丢失后也会恢复，无需重启\n'
+                         '（PC）。',
+                  'zht': '插拔耳機時聲音隨之切換，裝置\n'
+                         '遺失後也會恢復，無需重新啟動\n'
+                         '（PC）。'},
          choices=[ON, OFF]),
     # F10's graphics rows a player looks for first (v0.1.8, pc-ui), in the Graphics section
     dict(type=140, key='graphics.dynamic_resolution',   # pc_settings.cpp, live (its frame-rate aim too, since 11-02)
@@ -762,7 +1024,16 @@ ENTRIES = [
                   'it': 'Abbassa la risoluzione 3D solo quando la\nGPU è a corto di tempo, mai sotto il\n'
                         'minimo scelto (PC).',
                   'pt': 'Reduz a resolução 3D só quando falta tempo à\n'
-                        'GPU, nunca abaixo do mínimo escolhido (PC).'},
+                        'GPU, nunca abaixo do mínimo escolhido (PC).',
+                  'ru': 'Снижает 3D-разрешение, только когда\n'
+                        'GPU не хватает времени, но не ниже\n'
+                        'выбранного порога (ПК).',
+                  'zhs': '仅在 GPU 时间不足时降低 3D\n'
+                         '分辨率，不低于所选下限\n'
+                         '（PC）。',
+                  'zht': '僅在 GPU 時間不足時降低 3D\n'
+                         '解析度，不低於所選下限\n'
+                         '（PC）。'},
          choices=[{'en': 'Off (fixed)', 'es': 'No (fija)', 'fr': 'Non (fixe)', 'de': 'Aus (fest)', 'it': 'No (fissa)',
                    'nl': 'Uit (vast)', 'ru': 'Выкл. (фикс.)', 'ja': 'オフ（固定）', 'ko': '끔 (고정)', 'zhs': '关（固定）',
                    'zht': '關（固定）', 'pt': 'Não (fixa)'},
@@ -795,7 +1066,16 @@ ENTRIES = [
                         'nitide. Costa un po\' di GPU (PC).',
                   'pt': 'Fixo o mantém no maior tamanho que o jogo usa:\n'
                         'sombras de folhas estáveis e mais nítidas.\n'
-                        'Usa um pouco da GPU (PC).'},
+                        'Usa um pouco da GPU (PC).',
+                  'ru': 'Фиксированная: наибольший размер,\n'
+                        'выбираемый игрой: чёткие тени листвы\n'
+                        'без мерцания. Нагружает GPU (ПК).',
+                  'zhs': '固定：保持游戏所选的最大尺寸：\n'
+                         '稳定、更清晰的树叶阴影。\n'
+                         '耗一些 GPU（PC）。',
+                  'zht': '固定：保持遊戲所選的最大尺寸：\n'
+                         '穩定、更清晰的樹葉陰影。\n'
+                         '耗一些 GPU（PC）。'},
          choices=[{'en': "The game's", 'es': 'La del juego', 'fr': 'Celle du jeu', 'de': 'Wie im Spiel',
                    'it': 'Quella del gioco', 'nl': 'Van het spel', 'ru': 'Как в игре', 'ja': 'ゲーム標準',
                    'ko': '게임 기본', 'zhs': '游戏默认', 'zht': '遊戲預設', 'pt': 'O do jogo'},
@@ -817,7 +1097,16 @@ ENTRIES = [
                         'Si applica subito (PC).',
                   'pt': 'As bordas das sombras do sol se alargam com a\n'
                         'distância do objeto. Desativado: o visual do jogo.\n'
-                        'Efeito imediato (PC).'},
+                        'Efeito imediato (PC).',
+                  'ru': 'Края теней солнца шире с расстоянием\n'
+                        'до того, что их отбрасывает. Выкл. —\n'
+                        'как в игре. Действует сразу (ПК).',
+                  'zhs': '太阳阴影边缘随与投影物的距离\n'
+                         '变宽。关闭为游戏原样。\n'
+                         '立即生效（PC）。',
+                  'zht': '太陽陰影邊緣隨與投影物的距離\n'
+                         '變寬。關閉為遊戲原樣。\n'
+                         '立即生效（PC）。'},
          choices=[OFF,
                   {'en': 'Soft', 'es': 'Suaves', 'fr': 'Douces', 'de': 'Weich', 'it': 'Morbide', 'nl': 'Zacht',
                    'ru': 'Мягкие', 'ja': '弱', 'ko': '약하게', 'zhs': '弱', 'zht': '弱', 'pt': 'Suaves'},
@@ -842,7 +1131,16 @@ ENTRIES = [
                         'Costa GPU. Si applica subito (PC).',
                   'pt': 'Pequenas sombras do sol nos pés, sob pedras\n'
                         'e na grama. Desativado: o visual do jogo;\n'
-                        'usa GPU. Efeito imediato (PC).'},
+                        'usa GPU. Efeito imediato (PC).',
+                  'ru': 'Маленькие тени у ног, под камнями и\n'
+                        'в траве. Выкл. — как в игре;\n'
+                        'нагружает GPU. Действует сразу (ПК).',
+                  'zhs': '脚下、石头下和草中的细小阴影。\n'
+                         '关闭为游戏原样；耗一些 GPU。\n'
+                         '立即生效（PC）。',
+                  'zht': '腳下、石頭下和草中的細小陰影。\n'
+                         '關閉為遊戲原樣；耗一些 GPU。\n'
+                         '立即生效（PC）。'},
          choices=[OFF,
                   {'en': 'Subtle', 'es': 'Sutiles', 'fr': 'Subtiles', 'de': 'Dezent', 'it': 'Leggere',
                    'nl': 'Subtiel', 'ru': 'Слабые', 'ja': '弱', 'ko': '약하게', 'zhs': '弱', 'zht': '弱', 'pt': 'Sutis'},
@@ -866,7 +1164,16 @@ ENTRIES = [
                         'appaiono un attimo dopo (PC).',
                   'pt': 'Um shader novo pode congelar a imagem durante\n'
                         'a compilação. Limite: após 0,1 s alguns objetos\n'
-                        'surgem um pouco depois. Sempre: sem limite (PC).'},
+                        'surgem um pouco depois. Sempre: sem limite (PC).',
+                  'ru': 'Новый шейдер может заморозить кадр.\n'
+                        'Предел: после 0,1 с часть объектов\n'
+                        'появится позже. Всегда: без предела.',
+                  'zhs': '新着色器编译时画面可能卡住。\n'
+                         '限制：0.1 秒后部分物体稍后\n'
+                         '出现。总是：不限（PC）。',
+                  'zht': '新著色器編譯時畫面可能卡住。\n'
+                         '限制：0.1 秒後部分物體稍後\n'
+                         '出現。總是：不限（PC）。'},
          choices=[{'en': 'Limit to 0.1 s', 'es': 'Límite 0,1 s', 'fr': 'Limite 0,1 s', 'de': 'Limit 0,1 s',
                    'it': 'Limite 0,1 s', 'nl': 'Limiet 0,1 s', 'ru': 'Предел 0,1 с', 'ja': '0.1秒まで', 'ko': '0.1초 제한',
                    'zhs': '最多0.1秒', 'zht': '最多0.1秒', 'pt': 'Limite 0,1 s'},
@@ -886,7 +1193,16 @@ ENTRIES = [
                   'it': 'La temperatura della mappa del tablet.\nAutomatica: quella del gioco (°F in\n'
                         'inglese USA) (PC).',
                   'pt': 'A temperatura do mapa da Tabuleta da Purah.\n'
-                        'Automático: a do jogo (°F em inglês (EUA)) (PC).'},
+                        'Automático: a do jogo (°F em inglês (EUA)) (PC).',
+                  'ru': 'Температура на карте Пураншета.\n'
+                        'Автоматически: как в игре (°F в\n'
+                        'English (US)) (ПК).',
+                  'zhs': '普尔亚平板地图上的温度。\n'
+                         '自动：随游戏（English (US)\n'
+                         '为 °F）（PC）。',
+                  'zht': '普爾亞平板地圖上的溫度。\n'
+                         '自動：隨遊戲（English (US)\n'
+                         '為 °F）（PC）。'},
          choices=[{'en': 'Automatic', 'es': 'Automática', 'fr': 'Automatique', 'de': 'Automatisch', 'it': 'Automatica',
                    'nl': 'Automatisch', 'ru': 'Автоматически', 'ja': '自動', 'ko': '자동', 'zhs': '自动', 'zht': '自動',
                    'pt': 'Automático'},
@@ -909,7 +1225,16 @@ ENTRIES = [
                         'tasto, scelto qui sotto (PC).',
                   'pt': 'Como no console: as teclas funcionam como os\n'
                         'botões do controle. PC: cada ação tem sua\n'
-                        'tecla, definida nas linhas abaixo (PC).'},
+                        'tecla, definida nas linhas abaixo (PC).',
+                  'ru': 'Как на консоли: клавиши работают\n'
+                        'как кнопки геймпада. ПК: у каждого\n'
+                        'действия своя клавиша (ниже).',
+                  'zhs': '主机布局：按键对应手柄按键。\n'
+                         'PC：每个动作有自己的按键，\n'
+                         '在下面各行设置（PC）。',
+                  'zht': '主機配置：按鍵對應控制器按鈕。\n'
+                         'PC：每個動作有自己的按鍵，\n'
+                         '在下面各列設定（PC）。'},
          choices=[{'en': 'Console layout', 'es': 'Como en consola', 'fr': 'Comme sur console', 'de': 'Wie auf Konsole',
                    'it': 'Come su console', 'nl': 'Zoals op console', 'ru': 'Как на консоли', 'ja': 'コンソール配置',
                    'ko': '콘솔 배치', 'zhs': '主机布局', 'zht': '主機配置', 'pt': 'Como no console'},
@@ -1061,6 +1386,18 @@ KEY_ENTRIES = [
                                           'it': 'Esci dal potere', 'nl': 'Kracht stoppen', 'ru': 'Выйти из функции',
                                           'ja': '右手の能力をやめる', 'ko': '오른손의 능력 그만두기', 'zhs': '退出右手能力',
                                           'zht': '退出右手能力', 'pt': 'Sair da habilidade'}),
+    # (132 / 133: the reverted FSR rows' numbers, never in a release)
+    dict(type=132, action='walk', label={'en': 'Walk (hold)', 'es': 'Caminar (mantener)', 'fr': 'Marcher (maintenir)',
+                                         'de': 'Gehen (halten)', 'it': 'Cammina (tieni premuto)',
+                                         'nl': 'Lopen (ingedrukt)', 'ru': 'Ходьба (удерж.)', 'ja': '歩く（長押し）',
+                                         'ko': '걷기 (누르고 있기)', 'zhs': '步行（按住）', 'zht': '步行（按住）',
+                                         'pt': 'Andar (segurar)'}),
+    dict(type=133, action='let_go', label={'en': 'Let go (a wall, a ride)', 'es': 'Soltarse (pared, vehículo)',
+                                           'fr': 'Lâcher (paroi, monture)', 'de': 'Loslassen (Wand, Reittier)',
+                                           'it': 'Lascia (parete, mezzo)', 'nl': 'Loslaten (wand, rijdier)',
+                                           'ru': 'Отпустить (стена, езда)', 'ja': '手を離す（壁・乗り物）',
+                                           'ko': '손 놓기 (벽, 탈것)', 'zhs': '松手（墙壁、骑乘）', 'zht': '鬆手（牆壁、騎乘）',
+                                           'pt': 'Soltar (parede, montaria)'}),
 ]
 KEY_CAPTION = {'en': 'Press A, then the new key or mouse button.\nEsc cancels; a key another action uses is\n'
                      'swapped. Used when Keyboard controls is PC.',
@@ -1074,7 +1411,16 @@ KEY_CAPTION = {'en': 'Press A, then the new key or mouse button.\nEsc cancels; a
                      'scambiato. Con Comandi da tastiera: PC.',
                'pt': 'Pressione A e depois a nova tecla ou botão do\n'
                      'mouse. Esc cancela; uma tecla usada por outra\n'
-                     'ação é trocada. Vale se Controles do teclado: PC.'}
+                     'ação é trocada. Vale se Controles do teclado: PC.',
+               'ru': 'Нажмите A, затем новую клавишу или\n'
+                     'кнопку мыши. Esc — отмена; клавиша\n'
+                     'другого действия меняется с ней.',
+               'zhs': '按 A，再按新的按键或鼠标键。\n'
+                      'Esc 取消；其他动作用的按键会\n'
+                      '互换。键盘操作为 PC 时使用。',
+               'zht': '按 A，再按新的按鍵或滑鼠鍵。\n'
+                      'Esc 取消；其他動作用的按鍵會\n'
+                      '互換。鍵盤操作為 PC 時使用。'}
 KEY_PLACEHOLDER = {'en': '...'}
 # "1069_%02d": the key rows' status texts, in the order of KeyStatus in the C file (no row has type 69)
 STATUS = [
@@ -1141,7 +1487,16 @@ KEY_LINK = dict(
              'ja': '各アクションのキーとマウスボタンは\nF10 設定ウィンドウの Keys タブにあります。\nこの行を選ぶか F10 を押すと開きます。',
              'pt': 'A tecla e o botão do mouse de cada ação estão\n'
                    'na janela F10, aba Keys. Selecione esta linha\n'
-                   '(ou pressione F10) para abri-la.'},
+                   '(ou pressione F10) para abri-la.',
+             'ru': 'Клавиши и кнопки мыши всех действий\n'
+                   'в настройках F10, вкладка «Клавиши».\n'
+                   'Выберите строку (или F10) — открыть.',
+             'zhs': '所有动作的按键和鼠标按键都在\n'
+                    'F10 设置窗口的按键页。选择\n'
+                    '此行（或按 F10）打开。',
+             'zht': '所有動作的按鍵和滑鼠按鍵都在\n'
+                    'F10 設定視窗的按鍵頁。選擇\n'
+                    '此列（或按 F10）開啟。'},
     choices=[{'en': 'Open (F10)', 'es': 'Abrir (F10)', 'fr': 'Ouvrir (F10)', 'de': 'Öffnen (F10)', 'it': 'Apri (F10)',
               'nl': 'Openen (F10)', 'ru': 'Открыть (F10)', 'ja': '開く（F10）', 'ko': '열기 (F10)', 'zhs': '打开（F10）',
               'zht': '開啟（F10）', 'pt': 'Abrir (F10)'}])
@@ -1162,7 +1517,14 @@ KEY_RESET = dict(
              'it': 'Tutti i tasti tornano a quelli predefiniti.\nConferma, poi conferma di nuovo entro 3 secondi.',
              'ja': 'すべてのキーをPCの初期設定に戻します。\n決定したあと、3秒以内にもう一度決定します。',
              'pt': 'Todas as teclas voltam ao padrão do PC. Confirme\n'
-                   'e confirme de novo em até 3 segundos.'},
+                   'e confirme de novo em até 3 segundos.',
+             'ru': 'Все клавиши по умолчанию для ПК.\n'
+                   'Подтвердите и подтвердите ещё раз\n'
+                   'в течение 3 секунд.',
+             'zhs': '所有按键恢复 PC 默认。确认后\n'
+                    '在 3 秒内再次确认即可重置。',
+             'zht': '所有按鍵恢復 PC 預設。確認後\n'
+                    '在 3 秒內再次確認即可重設。'},
     choices=[{'en': 'Reset', 'es': 'Restablecer', 'fr': 'Rétablir', 'de': 'Zurücksetzen', 'it': 'Ripristina',
               'nl': 'Herstellen', 'ru': 'Сбросить', 'ja': '初期化', 'ko': '초기화', 'zhs': '恢复', 'zht': '恢復',
               'pt': 'Restaurar'}])
@@ -1188,7 +1550,16 @@ MODS_FOLDER = dict(
                    'Ordine e problemi: F10, scheda Mods (PC).',
              'pt': 'Uma pasta por mod, carregada ao reiniciar o\n'
                    'jogo. Selecione esta linha para abri-la.\n'
-                   'Ordem e problemas: F10, aba Mods (PC).'},
+                   'Ordem e problemas: F10, aba Mods (PC).',
+             'ru': 'По папке на мод, загрузка при след.\n'
+                   'запуске. Выберите строку, чтобы\n'
+                   'открыть. Порядок, ошибки: F10, Моды.',
+             'zhs': '每个模组一个文件夹，下次启动\n'
+                    '时载入。选择此行打开。顺序\n'
+                    '和问题：F10 的 Mod 页（PC）。',
+             'zht': '每個模組一個資料夾，下次啟動\n'
+                    '時載入。選擇此列開啟。順序\n'
+                    '和問題：F10 的 Mod 頁（PC）。'},
     choices=[{'en': 'Open', 'es': 'Abrir', 'fr': 'Ouvrir', 'de': 'Öffnen', 'it': 'Apri', 'nl': 'Openen',
               'ru': 'Открыть', 'ja': '開く', 'ko': '열기', 'zhs': '打开', 'zht': '開啟', 'pt': 'Abrir'}])
 MOD_FIRST, MOD_MAX = 145, 32   # kModFirst, kMaxMods
@@ -1200,7 +1571,13 @@ MOD_ROW = dict(
              'de': 'Diese Mod an oder aus, ab dem nächsten\nStart. Ladereihenfolge: F10, Mods (PC).',
              'it': 'Questa mod attiva o no, dal prossimo\navvio. Ordine di caricamento: F10 (PC).',
              'pt': 'Ativa ou desativa este mod ao reiniciar o jogo.\n'
-                   'A ordem de carga: F10, aba Mods (PC).'},
+                   'A ordem de carga: F10, aba Mods (PC).',
+             'ru': 'Мод вкл. или выкл. со следующего\n'
+                   'запуска. Порядок: F10, вкладка Моды.',
+             'zhs': '此模组开或关，下次启动生效。\n'
+                    '载入顺序：F10 的 Mod 页（PC）。',
+             'zht': '此模組開或關，下次啟動生效。\n'
+                    '載入順序：F10 的 Mod 頁（PC）。'},
     choices=[OFF, ON])
 MOD_ENTRIES = [dict(MOD_ROW, type=MOD_FIRST + i) for i in range(MOD_MAX)]
 
@@ -1220,7 +1597,14 @@ ZONES = dict(
              'it': 'Le impostazioni sono divise in sezioni:\nsinistra / destra (o un clic su < o >)\n'
                    'cambia sezione (PC).',
              'pt': 'As configurações ficam em seções: esquerda /\n'
-                   'direita (ou clique em < ou >) muda a seção (PC).'},
+                   'direita (ou clique em < ou >) muda a seção (PC).',
+             'ru': 'Настройки разделены на разделы:\n'
+                   'влево / вправо (или щелчок по < >)\n'
+                   'показывает другой (ПК).',
+             'zhs': '设置分为多个部分：左 / 右\n'
+                    '（或点击 < 或 >）切换（PC）。',
+             'zht': '設定分為多個類別：左 / 右\n'
+                    '（或點擊 < 或 >）切換（PC）。'},
     choices=[{'en': 'General', 'es': 'General', 'fr': 'Général', 'de': 'Allgemein', 'it': 'Generale', 'nl': 'Algemeen',
               'ru': 'Общие', 'ja': '全般', 'ko': '일반', 'zhs': '常规', 'zht': '一般', 'pt': 'Geral'},
              {'en': 'Display', 'es': 'Pantalla', 'fr': 'Affichage', 'de': 'Anzeige', 'it': 'Schermo', 'nl': 'Beeld',

@@ -63,6 +63,15 @@ void apply(void *arg, bool ran) {
         printf("[ability] %s: PouchMgr's field has no place in this build, dropped\n", kAbilityName[n]);
         return;
     }
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    // a game function the version's table left on the sentinel would trap (public #72's class): 1.4.3's has the
+    // struct setters unmatched
+    if (!(totk_main_known(0xb60880) && totk_main_known(0xde5ce0) && totk_main_known(0x820bfc) &&
+          totk_main_known(0x755f20) && totk_main_known(0xa02aec))) {
+        printf("[ability] %s: the game data calls have no place in this game version, dropped\n", kAbilityName[n]);
+        return;
+    }
+#endif
     if (!unlocked(n)) {
         printf("[ability] %s: not unlocked yet (CheckIsGet %#x), refused\n", kAbilityName[n], kUnlockFlag[n]);
         return;

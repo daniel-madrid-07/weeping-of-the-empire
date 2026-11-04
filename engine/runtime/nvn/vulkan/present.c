@@ -1313,7 +1313,7 @@ static VkPipeline hdr_pipeline(VkFormat fmt) {
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = g_hdr_layout};
     VkPipeline p;
-    VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
+    VK_CHECK(vk_engine_graphics_pipeline("HDR encode", g_vk.pcache, &pi, &p));
     for (int i = 0; i < 4; i++) if (!cache[i].p) { cache[i].f = fmt; cache[i].p = p; break; }
     return p;
 }

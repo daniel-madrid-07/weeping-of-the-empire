@@ -83,9 +83,45 @@ static int main_has_realtime(uint64_t main_base) {
    TOTK_SPEED_FIX given explicitly wins (with a warning when it would rescale the step). The image is TOTK_IMG's: with
    a patched image under an unpatched exe (a tool's fallback to the newest image directory) this turns the fix off
    wrongly, which only costs game speed above 30 fps in that dev boot; the package and key exes load their own image. */
+const char *totk_link_patches(void);   /* engine/runtime/exe_tag.cpp (exe_tag.h): NULL = no tag, "" = no patch set */
+
+/* Is `name` one of the set's features? The set is "totk-fps60+realtime+..." (the patches file's name) or "fps60+realtime"
+   (the tag's list): whole tokens between '+', the first one after an optional "totk-".*/
+static int patch_set_has(const char *set, const char *name) {
+    if (!strncmp(set, "totk-", 5)) set += 5;
+    const size_t n = strlen(name);
+    for (const char *t = set; *t;) {
+        const char *end = strchr(t, '+');
+        const size_t len = end ? (size_t)(end - t) : strlen(t);
+        if (len == n && !strncmp(t, name, n)) return 1;
+        if (!end) break;
+        t = end + 1;
+    }
+    return 0;
+}
+
 static void speed_fix_default(uint64_t main_base) {
-    if (!main_has_realtime(main_base)) return;
     const char *e = getenv("TOTK_SPEED_FIX");
+    /* (v0.1.10, LEAD 12:54: a package's player.txt sets TOTK_SPEED_FIX=0 for its patched key; code without the realtime
+       step then runs on the game's interval step, fps / 60 x speed. The speed fix's hook reads the variable at its first
+       call, after this. What the CODE has comes from the exe's tag (exe_tag.h: the linked key's patch set; the 11-03 slot
+       exe, an unpatched key under the patched image, passed the image test); an exe with no tag falls back to the
+       image's words, and hle_vi.cpp's step check still watches in play.) */
+    const char *linked = totk_link_patches();
+    const int image = main_has_realtime(main_base), code = linked ? patch_set_has(linked, "realtime") : image;
+    if (linked && code && !image)
+        fprintf(stderr, "[totk] warning: the exe was linked with the realtime step (%s) but TOTK_IMG's main has none: "
+                        "another build's image\n", linked);
+    if (!code) {
+        const char *ck = getenv("TOTK_STEP_CHECK");   /* (=0: the fixed step on purpose, an A/B) */
+        if (e && !strcmp(e, "0") && !(ck && !strcmp(ck, "0"))) {
+            setenv_("TOTK_SPEED_FIX", "1");
+            fprintf(stderr, "[totk] WARNING: %s has NO realtime frame step but TOTK_SPEED_FIX=0 (a package's setting for "
+                            "its patched key: wrong %s?): the speed fix is ON instead, else the game runs at fps / 60 x speed\n",
+                    linked ? "the exe's linked code" : "main", linked ? "exe" : "image");
+        }
+        return;
+    }
     if (!e) {
         setenv_("TOTK_SPEED_FIX", "0");
         fprintf(stderr, "[totk] main has the realtime frame step: TOTK_SPEED_FIX=0 (the engine's speed fix would rescale it)\n");
@@ -334,6 +370,7 @@ static void write_slot(int i, const char *value) {
     float v = strtof(value, NULL);
     if (!(v >= g_live_min[i] && v <= g_live_max[i])) return;
     if (v == 1.0f && one_is_shipping(g_live_slot[i])) v = 0.0f;
+    if (g_live_slot[i] == TOTK_DP_SHADOW_SPLIT) v = totk_shadow_reach_slot(v);   /* (with Shadow distance: #69) */
     uint32_t bits;
     memcpy(&bits, &v, 4);
     __atomic_store_n((uint32_t *)(page + g_live_slot[i]), bits, __ATOMIC_RELEASE);
@@ -371,17 +408,18 @@ static void (*const k_apply[MAX_LIVE_ROWS])(const char *) = {apply_0, apply_1, a
 static const char *const k_fast_values[] = {"0", "1", NULL}, *const k_fast_names[] = {"Normal", "Fast", NULL};
 /* (the default is "window" since v0.1.9: at "16:9" an ultrawide window was pillarboxed; a 16:9 screen gets the same
    picture either way. pc_settings.cpp moves a file's old default 16:9 once, graphics.aspect_rev)*/
-static const char *const k_wide_values[] = {"16:9", "window", "16:10", "21:9", "32:9", "48:9", NULL},
-                         *const k_wide_names[] = {"16:9 (the game's)", "The window's (16:10, 21:9, 32:9, 48:9)", "16:10", "21:9",
-                                                  "32:9", "48:9", NULL};
+/* (3:2 last: totk_options_menu.cpp kWide and the in-game menu's choices list the values in this order) */
+static const char *const k_wide_values[] = {"16:9", "window", "16:10", "21:9", "32:9", "48:9", "3:2", NULL},
+                         *const k_wide_names[] = {"16:9 (the game's)", "The window's (3:2, 16:10, 21:9, 32:9, 48:9)", "16:10",
+                                                  "21:9", "32:9", "48:9", "3:2", NULL};
 static const char *const k_hud_values[] = {"auto", "corner", "center", NULL},
                          *const k_hud_names[] = {"Automatic (in the middle on 48:9)", "At the screen's edges", "In the middle 16:9", NULL};
 static const pc_setting k_restart_rows[] = {
     {"graphics.aspect_ratio", "Graphics", "Game patches", "Aspect ratio",
-     "The window's: on a 16:10, 21:9, 32:9 or 48:9 window or monitor the game draws a canvas of that shape at start "
-     "(1920x1200, 3440x1440, 5120x1440 or 7680x1440), the HUD laid out for it: 21:9, 32:9 and 48:9 a wider view, 16:10 a taller one (the "
-     "same height of view, a little less at the sides). Other shapes, and 16:9, keep the game's 16:9 picture. 16:10 / "
-     "21:9 / 32:9 / 48:9: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9, 32:9 and 48:9 are "
+     "The window's: on a 3:2, 16:10, 21:9, 32:9 or 48:9 window or monitor the game draws a canvas of that shape at start "
+     "(1920x1280, 1920x1200, 3440x1440, 5120x1440 or 7680x1440), the HUD laid out for it: 21:9, 32:9 and 48:9 a wider view, 3:2 "
+     "and 16:10 a taller one (the same height of view, a little less at the sides). Other shapes, and 16:9, keep the game's "
+     "16:9 picture. 16:10 / 21:9 / 32:9 / 48:9 / 3:2: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9, 32:9 and 48:9 are "
      "heavier than the window's own shape: the whole canvas is drawn, then shown smaller). Needs the game patches' "
      "RomFS sets (TOTK_PATCH_SETS) and the overlay's layout for that shape. At the next start: the canvas and the game "
      "files laid out for it are chosen as the game starts. Setup prepares the layouts of this PC's monitors' shapes; "
@@ -654,8 +692,11 @@ static void build_shape(const char *const *sets, int n) {
 
 /* each shape's canvas and scene: 21:9 / 32:9 / 48:9 drawn whole at the canvas's size; 16:10 (laptops, handhelds) the game's
    own 1920x1080 output and 1600x900 scene made taller (overlays builds the output-1920x1200[-scene-1600x1000] heap sets;
-   its UI layouts are the 2560x1600 set's, totk_layout_set). lo.. hi: the window shapes that take it*/
+   its UI layouts are the 2560x1600 set's, totk_layout_set); 3:2 (Surface, Framework: 2160x1440, 2256x1504, 2880x1920,
+   3000x2000) the same, taller still: 1920x1280, its scene 1620x1080 (1600 x 1066.7 is no whole size; the scene keeps the
+   canvas's exact 3:2), the 2160x1440 set's layouts. lo.. hi: the window shapes that take it*/
 static const struct { const char *name, *canvas, *scene; double lo, hi; } k_shapes[] = {
+    {"3:2", "1920x1280", "1620x1080", 1.45, 1.55},
     {"16:10", "1920x1200", "1600x1000", 1.55, 1.65},
     {"21:9", "3440x1440", "3440x1440", 2.2, 2.6},
     {"32:9", "5120x1440", "5120x1440", 3.3, 3.8},
@@ -695,7 +736,7 @@ static void wide_canvas(void) {
         double a = (double)w / h;
         shape = shape_of(a);
         if (shape < 0) {
-            fprintf(stderr, "[totk] aspect ratio: the %s is %ux%u (%.3f), no 16:10 or ultrawide shape: the game's 16:9\n",
+            fprintf(stderr, "[totk] aspect ratio: the %s is %ux%u (%.3f), no 3:2, 16:10 or ultrawide shape: the game's 16:9\n",
                     how, w, h, a);
             return;
         }

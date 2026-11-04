@@ -160,6 +160,17 @@ class PinTest(unittest.TestCase):
                                         '0x300': {'new': '0x1300', 'body': body(0x1300), 'why': 'y', 'checked': 'read'}}, '1.4.3')
         self.assertIn('already the pair of 0x300', problems[0])   # two pins, one target
 
+    def test_pinned_start_is_an_address(self):
+        # public #72: a pinned call target (unconfirmed pair) named as an address takes the pin's place, never the
+        # beta sentinel; an unpinned or refused function's start is left to porter.map()
+        p = self.FakePorter()
+        pinned, problems = em.apply_pins(p, {'0x100': {'new': '0x1100', 'body': body(0x1100), 'why': 'a call', 'checked': 'r'},
+                                             '0x300': {'new': '0x1400', 'body': body(0x1200), 'why': 'x', 'checked': 'r'}}, '1.4.3')
+        self.assertEqual(len(problems), 1)                     # 0x300's body is another function's: refused
+        self.assertEqual(em.pinned_start(p, pinned, 0x100), 0x1100)
+        self.assertIsNone(em.pinned_start(p, pinned, 0x300))  # (its voted pair stays porter.map()'s to judge)
+        self.assertIsNone(em.pinned_start(p, pinned, 0x200))  # confirmed, not pinned: porter.map() places it
+
 
 class AddressPinTest(unittest.TestCase):
     def test_code_and_data(self):
@@ -521,6 +532,28 @@ class SafeModeTest(unittest.TestCase):
         self.assertEqual(engine.runtime_env(['realtime'], safe),
                          {'TOTK_SPEED_FIX': '0', 'TOTK_LOAD_FPS': '0', 'TOTK_TITLE_FPS': '0', 'TOTK_FPS': '30',
                           'TOTK_UNLOCK_FPS': '0'})
+
+
+class OptionsGuardTest(unittest.TestCase):
+    """totk_options_menu.cpp enabled()'s kUsed (public #72: on another version an unplaced guest call turns the PC rows
+    off instead of trapping) lists exactly the guest calls and data addresses the options code uses there, so a new
+    one cannot fall behind it"""
+    def test_kused_matches_the_options_code(self):
+        import re
+        rt = em.ROOT / 'engine' / 'runtime'
+        menu = (rt / 'totk_options_menu.cpp').read_text(encoding='utf-8')
+        ui = (rt / 'totk_options_ui.h').read_text(encoding='utf-8')
+        # (1.0.0's own ChoicesAlloc sits in the header's version-100 branch: another version inlines it)
+        ui = re.sub(r'#if !defined\(TOTK_GAME_VERSION\) \|\| TOTK_GAME_VERSION == 100\n.*?#else\n', '', ui, flags=re.S)
+        used = set()
+        for text in (menu, ui):
+            used |= {int(m, 16) - 0x1000000000 for m in re.findall(r'DECOMP_GUEST_FN\(\w+, (10[0-9a-f]{8})', text)}
+            used |= {int(m, 16) - 0x1000000000 for m in re.findall(r'guest_data<[^>]*>\(0x(10[0-9a-f]{8})\)', text)}
+        block = re.search(r'kUsed\[\] = \{(.*?)\};', menu, re.S)
+        self.assertIsNotNone(block, 'kUsed not found in totk_options_menu.cpp')
+        listed = {int(h, 16) for h in re.findall(r'0x[0-9a-f]+', block.group(1))}
+        self.assertEqual(sorted(hex(o) for o in used - listed), [], 'used by the options code, not in kUsed')
+        self.assertEqual(sorted(hex(o) for o in listed - used), [], 'in kUsed, not used by the options code')
 
 
 if __name__ == '__main__':

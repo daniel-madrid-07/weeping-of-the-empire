@@ -9,7 +9,8 @@
  *     settings=<settings.ini defaults, copied to %APPDATA%\nxrecomp\TotK-engine\settings.ini when there is none>
  * A release folder (package.py) is the single-build case: launcher, totk.exe, player.txt, settings.ini, LEEME.txt.
  * Tries current, then lastgood: a build that is missing files, or whose game exits with an error in its first EARLY_MS,
- * is skipped for the next one. Messages are in Spanish or English, as the game's language (lang_init).
+ * is skipped for the next one. Messages are in the game's language (lang_init): Spanish, Brazilian Portuguese, Russian,
+ * Simplified Chinese or English.
  *
  * The game gets a clean environment (no TOTK_ / LARECOMP_ / NX* variables from a test shell) plus:
  *     TOTK_USERDATA = %APPDATA%\nxrecomp\TotK-engine\userdata    (save\ inside; the settings file sits next to it)
@@ -55,7 +56,7 @@
 #include "saves.h"
 #include "autoupdate.h"
 #include "preplay.h"
-#include "text_pt.h"
+#include "text_tr.h"
 #include "../../runtime/mods_install.h"
 #include <bcrypt.h>
 
@@ -69,8 +70,8 @@ static wchar_t g_base[MAX_PATH];   /* %APPDATA%\nxrecomp\TotK-engine: userdata, 
 static wchar_t g_local[MAX_PATH];  /* %LOCALAPPDATA%\nxrecomp\TotK-engine: run, logs, crashes, launcher.log */
 static FILE *g_log;
 static int g_es = 1;   /* the player's texts in Spanish (else English): lang_init (Spanish until then: test_launcher.c) */
-static int g_pt;       /* ... or in Brazilian Portuguese (text_pt.inc, looked up by the English: English where it lacks one) */
-#define ES_EN(es, en) (g_es ? (es) : g_pt ? pt_of(en) : (en))
+static int g_tr;       /* ... or TR_PT / TR_RU / TR_ZH (text_tr.h, looked up by the English: English where it lacks one) */
+#define ES_EN(es, en) (g_es ? (es) : g_tr ? tr_of(g_tr, en) : (en))
 
 static void say(const wchar_t *fmt, ...) {
     if (!g_log) return;
@@ -122,6 +123,13 @@ static void open_file(const wchar_t *file) {
     }
     say(L"opened %ls (%ls)", file, r > 32 ? L"ok" : L"failed");
 }
+/* the players' community: the saves menu's and the failed start's Community button; the same address as Setup's last
+ * page and the Discord status button*/
+static const wchar_t COMMUNITY_URL[] = L"https://www.reddit.com/r/WeepingOfTheEmpire/";
+static void open_community(void) {
+    INT_PTR r = (INT_PTR)ShellExecuteW(NULL, L"open", COMMUNITY_URL, NULL, NULL, SW_SHOWNORMAL);   /* the default browser */
+    say(L"opened %ls (%ls)", COMMUNITY_URL, r > 32 ? L"ok" : L"failed");
+}
 static int exists(const wchar_t *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
 /* a folder holding anything besides . and .. */
 static int dir_has_files(const wchar_t *dir) {
@@ -167,10 +175,14 @@ static int init_paths(void) {
 }
 
 /* The player's language, as the game decides it (pc_lang.cpp): game.language in <g_base>\settings.ini when set (Spanish
- * for "es" and "es-419", Brazilian Portuguese for "pt-BR", English for any other), else Windows' display language. The
- * launcher speaks those three.
+ * for "es" and "es-419", Brazilian Portuguese for "pt-BR", Russian for "ru", Simplified Chinese for "zh-Hans", English
+ * for any other), else Windows' display language. The launcher speaks those five.
  * Before the first start there is no settings.ini yet (run_package copies the build's defaults later), so Windows
  * decides, as it does for the game whose default is "automatic". */
+static const wchar_t *lang_name(void) {
+    return g_es ? L"Spanish" : g_tr == TR_PT ? L"Portuguese (Brasil)" : g_tr == TR_RU ? L"Russian"
+         : g_tr == TR_ZH ? L"Simplified Chinese" : L"English";
+}
 static void lang_init(void) {
     wchar_t p[MAX_PATH], line[512], value[64] = L"";
     swprintf(p, MAX_PATH, L"%ls\\settings.ini", g_base);
@@ -196,14 +208,16 @@ static void lang_init(void) {
     }
     if (value[0]) {
         g_es = !wcscmp(value, L"es") || !wcscmp(value, L"es-419");
-        g_pt = !wcscmp(value, L"pt-BR");
-        say(L"language: %ls (game.language = %ls)", g_es ? L"Spanish" : g_pt ? L"Portuguese (Brasil)" : L"English", value);
+        g_tr = !wcscmp(value, L"pt-BR") ? TR_PT : !wcscmp(value, L"ru") ? TR_RU
+             : !wcscmp(value, L"zh-Hans") ? TR_ZH : TR_EN;
+        say(L"language: %ls (game.language = %ls)", lang_name(), value);
     } else {
         LANGID ui = GetUserDefaultUILanguage();
         g_es = PRIMARYLANGID(ui) == LANG_SPANISH;
-        g_pt = PRIMARYLANGID(ui) == LANG_PORTUGUESE;
-        say(L"language: %ls (Windows' display language 0x%04x%ls)",
-            g_es ? L"Spanish" : g_pt ? L"Portuguese (Brasil)" : L"English", (unsigned)ui,
+        int simplified = SUBLANGID(ui) == SUBLANG_CHINESE_SIMPLIFIED || SUBLANGID(ui) == SUBLANG_CHINESE_SINGAPORE;
+        g_tr = PRIMARYLANGID(ui) == LANG_PORTUGUESE ? TR_PT : PRIMARYLANGID(ui) == LANG_RUSSIAN ? TR_RU
+             : PRIMARYLANGID(ui) == LANG_CHINESE && simplified ? TR_ZH : TR_EN;
+        say(L"language: %ls (Windows' display language 0x%04x%ls)", lang_name(), (unsigned)ui,
             have_file ? L"; no game.language in settings.ini" : L"; no settings.ini");
     }
 }
@@ -648,9 +662,12 @@ static int saves_menu(void) {
                         L"Saves of later game versions (1.1.x to 1.4.x) are converted to 1.0.0.")},
             {102, ES_EN(L"Restaurar una copia…", L"Restore a backup…")},
             {103, ES_EN(L"Hacer una copia ahora", L"Make a backup now")},
+            {104, ES_EN(L"Comunidad\nr/WeepingOfTheEmpire en Reddit: novedades, ayuda, capturas",
+                        L"Community\nr/WeepingOfTheEmpire on Reddit: news, help, screenshots")},
         };
-        int b = task(ES_EN(L"Partidas", L"Saves"), content, buttons, 4, NULL, 0, NULL, TDCBF_CLOSE_BUTTON, NULL);
+        int b = task(ES_EN(L"Partidas", L"Saves"), content, buttons, 5, NULL, 0, NULL, TDCBF_CLOSE_BUTTON, NULL);
         if (b == 100) return 1;
+        if (b == 104) { open_community(); continue; }   /* (the menu stays) */
         if (b == 101) {
             static SaveCandidate c[MAX_CANDIDATES];
             import_save(c, find_candidates(c, MAX_CANDIDATES));
@@ -1635,7 +1652,7 @@ static int preplay(const wchar_t *pkg, const wchar_t *note) {
     settings_defaults(pkg, defs);
     swprintf(ini, MAX_PATH, L"%ls\\settings.ini", g_base);
     swprintf(title, 128, L"%ls - %ls", TITLE, ES_EN(L"Ajustes", L"Settings"));
-    int play = preplay_dialog(ini, defs[0] ? defs : NULL, g_es ? 1 : g_pt ? 2 : 0, title, note);
+    int play = preplay_dialog(ini, defs[0] ? defs : NULL, g_es ? TR_ES : g_tr, title, note);
     say(L"settings before play: %ls", play ? L"play" : L"closed");
     return play;
 }
@@ -1711,11 +1728,20 @@ static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, si
                                                 L" Your 1.0.0 saves were copied to this version once: what you play later "
                                                 L"in 1.0.0 will not show up here, and %ls saves do not go back to 1.0.0."), ver);
                 message(MB_ICONINFORMATION, ES_EN(
-                    L"TotK %ls (beta). Esta versión juega a 30 fps, con los controles como un mando (el teclado y el ratón "
-                    L"hacen de botones de Switch) y sin la pantalla de opciones de PC dentro del juego (los ajustes están "
-                    L"en F10).%ls",
-                    L"TotK %ls (beta). This version plays at 30 fps, with the controls as a pad (keyboard and mouse act as "
-                    L"Switch buttons) and without the in-game PC options screen (settings are in F10).%ls"), ver, copied);
+                    /* (only gated claims, LEAD 11-04: 'runs at full frame rate' verified in the 9.1 gate's v143 line
+                       (integration 11-04 15:27), with Setup's BetaNote. The controls: 9.1 runs the placed
+                       player-state groups by default on 1.4.3 and fps360's 1.4.3 pins; the ability keys' game-data
+                       calls have no 1.4.3 match, so 4-9 are dropped there. The menu mouse cursor needs ui fields
+                       1.4.3's map does not place yet, so it is off there: menus by keyboard or pad)*/
+                    L"TotK %ls (beta). Esta versión va a la frecuencia de fotogramas completa, pero está menos probada "
+                    L"que la 1.0.0. "
+                    L"Los controles de teclado y ratón funcionan como en la 1.0.0 durante el juego, salvo las teclas "
+                    L"de poderes 4 a 9 (elige los poderes en la rueda de poderes). En los menús, usa el teclado o un "
+                    L"mando: el puntero del ratón aún no funciona en los menús de la 1.4.3.%ls",
+                    L"TotK %ls (beta). This version runs at full frame rate, but it is less tested than 1.0.0. The "
+                    L"keyboard and mouse controls work as on 1.0.0 in play, except the ability keys 4 to 9 (pick "
+                    L"abilities from the ability wheel instead). In menus, use the keyboard or a controller: the mouse "
+                    L"pointer does not work in 1.4.3's menus yet.%ls"), ver, copied);
                 mkdirs(userdata);
                 FILE *mf = _wfopen(seen, L"w");
                 if (mf) fclose(mf);
@@ -1778,6 +1804,10 @@ static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, si
         say(L"%ls", why);
         return FAILED;
     }
+    /* (the game's window comes to the front as it opens, rival v0.3.7 parity PARITY_037.md #27: the launcher, started by
+       the player, may set the foreground and hands that on; shim_win.c asks for it at the window's first show. Windows
+       refuses it once the player has used another window meanwhile, so a player who switched away is left there) */
+    AllowSetForegroundWindow(pi.dwProcessId);
     say(L"started %ls (pid %lu), img %ls, romfs %ls, log %ls", name, pi.dwProcessId, img, romfs[0] ? romfs : L"(game default)", logp);
     DWORD w = WaitForSingleObject(pi.hProcess, g_early_ms), code = 0;
     if (w == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
@@ -1899,9 +1929,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show) {
         say(L"vulkan: loader found");
     }
     install_dropped();   /* (a mod dropped on the launcher: installed, said, then the game starts) */
-    int menu = (args && wcsstr(args, L"--saves")) || (GetAsyncKeyState(VK_SHIFT) & 0x8000);
-    /* Ctrl or --settings: the settings before play (preplay.c), for a game that closes or crawls before F10 */
-    int pre = (args && wcsstr(args, L"--settings")) || (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+    const int play = args && wcsstr(args, L"--play");   /* (tools: neither window below, whatever key is held) */
+    int menu = !play && ((args && wcsstr(args, L"--saves")) || (GetAsyncKeyState(VK_SHIFT) & 0x8000));
+    /* Ctrl or --settings: the settings before play (preplay.c), for a game that closes or crawls before F10. --play:
+       never (the tools that start the launcher headless: Ctrl is the desktop's global state, and anyone holding it at
+       that moment opened a window no one would close; canary_release 11-03 judged a good v0.1.9 package 'bad') */
+    int pre = !play &&
+              ((args && wcsstr(args, L"--settings")) || (GetAsyncKeyState(VK_CONTROL) & 0x8000));
     if (menu) say(L"update check: skipped (saves menu)");   /* the player asked for this folder's menu */
     else if (auto_update()) return 0;                        /* the updated build's launcher does the rest */
     else if (offer_newer_release()) return 0;                /* its launcher does the rest (backups, import offer) */
@@ -1971,9 +2005,13 @@ again:
         const TASKDIALOG_BUTTON b[] = {
             {401, ES_EN(L"Cambiar ajustes y volver a intentarlo\nModo seguro, ventana, escala de resolución, fotogramas...",
                         L"Change settings and try again\nSafe mode, window, resolution scale, frame rate...")},
-            {402, ES_EN(L"Ver el registro", L"Show the log")}};
-        int r = task(ES_EN(L"No se pudo arrancar el juego", L"Couldn't start the game"), content, b, 2, NULL, 0, NULL,
-                     TDCBF_CLOSE_BUTTON, TD_WARNING_ICON);
+            {402, ES_EN(L"Ver el registro", L"Show the log")},
+            {403, ES_EN(L"Comunidad\nPide ayuda en r/WeepingOfTheEmpire (Reddit)",
+                        L"Community\nAsk for help on r/WeepingOfTheEmpire (Reddit)")}};
+        int r;
+        while ((r = task(ES_EN(L"No se pudo arrancar el juego", L"Couldn't start the game"), content, b, 3, NULL, 0, NULL,
+                         TDCBF_CLOSE_BUTTON, TD_WARNING_ICON)) == 403)
+            open_community();   /* (the box stays: the log and the settings are still to hand) */
         if (r == 401 && preplay(pkgs[0], ES_EN(L"El juego se cerró al arrancar. El modo seguro, una escala de resolución "
                                                L"más baja o jugar en ventana pueden ayudar.",
                                                L"The game closed while starting. Safe mode, a lower resolution scale or a "

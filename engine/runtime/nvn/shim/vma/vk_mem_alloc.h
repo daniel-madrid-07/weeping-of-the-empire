@@ -15,6 +15,8 @@ enum {
     VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT = 0x400, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT = 0x800
 };
 typedef VkFlags VmaAllocationCreateFlags;
+// (VMA's own bit; the second is the shim's: VK_EXT_pageable_device_local_memory enabled, block priorities kept current)
+enum { VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT = 0x40, VMA_ALLOCATOR_CREATE_SHIM_PAGEABLE_BIT = 0x40000000 };
 
 typedef struct {
     VmaAllocationCreateFlags flags;

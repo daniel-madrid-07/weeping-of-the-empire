@@ -19,11 +19,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "shader.h"
 #include "soft_f64.h"
 
 MAXWELL_TLS uint64_t maxwell_gmem_base, maxwell_gmem_size, maxwell_gdev_size;
+// (offline census only: 0 in the runtime) per LDG, whether its address register was last set from the driver table's
+// storage-buffer slots in cb0 (exec.c cbuf_info_ maps those through the device window) or not: a pointer from a UBO or
+// from memory, read IN PLACE on the GPU timeline. A linear scan in code order (taint through set_reg's expressions):
+// branches and writers outside set_reg make it an estimate.
+MAXWELL_TLS int maxwell_ldg_census;
+MAXWELL_TLS unsigned maxwell_ldg_table, maxwell_ldg_raw, maxwell_ldg_abs;
 // The program's compiler constants (c1) while translating it, when the caller has them (exec.c translate_program: the live
 // program; the archive precompile has only the code): BRX jump tables are read from them (brx_targets). NULL: every
 // instruction may be a BRX target.
@@ -107,6 +114,7 @@ typedef struct {
     bool solid_all; float solid_rgb[3];   // (a LARECOMP_DEBUG_SOLID list: a colour per shader, in every float target)
     bool ssfetch;     // maxwell_ssfetch_next: 2D texel fetches at mip 0 average their guest texel's scaled footprint
     uint32_t ssf_slots;   // texture slots those fetches use (each gets an ssf<slot>() helper)
+    uint32_t gth_slots;   // texture slots gathered from (each gets a gth<slot>() helper: the guest's 2x2 on a scaled texture)
     bool nodiscard;   // LARECOMP_NO_DISCARD (=1: every shader, =<fs hash hex>: that fragment shader): KIL emits nothing
     bool kil_demote;  // a KIL became GLSL demote (needs GL_EXT_demote_to_helper_invocation in this shader's header)
     bool uses_quad;   // a quad swap (SHFL.BFLY by 1 / 2 / 3, wave-safe fragment form): GL_KHR_shader_subgroup_quad in its header
@@ -127,6 +135,7 @@ typedef struct {
     bool uses_f2iq;       // F2I sources with a NaN made 0 (f2iq(), f2i_nan_on)
     int soft_n;           // cascade compares emitted as nxsoft<slot>() (soft_shadow_pct); soft_twin[slot] = its raw-depth
     int8_t soft_twin[32]; // binding + 1 (the same texture without the compare: the blocker search reads its depth)
+    uint8_t gtaint[256];  // (maxwell_ldg_census) per register: last set from the driver table's storage-buffer slots
 } Ctx;
 
 // Global memory windows (exec.c gmem_import): where one buffer cannot hold the heap, [k * W, (k + 1) * W) is buffer
@@ -261,8 +270,28 @@ static const char *operand_c_for_ffma(Ctx *c, uint64_t w, char *buf, const char 
     return reg(c, (int)bits(w, 39, 8), buf);
 }
 
+// (maxwell_ldg_census) does an expression read the driver table's storage-buffer slots (cb0 0x110 vertex / geometry,
+// 0x510 fragment, 0x310 compute; 16 slots of 16 bytes), an indexed cb0 read, or a register so derived?
+static bool expr_gtaint(const Ctx *c, const char *e) {
+    const long base = c->stage == STAGE_COMPUTE ? 0x310 : c->stage == STAGE_FRAGMENT ? 0x510 : 0x110;
+    for (const char *p = e; (p = strstr(p, "cb0[")) != NULL; p += 4) {
+        const long o = strtol(p + 4, NULL, 10) * 16;
+        if (o >= base && o < base + 0x100) return true;
+    }
+    if (strstr(e, "cbr(cb0,")) return true;
+    for (const char *p = e; *p; p++)
+        if (*p == 'r' && p[1] >= '0' && p[1] <= '9' && (p == e || !(isalnum((unsigned char)p[-1]) || p[-1] == '_'))) {
+            const int r = atoi(p + 1);
+            if (r >= 0 && r < 256 && c->gtaint[r]) return true;
+        }
+    return false;
+}
+// tracked for every compute program (ShaderInfo.ldg_raw / ldg_table: exec.c counts the dispatches of programs with raw
+// loads), every stage under the offline census; graphics translations pay nothing
+static inline bool ldg_track(const Ctx *c) { return maxwell_ldg_census || c->stage == STAGE_COMPUTE; }
 static void set_reg(Ctx *c, int r, const char *expr) {
     if (r == RZ) return;
+    if (ldg_track(c)) c->gtaint[r] = expr_gtaint(c, expr);
     c->reg_used[r] = 1;
     sp(&c->body, "    r%d = %s;\n", r, expr);
     if (c->trace) sp(&c->body, "    if (trace_on) debugPrintfEXT(\"[trace] %%x r%%u=%%08x\", %uu, %du, r%d);\n", c->cur_pc, r, r);
@@ -819,6 +848,21 @@ static int rsc_own_mode(void) {
     if (m < 0) { const char *e = getenv("LARECOMP_RSC_OWN"); m = e && *e ? atoi(e) : 2; if (m < 0 || m > 2) m = 2; }
     return m;
 }
+// A gather (TLD4 / TLD4S, not a depth compare) from a scaled texture returns the 2x2 HOST texels around P: at render
+// scale s they cover 2 / s guest texels, at 2 the four sub-texels of ONE guest texel. TotK's reduced-resolution sky / fog
+// composite upsamples across depth edges by gathering its low-resolution depth and colour and keeping the taps whose depth
+// matches the pixel's: with one guest texel in all four taps it found no match across an edge and took the sky's colour,
+// a bright, stair-stepped fringe one low-resolution texel wide around distant silhouettes at render scale 2 (public #53,
+// RX 7900 XTX at 4K: gone at 100 %; likely #19's squares in torch glow too). Now (default; LARECOMP_GATHER_SCALE=0: the
+// hardware gather everywhere) a gather from a 2D / 2D-array texture whose scale is not 1 reads the guest's 2x2 texels,
+// each at the centre of its host footprint (rsc's mapping), in textureGather's order, clamped to the edge (a gather's
+// wrap is not applied: screen buffers clamp); at scale 1 the hardware gather as before. A register offset counts in guest
+// texels there (the shared path divides it by the host size: half a texel at scale 2).
+static bool gather_scale_on(void) {
+    static int on = -1;   // (read at translation: the shader text, so the pipeline cache key, follows it)
+    if (on < 0) { const char *e = getenv("LARECOMP_GATHER_SCALE"); on = !(e && *e == '0'); }
+    return on;
+}
 static bool rsc_own(Ctx *c, char *o, size_t n, const char *inner, int k) {
     int mode = rsc_own_mode();
     if (c->stage != STAGE_FRAGMENT || !mode || strlen(inner) > 120) return false;   // (bounded: callers' buffers)
@@ -983,7 +1027,16 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
         if (layer) snprintf(P, sizeof P, "vec%d(%s, float(%s))", n + 1, xs, layer);
         else snprintf(P, sizeof P, "%s", xs);
         if (t->shadow) sprintf(out, "textureGather(t%d, %s, %s)", slot, P, dref ? dref : "0.0f");
-        else sprintf(out, "textureGather(t%d, %s, %s)", slot, P, lod);
+        else if (slot < 32 && (type == TEXTYPE_2D || type == TEXTYPE_2D_ARRAY) && gather_scale_on()) {
+            // (a scaled texture: the guest's 2x2 texels, gth<slot>; at scale 1 the hardware gather as before)
+            char P0[1200];
+            if (layer) snprintf(P0, sizeof P0, "vec3(%s, %s, float(%s))", co[0], co[1], layer);
+            else snprintf(P0, sizeof P0, "vec2(%s, %s)", co[0], co[1]);
+            sprintf(out, "((rscale[%d].x == 1.0f && rscale[%d].y == 1.0f) ? textureGather(t%d, %s, %s) : gth%d(%s, %s%s%s, %s))",
+                    slot + 1, slot + 1, slot, P, lod, slot, P0, off ? "ivec2(" : "ivec2(0", off ? off : "", ")", lod);
+            c->uses_rscale = true;
+            c->gth_slots |= 1u << slot;
+        } else sprintf(out, "textureGather(t%d, %s, %s)", slot, P, lod);
         return;
     }
     if (!t->shadow) {
@@ -2160,6 +2213,13 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         // 3413 programs, 2026-10-27: no MEMBAR, no LDG.CG /.CV, no STG.CG /.WT; LDG uses CA and CI only)
         int cop = (int)bits(w, 46, 2);
         if (gmem_coherent_on() && c->glsl && (cop == 1 || cop == 3)) c->gmem_coherent = true;   // (LDG .CG / .CV, STG .CG / .WT; .CI is the non-coherent path)
+        if (ldg_track(c) && !store) {   // (where this load's address came from: the driver table, or not)
+            if (a == RZ) maxwell_ldg_abs++;
+            else if (c->gtaint[a] || (wide && a + 1 < 256 && c->gtaint[a + 1])) maxwell_ldg_table++, c->info->ldg_table++;
+            else maxwell_ldg_raw++, c->info->ldg_raw++;
+        }
+        if (ldg_track(c) && !store)   // (the loaded words: memory values, not table addresses)
+            for (int k = 0, nk = size == 5 ? 2 : size >= 6 ? 4 : 1; k < nk && d + k < 256; k++) c->gtaint[d + k] = 0;
         char addr[256];
         if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
         else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
@@ -2907,6 +2967,30 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                    "  acc.rgb /= max(1.0f - max(max(acc.r, acc.g), acc.b), 1e-4f);\n"
                    "  return acc;\n"
                    "}\n", i, i, i, i);
+        if (i < 32 && (c->gth_slots & (1u << i))) {   // gather_scale_on: the guest's 2x2 texels of a scaled texture
+            const bool arr = t->type == TEXTYPE_2D_ARRAY;
+            // (the guest size: host / scale, floored after a small epsilon: exact where the slot's scale is the allocation's
+            // own ratio (exec.c texture_info_, also below 1), and the inverse of ceil(guest * s) for a nominal one: 534 /
+            // 1.3333 = 400.5 -> 400, not 401. The layer clamped as the hardware gather does, SHOULD)
+            sp(&s, "vec4 gth%d(%s p, ivec2 o, int ci) {\n"
+                   "  vec2 sc = rscale[%d].xy;\n"
+                   "  ivec2 mx = textureSize(t%d, 0).xy - 1;\n"
+                   "  vec2 gs = floor(vec2(mx + 1) / sc + 0.001f);\n"
+                   "  ivec2 b = ivec2(floor(p.xy * gs - 0.5f)) + o;\n",
+               i, arr ? "vec3" : "vec2", i + 1, i);
+            if (arr) sp(&s, "  int ly = clamp(int(p.z + 0.5f), 0, textureSize(t%d, 0).z - 1);\n", i);
+            const int dx[4] = {0, 1, 1, 0}, dy[4] = {1, 1, 0, 0};   // (textureGather's order: i0j1, i1j1, i1j0, i0j0)
+            sp(&s, "  vec4 r;\n");
+            for (int q = 0; q < 4; q++) {
+                if (arr)
+                    sp(&s, "  r[%d] = texelFetch(t%d, ivec3(clamp(ivec2(floor((vec2(b + ivec2(%d, %d)) + 0.5f) * sc)), ivec2(0), mx), "
+                           "ly), 0)[ci];\n", q, i, dx[q], dy[q]);
+                else
+                    sp(&s, "  r[%d] = texelFetch(t%d, clamp(ivec2(floor((vec2(b + ivec2(%d, %d)) + 0.5f) * sc)), ivec2(0), mx), 0)[ci];\n",
+                       q, i, dx[q], dy[q]);
+            }
+            sp(&s, "  return r;\n}\n");
+        }
     }
     // soft_shadow_pct: nxsoft<slot>(P = (u, v, layer, reference), l), unrolled. The blocker search does not assume a
     // depth direction (the sampler's compare op decides it, unseen here): a tap whose own compare fails (< 0.5) is a

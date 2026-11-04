@@ -133,7 +133,7 @@
  "Your prod.keys cannot open the dump ({0}): {1}.": "你的 prod.keys 无法打开游戏转储（{0}）：{1}。",
  "Your prod.keys cannot open the update dump ({0}): {1}.": "你的 prod.keys 无法打开更新转储（{0}）：{1}。",
  "Your saves and settings stay in {0}.": "你的存档和设置保留在 {0}。",
- "Your {0} update dump: builds version {0}": "你的 {0} 更新转储：构建 {0} 版本",
+ "Beta: builds version {0} too (about 40 more minutes); full frame rate, less tested than 1.0.0": "测试版：同时构建 {0} 版本（约多需 40 分钟）；以完整帧率运行，但测试不如 1.0.0 充分",
  "downloading {0}": "正在下载 {0}",
  "dump prod.keys again on the console the game was dumped from, with a current key dumper (one that knows that console's firmware), and choose that file": "请在转储该游戏的主机上，用最新的密钥转储工具（能识别该主机固件的版本）重新转储 prod.keys，并选择该文件",
  "exFAT: each update rebuilds from scratch": "exFAT：每次更新都从头构建",
@@ -160,5 +160,7 @@
  "{0}: the copy next to Setup": "{0}：安装程序旁边的副本",
  "{0}: the download does not match its checksum (got {1}); press Install again": "{0}：下载的文件与校验和不符（得到 {1}）；请再次点击“安装”",
  "{0}: the resumed file does not match its checksum: from the start": "{0}：续传的文件与校验和不符：从头开始",
- "{0}: {1}; retrying in {2} s": "{0}：{1}；{2} 秒后重试"
+ "{0}: {1}; retrying in {2} s": "{0}：{1}；{2} 秒后重试",
+ "Community": "社区",
+ "Could not open {0}: {1}": "无法打开 {0}：{1}"
 }

@@ -7,7 +7,7 @@
   <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-5f8a97"></a>
 </p>
 
-**Turns your own copy of *The Legend of Zelda: Tears of the Kingdom* (TotK, Switch, version 1.0.0) into a native Windows game.** The game's ARM64 code is recompiled ahead of time into x86-64, a host runtime answers the Switch's system services, and the graphics run on Vulkan. It is not an emulator: nothing is interpreted while you play.
+**Turns your own copy of *The Legend of Zelda: Tears of the Kingdom* (TotK, Switch, version 1.0.0, and 1.4.3 as a beta) into a native Windows game.** The game's ARM64 code is recompiled ahead of time into x86-64, a host runtime answers the Switch's system services, and the graphics run on Vulkan. It is not an emulator: nothing is interpreted while you play.
 
 **No game files are included, and none are ever shared.** For use with a game you own: you build it on your PC from a dump of your own console's game and your own keys. This project gives no help getting them. Not affiliated with or endorsed by Nintendo. [Read LEGAL.md](LEGAL.md).
 
@@ -23,7 +23,7 @@ Most of the code was written by AI coding agents directed by one developer, who 
 - **Measured on one PC only** (Ryzen 7 9800X3D + RTX 5080, developer build, 2560x1440 window, 2133x1200 render, one run per place): 116.2-119.7 fps average at the 120 cap, 159.1-178.4 unlocked. Builds made by Setup get a list of the developer build's shaders instead of its full shader cache (the difference is not measured), so expect the same or lower. [Full table, and what is not measured](#performance-measured).
 - **Display:** any resolution, ultrawide, borderless or exclusive fullscreen; VRR and HDR options (not measured); colour profiles (Vivid, Brighter dark tones, Custom); upscaling and frame generation as options: NVIDIA DLSS / DLAA on RTX cards with DLSS frame generation x2-x4 on RTX 40 / 50, AMD FSR 3.1 upscaling and frame generation on any GPU, FSR 1, SMAA. Setup downloads the DLSS files itself: nothing to copy by hand.
 - **Controls:** keyboard and mouse with PC prompts in the game; Xbox, PlayStation and Switch controllers; settings window in game (F10). Every key and every setting: [CONTROLS.md](CONTROLS.md), [SETTINGS.md](SETTINGS.md).
-- **Limits today:** game version 1.0.0; a save from 1.1.x, 1.2.x or 1.4.x is converted to 1.0.0 when you import it (the original is kept). Windows only. Dedicated AMD and Intel cards are not measured. First visits can stutter while shaders are built.
+- **Limits today:** game version 1.0.0, plus 1.4.3 as a beta (the same frame rates as 1.0.0, fewer PC features); a save from 1.1.x, 1.2.x or 1.4.x is converted to 1.0.0 when you import it (the original is kept). Windows only. Dedicated AMD and Intel cards are not measured. First visits can stutter while shaders are built.
 
 To hear about new releases, use Watch > Custom > Releases. Later game versions are being worked on; there is no date.
 
@@ -31,11 +31,12 @@ To hear about new releases, use Watch > Custom > Releases. Later game versions a
 share your play in [Show and tell](https://github.com/daniel-madrid-07/weeping-of-the-empire/discussions/categories/show-and-tell),
 and send how it runs on your hardware, with the log, as a
 [performance report](https://github.com/daniel-madrid-07/weeping-of-the-empire/issues/new?template=performance.yml).
+Players also meet on Reddit, in [r/WeepingOfTheEmpire](https://www.reddit.com/r/WeepingOfTheEmpire/).
 
 ## Install in 3 steps
 
 1. **Download** the Setup exe from the [latest release](https://github.com/daniel-madrid-07/weeping-of-the-empire/releases/latest) and run it (no administrator rights needed). Setup is not code-signed, so Windows SmartScreen may warn the first time. Its SHA-256 is in the release notes.
-2. **Drop in your files:** your dump of the game, version 1.0.0 (`.nsp` or `.xci`; a compressed `.nsz` / `.xcz` works too, its game data is copied out once: 17 GB more; so does an unencrypted `.nup`, which needs no `prod.keys`), and your `prod.keys`. Pick a folder on an NTFS drive with about 15 GB free (Setup says if it needs more) and press **Install**.
+2. **Drop in your files:** your dump of the game, version 1.0.0 (`.nsp` or `.xci`; a compressed `.nsz` / `.xcz` works too, its game data is copied out once: 17 GB more; so does an unencrypted `.nup`, which needs no `prod.keys`), and your `prod.keys` (for the 1.4.3 beta, also your 1.4.3 update dump in the *Update (optional)* row, `.nsp`, `.xci`, `.nsz` or `.xcz`; a `.nup` that holds the update goes there as well, the same file, and then no `prod.keys` either). Pick a folder on an NTFS drive with about 15 GB free (Setup says if it needs more) and press **Install**.
 3. **Wait once, then play.** Setup downloads the tools it needs, an optimisation profile (made by running the game on the developer's PC: function names and how often their branches ran) and a list of the shaders the game used there (hashes and render states; see [LEGAL.md](LEGAL.md) for both), decrypts and recompiles the game on your PC, and puts two shortcuts on your desktop: the game, and *Weeping of the Empire - Settings*, which opens the settings window before the game starts (holding Ctrl while you start the game does the same). Setup's own estimate is 30 to 60 minutes. One full install of an earlier version took about 33 minutes on a 16-thread CPU with 62 GB of RAM while other work was running, and its folder peaked at about 39 GB. Since v0.1.8 the game reads its data straight from your dump instead of a 17 GB copy, so keep the dump where it is: if you move it, the game asks you to pick it again. With the dump on a USB, removable or network drive, or with **Copy the game files** ticked in Setup, the data is copied instead (17 GB more) and the dump can then go. An install from an earlier version keeps its copy; untick **Copy the game files** to free those 17 GB (the dump then has to stay). The install then holds a key made from your keys (see [LEGAL.md](LEGAL.md)): do not share the install folder. Internet is needed during the install. If it stops, press Install again and it continues where it stopped.
 
 Optional: your console's firmware, for its own Korean and Chinese fonts. Without it, Korean and Chinese text uses a
@@ -82,7 +83,7 @@ numbers are welcome: use the
 | | |
 |---|---|
 | **Frame rate** | 30 to 240 (30, 40, 45, 60, 75, 90, 120, 144, 165, 180, 200, 240) or unlocked (up to your monitor's refresh rate, 240 fps at most), with the game running at its real speed |
-| **Display** | Any window size and render resolution, ultrawide 21:9 / 32:9, triple-screen 48:9 and 16:10 (F10 > Graphics > Game patches > Aspect ratio; from v0.1.9 it follows your window's shape by default), borderless or exclusive fullscreen, VRR, HDR |
+| **Display** | Any window size and render resolution, ultrawide 21:9 / 32:9, triple-screen 48:9, 16:10 and 3:2 (Surface, Framework) (F10 > Graphics > Game patches > Aspect ratio; from v0.1.9 it follows your window's shape by default), borderless or exclusive fullscreen, VRR, HDR |
 | **Upscaling** | NVIDIA DLSS super resolution and DLAA on RTX cards, DLSS frame generation x2 / x3 / x4 on RTX 40 / 50 series, AMD FSR 3.1 upscaling and frame generation on any GPU, FSR 1, SMAA, all optional. Setup downloads NVIDIA's DLSS files itself (pinned by hash), so there is nothing to copy by hand |
 | **Colour** | The game's own colours by default; Vivid, Brighter dark tones, or Custom brightness, contrast, saturation and gamma (F10 > Graphics > Colour) |
 | **Controls** | Keyboard and mouse made for a PC, with keyboard and mouse glyphs in the game's prompts, gameplay and menu keys rebindable; Xbox, PlayStation and Switch controllers, back paddles of an Xbox Elite or DualSense Edge. Default keys: [CONTROLS.md](CONTROLS.md) |
@@ -97,7 +98,7 @@ generation) are options.
 
 ## Status and known limits
 
-- Version **1.0.0** of the game is supported (FAQ: [Which game versions work?](#faq)).
+- Version **1.0.0** of the game is supported; **1.4.3 is a beta** (FAQ: [Which game versions work?](#faq)).
 - Made for **Windows 10 / 11**. Linux and Steam Deck through Proton: experimental, not tested on Linux / Steam Deck
   yet ([Linux and Steam Deck](#linux-and-steam-deck-proton-experimental)).
 - First visits can stutter while shaders are built (above).
@@ -141,8 +142,8 @@ processor time per frame than on Windows. Setup puts no shortcut on the desktop 
 
 ## Requirements
 
-- **Your own files:** the game, version 1.0.0 (`.nsp`, `.xci`, `.nsz`, `.xcz` or `.nup`, title `0100F2C0115B6000`) and your `prod.keys` (not for a `.nup`: its files are unencrypted; the firmware's fonts still need them);
-  optionally your console's firmware, for its Korean and Chinese
+- **Your own files:** the game, version 1.0.0 (`.nsp`, `.xci`, `.nsz`, `.xcz` or `.nup`, title `0100F2C0115B6000`) and your `prod.keys` (not for a `.nup`: its files are unencrypted; the firmware's fonts and an update dump still need them);
+  for the 1.4.3 beta also your 1.4.3 update dump; optionally your console's firmware, for its Korean and Chinese
   fonts.
 - **CPU** with AVX2 (Intel Haswell / AMD Zen or newer) for the build we have tested. Processors with SSE4.2 but
   without AVX2 (Intel Sandy / Ivy Bridge, AMD FX, many Pentium / Celeron) get a compatible build that the Builder picks
@@ -150,8 +151,8 @@ processor time per frame than on Windows. Setup puts no shortcut on the desktop 
   Reports welcome. Setup refuses processors without SSE4.2. **GPU** with a current Vulkan 1.3 driver.
 - **RAM:** 8 GB recommended minimum (tested by simulation only), 16 GB recommended; less is allowed but untested.
 - **About 15 GB free** on an NTFS drive (the game's data stays in your dump: keep the dump where it is), about 30 GB
-  when Setup copies the data out of the dump (a dump on a USB drive, or the window's "Copy the game files"); and an
-  internet connection during the install.
+  when Setup copies the data out of the dump (a dump on a USB drive, or the window's "Copy the game files"), about
+  50 GB with the 1.4.3 update (beta); and an internet connection during the install.
 
 ## FAQ
 
@@ -171,9 +172,19 @@ Please report how it runs.
 
 **How do I play ultrawide (21:9, 32:9) or 16:10?** F10 > Graphics > Game patches > **Aspect ratio**. Choices: **The window's** (the game takes the shape of your window or monitor: 16:10, 21:9 or 32:9; any other shape keeps 16:9), **16:9** (the game's own picture, with bars on a wider screen), or a fixed **16:10**, **21:9** or **32:9**. The change applies at the next start. From v0.1.9 the default is **The window's**, and a saved 16:9 switches to it once (pick 16:9 again to keep it); before v0.1.9 a 21:9 or 32:9 screen showed the game with bars at the sides until you changed it. If you move or resize the window to another shape, the game tells you to restart for it (F10 > Restart the game now). The first start on a new shape prepares its layout (about 30 s, once); Setup already prepares the shapes of your monitors. Two rows next to it set where the HUD sits on a wide screen and how real-time cutscenes are framed. All rows: [SETTINGS.md](SETTINGS.md#graphics--game-patches).
 
-**Which game versions work?** 1.0.0. The patches and the recompiled code are tied to that version's code; other
-versions are not supported yet (1.4.3 is being finished). A save from 1.1.x, 1.2.x or 1.4.x can be imported: it is
-converted to 1.0.0 (the original is kept).
+**Which game versions work?** 1.0.0, and 1.4.3 as a beta. The patches and the recompiled code are tied to each
+version's code, so each version is a build of its own; other versions (1.1 to 1.2.1) are not supported. For 1.4.3,
+put your own 1.4.3 update dump in Setup's *Update (optional)* row, next to your 1.0.0 dump: Setup builds 1.4.3 in a
+folder of its own next to the 1.0.0 build, with its own desktop shortcut (*Weeping of the Empire 1.4.3*); Setup's
+**Play** and the main shortcut keep starting 1.0.0. 1.4.3 keeps its own saves: the first time it starts it copies
+your 1.0.0 saves once, and later progress in one version does not appear in the other. Its mods go in `mods-v143`
+([MODS.md](MODS.md)). It is a beta: it runs at the same frame rates as 1.0.0, but
+fewer of the port's PC features and fixes work in 1.4.3 yet. The keyboard and mouse controls (F10 > Controls) should
+work there in play as in 1.0.0, the keys that change while Link climbs, glides, swims, rides, uses an ability or aims a bow included (G
+should throw what Link carries, or the weapon, as the controller's R does), except the ability keys 4 to 9 (Ultrahand,
+Fuse, Ascend, Recall, Autobuild, Camera): they do nothing in 1.4.3 yet, so pick abilities with the ability wheel (hold Tab, or
+hold L on the controller). In menus, use the keyboard or a controller: the mouse pointer does not work in
+1.4.3's menus yet. Please report what you find.
 
 **Is my keys file safe?** Setup passes it to the build as a path. It is never printed, copied or uploaded, and the
 whole build runs on your PC.
@@ -188,12 +199,14 @@ each mod in it is listed on its own. Or let the game install a mod as you downlo
 folder): F10 > Mods > Install a mod..., or drop it on `TotK Launcher.exe` or the desktop shortcut. In the game, F10 > Mods
 shows them in load order (the top one wins a file two mods change), switches each one on or off, and says why a mod
 cannot be used; changes apply at the next start. The resource size table is adjusted by itself, so mods with bigger
-files do not need their own. Mods must be for version 1.0.0; the port's own files (PC button prompts, fixes) stay
+files do not need their own. Mods must be for the game version you play: 1.0.0 reads the `mods` folders, a 1.4.3
+build (beta) its own `mods-v143` folders (in the same two places); the port's own files (PC button prompts, fixes) stay
 over a mod's. No mods ship with the port. The full guide (layouts, F10 > Mods, why a mod is not used):
 [MODS.md](MODS.md).
 
-**Do code patches (.ips, .pchtxt) and cheats work?** Yes, with files made for 1.0.0: a mod's `exefs` folder (or the SD card's `atmosphere\exefs_patches\<name>`) and its
-`cheats\082CE09B06E33A12.txt` (Atmosphere format; a folder holding only that file
+**Do code patches (.ips, .pchtxt) and cheats work?** Yes, in 1.0.0 and in the 1.4.3 beta, each with files made for
+its own version: a mod's `exefs` folder (or the SD card's `atmosphere\exefs_patches\<name>`) and its
+`cheats\082CE09B06E33A12.txt` (1.4.3: `277178B7DBA1B6D4.txt`; Atmosphere format; a folder holding only that file
 is a cheats mod too). The game is recompiled
 ahead of time, so a patch that changes code needs the game built again with it: when the mods' code patches change,
 the game closes, rebuilds itself with Setup's tools (about 3 minutes; only the changed parts compile again) and starts

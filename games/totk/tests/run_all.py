@@ -19,8 +19,9 @@ from pathlib import Path
 from games.totk import patches as P
 from games.totk.patches import __main__ as cli
 
-from . import (verify_camblend, verify_cascade, verify_cloth, verify_effect_ease, verify_footik_ease, verify_fps60,
-               verify_havok_step, verify_paraglide_ease, verify_realtime, verify_sites, verify_swim_ease)
+from . import (verify_ability_pitch, verify_camblend, verify_cascade, verify_cloth, verify_effect_ease,
+               verify_footik_ease, verify_fps60, verify_grab_stick, verify_havok_step, verify_paraglide_ease,
+               verify_realtime, verify_sites, verify_swim_ease)
 
 
 def _apply_cli(args):
@@ -110,6 +111,7 @@ def main(argv=None):
                    verify_paraglide_ease.verify(original, patched),
                    verify_effect_ease.verify(original, patched),
                    verify_swim_ease.verify(original, patched),
+                   verify_ability_pitch.verify(original, patched), verify_grab_stick.verify(original, patched),
                    *verify_sites.verify(original, patched)]
         return dict(status='fail' if any(r['status'] != 'pass' for r in results) else 'pass', results=results)
     step('verifiers', verifiers)

@@ -362,6 +362,14 @@
    "for": [
     "0x157cdfc"
    ]
+  },
+  "0x3d4": {
+   "new": "0x3d4",
+   "for": [
+    "0x157ceac",
+    "0x15a7d54"
+   ],
+   "ro": true
   }
  },
  "UltraHand": {
@@ -465,6 +473,22 @@
    "new": "0x5b",
    "for": [
     "0x223b0a4"
+   ]
+  }
+ },
+ "EquipmentUser": {
+  "0x20": {
+   "new": "0x20",
+   "for": [
+    "0x16ec9c0"
+   ]
+  }
+ },
+ "CameraStickInput": {
+  "0x154": {
+   "new": "0x15c",
+   "for": [
+    "0x1ce6ee8"
    ]
   }
  }

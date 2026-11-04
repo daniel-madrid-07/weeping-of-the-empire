@@ -437,8 +437,31 @@ static void sr_release(NVSDK_NGX_Handle *h) {
     NVSDK_NGX_VULKAN_ReleaseFeature(h);
 }
 
+// The DLSS model (pc_dlss.cpp graphics.dlss_preset, TOTK_DLSS_PRESET = k / j / empty; rival v0.3.7 parity): 0 =
+// NVIDIA's own per quality mode, else that NVSDK_NGX_DLSS_Hint_Render_Preset for every mode. NGX reads it as a feature
+// is made, so a change in game drops the features (apply_request) and the next evaluate makes them again (one ~100 ms
+// feature creation).
+static volatile LONG g_req_preset = -1;   // (-1: nothing asked; vk_ngx_set_preset's value)
+static int g_preset = -1;                 // (-1: TOTK_DLSS_PRESET not read yet)
+static int preset_from(const char *e) {   // (the row's / TOTK_DLSS_PRESET's name: the SDK's enum stays in here)
+    return !e ? 0 : !strcmp(e, "k") || !strcmp(e, "K") ? NVSDK_NGX_DLSS_Hint_Render_Preset_K
+         : !strcmp(e, "j") || !strcmp(e, "J") ? NVSDK_NGX_DLSS_Hint_Render_Preset_J : 0;
+}
+static int preset_env(void) { return preset_from(getenv("TOTK_DLSS_PRESET")); }
+static const char *preset_name(int p) {
+    return p == NVSDK_NGX_DLSS_Hint_Render_Preset_K ? "preset K" : p == NVSDK_NGX_DLSS_Hint_Render_Preset_J ? "preset J"
+         : "NVIDIA's default";
+}
+void vk_ngx_set_preset(const char *name) { InterlockedExchange(&g_req_preset, preset_from(name)); }
+
 static bool sr_create(VkCommandBuffer cb, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, int flags) {
     if (!g_sr_par && NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&g_sr_par))) { g_sr_fails = 99; return false; }
+    if (g_preset < 0) g_preset = preset_env();
+    static const char *const k_preset_par[] = {
+        NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+        NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
+        NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality};
+    for (int i = 0; i < 6; i++) NVSDK_NGX_Parameter_SetUI(g_sr_par, k_preset_par[i], (unsigned)g_preset);
     if (g_sr && (ow != g_sr_ow || oh != g_sr_oh || flags != g_sr_flags)) {   // (another output or flags: kept, the oldest goes)
         sr_release(g_sr_spare[SR_SPARES - 1].h);
         memmove(&g_sr_spare[1], &g_sr_spare[0], (SR_SPARES - 1) * sizeof g_sr_spare[0]);
@@ -463,9 +486,9 @@ static bool sr_create(VkCommandBuffer cb, uint32_t rw, uint32_t rh, uint32_t ow,
         return false;
     }
     g_sr_flags = flags; g_sr_rw = rw; g_sr_rh = rh; g_sr_ow = ow; g_sr_oh = oh; g_sr_minw = minw; g_sr_minh = minh;
-    LOG("[dlss] SR feature %ux%u -> %ux%u (quality %d, subrects down to %ux%u%s, flags 0x%x) in %.1f ms\n", rw, rh, ow, oh,
-        (int)cp.Feature.InPerfQualityValue, minw, minh, g_sr_exact ? ", not used" : minw ? "" : " unreported", (unsigned)flags,
-        (SDL_GetTicksNS() - t0) / 1e6);
+    LOG("[dlss] SR feature %ux%u -> %ux%u (quality %d, %s, subrects down to %ux%u%s, flags 0x%x) in %.1f ms\n", rw, rh,
+        ow, oh, (int)cp.Feature.InPerfQualityValue, preset_name(g_preset), minw, minh,
+        g_sr_exact ? ", not used" : minw ? "" : " unreported", (unsigned)flags, (SDL_GetTicksNS() - t0) / 1e6);
     return true;
 }
 
@@ -582,6 +605,19 @@ static VkDescriptorPool g_mv_pool;
 static VkDescriptorSet g_mv_sets[8];
 static OwnImage g_mv, g_out, g_dz[2], g_bias;
 static int g_bias_mode = -1;   // TOTK_DLSS_BIAS=0: no bias mask; TOTK_DLSS_SHOW=bias: the mask drawn over the frame (red)
+// How strongly the mask trusts this frame where something moved, in % (pc_dlss.cpp graphics.dlss_trails,
+// TOTK_DLSS_TRAILS; rival v0.3.7 parity, PARITY_037.md #12): 100 = the mask as it was (fewest trails behind Link and
+// animals), 0 = DLSS's history alone (smoother, more trails). Read every frame (-1: TOTK_DLSS_TRAILS not read yet).
+static volatile LONG g_bias_pct = -1;
+void vk_ngx_set_trails(int pct) { InterlockedExchange(&g_bias_pct, pct < 0 ? 0 : pct > 100 ? 100 : pct); }
+static uint32_t bias_pct(void) {
+    if (g_bias_pct < 0) {
+        const char *e = getenv("TOTK_DLSS_TRAILS");
+        int n = e && *e ? atoi(e) : 100;
+        InterlockedCompareExchange(&g_bias_pct, n < 0 ? 0 : n > 100 ? 100 : n, -1);
+    }
+    return (uint32_t)g_bias_pct;
+}
 static VkSampler g_mv_smp;
 static int g_sr_mode = -1;   // TOTK_DLSS=sr: 1 (SR / DLAA on the upscale pass); TOTK_DLSS=1: NGX up only
 static bool g_sr_last;       // evaluated last frame (exec.c jitters this frame's geometry only then)
@@ -601,6 +637,7 @@ static float g_jsx = 1.f, g_jsy = 1.f;   // TOTK_DLSS_JSIGN=<sx>,<sy>: sign of t
 // the last SR evaluate's inputs, for FG on the same frame
 static TexBackend *g_fg_depth;
 static uint32_t g_fg_ow, g_fg_oh;   // the canvas the scene went into (the upscale pass's target)
+static float g_fg_gw, g_fg_gh;   // (its guest size: its host size over its scale, within a texel: the host is rounded up)
 static float g_fg_jx, g_fg_jy;
 static bool g_fg_reset, g_fg_inv, g_fg_flip, g_fg_zminus;
 static float g_cam_eval_prev[CAM_FLOATS];
@@ -679,7 +716,7 @@ static const char k_mv_glsl[] =
     "        float z = dist(p.fl.y != 0u ? pd * 2.0f - 1.0f : pd);\n"
     "        lo = min(lo, z); hi = max(hi, z);\n"
     "      }\n"
-    "      b = (e < lo * 0.95f || e > hi * 1.05f) ? 1.0f : 0.0f;\n"
+    "      b = (e < lo * 0.95f || e > hi * 1.05f) ? float(p.fl.w) / 100.0f : 0.0f;\n"
     "    }\n"
     "  }\n"
     "  imageStore(mv, q, vec4(m, 0.0f, 0.0f));\n"
@@ -705,7 +742,7 @@ static bool mv_pipeline(void) {
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                                                 .module = m, .pName = "main"},
                                       .layout = g_mv_layout};
-    VK_CHECK(vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g_mv_pipe));
+    VK_CHECK(vk_engine_compute_pipeline("motion vectors", &ci, &g_mv_pipe));
     vkDestroyShaderModule(g_vk.dev, m, NULL);
     VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}};
     VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8, .poolSizeCount = 2, .pPoolSizes = ps};
@@ -726,7 +763,7 @@ static void own_image(VkCommandBuffer cb, OwnImage *im, uint32_t w, uint32_t h, 
                             .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
                             .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-    VK_CHECK(vmaCreateImage(g_vk.vma, &ic, &ai, &im->img, &im->mem, NULL));
+    VK_CHECK(vk_image_create_relieved(&ic, &ai, &im->img, &im->mem, "NGX image %ux%u fmt %d", w, h, fmt));
     VkImageViewCreateInfo vc = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
                                 .format = fmt, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     VK_CHECK(vkCreateImageView(g_vk.dev, &vc, NULL, &im->view));
@@ -818,7 +855,7 @@ static bool sr_run(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, Tex
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) pc.m[j * 4 + i] = (float)R[i][j];   // (GLSL mat4: column-major)
     pc.sz[0] = (float)w; pc.sz[1] = (float)h; pc.sz[2] = 1.f / w; pc.sz[3] = 1.f / h;
     // the mask needs last frame's depth (dz of the previous evaluate, same size) and no cut
-    pc.fl[0] = flip_y; pc.fl[1] = zminus; pc.fl[2] = g_bias_mode && !reset && !dz_new; pc.fl[3] = 0;
+    pc.fl[0] = flip_y; pc.fl[1] = zminus; pc.fl[2] = g_bias_mode && !reset && !dz_new; pc.fl[3] = bias_pct();
     const float *Pp = (reset ? c : g_cam_eval) + 16;   // (the previous camera's projection: its depth -> view distance)
     pc.lp[0] = Pp[10]; pc.lp[1] = Pp[11]; pc.lp[2] = Pp[14]; pc.lp[3] = Pp[15];
     vk_full_barrier(cb);
@@ -840,6 +877,7 @@ static bool sr_run(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, Tex
         memcpy(g_cam_eval_prev, g_cam_eval, sizeof g_cam_eval);
         memcpy(g_cam_eval, c, sizeof g_cam_eval);
         g_fg_depth = depth; g_fg_jx = jx; g_fg_jy = jy; g_fg_reset = reset; g_fg_inv = inv; g_fg_flip = flip_y; g_fg_zminus = zminus; g_fg_ow = out->width; g_fg_oh = out->height;
+        g_fg_gw = out->width / (out->sx > 0 ? out->sx : 1.f), g_fg_gh = out->height / (out->sy > 0 ? out->sy : 1.f);
         g_cam_eval_n = g_cam_n;
         return false;
     }
@@ -881,6 +919,7 @@ static bool sr_run(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, Tex
     memcpy(g_cam_eval_prev, g_cam_eval, sizeof g_cam_eval);
     memcpy(g_cam_eval, c, sizeof g_cam_eval);
     g_fg_depth = depth; g_fg_jx = jx; g_fg_jy = jy; g_fg_reset = reset; g_fg_inv = inv; g_fg_flip = flip_y; g_fg_zminus = zminus; g_fg_ow = out->width; g_fg_oh = out->height;
+        g_fg_gw = out->width / (out->sx > 0 ? out->sx : 1.f), g_fg_gh = out->height / (out->sy > 0 ? out->sy : 1.f);
     g_cam_eval_n = g_cam_n;
     static uint64_t nlog, nprinted;   // (every 300th evaluate and each reset, 200 lines at most)
     if ((nlog++ % 300 == 0 || reset) && nprinted++ < 200)
@@ -985,6 +1024,7 @@ static bool g_fg_hl;                   // the live feature was created with the 
 // 30 or more (vk_ngx_fg_set_active)
 #define FG_MAX 3
 static OwnImage g_fg_in, g_fg_out[FG_MAX], g_fg_hud;
+static OwnImage g_fg_hud_s;   // (the HUD-less canvas copy scaled to the presented image: graphics.native_ui off, vk_ngx_fg_frame)
 static int g_fg_n = -1;
 static volatile LONG g_fg_active;   // (the pacer's count, 1..g_fg_n; 0: g_fg_n)
 static int g_fg_fails, g_fg_hl_mode = -1, g_fg_show = -1;
@@ -1249,7 +1289,10 @@ static bool ngx_can(void) {
 
 static bool apply_request(void) {   // true: a feature was turned on or off, its backend or the count changed
     int sr = (int)InterlockedExchange(&g_req_sr, -1), fg = (int)InterlockedExchange(&g_req_fg, -1);
-    if (sr < 0 && fg < 0) return false;
+    const int preset = (int)InterlockedExchange(&g_req_preset, -1);
+    if (preset >= 0 && g_preset < 0) g_preset = preset_env();
+    const bool preset_new = preset >= 0 && preset != g_preset;
+    if (sr < 0 && fg < 0 && !preset_new) return false;
     (void)vk_ngx_on(), (void)vk_ngx_sr_on(), (void)vk_ngx_fg_on();   // (the start's state first)
     if (g_fg_mode == 2) fg = -1;
     bool want_sr = sr >= 0 ? sr != 0 : g_sr_want, sr_ffx = sr >= 0 ? sr == 2 : g_sr_ffx, dlaa = sr >= 0 ? sr == 3 : g_sr_dlaa;
@@ -1271,6 +1314,17 @@ static bool apply_request(void) {   // true: a feature was turned on or off, its
         g_sr_last = false;   // (no jitter until the upscaler has run again)
         LOG("[dlss] SR turned %s in game\n", !want_sr ? "off" : sr_ffx ? "on (FSR)" : dlaa ? "on (DLAA)" : "on (DLSS)");
     }
+    if (preset_new) {   // (DLSS's features were made with the old model: all go, the next evaluate makes one again)
+        g_preset = preset;
+        if (g_sr_want && !g_sr_ffx) {
+            sr_release_live(g_sr);
+            for (int i = 0; i < SR_SPARES; i++) sr_release_live(g_sr_spare[i].h);
+            g_sr = NULL, g_sr_flags = -1;
+            memset(g_sr_spare, 0, sizeof g_sr_spare);
+        }
+        changed = true;
+        LOG("[dlss] DLSS model %s in game\n", preset_name(preset));
+    }
     dlaa = dlaa && g_sr_want && !g_sr_ffx;
     if (dlaa != g_sr_dlaa) {   // (the render scale follows at the next present: totk_hooks.c output_scale, vk_render_epoch)
         g_sr_dlaa = dlaa, changed = true;
@@ -1280,7 +1334,7 @@ static bool apply_request(void) {   // true: a feature was turned on or off, its
         if (g_fg && (!want_fg || fg_ffx)) { vk_wait_seq(vk_pending_seq() - 1); NVSDK_NGX_VULKAN_ReleaseFeature(g_fg); g_fg = NULL; }
         ffx_off |= g_fg_mode && g_fg_ffx && (!want_fg || !fg_ffx);
         if (!want_fg) {
-            own_free(&g_fg_in), own_free(&g_fg_hud);
+            own_free(&g_fg_in), own_free(&g_fg_hud), own_free(&g_fg_hud_s);
             for (int i = 0; i < FG_MAX; i++) own_free(&g_fg_out[i]);
             g_fg_hud_frame = UINT64_MAX;
         }
@@ -1362,11 +1416,25 @@ int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) {
     g_fg_sr_evals = g_in_n;
     // TotK's menus draw the scene into a smaller canvas (960x540) behind the menu: not the presented image, so the menu
     // would be interpolated as scene and there is no HUD-less image of its size. Such frames count as frames without a
-    // scene
-    if (g_fg_ow != b->width || g_fg_oh != b->height) {
+    // scene With graphics.native_ui off (the default since v0.1.9, public #62) the canvas follows the render scale
+    // (3072x1728 at x1.6) while the presented image stays 1920x1080, the game's copy pass scaling the one into the other:
+    // that is the scene, not a menu (v0.1.9: FG never engaged with native UI off, integration's post-publish aim step). A
+    // canvas of the presented image's GUEST size (1920x1080 both; a menu's is 960x540 at any render scale) counts as the
+    // scene whatever its host size, and one of another guest size as a menu whatever its host size (at render scale 2
+    // with native UI off a menu's canvas is 1920x1080 on the host). The guest sizes are compared within a texel: a host
+    // extent is the guest's at the scale rounded up (1600 lines: x1.481, 2845 / 1.481 = 1920.99). Its HUD-less copy is
+    // scaled to the presented size below. LARECOMP_FG_CANVAS_SCALED=0: by host size (the old rule).
+    static int scaled_on = -1;
+    if (scaled_on < 0) { const char *e = getenv("LARECOMP_FG_CANVAS_SCALED"); scaled_on = !(e && *e == '0'); }
+    const bool host_same = g_fg_ow == b->width && g_fg_oh == b->height;
+    const bool scene = scaled_on ? fabsf(g_fg_gw - b->width / (b->sx > 0 ? b->sx : 1.f)) <= 1.01f &&
+                                       fabsf(g_fg_gh - b->height / (b->sy > 0 ? b->sy : 1.f)) <= 1.01f
+                                 : host_same;
+    const bool scaled = scene && !host_same;
+    if (!scene) {
         static int told;
-        if (!told++) LOG("[dlss] FG off while the scene's canvas (%ux%u) is not the presented image (%ux%u): a menu over the scene\n",
-                         g_fg_ow, g_fg_oh, b->width, b->height);
+        if (!told++) LOG("[dlss] FG off while the scene's canvas (%ux%u, guest %.0fx%.0f) is not the presented image (%ux%u): a menu over the scene\n",
+                         g_fg_ow, g_fg_oh, g_fg_gw, g_fg_gh, b->width, b->height);
         return 0;
     }
     // a gap since the last FG frame (presents without a scene: a menu, a loading screen, held frames): start over
@@ -1386,8 +1454,29 @@ int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) {
     }
     g_fg_pres_fmt = fmt;
     uint32_t w = b->width, h = b->height, rw = g_mv.w, rh = g_mv.h;
+    // (a canvas of another size than the presented image: its HUD-less copy scaled to the presented size, as the game's copy pass
+    // scales the canvas)
+    OwnImage *hud = &g_fg_hud;
+    if (scaled && g_fg_hl_mode && g_fg_hud_frame == g_sr_frame && g_fg_hud.w == g_fg_ow && g_fg_hud.h == g_fg_oh && g_fg_hud.fmt == fmt) {
+        own_image(cb, &g_fg_hud_s, w, h, fmt, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                                              | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, fmt, &fp);
+        const bool lin = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+        VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)g_fg_hud.w, (int32_t)g_fg_hud.h, 1}},
+                          {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+        vk_full_barrier(cb);
+        vkCmdBlitImage(cb, g_fg_hud.img, VK_IMAGE_LAYOUT_GENERAL, g_fg_hud_s.img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
+                       lin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        vk_full_barrier(cb);
+        hud = &g_fg_hud_s;
+    }
+    static int told_scaled;
+    if (scaled && !told_scaled++)
+        LOG("[dlss] FG on a canvas of another size than the presented image (%ux%u into %ux%u: graphics.native_ui off), the HUD-less "
+            "image scaled to it (LARECOMP_FG_CANVAS_SCALED)\n", g_fg_ow, g_fg_oh, w, h);
     // the HUD-less copy is of this frame and matches the presented image (the canvas itself, or a copy of its size)
-    bool hl = g_fg_hl_mode && g_fg_hud_frame == g_sr_frame && g_fg_hud.w == w && g_fg_hud.h == h && g_fg_hud.fmt == fmt;
+    bool hl = g_fg_hl_mode && g_fg_hud_frame == g_sr_frame && hud->w == w && hud->h == h && hud->fmt == fmt;
     static int told_hl;
     if (!told_hl++) LOG("[dlss] FG HUD-less image: %s (canvas %ux%u, presented %ux%u format %d, %s)\n", hl ? "used" : "not used",
                         g_fg_hud.w, g_fg_hud.h, w, h, (int)b->format, g_fg_hud_src == b->image ? "the same image" : "another image");
@@ -1431,7 +1520,7 @@ int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) {
         ti.depth = (VkNgxImage){g_fg_depth->image, fdv, g_fg_depth->format, rw, rh};
         ti.mv = (VkNgxImage){g_mv.img, g_mv.view, g_mv.fmt, rw, rh};
         ti.backbuffer = (VkNgxImage){g_fg_in.img, g_fg_in.view, fmt, w, h};
-        if (hl) ti.hudless = (VkNgxImage){g_fg_hud.img, g_fg_hud.view, g_fg_hud.fmt, w, h};
+        if (hl) ti.hudless = (VkNgxImage){hud->img, hud->view, hud->fmt, w, h};
         ti.jx = g_fg_jx, ti.jy = g_fg_jy, ti.mv_sx = ti.mv_sy = 1.f;
         ti.reset = reset, ti.depth_inverted = g_fg_inv, ti.frame = g_fg_id + 1;
         cam_lens(c, g_fg_flip, g_fg_zminus, &ti);
@@ -1493,7 +1582,7 @@ int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) {
     NVSDK_NGX_Parameter_SetVoidPointer(p, NVSDK_NGX_DLSSG_Parameter_Backbuffer, &rb);
     NVSDK_NGX_Parameter_SetVoidPointer(p, NVSDK_NGX_DLSSG_Parameter_Depth, &rd);
     NVSDK_NGX_Parameter_SetVoidPointer(p, NVSDK_NGX_DLSSG_Parameter_MVecs, &rm);
-    NVSDK_NGX_Resource_VK rhl = NVSDK_NGX_Create_ImageView_Resource_VK(g_fg_hud.view, g_fg_hud.img, cr, fmt, w, h, false);
+    NVSDK_NGX_Resource_VK rhl = NVSDK_NGX_Create_ImageView_Resource_VK(hud->view, hud->img, cr, fmt, w, h, false);
     NVSDK_NGX_Parameter_SetVoidPointer(p, NVSDK_NGX_DLSSG_Parameter_HUDLess, hl ? &rhl : NULL);
     NVSDK_NGX_Parameter_SetVoidPointer(p, NVSDK_NGX_DLSSG_Parameter_UI, NULL);
     vkq_drain();
@@ -1511,8 +1600,8 @@ int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) {
 generated:
     if (g_fg_mode == 2 || (g_fg_show && hl)) {   // fgtest: shown instead of the real frame; TOTK_DLSS_SHOW=hudless
         vk_full_barrier(cb);
-        copy_image(cb, g_fg_mode == 2 ? g_fg_out[0].img : g_fg_hud.img, b->image, w, h);
-        if (g_fg_mode == 1) copy_image(cb, g_fg_hud.img, g_fg_in.img, w, h);   // (the real present shows it too)
+        copy_image(cb, g_fg_mode == 2 ? g_fg_out[0].img : hud->img, b->image, w, h);
+        if (g_fg_mode == 1) copy_image(cb, hud->img, g_fg_in.img, w, h);   // (the real present shows it too)
         vk_full_barrier(cb);
     }
     static uint64_t nlog, nprinted;
@@ -1568,6 +1657,8 @@ int vk_ngx_fg_frames(void) { return 0; }
 void vk_ngx_fg_set_active(int n) { (void)n; }
 void vk_ngx_prepare(VkCommandBuffer cb, const TexBackend *b) { (void)cb; (void)b; }
 void vk_ngx_request(int sr, int fg) { (void)sr; (void)fg; }
+void vk_ngx_set_preset(const char *name) { (void)name; }
+void vk_ngx_set_trails(int pct) { (void)pct; }
 float vk_ngx_scene_scale(float out_scale) { (void)out_scale; return 0.f; }
 int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) { (void)cb; (void)b; return 0; }
 void vk_ngx_fg_show(VkCommandBuffer cb, TexBackend *b, int generated) { (void)cb; (void)b; (void)generated; }

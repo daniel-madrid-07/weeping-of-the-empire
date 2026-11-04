@@ -537,7 +537,7 @@ struct SchemeRows { SchemeRows() { pc_settings_add(kSchemeRows, (int)(sizeof kSc
 // router state (input thread)
 // (any: the title's any-key A; mac: a macro's claim; trow: the T row the key went down on, tap undecided while
 // row == trow, else row is its hold row; at: the press)
-struct KeyState { bool down = false, dead = false, any = false, mac = false; int16_t row = -1, trow = -1; uint64_t at = 0; };
+struct KeyState { bool down = false, dead = false, any = false, mac = false, lay = false; int16_t row = -1, trow = -1; uint64_t at = 0; };
 bool g_mclaim[256];   // the inputs the running macros claim (PcMacroOut.claim, their last ticks)
 std::atomic<bool> g_title_press{false};   // the title's "press a button" phase (pc_ctx_decide)
 KeyState g_keys[kInputs];
@@ -1595,6 +1595,17 @@ void pc_route(const PcRouteIn &in, PcRouteOut *out) {
                 if (!g_phys_prev[k]) continue;
                 if (g_last_ctx >= 0 && g_t.layout[g_last_ctx] && g_t.layout[c] && now_row < 0) continue;
                 s.down = true; s.row = -1; s.dead = true;
+                s.lay = g_last_ctx >= 0 && g_t.layout[g_last_ctx];   // (held with the layout's meaning)
+                continue;
+            }
+            // Public #79: a direction key held through a teleport's loading or an event (the end of Ascend) stayed dead
+            // in the world until pressed again. A key that went dead only for passing through a context without the
+            // layout, held with the layout's meaning and giving no button there (a stick's key: the moves, the camera),
+            // gets that meaning back where the layout reads it again, as a pad's stick held through does; a held button
+            // keeps the rule (an Esc / E held into a menu must not act again when it closes)
+            if (s.dead && s.lay && s.row < 0 && g_t.layout[c] && now_row < 0 &&
+                !(in.layout_bits && in.layout_bits(k, in.user))) {
+                s = KeyState();
                 continue;
             }
             // (a key pressed on a pulse row, P / O / F, carries into nothing: V closing the Scope is SCOPE's 'P' "scope" and
@@ -1607,10 +1618,19 @@ void pc_route(const PcRouteIn &in, PcRouteOut *out) {
                 continue;
             }
             const int16_t eff = t_now ? hold_of(now_row) : now_row;   // (a held key onto a T pair: its hold row)
-            if (s.dead || eff < 0 || !same_action(s.row, eff) || (kRows[eff].kind != 'H' && kRows[eff].kind != 'G') ||
-                was == 'P' || was == 'O' || was == 'F')
+            const bool held_row = eff >= 0 && (kRows[eff].kind == 'H' || kRows[eff].kind == 'G');
+            // (public #79, LEAD 09:11, rival v0.3.7's 'input ignored after a menu closes while a key still reads held': a
+            // move key, W / A / S / D on its 'H' row, held through a teleport's loading, an event or a menu went dead for
+            // good; it stays dead in between (no menu focus moves from a held W) and gets its hold back where a later
+            // context routes the same move again, as a pad's stick held through does. s.lay: a held move row went dead;
+            // buttons (E, Esc: no stick direction) keep the rule)
+            if (s.dead && s.lay && held_row && same_action(s.row, eff)) { s.dead = false; s.lay = false; s.row = eff; s.trow = -1; }
+            else if (s.dead || eff < 0 || !same_action(s.row, eff) || !held_row || was == 'P' || was == 'O' || was == 'F') {
+                if (!s.dead && s.row >= 0 && (kRows[s.row].kind == 'H' || kRows[s.row].kind == 'G') &&
+                    (kRows[s.row].out & (M_L | M_U | M_R | M_D)))
+                    s.lay = true;   // (a held move: it comes back where the same move is routed again)
                 s.dead = true;
-            else { s.row = eff; s.trow = t_now ? now_row : -1; }
+            } else { s.row = eff; s.trow = t_now ? now_row : -1; }
         }
         // Space tapped while a menu closes jumps once), else dropped. (the same for a quickmenu's close: the presses
         // queued after its opening key let go, played once the strip's macro run is over, below: its release tail,

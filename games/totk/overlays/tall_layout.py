@@ -1,13 +1,14 @@
-"""The game's UI layouts for a canvas taller than 16:9 (a 16:10 display), edited in place in the
+"""The game's UI layouts for a canvas taller than 16:9 (a 16:10 display, or a 3:2 one: Surface, Framework), edited in place in the
 decompressed UI/LayoutArchive/Common.Product.*.blarc (python -m games.totk.overlays --aspect; ported from MacNativeGames scripts/tall_layout.py, MIT). The vertical counterpart of
 scripts/ultrawide_layout.py.
 
-The game lays its UI out on a 1920x1080 grid and maps that grid onto the canvas, so on a 16:10 canvas every layout comes out 11%
-too tall. Here each layout's root pane is squeezed to 16:9 (scale y = (w / h) / (16 / 9) = k); the layouts that sit against the
-top or the bottom of the screen move out with it (the root pane's y); about sixty panes are set one by one: backdrops and
-blurs are stretched back to the screen's edges (scale y 1 / k), a few widgets keep their shape (scale y k) or sit where the
-squeeze left a gap (y), and three animations that move panes (the minimap's slide-in, the discovery banner, the dragon tears
-zoom) get the same distances.
+The game lays its UI out on a 1920x1080 grid and maps that grid onto the canvas, so on a 16:10 canvas every layout comes out 11% too
+tall (on a 3:2 one 19%). Every edit below is a function of k: the pane list was read from a 16:10 archive and is used for 3:2 as
+written (no 3:2 archive was compared; the 3:2 HUD is to be checked in game, GATE_v0.1.10). Here each layout's root pane is squeezed
+to 16:9 (scale y = (w / h) / (16 / 9) = k); the layouts that sit against the top or the bottom of the screen move out with it (the
+root pane's y); about sixty panes are set one by one: backdrops and blurs are stretched back to the screen's edges (scale y 1 / k),
+a few widgets keep their shape (scale y k) or sit where the squeeze left a gap (y), and three animations that move panes (the
+minimap's slide-in, the discovery banner, the dragon tears zoom) get the same distances.
 
 The pane list and the distances come from the TOTK-Ultrawide mod's 16:10 archive for 1.0.0.. 1.2.1 (github.com/Fruithapje21/TOTK-Ultrawide,
 GPL-3.0; none of its code or files are used here): the list is what differs between that archive's layouts and the game's own, read pane by pane

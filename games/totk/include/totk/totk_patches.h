@@ -80,6 +80,9 @@ void *totk_data_page(void *main_base, uint64_t main_span);
 void *totk_data_page_current(void);
 
 void totk_frame_step_update(uint64_t now_ns);
+/* The Near shadow reach slot's value for multiplier k (0 / 1: the game's own), held so that reach x Shadow distance
+   stays at 4 at most (public #69): at start and for a live F10 change (totk_engine.c write_slot). */
+float totk_shadow_reach_slot(float k);
 void totk_present_interval(int interval);
 /* Diagnostics: pin the frame step to ms milliseconds (0 = back to measured time). */
 void totk_frame_step_pin(double ms);
@@ -167,7 +170,7 @@ uint64_t totk_output_extra_bytes(const TotkSettings *s);
 int totk_overlay_sets(const TotkSettings *s, char names[2][64]);
 
 /* The UI layout set of a <w>x<h> canvas, aspect-<w>x<h>, where a layout set depends only on the canvas's shape: a canvas
- * of the shape of a set built by default is given that set (1920x1200 -> aspect-2560x1600). 0 (name untouched) at 16:9. */
+ * of the shape of a set built by default is given that set (1920x1200 -> aspect-2560x1600, 1920x1280 -> aspect-2160x1440). 0 (name untouched) at 16:9. */
 int totk_layout_set(unsigned w, unsigned h, char name[64]);
 
 #ifdef __cplusplus

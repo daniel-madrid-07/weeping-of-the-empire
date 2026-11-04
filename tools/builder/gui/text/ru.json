@@ -133,7 +133,7 @@
  "Your prod.keys cannot open the dump ({0}): {1}.": "Ваш prod.keys не может открыть дамп ({0}): {1}.",
  "Your prod.keys cannot open the update dump ({0}): {1}.": "Ваш prod.keys не может открыть дамп обновления ({0}): {1}.",
  "Your saves and settings stay in {0}.": "Ваши сохранения и настройки остаются в {0}.",
- "Your {0} update dump: builds version {0}": "Дамп обновления {0}: собирается версия {0}",
+ "Beta: builds version {0} too (about 40 more minutes); full frame rate, less tested than 1.0.0": "Бета: собирается и версия {0} (ещё около 40 минут); с полной частотой кадров, проверена меньше, чем 1.0.0",
  "downloading {0}": "скачивание: {0}",
  "dump prod.keys again on the console the game was dumped from, with a current key dumper (one that knows that console's firmware), and choose that file": "снимите prod.keys заново на той консоли, с которой снят дамп игры, актуальной программой для дампа ключей (знающей прошивку этой консоли), и выберите этот файл",
  "exFAT: each update rebuilds from scratch": "exFAT: каждое обновление собирается с нуля",
@@ -160,5 +160,7 @@
  "{0}: the copy next to Setup": "{0}: копия рядом с установщиком",
  "{0}: the download does not match its checksum (got {1}); press Install again": "{0}: загрузка не совпадает с контрольной суммой (получено {1}); снова нажмите «Установить»",
  "{0}: the resumed file does not match its checksum: from the start": "{0}: докачанный файл не совпадает с контрольной суммой: заново с начала",
- "{0}: {1}; retrying in {2} s": "{0}: {1}; повтор через {2} с"
+ "{0}: {1}; retrying in {2} s": "{0}: {1}; повтор через {2} с",
+ "Community": "Сообщество",
+ "Could not open {0}: {1}": "Не удалось открыть {0}: {1}"
 }

@@ -6,6 +6,7 @@
 #include "pc.h"
 #include "cpu_place.h"
 #include "mods_exefs.h"
+#include "exe_tag.h"
 extern "C" void hle_fs_index_romfs_early(void);   // hle_fs.cpp: the RomFS pack's index built ahead of the first open
 extern "C" void ui_window_init(void);   // nvn/vulkan/device.c (prepare mode: the device without the game)
 extern "C" int vk_prepare(void);        // nvn/vulkan/exec.c (prepare mode)
@@ -15,6 +16,7 @@ extern "C" void pc_safe_mode_env(void);         // pc_settings.cpp: graphics.saf
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cwctype>
 #include <string>
 #include <cstring>
 #include <vector>
@@ -32,6 +34,7 @@ extern "C" void pc_safe_mode_env(void);         // pc_settings.cpp: graphics.saf
 #include <tlhelp32.h>
 #include <psapi.h>
 #else
+#include <dlfcn.h>   // (on_crash_signal: the library a crash is in)
 #include <sys/resource.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -427,6 +430,15 @@ static void on_crash_signal(int sig, siginfo_t* si, void* uc) {
             g_stage, (unsigned long long)g_stage_idx);
     fprintf(stderr, "[crash] exe+%llx (load %llx)  in HLE: %s\n", (unsigned long long)(rip - rt_posix_exe_base()),
             (unsigned long long)rt_posix_exe_base(), t_hle_cur ? t_hle_cur : "(none: generated code)");
+    {   // (in another library, a GPU driver (libvulkan_radeon, libnvidia-glcore) or the system's: its name, as on Windows;
+        // the guest fn above is then meaningless)
+        Dl_info di;
+        if (rip && dladdr((void*)rip, &di) && di.dli_fname && di.dli_fbase && (u64)(uintptr_t)di.dli_fbase != rt_posix_exe_base()) {
+            const char* b = strrchr(di.dli_fname, '/');
+            fprintf(stderr, "[crash] in %s+0x%llx, not the game's code (a driver or another library)\n", b ? b + 1 : di.dli_fname,
+                    (unsigned long long)(rip - (u64)(uintptr_t)di.dli_fbase));
+        }
+    }
     if (sig == SIGSEGV || sig == SIGBUS)   // what the faulting page is
         fprintf(stderr, "[crash] fault address %llx is %sreadable; main heap %llx+%llx\n", (unsigned long long)(u64)si->si_addr,
                 rt_posix_readable((u64)si->si_addr, 1) ? "" : "NOT ", (unsigned long long)g_rt_heap_base, (unsigned long long)kernel_heap_size());
@@ -475,6 +487,36 @@ static thread_local int t_fault_guard;    // (pc_fault_guard, pc.h) an access vi
 extern "C" void pc_fault_guard(int on) { t_fault_guard += on ? 1 : -1; }
 extern "C" int vk_precompile_crashed(u64 *key);   // nvn/vulkan/exec.c
 extern "C" int vk_shader_crashed(char *msg, int n);   // nvn/vulkan/exec.c
+// The module holding a host address ("igvk64.dll+0x14d102"; "no module" for an address none holds: 0, freed code), into
+// out; the module's handle (nullptr: none). No allocation: it runs in the exception handler. GetModuleHandleExW takes
+// the loader lock (as pc_crash's host_symbol and the frame walks do): a crash while ANOTHER thread holds it (a DLL
+// loading) waits for that thread; the crashing thread holding it itself (a fault in a DllMain) re-enters it, fine.
+static HMODULE crash_module(u64 a, char* out, size_t n) {
+    HMODULE m = nullptr;
+    wchar_t path[MAX_PATH];
+    if (a && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                (LPCWSTR)a, &m) && m && GetModuleFileNameW(m, path, MAX_PATH)) {
+        const wchar_t* base = wcsrchr(path, L'\\');
+        char name[MAX_PATH];
+        if (!WideCharToMultiByte(CP_UTF8, 0, base ? base + 1 : path, -1, name, sizeof name, nullptr, nullptr)) strcpy(name, "?");
+        snprintf(out, n, "%s+0x%llx", name, (unsigned long long)(a - (u64)m));
+        return m;
+    }
+    snprintf(out, n, "no module (%llx)", (unsigned long long)a);
+    return nullptr;
+}
+extern "C" int vk_pcache_crashed(char *msg, int n);   // nvn/vulkan/device.c: in the driver's pipeline cache
+extern "C" void vk_gpu_driver_crashed(void);         // nvn/vulkan/device.c: safe GPU mode's count
+extern "C" const char *pc_tr(const char *en);        // pc_text.cpp
+extern "C" void osd_toast(const char *text, int ms);  // hle_osd.cpp
+// nvn/vulkan/device.c gpu_safe_decide: the notice for a start in safe GPU mode (here, so its text is one of the port's
+// translated ones: tools/engine/pc_texts_scan.py reads engine/runtime's own files)
+extern "C" void pc_gpu_safe_notice(int stage) {
+    osd_toast(stage >= 2 ? pc_tr("Safe GPU mode: the graphics driver kept crashing, so shaders are also built unoptimised; "
+                                 "the game may run slower until it has run cleanly a few times")
+                         : pc_tr("Safe GPU mode: the graphics driver crashed in the last runs, so shaders now build the slow, safe way"),
+              20000);
+}
 static LONG WINAPI on_crash(EXCEPTION_POINTERS* ep) {
     auto* er = ep->ExceptionRecord;
     if (er->ExceptionCode < 0xC0000000u || t_prof_unwind) return EXCEPTION_CONTINUE_SEARCH;
@@ -498,11 +540,46 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS* ep) {
     }
     fflush(stdout);
     u64 rip = ep->ContextRecord->Rip;
-    u64 gf = guest_fn_of(rip);
-    crash_say("[crash] code %08lx at host %llx (guest fn %s_%llx) addr %llx  stage %s #%llu\n", er->ExceptionCode, rip,
-            gf >> 40 == 1 ? "s" : "f", gf & 0xFFFFFFFFFFull, er->NumberParameters > 1 ? (u64)er->ExceptionInformation[1] : 0ull,
-            g_stage, g_stage_idx);
-    crash_say("[crash] exe+%llx  in HLE: %s\n", rip - (u64)GetModuleHandleW(nullptr), t_hle_cur ? t_hle_cur : "(none: generated code)");
+    const HMODULE exe = GetModuleHandleW(nullptr);
+    char where[MAX_PATH + 40];
+    if (crash_module(rip, where, sizeof where) == exe) {
+        u64 gf = guest_fn_of(rip);
+        crash_say("[crash] code %08lx at host %llx (guest fn %s_%llx) addr %llx  stage %s #%llu\n", er->ExceptionCode, rip,
+                gf >> 40 == 1 ? "s" : "f", gf & 0xFFFFFFFFFFull, er->NumberParameters > 1 ? (u64)er->ExceptionInformation[1] : 0ull,
+                g_stage, g_stage_idx);
+        crash_say("[crash] exe+%llx  in HLE: %s\n", rip - (u64)exe, t_hle_cur ? t_hle_cur : "(none: generated code)");
+    } else {
+        // Outside the exe (a GPU driver, an overlay, a system DLL; or a call to address 0 / freed code): name the module,
+        // never a guest function (the guest table has none there: a driver address read as the last SDK function, #34 /
+        // #55), and the nearest caller of ours on the host stack: where the runtime called into it (rival 0.3.7).
+        crash_say("[crash] code %08lx in %s, not the game's code (a driver or another DLL)  addr %llx  stage %s #%llu\n",
+                er->ExceptionCode, where, er->NumberParameters > 1 ? (u64)er->ExceptionInformation[1] : 0ull, g_stage, g_stage_idx);
+        CONTEXT cx = *ep->ContextRecord;
+        int i = 0;
+        for (; i < 64 && cx.Rip; i++) {
+            DWORD64 image = 0;
+            if (i && crash_module(cx.Rip, where, sizeof where) == exe) break;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(cx.Rip, &image, nullptr);
+            if (!fn) {   // (a leaf, or no unwind data (rip 0): the return address is at rsp)
+                MEMORY_BASIC_INFORMATION mi;
+                if (!VirtualQuery((void*)cx.Rsp, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                    break;
+                cx.Rip = *(DWORD64*)cx.Rsp;
+                cx.Rsp += 8;
+                continue;
+            }
+            void* hd;
+            DWORD64 est;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, cx.Rip, fn, &cx, &hd, &est, nullptr);
+        }
+        if (i && i < 64 && cx.Rip && crash_module(cx.Rip, where, sizeof where) == exe) {
+            crash_say("[crash] called from exe+%llx (%d frame(s) up)  in HLE: %s\n", cx.Rip - (u64)exe, i,
+                    t_hle_cur ? t_hle_cur : "(none)");
+        } else {
+            crash_say("[crash] no caller in the exe on this thread's stack (a thread of that module)  in HLE: %s\n",
+                    t_hle_cur ? t_hle_cur : "(none)");
+        }
+    }
     {   // (the stage above is global: this is the thread that crashed, #51)
         char tl[160];
         os_crash_thread_line(tl, sizeof tl);
@@ -517,6 +594,22 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS* ep) {
                       "(cache/precompile_stuck.txt)\n", kn[kind & 3], qk);
         char sm[256];   // (a program's driver build on this thread, the game's or a pre-build's: which shader, and its next form)
         if (vk_shader_crashed(sm, sizeof sm)) crash_say("[crash] %s\n", sm);
+        if (vk_pcache_crashed(sm, sizeof sm)) crash_say("[crash] %s\n", sm);   // (the pipeline cache file: set aside)
+    }
+    {   // (a crash inside the graphics driver's own files, which every vendor installs under Windows' DriverStore: one more
+        // run in a row for safe GPU mode, nvn/vulkan/device.c; a clean exit clears the count)
+        HMODULE m = nullptr;
+        wchar_t mp[MAX_PATH] = L"";
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)rip, &m) &&
+            GetModuleFileNameW(m, mp, MAX_PATH)) {
+            for (wchar_t *q = mp; *q; q++) *q = (wchar_t)towlower(*q);
+            if (wcsstr(mp, L"\\driverstore\\")) {
+                vk_gpu_driver_crashed();
+                const wchar_t *base = wcsrchr(mp, L'\\');
+                crash_say("[crash] in the graphics driver (%ls): counted for safe GPU mode (cache/gpu_crashes.txt; the third such "
+                          "run in a row on this GPU and driver starts in it, a clean exit clears it)\n", base ? base + 1 : mp);
+            }
+        }
     }
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters > 1) {   // what the faulting page is
         MEMORY_BASIC_INFORMATION mi{};
@@ -1294,6 +1387,7 @@ int main(int argc, char** argv) {
 #endif
     pc_crash_install();   // nxrecomp: TOTK_PC_CRASH=1 crash reports + minidumps, from here on (on_crash comes later)
     fleet_apply();        // (before anything reads the variables it sets)
+    exe_tag_check();      // the game key this exe was linked against vs player.txt's (exe_tag.cpp; 11-03's wrong-key slot exe)
     pc_safe_mode_env();   // pc_settings.cpp: graphics.safe_mode's renderer switches (likewise, over every row's)
     // Idle priority class by default: test runs shared the PC with the user's video playback and made its audio crackle
     // (user 2026-10-14). TOTK_PRIORITY=normal opts out (e.g. for clean perf measurements) and sets the normal class

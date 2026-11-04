@@ -8,12 +8,29 @@
 #include <vma/vk_mem_alloc.h>
 
 typedef struct SubBlock SubBlock;
-struct VmaAllocator_T { VkDevice dev; VkPhysicalDeviceMemoryProperties mp; uint64_t vram_cap; uint32_t vram_heap; SubBlock *blocks; bool uma; };
-// sub: the block it was carved from (at offset), NULL for a resource with its own vkAllocateMemory
-struct VmaAllocation_T { VkDeviceMemory mem; void *mapped; uint32_t type; VkDeviceSize size, offset; uint32_t tag; SubBlock *sub; };
+struct VmaAllocator_T {
+    VkDevice dev; VkPhysicalDeviceMemoryProperties mp; uint64_t vram_cap; uint32_t vram_heap; SubBlock *blocks; bool uma;
+    bool prio;                                   // VK_EXT_memory_priority: priorities given at allocation (below)
+    PFN_vkSetDeviceMemoryPriorityEXT set_prio;   // VK_EXT_pageable_device_local_memory: and kept current per block
+};
+// sub: the block it was carved from (at offset), NULL for a resource with its own vkAllocateMemory; cold: a sampled texture
+// the CPU fills (vma_shim_cold), the rest (render targets, GPU-written images, buffers) hot
+struct VmaAllocation_T { VkDeviceMemory mem; void *mapped; uint32_t type; VkDeviceSize size, offset; uint32_t tag; SubBlock *sub; bool cold; };
 // Live bytes per caller tag (Deck d16 2026-10-16: 3 GB asked for in a 1 GB VRAM carve-out; which kind of image holds it?).
 // The caller sets vma_shim_tag around a create (textures.c: 1 ASTC decoded to RGBA8, 2 other texture images, 3 block shadows).
 _Thread_local int vma_shim_tag;
+// Residency priority (P1.1: other apps took the card, WDDM demoted ours to system RAM, render targets as readily as
+// textures unused for minutes GPU waits 1.3 s per 2 s). textures.c sets vma_shim_cold around the creation of a sampled
+// texture the CPU fills (not a render target): those are the bytes a frame can lose to system RAM at the least cost. With
+// VK_EXT_memory_priority an allocation of its own gets PRIO_COLD or PRIO_HOT, a block PRIO_BLOCK (neutral: both classes
+// share kind 1 / 2 blocks, so a block made by a cold texture can hold render targets later, which a cold priority fixed at
+// creation would demote first); with VK_EXT_pageable_device_local_memory a block follows what it holds: PRIO_HOT while any
+// hot resource lives in it, PRIO_COLD once only cold ones do (vkSetDeviceMemoryPriorityEXT, when that count crosses 0).
+// device.c LARECOMP_MEM_PRIORITY=0: none of it.
+_Thread_local int vma_shim_cold;
+#define PRIO_HOT 1.0f
+#define PRIO_COLD 0.25f
+#define PRIO_BLOCK 0.5f   // (every block at its creation, spares too: the OS default's middle)
 static _Atomic uint64_t tag_bytes[8];
 static _Atomic uint32_t tag_count[8];
 uint64_t vma_shim_tag_bytes(int tag, uint32_t *count) { if (count) *count = tag_count[tag & 7]; return tag_bytes[tag & 7]; }
@@ -58,6 +75,9 @@ VkResult vmaCreateAllocator(const VmaAllocatorCreateInfo *ci, VmaAllocator *out)
     else if (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && hs) cap = hs - (hs / 2 < (384ull << 20) ? hs / 2 : 384ull << 20);
     a->vram_cap = cap;
     a->uma = pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    a->prio = (ci->flags & VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT) != 0;
+    if (a->prio && (ci->flags & VMA_ALLOCATOR_CREATE_SHIM_PAGEABLE_BIT))
+        a->set_prio = (PFN_vkSetDeviceMemoryPriorityEXT)vkGetDeviceProcAddr(ci->device, "vkSetDeviceMemoryPriorityEXT");
     if (cap) fprintf(stderr, "[vma] VRAM cap %llu MB of the %llu MB device-local heap %u (LARECOMP_VRAM_CAP_MB): allocations past it go to the other heap\n",
                      (unsigned long long)(cap >> 20), (unsigned long long)(hs >> 20), a->vram_heap);
     *out = a;
@@ -82,12 +102,19 @@ enum { SUB_BLOCK = 32 << 20, SUB_MAX = 4 << 20 };
 // LARECOMP_VMA_SPARE=0: no helper.
 enum { BIG_BLOCK = 256 << 20, BIG_MAX = 64 << 20 };
 static VkDeviceSize block_size(uint32_t kind) { return kind == 2 ? BIG_BLOCK : SUB_BLOCK; }
+// the priority chained into a vkAllocateMemory of type t (device-local types only: host memory has no residency to lose);
+// NULL when priorities are off
+static const void *prio_info(VmaAllocator a, uint32_t t, float p, VkMemoryPriorityAllocateInfoEXT *pi) {
+    if (!a->prio || !(a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return NULL;
+    *pi = (VkMemoryPriorityAllocateInfoEXT){.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT, .priority = p};
+    return pi;
+}
 bool vk_residency_tight(void);   // (textures.c: short of the VRAM budget / commit floor now or within the last 2 s)
 struct SubBlock {
     SubBlock *next;
     VkDeviceMemory mem;
     uint8_t *mapped;
-    uint32_t type, kind, nfree, capfree, nlive;
+    uint32_t type, kind, nfree, capfree, nlive, nhot;   // (nhot: live hot resources, the block's priority)
     uint32_t cand, gid;   // (vma_shim_free_gain's scratch, under sub_mu)
     VkDeviceSize live_bytes;
     struct { VkDeviceSize off, size; } *fr;   // free ranges, by offset
@@ -119,7 +146,10 @@ static bool spare_on(void) {
 // in those frames: a 2400x2400 x4 shadow map 126 ms, a 1856x1856 x4 one 52 ms, a 128x128 depth 31 ms; while
 // vkAllocateMemory itself was 0.3-0.5 ms where it showed): the driver's own work on new device memory looks deferred to
 // its first bind. So the helper binds a buffer over the whole spare once, off the render thread, and frees it; the first
-// lines say what that cost (evidence for the gate). LARECOMP_VMA_PREBIND=0: not.
+// lines say what that cost (evidence for the gate). LARECOMP_VMA_PREBIND=0: not. Measured (v0.1.9 gate g19_see_kak_169,
+// RTX 5080): every such bind 0.0 ms, so the deferral is NOT in the bind; a 3072 x 3072 x4 D16 image took 10-16 ms with
+// its 72 MB allocated in 0.3 ms: the cost is the depth image's own creation / bind. Kept (free, harmless); the shadow
+// rungs and the pool are what avoid it.
 static void spare_prebind(VkDeviceMemory mem, uint32_t type, VkDeviceSize size) {
     static int on = -1;
     static uint32_t nlog;
@@ -152,8 +182,9 @@ static void *spare_main(void *arg) {
         spare[wt][wk].want = false;
         if (vk_residency_tight()) continue;   // (short of memory: hold nothing spare)
         pthread_mutex_unlock(&sub_mu);
+        VkMemoryPriorityAllocateInfoEXT pi;
         VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = spare_size(wk),
-                                   .memoryTypeIndex = (uint32_t)wt};
+                                   .memoryTypeIndex = (uint32_t)wt, .pNext = prio_info(spare_a, (uint32_t)wt, PRIO_BLOCK, &pi)};
         VkDeviceMemory mem = VK_NULL_HANDLE;
         VkResult r = vkAllocateMemory(spare_a->dev, &mi, NULL, &mem);
         if (r == VK_SUCCESS) spare_prebind(mem, (uint32_t)wt, mi.allocationSize);
@@ -166,6 +197,23 @@ static void *spare_main(void *arg) {
         spare_made++;
     }
     return NULL;
+}
+// textures.c res_real_budget, once room is back after a demotion: every device-local block's priority set again, through a
+// changed value so the driver passes it on and the video memory manager weighs placement anew. Its own allocations are not
+// listed and keep theirs. Pageable only (vkSetDeviceMemoryPriorityEXT). Returns the blocks set.
+uint32_t vma_shim_reassert(VmaAllocator a) {
+    if (!a->set_prio) return 0;
+    uint32_t n = 0;
+    pthread_mutex_lock(&sub_mu);
+    for (SubBlock *b = a->blocks; b; b = b->next) {
+        if (!(a->mp.memoryTypes[b->type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
+        const float p = b->nhot ? PRIO_HOT : PRIO_COLD;
+        a->set_prio(a->dev, b->mem, p - 0.01f);
+        a->set_prio(a->dev, b->mem, p);
+        n++;
+    }
+    pthread_mutex_unlock(&sub_mu);
+    return n;
 }
 // textures.c vk_residency_tick, when short: the idle spares go back to the driver
 void vma_shim_drop_spares(void) {
@@ -313,7 +361,12 @@ static void sub_give(SubBlock *b, VkDeviceSize off, VkDeviceSize size) {
 }
 // a resource carved from a block of memory type t; NULL: no block could take it and none could be made (the caller
 // allocates it alone)
-static VmaAllocation sub_alloc(VmaAllocator a, uint32_t t, uint32_t kind, VkMemoryRequirements req) {
+// a block's priority from what lives in it (pageable only; sub_mu held)
+static void block_prio(VmaAllocator a, SubBlock *b) {
+    if (a->set_prio && (a->mp.memoryTypes[b->type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        a->set_prio(a->dev, b->mem, b->nhot ? PRIO_HOT : PRIO_COLD);
+}
+static VmaAllocation sub_alloc(VmaAllocator a, uint32_t t, uint32_t kind, VkMemoryRequirements req, bool cold) {
     VmaAllocation al = NULL;
     VkDeviceSize off = 0, align = req.alignment ? req.alignment : 1;
     pthread_mutex_lock(&sub_mu);
@@ -322,7 +375,9 @@ static VmaAllocation sub_alloc(VmaAllocator a, uint32_t t, uint32_t kind, VkMemo
         if (b->type == t && b->kind == kind && sub_take(b, req.size, align, &off)) break;
     if (!b && !(kind == 2 && vk_residency_tight())) {   // (short: no new big block, the caller allocates it alone)
         const VkDeviceSize bs = block_size(kind);
-        VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = bs, .memoryTypeIndex = t};
+        VkMemoryPriorityAllocateInfoEXT pi;
+        VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = bs, .memoryTypeIndex = t,
+                                   .pNext = prio_info(a, t, PRIO_BLOCK, &pi)};
         VkDeviceMemory mem = VK_NULL_HANDLE;
         void *mapped = NULL;
         const bool from_spare = kind < 3 && spare[t][kind].mem;   // (made by spare_main: no allocation here)
@@ -343,11 +398,15 @@ static VmaAllocation sub_alloc(VmaAllocator a, uint32_t t, uint32_t kind, VkMemo
         spare_ask(a, t, kind);   // (the next block of this class: made off this thread)
     }
     if (b) {
-        b->nlive++;
+        // (pageable: the first hot resident raises the block; the first resident of an empty block, a spare's PRIO_BLOCK
+        // included, sets it to its class)
+        const bool first = !b->nlive++;
+        if (!cold) b->nhot++;
+        if (first || (!cold && b->nhot == 1)) block_prio(a, b);
         b->live_bytes += req.size;
         sub_count++;
         al = calloc(1, sizeof *al);
-        al->mem = b->mem; al->offset = off; al->sub = b;
+        al->mem = b->mem; al->offset = off; al->sub = b; al->cold = cold;
         al->mapped = b->mapped ? b->mapped + off : NULL;
     }
     pthread_mutex_unlock(&sub_mu);
@@ -359,6 +418,7 @@ static void sub_free(VmaAllocator a, VmaAllocation al) {
     sub_give(b, al->offset, al->size);
     b->live_bytes -= al->size;
     sub_count--;
+    if (!al->cold && !--b->nhot && b->nlive > 1) block_prio(a, b);   // (only cold ones left: the block may go first)
     if (!--b->nlive) {   // (empty: freed while another block of its type and kind remains; a big one under pressure too)
         for (o = a->blocks; o && (o == b || o->type != b->type || o->kind != b->kind); o = o->next) {}
         if (o || (b->kind == 2 && vk_residency_tight())) {
@@ -400,6 +460,7 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
                           VmaAllocation *out, VmaAllocationInfo *info) {
     bool host = ai->flags & (VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
                              VMA_ALLOCATION_CREATE_MAPPED_BIT);
+    const bool cold = kind == 1 && vma_shim_cold;   // (optimal images only: the caller's word for a CPU-filled sampled texture)
     VkMemoryPropertyFlags need = ai->requiredFlags, want = ai->preferredFlags;
     if (host) need |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     if (ai->flags & VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT) want |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
@@ -444,7 +505,7 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
         if (t < 0 && host) t = pick_type(a, bits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, want);
         if (t < 0) t = pick_type(a, bits, 0, want);
         if (t >= 0 && (!host || (a->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) &&
-            (al = sub_alloc(a, (uint32_t)t, kind, req)))
+            (al = sub_alloc(a, (uint32_t)t, kind, req, cold)))
             goto got;
     }
     for (bool first = true;; first = false) {
@@ -454,7 +515,9 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
             if (t < 0) t = pick_type(a, bits, 0, want);
         }
         if (t < 0) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-        VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)t};
+        VkMemoryPriorityAllocateInfoEXT pi;
+        VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)t,
+                                   .pNext = prio_info(a, (uint32_t)t, cold ? PRIO_COLD : PRIO_HOT, &pi)};
         al = calloc(1, sizeof *al);
         // (a device-local buffer of OWN_SPARE / 2.. OWN_SPARE: the helper's ready allocation, see spare[][SPARE_OWN]; not a
         // smaller one, which would hold up to twice its size: a range's last, shorter mirror block makes its own)
@@ -473,6 +536,7 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
             spare_ask(a, (uint32_t)t, SPARE_OWN);
             pthread_mutex_unlock(&sub_mu);
         }
+        if (took && a->set_prio) a->set_prio(a->dev, al->mem, PRIO_HOT);   // (a buffer: the spare's PRIO_BLOCK raised)
         r = took ? VK_SUCCESS : alloc_timed(a->dev, &mi, &al->mem, req.size > BIG_MAX ? "own allocation, over 64 MB"
                                                 : kind == 2 && vk_residency_tight() ? "own allocation, VRAM short: no new big block"
                                                 : req.alignment > (1u << 20) ? "own allocation, alignment over 1 MB"
@@ -498,7 +562,7 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
 got:
     // (al->size: the memory it holds, a taken OWN_SPARE allocation's whole size, which the counts and its free use; the
     // allocation info keeps the resource's size)
-    al->type = (uint32_t)t; al->size = own_size ? own_size : req.size; al->tag = (uint32_t)vma_shim_tag & 7;
+    al->type = (uint32_t)t; al->size = own_size ? own_size : req.size; al->tag = (uint32_t)vma_shim_tag & 7; al->cold = cold;
     tag_bytes[al->tag] += al->size; tag_count[al->tag]++;
     heap_bytes[a->mp.memoryTypes[t].heapIndex] += al->size;
     heap_count[a->mp.memoryTypes[t].heapIndex]++;

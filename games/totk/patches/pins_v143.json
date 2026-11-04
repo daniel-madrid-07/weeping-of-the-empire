@@ -143,6 +143,18 @@
   "why": "an actor reference's affordance mask getter: placed by its 8 paired callers' aligned calls",
   "checked": "6 instructions read side by side: the same, the mask moved from actor +0x5a0 to +0x5a8 (the actor grew by 8, as +0x220 -> +0x228)"
  },
+ "0x1347600": {
+  "new": "0x18a7bbc",
+  "body": "2c61f84a33cab200f857cb37efbd2ca801c79e9c395f575b528ac7de5771c4ae",
+  "why": "the camera mode parameter's lateral stick scale getter the ability camera calls; same flag / override walk / value +0x5c, loop form",
+  "checked": "the hook in the ability pitch file reads only the return address at entry, then the value pointer the getter returns"
+ },
+ "0x1347654": {
+  "new": "0x18a7c10",
+  "body": "50603b64629defa596ece95f5dd45a849f9c15dada13627ced76a06e5914aad4",
+  "why": "the camera mode parameter's longitudinal stick scale getter the ability camera calls; same flag +0xc3 / override walk / value +0x64, loop form (as 0x1347600's)",
+  "checked": "its only callers: 0x18a74ac (the parameter copy, 1.0.0 0x1346edc) and the ability camera update 0x23d33f8; the hook reads the return address, then the returned pointer"
+ },
  "0x13bd680": {
   "new": "0x193ec10",
   "body": "f11d6d7b426e79f3b44f75ffdcd6938ba65b3badca712c60f7c95c283b504176",
@@ -197,11 +209,41 @@
   "why": "a player-state test on slot 0's verb and Player +0xad8 / +0xae3 (the walk scheduler's family): paired by its call",
   "checked": "whole body read side by side: same code, Actor +0x220 -> +0x228, a verb class gains verb 46 (mask bit 34; Invalid stays 284), callee 0x1122bbc -> 0x1bccec0; verb chain, +0xad8 same"
  },
+ "0x171323c": {
+  "new": "0x1d3ab44",
+  "body": "1874f8330a6b7bdfdb2f65c1b49e30a3b39c78c8e1a678d451538aa00468011c",
+  "why": "UltraHand's MoveSpeed X exponent getter (flag +0x119, value +0xf4), loop form",
+  "checked": "the only getter with flag +0x119 / value +0xf4; its outside caller is the grab update X exponent read; the hook reads the return address, then the returned pointer"
+ },
+ "0x1713290": {
+  "new": "0x1d3ab98",
+  "body": "b7488e636a06bf26a8961847514ccd264d9b8f3156e606937f0f9148c5f71320",
+  "why": "UltraHand's MoveSpeed Y exponent getter (flag +0x11a, value +0xf8), loop form",
+  "checked": "the only getter with flag +0x11a / value +0xf8; its external caller is calcGrab's Y exponent read"
+ },
  "0x171fafc": {
   "new": "0x1d4ac34",
   "body": "f49c189ed4824dee71bb24fcbb6dd3cb1591e7e704a37201db410614409e3eb4",
   "why": "Recall's next-velocity step: the 500 / -400 / 100 / 900 constants and the 1/30 step agree (4 of 5, next best 3); 1.4.3 inlines the move-toward helper and moved the k ramp to its caller",
   "checked": "totk_recall_accel.cpp hook_f_171fafc: k at +0x2c of x0, read only for the two steps (500 - 400 k) / 30 and over the mass s0; w1 zero returns at once; the 900 speed clamp after"
+ },
+ "0x172d1bc": {
+  "new": "0x1d58e80",
+  "body": "f3a9c5fdc987665aab2148328f47f80ca0cd31725a76e0f612e021fc3cfd8a7d",
+  "why": "the Ultrahand grab update (a vtable call, no bl callers in either version): x19 = x0 = the Ultrahand object",
+  "checked": "same prologue; stick read at +0x11c / +0x120, each curved by powf with the two exponents above, then flags +0x13e..+0x141: the hook's constant offsets hold"
+ },
+ "0x172d6d4": {
+  "new": "0x1d5bf24",
+  "body": "f3a9c5fdc987665aab2148328f47f80ca0cd31725a76e0f612e021fc3cfd8a7d",
+  "why": "return address after calcGrab's X exponent getter call (1.4.3: in its out-of-line block, back to 0x1d593f0)",
+  "checked": "the hook compares the return address with it; the X exponent is loaded from the returned pointer next, for the first power curve"
+ },
+ "0x172d6f0": {
+  "new": "0x1d5bf48",
+  "body": "f3a9c5fdc987665aab2148328f47f80ca0cd31725a76e0f612e021fc3cfd8a7d",
+  "why": "return address after calcGrab's Y exponent getter call",
+  "checked": "the hook compares the return address with it; the Y exponent is loaded from the returned pointer next, for the second power curve"
  },
  "0x1a067c8": {
   "new": "0x9ead30",
@@ -226,6 +268,12 @@
   "body": "44d3a477b4df654662ab57b83c8106b9e8bfa35400102a415e97a9153c357bfc",
   "why": "the extra-stamina gauge's event path: body match (ratio 0.60; next best 0.26)",
   "checked": "totk_stamina_pause.cpp: state +0x78 (2 starts, 3 counts, 4 after 15) and the counter +0x80 adding one per call, the same; 1.4.3 adds a second start branch that also adds one"
+ },
+ "0x1a857a0": {
+  "new": "0x28f8850",
+  "body": "aa27f7498207b430c996c3ab468aefea4a64baaff3a2e58d34685f390a85f656",
+  "why": "the options toggle button state setter the PC toggle rows call: its pair is confirmed by three call edges, only the entry changed",
+  "checked": "same store to +0x89, the same +0x68 child and its two vtable slots by the flag; 1.4.3 stores the flag byte without masking it (the engine passes 0 or 1)"
  },
  "0x1a85b3c": {
   "new": "0x212bf04",
@@ -323,6 +371,18 @@
   "why": "the player's stick calculator: the same vtable slot (slot port); every field it touches, with the same use count per field, and its constants agree",
   "checked": "totk_roll_input.cpp: angle +0xe0, sum +0xe8, grace +0xec..+0xf4, length at the pointer +0x58, outputs +0x78 / +0xb8 / +0xa8 and the band and cap constants, the same values in 1.4.3"
  },
+ "0x1ce7684": {
+  "new": "0x23d33fc",
+  "body": "10e8d895f43990c99de56f3c3405d1500b72212475db116d1e27138b308c50c8",
+  "why": "return address after the LngStickScale getter call in the ability camera mode update (the yaw's scale)",
+  "checked": "the hook compares the return address with it; the same yaw math follows: the scale times the negated stick"
+ },
+ "0x1ce78fc": {
+  "new": "0x23d30e0",
+  "body": "10e8d895f43990c99de56f3c3405d1500b72212475db116d1e27138b308c50c8",
+  "why": "return address after the scale getter call in the ability camera mode update",
+  "checked": "the hook compares x30 with it; the same scale math follows"
+ },
  "0x1cfe320": {
   "new": "0x23eb604",
   "body": "8ed8e813a446558d8af3366133bfe07bbae84419e62b03d9008396003150c658",
@@ -418,6 +478,12 @@
   "body": "80868c220ecab90525dd894347bac4b56998500ea34995d049f86b1fb7bf62bb",
   "why": "the swim velocity ease's factor f32 0.175",
   "checked": "value verified in 1.4.3; read as the caller reads it"
+ },
+ "0x437ec50": {
+  "new": "0x37977c8",
+  "body": "930b49e38b08669757821e11aa68177a7848b9897099305b7631a3dd0dd0ba46",
+  "why": "the paraglide node's vtable; the one function storing it is the node factory (1.0.0 0x1d0c824)",
+  "checked": "totk_glide_ease.cpp compares the node's vptr with it"
  },
  "0x455aa88": {
   "new": "0x398a9d8",

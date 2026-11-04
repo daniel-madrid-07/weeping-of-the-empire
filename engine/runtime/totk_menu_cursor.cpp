@@ -1650,7 +1650,8 @@ int press_down(u64 node, int target) {
 // The focus to node: on eui's thread the game's own moveBoxCursor; elsewhere (no hook in this key) the three writes
 // it makes. True when it wrote them (the caller then re-raises the request bit until the focus is there).
 bool move_focus(const Focus& f, u64 node) {
-    if (g_in_hook) {
+    // (a version whose table leaves moveBoxCursor on the sentinel, 1.4.3's: the writes below, never a trapping call)
+    if (g_in_hook && totk_main_known(0x2230100)) {
         const u64 sm = SCREEN_MGR(), bm = game_object(sm) ? rd<u64>(sm + kSmBoxCursorMgr) : 0;
         if (ptr_ok(bm)) MoveBoxCursor(bm, node);
         return false;
@@ -2529,7 +2530,11 @@ double now_s() {
 }
 u64 frame(const Focus& f) {
     static bool was;
-    if (g_arrow_until && GetTickCount64() >= g_arrow_until)   // (first: every path below ends the arrow's D-pad press)
+    // (first: every path below ends the arrow's D-pad press). An Options section change reopening Options cuts it at
+    // once: the section row's step started the reopen, which presses B / A itself, and a D-pad press still held when
+    // the pause menu comes back moves the focus off Options, which stops the reopen with Options closed (public #54:
+    // a click on a section's < / > closed Options)
+    if (g_arrow_until && (GetTickCount64() >= g_arrow_until || totk_options_reopening()))
         g_arrow_until = 0, g_arrow_pad.store(0, std::memory_order_relaxed);
     if (!enabled()) {
         if (was) { pc_mouse_cursor_mode(false); was = false; }
@@ -2929,8 +2934,8 @@ u64 frame(const Focus& f) {
     u64 out = 0;
     out |= walk_step(f, now);
     // One edge per click: A is a 100 ms pulse, never held with the button, so a long press is still one confirm
-    if (a_from && now < a_until) out |= 1;
-    else if (a_from) a_node = 0, a_from = 0;
+    if (a_from && now < a_until && !reopening) out |= 1;
+    else if (a_from) a_node = 0, a_from = 0;   // (an Options reopen presses its own A: a click's A ends there too)
     return out;
 }
 }  // namespace

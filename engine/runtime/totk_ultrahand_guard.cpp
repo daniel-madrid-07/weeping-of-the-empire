@@ -86,21 +86,25 @@ bool enabled() {
     return on;
 }
 
-// once: the Ultrahand query manager's capacities (#51's result-ring question), read as the game reaches it:
+// the Ultrahand query manager's capacities (#51's result-ring question), read as the game reaches it, said once:
 // [[[GOT 0x4557a28]]+0x128] is the query system (0x15ecae0), its +0xb00 the managers, type 0 at +8 (0x13b093c);
-// [mgr+0x20] the request slots, [mgr+0x24] the result entries (the enqueue 0x7cba8c takes its tickets modulo them)
+// [mgr+0x20] the request slots, [mgr+0x24] the result entries (the enqueue 0x7cba8c takes its tickets modulo them).
+// Not reachable yet: said once, retried every 64th call until it is.
 void say_query_capacity() {
-    static std::atomic_flag said = ATOMIC_FLAG_INIT;
-    if (!kHere || said.test_and_set()) return;
+    static std::atomic<bool> done{false};
+    static std::atomic<u32> calls{0};
+    static std::atomic_flag said_wait = ATOMIC_FLAG_INIT;
+    if (!kHere || done.load(std::memory_order_relaxed) || (calls.fetch_add(1) & 63)) return;
     u64 sys = 0, mgrs = 0, mgr = 0;
     const u64 owner = totk_global(0x4557a28);
     if (readable(owner + 0x128, 8)) sys = ld64(owner + 0x128);
     if (readable(sys + 0xb00, 8)) mgrs = ld64(sys + 0xb00);
     if (readable(mgrs + 8, 8)) mgr = ld64(mgrs + 8);
-    if (readable(mgr + 0x20, 8))
-        printf("[query] type0 slots %u results %u\n", ld32(mgr + 0x20), ld32(mgr + 0x24));
-    else
-        printf("[query] type0 manager not reachable yet (system %llx)\n", (unsigned long long)sys);
+    if (readable(mgr + 0x20, 8)) {
+        if (!done.exchange(true)) printf("[query] type0 slots %u results %u\n", ld32(mgr + 0x20), ld32(mgr + 0x24));
+    } else if (!said_wait.test_and_set()) {
+        printf("[query] type0 manager not reachable yet (system %llx); retried until it is\n", (unsigned long long)sys);
+    }
 }
 }  // namespace
 
@@ -123,9 +127,11 @@ void hook_f_15eca7c(Ctx *__restrict c) {   // the Player component's Ultrahand u
     u64 p = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
     if (!p || target_ok(p)) { f_15eca7c_orig(c); return; }
     const u64 zero = (u64)(uintptr_t)&g_zero_entry;
-    if (!__atomic_compare_exchange_n(slot, &p, zero, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        f_15eca7c_orig(c);   // (the game bound a new result just now: its own read)
-        return;
+    // swap in the zero entry; if the game binds a new result meanwhile (the CAS fails, p = that result), check the
+    // new one the same way (a few rounds, then the original reads whatever is bound)
+    for (int round = 0;; round++) {
+        if (__atomic_compare_exchange_n(slot, &p, zero, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
+        if (!p || target_ok(p) || round == 3) { f_15eca7c_orig(c); return; }
     }
     static std::atomic<u64> skipped{0}, lines{0}, last_p{0}, last_a{0};
     const u64 a = readable(p, 8) ? ld64(p) : 0, n = skipped.fetch_add(1) + 1;

@@ -146,7 +146,7 @@ static bool init(void) {
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"}};
     bool ok = m && vkCreatePipelineLayout(g_vk.dev, &pl, NULL, &C.layout) == VK_SUCCESS &&
-              (ci.layout = C.layout, vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &C.pipe) == VK_SUCCESS);
+              (ci.layout = C.layout, vk_engine_compute_pipeline("contact shadows", &ci, &C.pipe) == VK_SUCCESS);
     if (m) vkDestroyShaderModule(g_vk.dev, m, NULL);
     if (!ok) {
         printf("[vk] contact shadows off: their pipeline could not be created\n");

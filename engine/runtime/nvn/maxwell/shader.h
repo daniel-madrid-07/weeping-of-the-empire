@@ -80,6 +80,9 @@ typedef struct {
     uint32_t num_insts;
     uint32_t pc_cases;      // GLSL pc-loop case labels (0: no pc loop); exec.c pa_job: AMD's driver takes minutes and GBs
                             // on a few hundred (issue #9)
+    uint16_t ldg_raw, ldg_table; // compute (every stage under maxwell_ldg_census): LDGs whose address came from anything
+                            // but the driver table's storage-buffer slots (a pointer from a UBO or from memory: read IN
+                            // PLACE through gmem_ on the GPU timeline) / from those slots (the device window). An estimate.
     uint8_t knobs_used;     // live knobs this translation read (1: maxwell_soft_pct, the sun-cascade compares, whatever
                             // its value): exec.c translates the program again when one of them changes
     char error[256];        // set when translation fails
@@ -98,6 +101,8 @@ extern uint64_t maxwell_gmem_window;
 // parallel with LARECOMP_PARALLEL_TRANSLATE=1; everything else still takes exec.c's translate_lock).
 #define MAXWELL_TLS __thread
 extern MAXWELL_TLS uint64_t maxwell_gmem_base, maxwell_gmem_size;
+extern MAXWELL_TLS int maxwell_ldg_census;   // (offline census, translate.c: 0 in the runtime)
+extern MAXWELL_TLS unsigned maxwell_ldg_table, maxwell_ldg_raw, maxwell_ldg_abs;
 extern MAXWELL_TLS const uint8_t *maxwell_const_data;  // (BRX jump tables: the program's c1 while it translates; NULL = unknown)
 extern MAXWELL_TLS size_t maxwell_const_size;
 // graphics.soft_shadows' percent for this translation (exec.c translate_program, live); -1: TOTK_SOFT_SHADOWS (tools)

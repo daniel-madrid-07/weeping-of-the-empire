@@ -93,7 +93,7 @@ const char *const kHdrPaper[] = {"80", "100", "120", "140", "160", "180", "200",
 const char *const kGameplay[] = {"console", "pc", nullptr};  // Console layout, PC
 const char *const kGyro[] = {"0.25", "0.5", "0.75", "1", "1.25", "1.5", "1.75", "2", "2.5", "3", nullptr};
 const char *const kFov[] = {"0.8", "0.9", "1", "1.1", "1.2", "1.3", "1.4", "1.5", nullptr};  // of a 0.5 .. 2 slider
-const char *const kWide[] = {"16:9", "window", "16:10", "21:9", "32:9", "48:9", nullptr};   // the game's, the window's shape (default)
+const char *const kWide[] = {"16:9", "window", "16:10", "21:9", "32:9", "48:9", "3:2", nullptr};   // the game's, the window's shape (default)
 const char *const kHud[] = {"auto", "corner", "center", nullptr};   // the ultrawide HUD: by shape (default), edges, middle 16:9
 const char *const kCut[] = {"wide", "16:9", nullptr};        // ultrawide cutscenes: wide (default), the original 16:9
 const char *const kWindowMode[] = {"windowed", "borderless", "exclusive", nullptr};  // borderless: the default
@@ -186,7 +186,7 @@ const KeyRow kKeyRows[] = {
     {99, "scope"},        {100, "whistle"},    {84, "inventory"},  {83, "map"},         {101, "adventure_log"},
     {102, "pause"},       {77, "ultrahand"},   {78, "fuse"},       {79, "ascend"},      {80, "recall"},
     {81, "autobuild"},    {82, "camera"},      {103, "ability_wheel"}, {104, "quit"},
-    {113, "leave"},
+    {113, "leave"},       {132, "walk"},       {133, "let_go"},
 };
 const char *const kKeyPages[] = {"Movement", "Combat", "Items and tools", "Abilities"};
 // The page entries at a context's own scope that get a row too (the rest are F10's): ABILITY's "leave" (Tab: its own
@@ -342,7 +342,19 @@ bool enabled() {
     static const bool placed = [] {
         const bool ok = totk_field_known(OptionSelect, 0x40) && totk_field_known(OptionsOwner, 0x5a0);
         if (!ok) printf("[options-menu] the Options fields are not placed in this game version: PC rows off\n");
-        return ok;
+        // the guest:: calls (totk_options_ui.h; 1.4.3 has HeapAlloc for the inlined ChoicesAlloc) and the data they
+        // are handed
+        static constexpr u64 kUsed[] = {0xb906ec,  0xa206b0,  0xb907a0,  0xb90810,  0x19ebf28, 0x1a857a0, 0x1a85d64,
+                                        0x1a861f8, 0x1a85d24, 0x1a85d84, 0x1a067c8, 0x98c090,  0x4558440, 0x45596a8,
+                                        0x36f84ce, 0x3700670, 0x3719b8b};
+        bool calls = true;
+        for (const u64 off : kUsed) {
+            if (totk_main_known(off)) continue;
+            printf("[options-menu] main+0x%llx (1.0.0) is not placed in this game version: PC rows off\n",
+                   static_cast<unsigned long long>(off));
+            calls = false;
+        }
+        return ok && calls;
     }();
     if (!placed) return false;
 #endif

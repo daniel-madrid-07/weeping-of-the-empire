@@ -454,6 +454,18 @@ bool shim_adapter_vram(const uint8_t luid[8], uint64_t *resident, uint64_t *size
     const D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP_INFORMATION *g = &q.QueryResult.ProcessSegmentGroupInformation;
     uint64_t dem = 0;
     for (int i = 0; i < D3DKMT_QUERYSTATISTICS_ALLOCATION_PRIORITY_CLASS_MAX; i++) dem += g->Demoted[i];
+    {   // which of ours the video memory manager moved, by priority class (shim_vma.c's residency priorities: cold textures
+        // should be the low class's, render targets the maximum's): each time the sum moves by 64 MB or more, and once at 0
+        static uint64_t said = 0;
+        static int nlog;
+        if (((dem > said ? dem - said : said - dem) >= (64ull << 20) || (!dem && said)) && nlog < 200) {
+            nlog++;
+            said = dem;
+            const ULONGLONG *d = g->Demoted;
+            fprintf(stderr, "[vram] demoted by priority class: minimum %llu, low %llu, normal %llu, high %llu, maximum %llu MB%s\n",
+                    d[0] >> 20, d[1] >> 20, d[2] >> 20, d[3] >> 20, d[4] >> 20, dem ? "" : " (all back)");
+        }
+    }
     *resident = res;
     *size = sz;
     *ours = g->Usage;
@@ -815,7 +827,11 @@ SDL_Window *SDL_CreateWindow(const char *title, int w, int h, SDL_WindowFlags fl
     const char *nf = getenv("TOTK_NO_FOCUS");
     if (flags & SDL_WINDOW_HIDDEN) {}
     else if (nf && *nf && strcmp(nf, "0")) SetWindowPos(g_win.hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    else ShowWindow(g_win.hwnd, SW_SHOW);
+    else {   // (in front of the other windows: the launcher allows it, AllowSetForegroundWindow; else Windows flashes the
+             // taskbar button instead. rival v0.3.7 parity, PARITY_037.md #27)
+        ShowWindow(g_win.hwnd, SW_SHOW);
+        SetForegroundWindow(g_win.hwnd);
+    }
     if (!(flags & SDL_WINDOW_HIDDEN)) keep_awake(true);
     return &g_win;
 }

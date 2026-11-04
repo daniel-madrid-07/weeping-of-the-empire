@@ -154,22 +154,31 @@ constexpr bool kPowerKnown = kVerbsKnown && all_known({kCompSpecialPower, kSpCur
 // 1.0.0 reader shows it yet, so it is its own gate and off where unplaced
 constexpr bool kRequestKnown = kPowerKnown && all_known({kSpRequested});
 constexpr bool kUltraHandKnown = kPowerKnown && all_known({kSpUltraHand, kUhState});
-constexpr bool kHandsKnown = kVerbsKnown && all_known({kCompEquipmentUser, kCompDynamicEquipment, kEuLinks, kEuSlotForce,
-                                                       kDeStateFlags, kDeState});
+constexpr bool kHandsKnown = kVerbsKnown && all_known({kCompEquipmentUser, kCompDynamicEquipment, kEuLinks, kDeStateFlags,
+                                                       kDeState});
+// (the force bytes, EquipmentUser +0x4610 + slot, override the equipment's own state while the game forces a slot drawn
+// or sheathed: read where placed. 1.4.3 has them at +0x4620 by reading (setSlotForce 0xdbba48 -> 0x4f5700,
+// isSheathed 0x697a9c -> 0x4cfdc4: movz #0x4610 -> #0x4620), but no evidence form takes a rewritten register-offset
+// literal yet; without them the slot reads the equipment's state, the same answer outside a forced moment)
+constexpr bool kHandsForceKnown = kHandsKnown && all_known({kEuSlotForce});
 // (the drawn type and ready slot feed the hands log only, a lead for the bow class: read where placed, never a gate)
 constexpr bool kHandsLogKnown = kHandsKnown && all_known({kEuDrawnType, kEuReadySlot});
-constexpr bool kRideKnown = kVerbsKnown && all_known({kCompRideLink, kLinkId, kLinkLive, kLinkSlot});
+constexpr bool kRideKnown = kVerbsKnown && all_known({kCompRideLink, kLinkId, kLinkLive});
+// (the link's entry index, RideLink +0x3c, only tells the steering-stick test that the link changed: read where placed;
+// without it a change is the actor or the link id changing, which a new ride always does)
+constexpr bool kRideSlotKnown = kRideKnown && all_known({kLinkSlot});
 constexpr bool kRootLogKnown = kCoreKnown;
 // every group (the start line says which are off)
 constexpr bool kFieldsKnown = kVerbsKnown && kEventKnown && kPlayerKnown && kPlayerLogKnown && kLockOnKnown &&
-                              kPowerKnown && kRequestKnown && kUltraHandKnown && kHandsKnown && kHandsLogKnown &&
-                              kRideKnown && kRootLogKnown;
-// The switch for a table that places only some groups (1.4.3 until decomp maps the rest): TOTK_PLAYER_STATE=1 runs the
-// placed groups, otherwise the file stands down as before (all or nothing). It turns on by default once a 1.4.3 boot
-// passes GATE_v0.1.9.md's player-state lines. 1.0.0 and a full table: always on.
+                              kPowerKnown && kRequestKnown && kUltraHandKnown && kHandsKnown && kHandsForceKnown &&
+                              kHandsLogKnown && kRideKnown && kRideSlotKnown && kRootLogKnown;
+// The switch for a table that places only some groups (1.4.3: every group the controls need is placed since v0.1.10,
+// the ability request, construct reach and the optional reads aside): the placed groups run by default, TOTK_PLAYER_STATE=0
+// stands the file down as before (all or nothing; v0.1.9's default, until its gate's player-state lines passed). 1.0.0
+// and a full table: always on.
 bool groups_on() {
     if (kFieldsKnown) return true;
-    static const bool on = [] { const char* e = getenv("TOTK_PLAYER_STATE"); return e && !strcmp(e, "1"); }();
+    static const bool on = [] { const char* e = getenv("TOTK_PLAYER_STATE"); return !e || strcmp(e, "0") != 0; }();
     return on;
 }
 
@@ -246,7 +255,7 @@ u8 hand_state(u64 eu, int slot) {
     if (!ptr_ok(data) || rd<s32>(data + kLinkDataId) != id) return kHandNone;
     const u64 proc = rd<u64>(data + kLinkDataProc);
     if (!game_object(proc) || (u32)(rd<s32>(proc + kProcState) - 7) < 5) return kHandNone;
-    const u8 force = rd<u8>(eu + kEuSlotForce + slot);
+    const u8 force = kHandsForceKnown ? rd<u8>(eu + kEuSlotForce + slot) : 0;
     if (force >> 1 & 1) return kHandDrawn;
     if (force >> 2 & 1) return kHandSheathed;
     const u64 comps = rd<u64>(proc + kActorComponents);
@@ -371,7 +380,7 @@ bool ride_link_walk(RideLink* r) {
         if (!ptr_ok(link) || rd<u32>(link + kLinkLive) != 1) return false;
         const s32 id = rd<s32>(link + kLinkId);
         if (id == -1) return false;
-        *r = RideLink{actor, id, rd<u32>(link + kLinkSlot)};
+        *r = RideLink{actor, id, kRideSlotKnown ? rd<u32>(link + kLinkSlot) : 0u};
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
                                                                  : EXCEPTION_CONTINUE_SEARCH) {
         return false;
@@ -438,7 +447,7 @@ void read_player() {
                    kRideKnown ? " ride" : "", kVerbsKnown ? "" : " verbs", kEventKnown ? "" : " event",
                    kPlayerKnown ? "" : " player", kLockOnKnown ? "" : " lock-on", kPowerKnown ? "" : " ability",
                    kUltraHandKnown ? "" : " ultrahand", kHandsKnown ? "" : " hands", kRideKnown ? "" : " ride",
-                   groups_on() ? "TOTK_PLAYER_STATE=1: the placed ones run" : "all off; TOTK_PLAYER_STATE=1 runs the placed ones");
+                   groups_on() ? "the placed ones run; TOTK_PLAYER_STATE=0: all off" : "all off: TOTK_PLAYER_STATE=0");
             return true;
         }();
         (void)said;

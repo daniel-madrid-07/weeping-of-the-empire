@@ -36,14 +36,55 @@ def mem_status():
     return m
 
 
+_WINE = []
+
+
+def on_wine():
+    """this Windows build runs on Linux through Wine / Proton (ntdll exports wine_get_version)"""
+    if not _WINE:
+        try:
+            k = ctypes.WinDLL('kernel32')   # (its own handle: the argtypes below change no other caller's)
+            k.GetModuleHandleW.restype = ctypes.c_void_p
+            k.GetProcAddress.restype = ctypes.c_void_p
+            k.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            h = k.GetModuleHandleW('ntdll.dll')
+            _WINE.append(bool(h and k.GetProcAddress(h, b'wine_get_version')))
+        except (OSError, AttributeError):
+            _WINE.append(False)
+    return _WINE[0]
+
+
+def linux_meminfo():
+    """Wine / Proton: /proc/meminfo in GB ({'MemAvailable': ..., 'SwapFree': ...}), else None. There Wine's
+    GlobalMemoryStatusEx gives the free commit as MemFree + SwapFree, and Linux keeps most free RAM as page cache
+    (reading the 16 GB dump fills it): the free commit read ~1 GB on a big PC, every compile waited under its commit
+    floor and the build ran one compile at a time. MemAvailable is Linux's own count of what new allocations get at
+    once, page cache included."""
+    if not on_wine():
+        return None
+    try:
+        out = {}
+        with open(r'Z:\proc\meminfo', encoding='ascii', errors='replace') as f:   # (Wine maps the Linux root to Z:)
+            for ln in f:
+                name, _, rest = ln.partition(':')
+                parts = rest.split()
+                if parts and parts[0].isdigit():
+                    out[name.strip()] = int(parts[0]) / 2**20   # (kB)
+        return out if 'MemAvailable' in out else None
+    except OSError:
+        return None
+
+
 def free_gb():
-    """free physical memory"""
-    return mem_status().ullAvailPhys / 2**30
+    """free physical memory (Wine / Proton: Linux's MemAvailable)"""
+    mi = linux_meminfo()
+    return mi['MemAvailable'] if mi else mem_status().ullAvailPhys / 2**30
 
 
 def free_commit_gb():
-    """commit limit minus commit charge"""
-    return mem_status().ullAvailPageFile / 2**30
+    """commit limit minus commit charge (Wine / Proton: Linux's MemAvailable + free swap, linux_meminfo)"""
+    mi = linux_meminfo()
+    return mi['MemAvailable'] + mi.get('SwapFree', 0.0) if mi else mem_status().ullAvailPageFile / 2**30
 
 
 def commit_floor(pool):

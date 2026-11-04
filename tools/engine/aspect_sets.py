@@ -28,8 +28,8 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 
 # (name, ratio range, the size of its layout set): the ranges are totk_engine.c wide_canvas's k_shapes, the sizes the
 # sets totk_patches.c totk_layout_set gives every canvas of that shape
-SHAPES = (('16:10', 1.55, 1.65, '2560x1600'), ('21:9', 2.2, 2.6, '3440x1440'), ('32:9', 3.3, 3.8, '5120x1440'),
-          ('48:9', 4.8, 5.9, '7680x1440'))
+SHAPES = (('3:2', 1.45, 1.55, '2160x1440'), ('16:10', 1.55, 1.65, '2560x1600'), ('21:9', 2.2, 2.6, '3440x1440'),
+          ('32:9', 3.3, 3.8, '5120x1440'), ('48:9', 4.8, 5.9, '7680x1440'))
 WANTED = 'aspects.txt'   # in <work>/overlays: the sets Setup builds besides the monitors' (one per line)
 
 

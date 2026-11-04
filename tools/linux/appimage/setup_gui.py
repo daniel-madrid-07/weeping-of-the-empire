@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import webbrowser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APPDIR = os.environ.get('APPDIR') or os.path.dirname(os.path.dirname(HERE))
@@ -32,6 +33,7 @@ BUNDLE = os.path.join(APPDIR, 'usr', 'bundle') if RELEASE.get('bundle') else Non
 CONFIG = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.path.expanduser('~'), '.config'),
                       'weeping-of-the-empire', 'setup.json')
 DEFAULT_INSTALL = os.path.join(os.path.expanduser('~'), 'Games', 'WeepingOfTheEmpire')
+COMMUNITY_URL = 'https://www.reddit.com/r/WeepingOfTheEmpire/'
 PERCENT = re.compile(r'(\d{1,3})% \(')
 STEP = re.compile(r'step (\d+)/(\d+)')
 
@@ -251,6 +253,10 @@ def window():
     install_btn.pack(side='left', padx=4)
     play_btn = ttk.Button(btns, text='Play', command=do_play)
     play_btn.pack(side='left', padx=4)
+    # the players' community, as Windows Setup's Community link: always here, for testers too (no browser or xdg-open
+    # found: webbrowser says False, the address goes to the log pane instead)
+    ttk.Button(btns, text='Community', command=lambda: webbrowser.open(COMMUNITY_URL) or
+               say(f'open {COMMUNITY_URL} in your browser')).pack(side='left', padx=4)
     root.after(200, pump)
     root.mainloop()
 

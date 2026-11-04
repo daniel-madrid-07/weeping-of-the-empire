@@ -106,7 +106,9 @@ Saves menu (Shift while opening the launcher):
 Import a save converts a save of a later game version (1.1.x, 1.2.x, 1.4.x) to 1.0.0: what 1.0.0 doesn't have
 (flags and settings of later updates) is left out, and the slot pictures are made smaller. The original, not
 converted, is kept in the backups ("imported original"). A save with data the converter doesn't know (a modified
-save, or a version after 1.4.x) is refused with the reason, and nothing changes.
+save, or a version after 1.4.x) is refused with the reason, and nothing changes. A 1.4.3 build (beta) keeps its own
+saves, in userdata-v143 next to userdata: the first time it starts it copies the 1.0.0 saves once; its saves can be
+imported back into 1.0.0 the same way ("nxrecomp v143" in the list).
 
 
 5. IF SOMETHING GOES WRONG

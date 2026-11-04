@@ -39,6 +39,7 @@ extern "C" bool shim_window_fullscreen(void);   // shim_win.c (borderless or exc
 extern "C" bool pc_overlay_open(void);          // pc_overlay.cpp: the settings window (or the Welcome one) is open
 extern "C" void* totk_data_page_current(void);  // games/totk/runtime/totk_patches.c: the data page, or NULL
 extern "C" float totk_camera_stick_applied(void);   // totk_camera_speed.cpp: the right stick's camera speed row
+extern "C" uint64_t nvn_present_count(void);         // nvn/objects.c: presents so far (the grab bias's parity)
 extern "C" void pc_mouse_inject(double dx, double dy);   // (below: TOTK_CTL "mouse", and TOTK_MOUSE_FLOOD's events)
 #define WM_APP_CAPTURE (WM_APP + 50)            // wParam 1 / 0, lParam the reason (const char*); shim_win.c: WM_APP + 1 .. 3
 #define WM_APP_RECLIP (WM_APP + 51)
@@ -134,25 +135,109 @@ bool bow_aim() {
 // mouse_gyro_speed). g_lock.
 double g_aim_scale = 1;
 double aim_gain() { return g_aim_scale != 1 && bow_aim() ? g_aim_scale : 1; }
+// The active ability camera mode's own stick scales (fps360-abilscales: its hooks write them each frame as the mode
+// update reads them, data page +228 LatStickScale / +232 LngStickScale, 0 = not seen yet, e.g. 1.4.3 until its getters
+// are placed): the gains divide by the live ones, so a mode with other scales (holding, another ability) turns as on
+// foot too; the 1.5 / 0.8 above when a slot reads 0. TOTK_MOUSE_ABILITY_GAIN, when set, wins over both.
+const unsigned kAbilLat = 228, kAbilLng = 232;
 void mode_gain(double* gx, double* gy) {   // (each count: the window thread, the ctl injection)
     static double ax = -1, ay = -1;
+    static bool forced;
     if (ax < 0) {
         double x = kAbilityGainX, y = kAbilityGainY;
-        if (const char* e = getenv("TOTK_MOUSE_ABILITY_GAIN"); e && sscanf(e, "%lf,%lf", &x, &y) != 2) x = kAbilityGainX, y = kAbilityGainY;
+        const char* e = getenv("TOTK_MOUSE_ABILITY_GAIN");
+        forced = e && sscanf(e, "%lf,%lf", &x, &y) == 2;
+        if (!forced) x = kAbilityGainX, y = kAbilityGainY;
         ay = y; ax = x;
     }
     const bool ability = pc_ctx() == PCX_ABILITY;
     const double aim = aim_gain();
-    *gx = (ability ? ax : 1) * aim; *gy = (ability ? ay : 1) * aim;
+    double x = ax, y = ay;
+    if (ability && !forced)
+        if (uint8_t* p = page()) {
+            auto f32 = [p](unsigned off) {
+                const uint32_t b = __atomic_load_n((const uint32_t*)(p + off), __ATOMIC_ACQUIRE);
+                float f;
+                memcpy(&f, &b, 4);
+                return f;
+            };
+            const float lat = f32(kAbilLat), lng = f32(kAbilLng);
+            if (lng > 0.05f && lng < 20.0f) x = 1.0 / lng;
+            if (lat > 0.05f && lat < 20.0f) y = 70.0 / (lat * 51.0);
+        }
+    *gx = (ability ? x : 1) * aim; *gy = (ability ? y : 1) * aim;
     pitch_gain_apply();
+}
+// TOTK_MOUSE_STEP_MAX=<degrees> (v0.1.9 gate, LEAD 10:47: the "camera elsewhere" one-frame hits cluster at the see
+// script's mouse flicks, TOTK_CTL "mouse 600 0" every 50 ms, often two or three read together): the veneer applies
+// whatever the totals moved since its last camera step, after the game's clamp, so a burst turns the camera ~28 deg
+// per 600 counts in ONE step (rate 0.02 x 70 deg/s / 30), where a pad's full tilt turns 2.3 deg a step at 30 fps. One
+// such frame renders from a camera the game's collision has not caught up with (strip g19_see_kak_329_006995: one frame
+// pulled in past the wall, its neighbours alike). With the switch the published totals move at most that many degrees
+// a camera step (DP_MOUSE_BEAT, stamped by the veneer at each) and the rest goes out at the next steps: no motion is
+// lost, a flick past the limit takes a few frames. After a stale beat (no step for more than MOUSE_STALE presents) the
+// veneer drops the motion anyway, so no backlog is kept there. 0 / unset: everything at once, as before. Published
+// from the raw events and from every input read (pc_mouse_stick_counts) and keeper tick, so the rest goes out without
+// new motion.
+const unsigned kPresents = 88;   // TOTK_DP_PRESENTS
+double step_max_deg() {
+    static const double d = [] {
+        const char* e = getenv("TOTK_MOUSE_STEP_MAX");
+        const double v = e && *e ? atof(e) : 0;
+        if (v > 0) printf("[mouse] camera turn at most %.1f deg a camera step (TOTK_MOUSE_STEP_MAX), the rest at the next steps\n", v);
+        return v > 0 ? v : 0;
+    }();
+    return d;
+}
+float page_f32_at(const uint8_t* p, unsigned off) {
+    uint32_t b = __atomic_load_n((const uint32_t*)(p + off), __ATOMIC_ACQUIRE);
+    float f;
+    memcpy(&f, &b, 4);
+    return f;
+}
+bool g_cap_init;                 // g_lock: the step window below is set
+uint32_t g_cap_beat;             // g_lock: the camera step the window is for
+double g_cap_x0, g_cap_y0;       // g_lock: the totals published when that step's window opened
+double g_pub_x, g_pub_y;         // g_lock: the totals published last
+unsigned g_cap_held;             // g_lock: publishes that held motion back (logged)
+void cap_totals(const uint8_t* p, double* x, double* y) {   // g_lock held: *x / *y the totals, out: those to publish
+    const double deg = step_max_deg();
+    const float rate = page_f32_at(p, kMouseRate), mult = page_f32_at(p, kMouseScale);
+    if (!(deg > 0) || !(rate > 0) || !(mult > 0)) { g_cap_init = false; return; }
+    // (the veneer turns rate x multiplier x 70 / 30 deg a published unit, at any frame rate: k = rate x mult / ratio,
+    // and the game turns stick x 70 deg/s x ratio / 30; pitch, once shaped, as many degrees a unit as yaw)
+    const double cap = deg * 30.0 / (70.0 * rate * mult);
+    const uint32_t beat = __atomic_load_n((const uint32_t*)(p + kBeat), __ATOMIC_ACQUIRE);
+    const uint32_t presents = __atomic_load_n((const uint32_t*)(p + kPresents), __ATOMIC_ACQUIRE);
+    if (!g_cap_init || presents - beat > 3) {   // (TOTK_MOUSE_STALE_PRESENTS: the veneer primes, the motion is dropped)
+        g_cap_init = true, g_cap_beat = beat, g_cap_x0 = *x, g_cap_y0 = *y;
+        return;
+    }
+    if (beat != g_cap_beat) g_cap_beat = beat, g_cap_x0 = g_pub_x, g_cap_y0 = g_pub_y;
+    const double cx = g_cap_x0 + fmax(-cap, fmin(cap, *x - g_cap_x0));
+    const double cy = g_pitch_veneer.load(std::memory_order_acquire) ? g_cap_y0 + fmax(-cap, fmin(cap, *y - g_cap_y0)) : *y;   // (else pitch_feed's)
+    if (cx != *x || cy != *y) {
+        g_cap_held++;
+        static ULONGLONG next;
+        if (GetTickCount64() >= next) {
+            next = GetTickCount64() + 10000;
+            printf("[mouse] camera step limit: %u publishes held motion back (%.0f units of %.0f a step)\n", g_cap_held,
+                   fmax(fabs(*x - cx), fabs(*y - cy)), cap);
+            g_cap_held = 0;
+        }
+    }
+    *x = cx, *y = cy;
 }
 void page_totals() {   // g_lock held
     if (uint8_t* p = page()) {
+        double px = g_tx, py = g_ty + g_ty_off;
+        cap_totals(p, &px, &py);
+        g_pub_x = px, g_pub_y = py;
         uint64_t x;
-        memcpy(&x, &g_tx, 8);
+        memcpy(&x, &px, 8);
         __atomic_store_n((uint64_t*)(p + kPcPage + kMouseX), x, __ATOMIC_RELEASE);
         if (g_pitch_veneer.load(std::memory_order_acquire)) {   // (else y: pitch_feed)
-            const double yv = g_ty + g_ty_off;
+            const double yv = py;
             uint64_t y;
             memcpy(&y, &yv, 8);
             __atomic_store_n((uint64_t*)(p + kPcPage + kMouseY), y, __ATOMIC_RELEASE);
@@ -214,6 +299,95 @@ void grab_switch() {   // the input thread, each read
                hold ? "drives the right stick" : "turns the camera directly again");
 }
 
+// The stick while Ultrahand holds: the velocity path below turns a move into deflection only while it lasts, so a quick
+// move's counts past full deflection were lost, and the ability's own stick scales (yaw x 0.8, pitch x 1.5) came on top.
+// Here each count is owed as full-tilt seconds at the camera's own degrees a count (mode_gain's factors undo the
+// ability's scales, as for the veneer) and paid out with a 30 ms time constant, at most full deflection: the same turn
+// as the camera for the same move, at any frame rate and read cadence (only the deflection's time integral counts), the
+// part past the full tilt's speed a little later instead of never (at most kGrabOweS owed: no long drift after a big
+// flick). The full tilt's speed itself still bounds a fast move: past it only a hook in the ability camera would help.
+const double kGrabTau = 0.03, kGrabOweS = 0.35;
+const double kGrabBiasRaw = 0.2 + 0.8 * 0.001;   // (the dead zone pc_mouse assumes, 0.2, and 0.001 of a full tilt past it)
+// fps360-grabstick's page slots (data_page.h TOTK_DP_GRAB_*): the held object's stick from the mouse, X / Y (f32,
+// unclamped, before the game's inverts, as a pad's), the present it was written for (TOTK_DP_PRESENTS at +88; the hook
+// takes the pair for that present and the next only), and calcGrab's two curve exponents (it moves each axis by
+// sign(v) |v|^p x MoveSpeed x dt): the feed is sign(t) |t|^(1/p), so the object moves t full tilts' worth, in proportion
+// to the hand's move whatever p is. kGrabFeedMax: a flick moves it at most 3 full tilts fast
+const unsigned kGrabX = 236, kGrabY = 240, kGrabLive = 244, kGrabPx = 248, kGrabPy = 252;
+const double kGrabFeedMax = 3.0;  // (and each written axis at most +-3 after the curve: calcGrab's powf input stays sane)
+float page_f32_at_or0(unsigned off) {
+    uint8_t* p = page();
+    if (!p) return 0;
+    const uint32_t b = __atomic_load_n((const uint32_t*)(p + off), __ATOMIC_ACQUIRE);
+    float f;
+    memcpy(&f, &b, 4);
+    return f > 0.01f && f < 100.0f ? f : 0;
+}
+// the hook took the pair at this present or the one before (TOTK_DP_GRAB_ACK, data page +384, after the PC page:
+// fps360-grabstick stamps TOTK_DP_PRESENTS there each calcGrab call it fed): the owed counts are then paid at the
+// object's rate; else at most full deflection, as the emulated stick delivers (a key without the hook, 1.4.3 unplaced)
+const unsigned kGrabAck = 384;
+bool grab_acked() {
+    uint8_t* p = page();
+    if (!p) return false;
+    const uint32_t ack = __atomic_load_n((const uint32_t*)(p + kGrabAck), __ATOMIC_ACQUIRE);
+    const uint32_t now = __atomic_load_n((const uint32_t*)(p + kPresents), __ATOMIC_ACQUIRE);
+    return ack != 0 && now - ack <= 2;
+}
+void grab_feed(double tx, double ty, float pexp_x, float pexp_y) {
+    uint8_t* p = page();
+    if (!p) return;
+    auto curve = [](double t, float pe) { return copysign(pow(fabs(t), 1.0 / (pe > 0 ? pe : 1.0)), t); };
+    const float vx = (float)fmax(-kGrabFeedMax, fmin(kGrabFeedMax, curve(tx, pexp_x)));
+    const float vy = (float)fmax(-kGrabFeedMax, fmin(kGrabFeedMax, curve(ty, pexp_y)));
+    uint32_t bx, by;
+    memcpy(&bx, &vx, 4); memcpy(&by, &vy, 4);
+    __atomic_store_n((uint32_t*)(p + kGrabX), bx, __ATOMIC_RELEASE);
+    __atomic_store_n((uint32_t*)(p + kGrabY), by, __ATOMIC_RELEASE);
+    __atomic_store_n((uint32_t*)(p + kGrabLive), __atomic_load_n((const uint32_t*)(p + kPresents), __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+}
+double g_owe_x, g_owe_y;   // stick reader: full-tilt seconds still to turn (+y up)
+void grab_stick(double dx, double dy, double dt, double full, int32_t* rx, int32_t* ry) {
+    double gx, gy;
+    mode_gain(&gx, &gy);
+    g_owe_x = fmax(-kGrabOweS, fmin(kGrabOweS, g_owe_x + dx * gx / full));
+    g_owe_y = fmax(-kGrabOweS, fmin(kGrabOweS, g_owe_y - dy * gy * g_inv / full));
+    if (!(dt > 0 && dt < 0.25)) return;   // (a first read or a stall: owed, paid from the next read)
+    double px = g_owe_x / kGrabTau, py = g_owe_y / kGrabTau;
+    const double m = sqrt(px * px + py * py);
+    // fps360-grabstick's hook on calcGrab (v0.1.10, LEAD 13:59) present on this key: its exponents on the page (written
+    // as calcGrab reads them; 0 on a key without the hook or before calcGrab ran). Then the held object takes the owed
+    // rate itself, past full tilt (at most kGrabFeedMax), from the page: paid at that rate; the emulated stick (the
+    // camera's) stays at most full deflection. Without it, paid at most full deflection, as the emulated stick delivers
+    const float pexp_x = page_f32_at_or0(kGrabPx), pexp_y = page_f32_at_or0(kGrabPy);
+    const bool feed = pexp_x > 0 || pexp_y > 0;   // (the pair is written; paid past full tilt only once the hook took it)
+    const double cap = feed && grab_acked() ? kGrabFeedMax : 1.0;
+    if (m > cap) px *= cap / m, py *= cap / m;   // (the direction kept)
+    // (the object gets what is paid: at most full tilt until the hook's first ACK, the owed rate from the next present;
+    // none while nothing is owed, so a pad's stick takes over 2 presents on)
+    if (feed && m >= 0.01) grab_feed(px, py, pexp_x, pexp_y);
+    double pay_x = px * dt, pay_y = py * dt;
+    if (fabs(pay_x) > fabs(g_owe_x)) pay_x = g_owe_x;
+    if (fabs(pay_y) > fabs(g_owe_y)) pay_y = g_owe_y;
+    g_owe_x -= pay_x; g_owe_y -= pay_y;
+    const double mm = fmin(m, 1.0);
+    if (feed && m > 1) px /= fmin(m, cap), py /= fmin(m, cap);   // (the camera's stick: full deflection at most)
+    if (mm < 0.01) {   // (still: the pad's or the keys' stick stays; with none, the bias below)
+        // (fps360's trace of the ability camera, LEAD 13:48: a frame whose processed stick is exactly 0 can take its 'no
+        // stick' path, which resets the turn state; a still mouse gave one every frame between moves. So with no other
+        // stick a still mouse holds X just past the game's dead zone, the sign alternating with the game's frames
+        // (present parity): never exactly 0, no turn on balance. OFF by default since fps360's check: it assumes the
+        // input mapper's dead zone is the 0.2 pc_mouse takes; were it smaller (the camera step's own is 0.005 on the
+        // processed value) the bias would reach the game as a +-0.2 tilt flip each present, and the held object moves by
+        // calcGrab, not the camera, so (C) is no longer the lead. TOTK_MOUSE_GRAB_BIAS=1 turns it on (the gate's A/B
+        // with the [ability-cam] path lines)
+        static const bool bias = [] { const char* e = getenv("TOTK_MOUSE_GRAB_BIAS"); return e && !strcmp(e, "1"); }();
+        if (bias && *rx == 0 && *ry == 0) *rx = (int32_t)((nvn_present_count() & 1 ? 1 : -1) * kGrabBiasRaw * 32767);
+        return;
+    }
+    const double k = (0.2 + 0.8 * mm) / mm;   // (past the game's dead zone, as the velocity path)
+    *rx = (int32_t)(fmax(-1.0, fmin(1.0, px * k)) * 32767); *ry = (int32_t)(fmax(-1.0, fmin(1.0, py * k)) * 32767);
+}
 // TOTK_MOUSE_CAMERA is a multiplier (the controls.mouse_camera_scale row writes it 0..4): unset = 1 (on by default since
 // the 2026-10-23 all-on pass), 0 = off, above 0 scales the turn (the veneer's multiplier; the stick's full speed / it).
 // TOTK_MOUSE_SENS 0.1.. 20 (the controls.mouse_sensitivity row).
@@ -721,6 +895,7 @@ DWORD WINAPI pitch_feed(void*) {   // (see kPitchGain)
             memcpy(&gw, &g, 4);
             AcquireSRWLockExclusive(&g_lock);
             g_ty_off = pub - raw_pub;   // (motion since the last publish goes to the veneer, shaped there)
+            g_cap_init = false;         // (TOTK_MOUSE_STEP_MAX: y published from here on, from this value)
             __atomic_store_n((uint32_t*)(p + kPitchG), gw, __ATOMIC_RELEASE);
             g_pitch_veneer.store(true, std::memory_order_release);
             page_totals();
@@ -872,6 +1047,7 @@ DWORD WINAPI keeper(LPVOID) {
         }
         const HWND h = g_hwnd;
         if (!h) continue;
+        if (step_max_deg() > 0) { AcquireSRWLockExclusive(&g_lock); page_totals(); ReleaseSRWLockExclusive(&g_lock); }   // (the rest held back)
         const double t_in = qpc_us();
         clip_check();
         bool looked = false;
@@ -1202,6 +1378,13 @@ extern "C" bool pc_mouse_client_size(int* w, int* h) {
 // hle_hid.cpp keyboard_read: a menu screen has the mouse (the map's cursor, the menu keys): the stick from the mouse
 // (the cursor) ignores the camera's Y inversion there.
 extern "C" void pc_mouse_menu(bool on) { g_menu.store(on); }
+// Mouse counts per degree of the camera's turn on foot at the current rows (the veneer's and the stick's rate alike:
+// full tilt, 70 deg/s, at g_full / (sensitivity x multiplier) counts a second): pc_gameplay.cpp's Ultrahand rotation
+// sizes its 45-degree steps by it, so a step takes the move that turns the camera 45 degrees
+extern "C" double pc_mouse_counts_per_degree(void) {
+    const double d = 70.0 * g_sens * g_scale;
+    return d > 0 ? g_full / d : 1500.0 / 70.0;
+}
 // hle_hid.cpp keyboard_read (input refresh, game window in front): right-stick deflection from the mouse while captured
 // and the veneer does not apply it (the map's cursor, menus, an unpatched key). pc_mouse_stick_counts also gives the raw
 // counts this read took (0 while not captured): the map's drag tells a click from a drag by them.
@@ -1219,16 +1402,19 @@ extern "C" void pc_mouse_stick_counts(int32_t* rx, int32_t* ry, double* cdx, dou
     g_last = now;
     AcquireSRWLockExclusive(&g_lock);
     double dx = g_dx, dy = g_dy; g_dx = g_dy = 0;
+    if (step_max_deg() > 0) page_totals();   // (TOTK_MOUSE_STEP_MAX: the rest held back goes out step by step)
     ReleaseSRWLockExclusive(&g_lock);
     if (!captured_now()) { g_vx = g_vy = 0; return; }
     *cdx = dx; *cdy = dy;
     if (page_claimed() && !g_menu.load()) { g_vx = g_vy = 0; return; }   // the veneer turns the camera by the totals
+    double full = g_full / (g_sens * g_scale * (g_menu.load() ? 1 : aim_gain()));   // (the bow drawn: controls.mouse_aim_scale)
+    if (!g_menu.load()) full *= g_speed.load(std::memory_order_relaxed);   // (the camera's speeds times the stick row)
+    if (g_grab.load() && !g_menu.load()) { g_vx = g_vy = 0; grab_stick(dx, dy, dt, full, rx, ry); return; }
+    g_owe_x = g_owe_y = 0;
     if (dt > 0 && dt < 0.25) {
         double a = 1 - exp(-dt / 0.025);
         g_vx += (dx / dt - g_vx) * a; g_vy += (dy / dt - g_vy) * a;
     } else g_vx = g_vy = 0;
-    double full = g_full / (g_sens * g_scale * (g_menu.load() ? 1 : aim_gain()));   // (the bow drawn: controls.mouse_aim_scale)
-    if (!g_menu.load()) full *= g_speed.load(std::memory_order_relaxed);   // (the camera's speeds times the stick row)
     double sx = g_vx / full, sy = -g_vy / full * (g_menu.load() ? 1 : g_inv);   // stick +y = up (a menu's cursor: not inverted)
     double m = sqrt(sx * sx + sy * sy);
     if (m < 0.01) return;   // still: the pad's or the keys' stick stays

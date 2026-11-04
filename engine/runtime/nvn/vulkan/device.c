@@ -43,6 +43,23 @@ static const char *pcache_file(void) {
     const char *e = getenv("LARECOMP_VK_DYN_UBO");
     return e && !strcmp(e, "0") ? "cache/vk_pipelines.bin" : "cache/vk_pipelines_dynubo.bin";
 }
+// rt_main.cpp on_crash, on the crashing thread (Windows; public #55's follow-up, LEAD v0.1.10): this thread was inside the
+// driver's pipeline cache, parsing the file (vkCreatePipelineCache with its data) or serialising it (vkGetPipelineCacheData,
+// the periodic saver and the exit's save): a cache the driver chokes on would crash every start the same way, so the file
+// is set aside as <file>.crashed (kept for a report) and the next start builds a new one. Writes what to tell the player
+// into msg; 0: not in a cache call. No locks (a crash handler); rename after removing an older aside copy.
+static __thread const char *tl_pcache_op;
+int vk_pcache_crashed(char *msg, int n) {
+    if (!tl_pcache_op) return 0;
+    char aside[96];
+    snprintf(aside, sizeof aside, "%s.crashed", pcache_file());
+    remove(aside);
+    const bool moved = rename(pcache_file(), aside) == 0;
+    snprintf(msg, n, "in the GPU driver's pipeline cache (%s): %s", tl_pcache_op,
+             moved ? "the cache file is set aside (.crashed); the next start builds a new one"
+                   : "the cache file could not be set aside; delete it by hand if this repeats");
+    return 1;
+}
 static size_t pcache_saved;  // size of the last file written / loaded (an unchanged 1.8 GB cache was rewritten every boot)
 static _Atomic size_t pcache_known;   // its size in memory at the last query (the saver's, every 10 s at most): [hostmem]
 // Two boots of one exe share cache/ (boot.py --cache shared) and used to write one cache/<file>.tmp: a body spliced from
@@ -592,12 +609,91 @@ static bool g_queue_shared;
 static pthread_mutex_t g_queue_mu = PTHREAD_MUTEX_INITIALIZER;
 void vk_queue_lock(void) { if (g_queue_shared) pthread_mutex_lock(&g_queue_mu); }
 void vk_queue_unlock(void) { if (g_queue_shared) pthread_mutex_unlock(&g_queue_mu); }
+// Safe GPU mode (public #55's follow-up, LEAD v0.1.10): a run that ends in a crash inside the graphics driver's own files
+// (rt_main.cpp on_crash: the faulting module lives in Windows' DriverStore, where every vendor installs its Vulkan driver
+// and shader compiler) adds one to this GPU and driver's count in cache/gpu_crashes.txt ("vendor device driver crashes
+// clean"). In stages, from the third such run in a row: whole pipelines instead of pipeline libraries (GPL off) and one
+// shader build at a time (exec.c: one precompile worker, the compile gate at 1), which costs build time only; from the
+// fifth, also the driver's optimizer off for every program (exec.c noopt, engine pipelines), which can cost frame rate. A
+// clean exit before the third clears the count; once in safe mode it takes three clean runs in a row to end it (one good
+// run after three crashes is no cure), and a new driver or GPU starts clean (the file names them). The per-shader
+// quarantine (shader_quar.h) still moves single shaders on; this covers crashes it cannot place (outside a build of ours,
+// on a driver thread, a driver failing everywhere). LARECOMP_GPU_SAFE=0: never; =1: the first stage; =2: both.
+#define GPU_CRASH_PATH "cache/gpu_crashes.txt"
+enum { GPU_SAFE_AFTER = 3, GPU_NOOPT_AFTER = 5, GPU_SAFE_CLEAN_END = 3 };
+static int g_gpu_stage;              // (0 off, 1 GPL off + one build at a time, 2 and the optimizer off)
+static int g_gpu_crashes, g_gpu_clean;   // (this GPU and driver's counts at the start)
+bool vk_gpu_safe(void) { return g_gpu_stage >= 1; }
+bool vk_gpu_safe_noopt(void) { return g_gpu_stage >= 2; }
+static void gpu_id(char *buf, size_t n) {
+    snprintf(buf, n, "%04x %04x %08x", g_vk.props.vendorID, g_vk.props.deviceID, g_vk.props.driverVersion);
+}
+static void gpu_counts(int *crashes, int *clean) {   // (this GPU and driver's line; 0 0 for another one or none)
+    *crashes = *clean = 0;
+    FILE *f = fopen(GPU_CRASH_PATH, "rb");
+    if (!f) return;
+    char id[32], line[96];
+    gpu_id(id, sizeof id);
+    if (fgets(line, sizeof line, f) && !strncmp(line, id, strlen(id)) && sscanf(line + strlen(id), "%d %d", crashes, clean) < 1)
+        *crashes = 0;
+    fclose(f);
+}
+static void gpu_counts_write(int crashes, int clean) {
+    char id[32];
+    gpu_id(id, sizeof id);
+    mkdir("cache", 0755);
+    FILE *f = fopen(GPU_CRASH_PATH, "wb");
+    if (!f) return;
+    fprintf(f, "%s %d %d\n", id, crashes, clean);
+    fclose(f);
+}
+static void gpu_safe_decide(void) {
+    const char *e = getenv("LARECOMP_GPU_SAFE");
+    gpu_counts(&g_gpu_crashes, &g_gpu_clean);
+    g_gpu_stage = e && *e ? (*e == '2' ? 2 : *e == '1' ? 1 : 0)
+                          : g_gpu_crashes >= GPU_NOOPT_AFTER ? 2 : g_gpu_crashes >= GPU_SAFE_AFTER ? 1 : 0;
+    if (g_gpu_stage) {
+        LOG("[vk] safe GPU mode, stage %d: %s: whole pipelines (no pipeline libraries), one shader build at a time%s; "
+            "the same picture (ends after %d clean exits in a row, or with a new driver; LARECOMP_GPU_SAFE=0: off)\n",
+            g_gpu_stage, e && *e ? "LARECOMP_GPU_SAFE" : "the last runs on this GPU and driver ended in a crash inside the graphics driver",
+            g_gpu_stage >= 2 ? ", and the driver's optimizer off for every shader: the game may run slower" : ": slower shader builds only",
+            GPU_SAFE_CLEAN_END);
+#ifdef _WIN32   // (the count is only kept by Windows' crash handler; rt_main.cpp is Windows-only)
+        extern void pc_gpu_safe_notice(int stage);   // (rt_main.cpp: the toast, its text with the port's translated ones)
+        pc_gpu_safe_notice(g_gpu_stage);
+#endif
+    } else if (g_gpu_crashes)
+        LOG("[vk] the graphics driver crashed in %d run(s) in a row on this GPU and driver: safe GPU mode from %d\n",
+            g_gpu_crashes, GPU_SAFE_AFTER);
+}
+// rt_main.cpp on_crash (Windows), when the faulting module is one of the graphics driver's: one more run in a row, and
+// the clean runs start over. No locks (a crash handler); the device is up, so g_vk.props names the GPU (0 = not yet).
+void vk_gpu_driver_crashed(void) {
+    if (!g_vk.props.vendorID) return;
+    int crashes, clean;
+    gpu_counts(&crashes, &clean);
+    gpu_counts_write(crashes + 1, 0);
+}
+// device.c's exit path, after the GPU idles: a clean run. Before safe mode the count clears; in it, the third clean run
+// in a row ends it.
+static void gpu_clean_exit(void) {
+    int crashes, clean;
+    gpu_counts(&crashes, &clean);
+    if (!crashes) return;
+    if (crashes < GPU_SAFE_AFTER || clean + 1 >= GPU_SAFE_CLEAN_END) {
+        remove(GPU_CRASH_PATH);
+        LOG("[vk] clean exit: the driver-crash count is cleared%s\n", crashes >= GPU_SAFE_AFTER ? ": safe GPU mode ends" : "");
+    } else {
+        gpu_counts_write(crashes, clean + 1);
+        LOG("[vk] clean exit %d of %d in a row: safe GPU mode stays until %d\n", clean + 1, GPU_SAFE_CLEAN_END, GPU_SAFE_CLEAN_END);
+    }
+}
 static void create_device(void) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[40];
+    const char *ext[48];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
@@ -625,6 +721,16 @@ static void create_device(void) {
     // VK_EXT_depth_range_unrestricted (optional): depth values outside [0,1] stay defined in D32_SFLOAT copies
     g_vk.depth_unrestricted = has_ext(ep, ne, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     if (g_vk.depth_unrestricted) ext[n_ext++] = VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME;
+    // VK_EXT_memory_priority + VK_EXT_pageable_device_local_memory (optional P1.1: the card full of other apps' memory,
+    // ours demoted to system RAM at 230k page faults/s, render targets as readily as textures unused for minutes): a
+    // residency priority on our device memory (shim_vma.c), so WDDM demotes blocks holding only sampled textures first.
+    // Pageable: the priority of a block follows what it holds (vkSetDeviceMemoryPriorityEXT). LARECOMP_MEM_PRIORITY=0:
+    // neither (every allocation at the OS default, as before).
+    const char *mpe = getenv("LARECOMP_MEM_PRIORITY");
+    g_vk.mem_priority = has_ext(ep, ne, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) && !(mpe && *mpe == '0');
+    g_vk.pageable = g_vk.mem_priority && has_ext(ep, ne, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+    if (g_vk.mem_priority) ext[n_ext++] = VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME;
+    if (g_vk.pageable) ext[n_ext++] = VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME;
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
@@ -685,8 +791,9 @@ static void create_device(void) {
                                      ? p13.requiredSubgroupSizeStages & sg_used : 0;
     // (independent interpolation: our vertex outputs carry no interpolation qualifiers while the fragment inputs do, and
     // the two libraries compile apart; without it, monolithic pipelines)
+    gpu_safe_decide();   // (safe GPU mode after repeated driver crashes: no pipeline libraries, below)
     g_vk.gpl = has_gpl && gplp.graphicsPipelineLibraryFastLinking && gplp.graphicsPipelineLibraryIndependentInterpolationDecoration &&
-               !getenv("LARECOMP_NO_GPL");
+               !getenv("LARECOMP_NO_GPL") && !vk_gpu_safe();
     if (g_vk.gpl) {
         ext[n_ext++] = VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME;
         ext[n_ext++] = VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME;
@@ -772,7 +879,7 @@ static void create_device(void) {
     g_vk.dbias_unorm = has_ext(ep, ne, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME) && !(dbu && *dbu == '0');
     if (g_vk.dbias_unorm) ext[n_ext++] = VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME;
     vk_present_device_exts(ep, ne, ext, &n_ext);   // present.c: present id / wait, HDR metadata (when used)
-    vk_ngx_device_exts(ep, ne, ext, &n_ext, 40);   // ngx.c: what DLSS asks for on this GPU (TOTK_DLSS only)
+    vk_ngx_device_exts(ep, ne, ext, &n_ext, 48);   // ngx.c: what DLSS asks for on this GPU (TOTK_DLSS only)
     free(ep);
 
     // features the backend relies on. Every bit enabled below is one the device reports (present's audit, 2026-10-27: an
@@ -799,7 +906,21 @@ static void create_device(void) {
     if (g_vk.view2d_of_3d) { have_v23.pNext = have13.pNext; have13.pNext = &have_v23; }
     VkPhysicalDeviceDepthBiasControlFeaturesEXT have_dbc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT};
     if (g_vk.dbias_unorm) { have_dbc.pNext = have13.pNext; have13.pNext = &have_dbc; }
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT have_mp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT};
+    if (g_vk.mem_priority) { have_mp.pNext = have13.pNext; have13.pNext = &have_mp; }
+    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT have_pg = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT};
+    if (g_vk.pageable) { have_pg.pNext = have13.pNext; have13.pNext = &have_pg; }
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    if (g_vk.pageable && !have_pg.pageableDeviceLocalMemory) { g_vk.pageable = false; drop_ext(ext, &n_ext, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME); }
+    if (g_vk.mem_priority && !have_mp.memoryPriority) {
+        g_vk.mem_priority = false;
+        drop_ext(ext, &n_ext, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+        if (g_vk.pageable) { g_vk.pageable = false; drop_ext(ext, &n_ext, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME); }
+    }
+    LOG("[vk] memory residency priority: %s\n", g_vk.pageable ? "on, per block as its contents change (VK_EXT_memory_priority + pageable_device_local_memory)"
+        : g_vk.mem_priority ? "on, set when an allocation is made (VK_EXT_memory_priority)"
+        : mpe && *mpe == '0' ? "off (LARECOMP_MEM_PRIORITY=0)" : "off: not on this driver (VK_EXT_memory_priority)");
     if (g_vk.dbias_unorm && !(have_dbc.depthBiasControl && have_dbc.leastRepresentableValueForceUnormRepresentation)) {
         g_vk.dbias_unorm = false;
         drop_ext(ext, &n_ext, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
@@ -911,6 +1032,11 @@ static void create_device(void) {
                                                         .depthBiasControl = VK_TRUE, .leastRepresentableValueForceUnormRepresentation = VK_TRUE,
                                                         .depthBiasExact = g_vk.dbias_exact};
     if (g_vk.dbias_unorm) { dbcf.pNext = f13.pNext; f13.pNext = &dbcf; }
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT mpf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT, .memoryPriority = VK_TRUE};
+    if (g_vk.mem_priority) { mpf.pNext = f13.pNext; f13.pNext = &mpf; }
+    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pgf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT, .pageableDeviceLocalMemory = VK_TRUE};
+    if (g_vk.pageable) { pgf.pNext = f13.pNext; f13.pNext = &pgf; }
     f13.pNext = vk_present_features(f13.pNext);
     // vendor binary = the driver's own GPU crash dump (NVIDIA 617: supported), saved by vk_device_fault_report
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
@@ -1009,7 +1135,9 @@ static void create_device(void) {
     vk_ngx_device_ready();   // ngx.c: NGX on our device, capability map logged (TOTK_DLSS only)
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
-                                 .vulkanApiVersion = VK_API_VERSION_1_3};
+                                 .vulkanApiVersion = VK_API_VERSION_1_3,
+                                 .flags = (g_vk.mem_priority ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT : 0) |
+                                          (g_vk.pageable ? VMA_ALLOCATOR_CREATE_SHIM_PAGEABLE_BIT : 0)};
     VK_CHECK(vmaCreateAllocator(&ai, &g_vk.vma));
 
     VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
@@ -1057,7 +1185,10 @@ static void create_device(void) {
     const uint64_t pc_t2 = SDL_GetTicksNS();
     VkPipelineCacheCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = sz,
                                     .pInitialData = data};
-    if (vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache) != VK_SUCCESS) {
+    tl_pcache_op = "loading the file";   // (vk_pcache_crashed: a driver crash parsing it sets the file aside)
+    VkResult pcr = vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache);
+    tl_pcache_op = NULL;
+    if (pcr != VK_SUCCESS) {
         pc.initialDataSize = 0;
         VK_CHECK(vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache));
     }
@@ -1094,7 +1225,9 @@ void vk_pipeline_cache_save(void) {
     pthread_mutex_lock(&pcache_save_lock);
     size_t sz = 0;
     uint32_t warm_n = vk_archive_warm_snapshot();   // archive programs warmed so far: inside the data read below
+    tl_pcache_op = "saving it";
     const bool sized = vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) == VK_SUCCESS;
+    tl_pcache_op = NULL;
     if (sized) pcache_known = sz;
     if (!sized || !sz || sz == pcache_saved) {
         if (sz && sz == pcache_saved && pcache_saved) vk_archive_warm_commit(warm_n);   // unchanged since the file
@@ -1111,7 +1244,9 @@ void vk_pipeline_cache_save(void) {
     uint8_t *view = shim_file_map_new(tmp, sz + sizeof(PcacheTrailer), &mh);
     if (view) {
         size_t got = sz;
-        bool ok = vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &got, view) == VK_SUCCESS && got;   // (VK_INCOMPLETE: it grew since)
+        tl_pcache_op = "saving it";
+        bool ok = vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &got, view) == VK_SUCCESS && got;
+        tl_pcache_op = NULL;   // (VK_INCOMPLETE: it grew since)
         if (ok) {
             PcacheTrailer tr = {.size = got, .hash = pcache_hash(view, got)};
             memcpy(tr.magic, PCACHE_MAGIC, sizeof tr.magic);
@@ -1128,7 +1263,10 @@ void vk_pipeline_cache_save(void) {
     }
 #endif
     void *data = malloc(sz);
-    if (data && vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
+    tl_pcache_op = "saving it";
+    const VkResult gdr = data ? vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) : VK_ERROR_OUT_OF_HOST_MEMORY;
+    tl_pcache_op = NULL;
+    if (data && gdr == VK_SUCCESS) {
         FILE *f = fopen(tmp, "wb");
         if (f) {
             PcacheTrailer tr = {.size = sz, .hash = pcache_hash(data, sz)};
@@ -1183,7 +1321,10 @@ static void *pcache_saver(void *arg) {
         const bool early = n < 150;
         if (since < (early ? 15 : 60) || since % 5) continue;   // (the size query every 10 s at most)
         size_t sz = 0;
-        if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS) continue;
+        tl_pcache_op = "measuring it";
+        const VkResult szr = vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL);
+        tl_pcache_op = NULL;
+        if (szr != VK_SUCCESS) continue;
         pcache_known = sz;
         size_t step = early ? (pcache_saved / 16 > ((size_t)2 << 20) ? pcache_saved / 16 : (size_t)2 << 20) : (size_t)16 << 20;
         if (sz >= pcache_saved + step || (sz != pcache_saved && since >= 300)) { vk_pipeline_cache_save(); since = 0; }
@@ -1562,10 +1703,11 @@ static void osd_blit(VkCommandBuffer cb, const uint32_t *px, int bw, int bh, int
 static char g_fps_text[96];   // backend_present's 0.5 s fps line (hle_osd.cpp's fps box)
 // The fps readout's numbers (pc_overlay.cpp), from backend_present every 0.5 s while the readout is on: shown fps,
 // their mean frame time (ms), the 1% low (fps: the mean of the slowest 1% of the last 1000 shown frames; 0 below 100
-// of them) and the worst gap between shown frames (ms). Present thread only, as the overlay.
-static float g_fps_stats[4];
+// of them), the worst gap between shown frames (ms) and the 0.1% low (fps: the slowest of the last 1000 shown frames;
+// 0 below 1000 of them; rival v0.3.7 parity, PARITY_037.md #25). Present thread only, as the overlay.
+static float g_fps_stats[5];
 static uint64_t g_fps_stats_n;   // updates so far (0: none yet)
-uint64_t vk_fps_readout_stats(float out[4]) { memcpy(out, g_fps_stats, sizeof g_fps_stats); return g_fps_stats_n; }
+uint64_t vk_fps_readout_stats(float out[5]) { memcpy(out, g_fps_stats, sizeof g_fps_stats); return g_fps_stats_n; }
 
 static uint64_t total_frames;   // (tentative: the frame counters are below, with backend_present)
 static bool g_game_present;     // vk_frame_end called from backend_present (a game frame; not backend_clear_window)
@@ -2621,7 +2763,7 @@ void backend_present(NvnTexture *t) {
             if (last_t > 0 && tn - last_t > worst) worst = tn - last_t;  // nothing shown lately (frames held): the stall so far
             snprintf(g_fps_text, sizeof g_fps_text, "%.0f fps  |  worst %.0f ms", shown_n / (tn - t_from), worst * 1000.0);
             if (on) {
-                float low = 0;
+                float low = 0, low01 = 0;
                 if (gaps_n >= 100) {   // the k slowest of the ring by selection (k <= 10: ~10k compares every 0.5 s)
                     const int k = gaps_n / 100;
                     float top[10] = {0}, sum = 0;
@@ -2631,11 +2773,13 @@ void backend_present(NvnTexture *t) {
                     }
                     for (int j = 0; j < k; j++) sum += top[j];
                     low = sum > 0 ? 1000.0f * k / sum : 0;
+                    if (gaps_n >= kGaps && top[0] > 0) low01 = 1000.0f / top[0];   // (the slowest one of the 1000)
                 }
                 g_fps_stats[0] = (float)(shown_n / (tn - t_from));
                 g_fps_stats[1] = shown_n ? (float)((tn - t_from) * 1000.0 / shown_n) : 0;
                 g_fps_stats[2] = low;
                 g_fps_stats[3] = (float)(worst * 1000.0);
+                g_fps_stats[4] = low01;
                 g_fps_stats_n++;
             }
             t_from = tn, shown_n = 0, worst = 0;
@@ -2794,6 +2938,24 @@ void backend_present(NvnTexture *t) {
                 (unsigned long long)(cum_img_unpooled - l_u), slow);
             l_n = cum_img_n; l_r = cum_img_reused; l_u = cum_img_unpooled; l_sn = cum_img_slow_n; l_sns = cum_img_slow_ns;
             img_slow_worst_ns = 0;
+            {   // (shadow rungs: why a re-sized sun shadow map still got a new image; gate g19_see_kak_169, 11-03: 3072 x4
+                // made again 8 times in triples although it is a rung)
+                extern uint64_t shadow_miss[7], shadow_open_picks, shadow_fresh_cleared;
+                static uint64_t l_sm[7], l_op, l_fc;
+                uint64_t d[7], all = 0;
+                for (int i = 0; i < 7; i++) all += d[i] = shadow_miss[i] - l_sm[i];
+                if (all || shadow_open_picks != l_op || shadow_fresh_cleared != l_fc)
+                    LOG("[vram] shadow maps since the last line: taken from the open submission %llu, taken at a new size %llu (both "
+                        "zeroed when taken); made without a pooled image %llu (their rung finalized in the open submission: same "
+                        "address %llu, another address %llu; parked %llu; only other rungs pooled %llu; none %llu; a pass being "
+                        "recorded %llu; matched but not taken %llu)\n", (unsigned long long)(shadow_open_picks - l_op),
+                        (unsigned long long)(shadow_fresh_cleared - l_fc), (unsigned long long)all, (unsigned long long)d[0],
+                        (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[3], (unsigned long long)d[4],
+                        (unsigned long long)d[5], (unsigned long long)d[6]);
+                memcpy(l_sm, shadow_miss, sizeof l_sm);
+                l_op = shadow_open_picks;
+                l_fc = shadow_fresh_cleared;
+            }
         }
         max_gap = 0;
         g_held_window = 0;
@@ -2905,6 +3067,7 @@ static void quick_exit_handler(void) {
         vkDeviceWaitIdle(g_vk.dev);
         vk_queue_unlock();
         t = exit_step("GPU idle", "pipeline cache save", t);
+        gpu_clean_exit();   // (safe GPU mode's counts: a clean run)
         vk_pipeline_cache_save();   // (tmp file + one-step replace: an exit cut short leaves the previous cache)
         t = exit_step("pipeline cache save", "exit hook", t);
     }
@@ -2967,7 +3130,8 @@ void ui_window_init(void) {
     if (getenv("LARECOMP_WINDOW")) sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", &win_w, &win_h);
     SDL_WindowFlags wflags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (getenv("LARECOMP_HIDDEN")) wflags |= SDL_WINDOW_HIDDEN;
-    window = SDL_CreateWindow("Tears of the Kingdom", win_w, win_h, wflags);
+    extern const char *exe_tag_title(void);   // ("Tears of the Kingdom"; a wrong-key exe says so there: exe_tag.cpp)
+    window = SDL_CreateWindow(exe_tag_title(), win_w, win_h, wflags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows,

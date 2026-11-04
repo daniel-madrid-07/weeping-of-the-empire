@@ -61,7 +61,7 @@ LINUX = sys.platform.startswith('linux')   # the native Linux build (mkninja_lin
 if not LINUX:
     from recomp.toolchain import msvc_env  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import genpart, genshard, tusplit  # noqa: E402
+import exekey, genpart, genshard, tusplit  # noqa: E402
 sys.path.insert(0, os.path.join(REPO, 'tools', 'builder'))
 import kit  # noqa: E402  (the download kit: an offline install's packages and SDK files)
 
@@ -109,32 +109,37 @@ GEN_CODEGEN = ['--simd', '--nanrun', '--vdirect', '--lso-abi', 'auto']
 # 1a06840 / 1a068cc its shown entries' count / n-th (the Options sections, totk_options_menu.cpp). 274a3c the Havok world's step controller: TOTK_HAVOK_STEP_LOG=1 logs dt / numSteps / tau (totk_havok_step_log.cpp, fps360 v0.1.9
 # diagnostic; unset: the call only). 83e3f8 eui::UIController::updateState. 1ccf894 ExecutePlayerCalcKey::updateImpl_, the player's virtual keys (totk_pc_vk.cpp; patches' vk_guard needs it). b6afc8 PouchActorInfoTable::getRow, an
 # exact memo (totk_rsdb_memo.cpp: the largest guest item in towns), and the table's mutators that drop it: 75718c 18fb7d0 18fbf18 18fbf68 18fc0ac 279a77c 2798a1c. f15364 UIMapScreen's per-frame move: the stick's map scroll at
-# real-time speed. f0fdec UIMapScreen's Hero's Path player: its step per 30 Hz of game time. 16e4728 Player::checkPreLeftStickLengthGreaterThan: Walk's stop keeps the Switch's delay. 8f689c Framework::procFrame_: the
-# present-interval minimum from the live frame-rate setting (totk_interval_min.cpp). 1cd0260 ExecutePlayerCalcStick's calc: a stick spin counts at the Switch's angular speed. 16e4610 GameActor::isStickMash: the struggle spin
-# sampled at 30 Hz of game time. 1aa3e44 UIGetWindowScreen's update: the get-item info line's delays in game time. 16e4b80 GameActor::approachTargetSpeed at the Cucco glide's and the paraglider's calls: their velocity ease in game
-# time. 1d23614 ExecutePlayerSlippingDown's sound tail: the tumble-slide sound's wobble and stop grace in game time. a5f010 game::wm::LightningMgr::calc: the storm's per-frame rolls thinned to 30 Hz of game time. 1d97648 1c17fb0
+# real-time speed. f0fdec UIMapScreen's Hero's Path player: its step per 30 Hz of game time. 16e4728 Player::checkPreLeftStickLengthGreaterThan: Walk's stop keeps the Switch's delay. 8f689c Framework::procFrame_: the present-interval
+# minimum from the live frame-rate setting (totk_interval_min.cpp). 1cd0260 ExecutePlayerCalcStick's calc: a stick spin counts at the Switch's angular speed. 16e4610 GameActor::isStickMash: the struggle spin sampled at 30 Hz of game
+# time. 1aa3e44 UIGetWindowScreen's update: the get-item info line's delays in game time. 16e4b80 GameActor::approachTargetSpeed at the Cucco glide's and the paraglider's calls: their velocity ease in game time. 1d23614
+# ExecutePlayerSlippingDown's sound tail: the tumble-slide sound's wobble and stop grace in game time. a5f010 game::wm::LightningMgr::calc: the storm's per-frame rolls thinned to 30 Hz of game time. 1d97648 1c17fb0
 # ExecuteWaitCreateActor / ExecuteEventWaitResourceStableForTerrainAndCave: event waits in game time. 120ec94 the move-toward helper at Recall's two velocity calls: the step per 30 Hz of game time. 171fafc
-# ReverseRecorderExtension::getNextVelocity: 1.4.3 inlines 120ec94 there, the hook scales its steps (1.0.0: the original). 9d8d00 SpecialPowerReceiver::postCalcUltraHand: the settle window after an Autobuild in game time. 704b7c
-# the submesh AABB vs view-volume cull (totk_hot_native.cpp, native hot functions; TOTK_NATIVE_HOT). 1b3ebac 1a4f0ac 1c73fbc 1dbdcf0 the cooking pot's settle, the extra-stamina pause, tar Like Like spots, flying enemies' path
-# probes in game time. 1aa6a94 UIHorseGaugeScreen's update: the bar tween in game time. 1b7ba58 ExecuteCalculateAverageVec3f: the followers' ring sampled at 30 Hz of game time. 212b740 SelectorPouchPlayer's update: the inventory
-# Link's tab debounce in game time. 1f61d6c QueryControllerGetStick's worker: the UI stick scaled to 30 Hz of game time for the AI programs. 2833b60 ExecuteBlackboardSetToBase::updateImpl_: listed AI-program integrators step per 30
-# Hz of AI time. 200f61c 200f8b0 20147f4 27dcb98 the ChaseF32 / ChaseVec3f / LerpF32 / AddF32 calcs: listed easers / adders of drawn values scaled by the step. 27b6e64 SeqOneShotPrintLoadLapTimeForPatrol's oneShot: the game's load
-# lap labels logged with TOTK_LOAD_LAPS=1. 11276cc ares::System::initializeThreads: the resource loader thread count, TOTK_LOADER_THREADS=<n> for the A/B. 9c2ef0 aal's per-frame command-list flush: a full game -> audio ring keeps
-# the frame's commands instead of dropping them above 200 fps. 9c2b70 the watchdog step AudioRendererController::calc tail-calls: aal's jam watchdog fires after 10 s of jam, not 300 calls (1.25 s at 240 fps). 10bc078
+# ReverseRecorderExtension::getNextVelocity: 1.4.3 inlines 120ec94 there, the hook scales its steps (1.0.0: the original). 9d8d00 SpecialPowerReceiver::postCalcUltraHand: the settle window after an Autobuild in game time. 704b7c the
+# submesh AABB vs view-volume cull (totk_hot_native.cpp, native hot functions; TOTK_NATIVE_HOT). 1b3ebac 1a4f0ac 1c73fbc 1dbdcf0 the cooking pot's settle, the extra-stamina pause, tar Like Like spots, flying enemies' path probes in
+# game time. 1aa6a94 UIHorseGaugeScreen's update: the bar tween in game time. 1b7ba58 ExecuteCalculateAverageVec3f: the followers' ring sampled at 30 Hz of game time. 212b740 SelectorPouchPlayer's update: the inventory Link's tab
+# debounce in game time. 1f61d6c QueryControllerGetStick's worker: the UI stick scaled to 30 Hz of game time for the AI programs. 2833b60 ExecuteBlackboardSetToBase::updateImpl_: listed AI-program integrators step per 30 Hz of AI
+# time. 200f61c 200f8b0 20147f4 27dcb98 the ChaseF32 / ChaseVec3f / LerpF32 / AddF32 calcs: listed easers / adders of drawn values scaled by the step. 27b6e64 SeqOneShotPrintLoadLapTimeForPatrol's oneShot: the game's load lap labels
+# logged with TOTK_LOAD_LAPS=1. 11276cc ares::System::initializeThreads: the resource loader thread count, TOTK_LOADER_THREADS=<n> for the A/B. 9c2ef0 aal's per-frame command-list flush: a full game -> audio ring keeps the frame's
+# commands instead of dropping them above 200 fps. 9c2b70 the watchdog step AudioRendererController::calc tail-calls: aal's jam watchdog fires after 10 s of jam, not 300 calls (1.25 s at 240 fps). 10bc078
 # game::event::Actor::initialize: the cutscene actors' 600-frame equipment fallback in game time. 13bd680 game::event::EventContext::isLoadFinished: the 61-frame 'surroundings stable' count before a cutscene starts in game time.
-# 91a290 the layout-animation binder: the Purah Pad map's temperature sign follows game.temperature_unit. 15eca7c the Player component's Ultrahand update: its bound target is read only while it is a live actor, 1.0.0 only. 7cba8c
-# the query manager's enqueue: a new request's result entries are never ones a live request still uses (Ultrahand's persistent request, public #51), 1.0.0 only. abb518 the EnvSound one-shot emitter step: the 200-frame settle
-# between two ambient one-shots in game time. 9a7130 FootIKParam's GroundPositionLerpFacror getter at the foot IK controller's call: the ground-height ease per 30 Hz of game time (totk_footik_ease.cpp, fps360). a6fd14
-# engine::actor::PlacementMgr::calc: the placement request cooldown and refresh period in game time, not frames (totk_placement_timers.cpp, rival-034 per-frame sweep). cc2c2c the call right after the 'Basic2' sway spring's k1 / k2
-# load (lr 0x13b10a0): its constants per call so the spring keeps the Switch's modes in game time (totk_effect_sway.cpp, rival-034 per-frame sweep R4). 16e4f90 the swim speed getter at the swim-move physics' call: Link's swim
-# velocity eased per 30 Hz of game time (totk_swim_ease.cpp, fps360). --vlocal: V registers in locals in these functions (stages 1-2; verified only on top of --vdirect; not `all`: the giant functions grow 20-60% in x86) --split:
-# these functions as chunks (gen.py Emitter.split_text): every 1.0.0 function of 10,000+ guest instructions with no count in the release profile (855fd396: every block 0; 553d80, 5732d0, 58fd70, 4d9ba0, 6e5b38, ae4c40, 719acc,
-# ee92d8 have counts and stay whole, so no hot path crosses a chunk). They were 2.6k of a cold key's ~9.8k s of compile CPU and its 2.3 GB-a-compile peaks (setup-fast, 2026-11-02). Another version / game: none (its own list).
+# 91a290 the layout-animation binder: the Purah Pad map's temperature sign follows game.temperature_unit. 15eca7c the Player component's Ultrahand update: its bound target is read only while it is a live actor, 1.0.0 only. 7cba8c the
+# query manager's enqueue: a new request's result entries are never ones a live request still uses (Ultrahand's persistent request, public #51), 1.0.0 only. 844634 a model scene's per-object coverage from the frame's report rows: a
+# row index that is not a row is not followed, 1.0.0 only. abb518 the EnvSound one-shot emitter step: the 200-frame settle between two ambient one-shots in game time. 9a7130 FootIKParam's GroundPositionLerpFacror getter at the foot IK
+# controller's call: the ground-height ease per 30 Hz of game time (totk_footik_ease.cpp, fps360). a6fd14 engine::actor::PlacementMgr::calc: the placement request cooldown and refresh period in game time, not frames
+# (totk_placement_timers.cpp, rival-034 per-frame sweep). cc2c2c the call right after the 'Basic2' sway spring's k1 / k2 load (lr 0x13b10a0): its constants per call so the spring keeps the Switch's modes in game time
+# (totk_effect_sway.cpp, rival-034 per-frame sweep R4). 16e4f90 the swim speed getter at the swim-move physics' call: Link's swim velocity eased per 30 Hz of game time (totk_swim_ease.cpp, fps360). 1347600 the camera mode parameter's
+# LatStickScale getter at the ability camera's pitch (lr 0x1ce78fc): the abilities' camera pitch per 30 Hz of game time (totk_ability_pitch.cpp, fps360; public #66). 1347654 the camera mode parameter's LngStickScale getter at the
+# ability camera's yaw (lr 0x1ce7684): read-only, the live value on the data page for pc_mouse's ability gains (totk_ability_pitch.cpp, fps360; Ultrahand with the mouse). 172d1bc UltraHand::calcGrab: the mouse's unclamped grab stick
+# from the data page at +0x11c / +0x120 for the call. 171323c / 1713290 calcGrab's stick exponents for X / Y (lr 0x172d6d4 / 0x172d6f0): read-only, to the data page (totk_grab_stick.cpp). ba6d48 Player::getAdjustedRetargetPosAndRot at
+# the climb's updatePhysics call (lr 0x1cf6334): TOTK_DEBUG_CLIMB=1 logs the climb's root motion once a second, read-only (totk_climb_log.cpp, fps360; public #59). --vlocal: V registers in locals in these functions (stages 1-2;
+# verified only on top of --vdirect; not `all`: the giant functions grow 20-60% in x86) --split: these functions as chunks (gen.py Emitter.split_text): every 1.0.0 function of 10,000+ guest instructions with no count in the release
+# profile (855fd396: every block 0; 553d80, 5732d0, 58fd70, 4d9ba0, 6e5b38, ae4c40, 719acc, ee92d8 have counts and stay whole, so no hot path crosses a chunk). They were 2.6k of a cold key's ~9.8k s of compile CPU and its 2.3
+# GB-a-compile peaks (setup-fast, 2026-11-02). Another version / game: none (its own list).
 SPLIT_FUNCS = ['433b78', '48429c', '5ad300', '5346a0', '516d00', '4f8610', '4cad70', '564b60', '426084', '546ce0',
                '477234', '50a1a0', '4ebab0', '5a14f0', '528890', '584890', '41269c']
 GEN_MAIN = ['--hook', '7a83e4,f6092c,1a862e4,1a86420,1a85b3c,1a8604c,1a85e4c,83e3f8,1ccf894,'
             'b6afc8,75718c,18fb7d0,18fbf18,18fbf68,18fc0ac,279a77c,2798a1c,f15364,16e4728,8f689c,1cd0260,16e4610,f0fdec,1aa3e44,16e4b80,1d23614,a5f010,1d97648,1c17fb0,120ec94,171fafc,9d8d00,212b740,1b7ba58,1aa6a94,1f61d6c,2833b60,200f61c,200f8b0,20147f4,27dcb98,1b3ebac,1a4f0ac,1c73fbc,1dbdcf0,'
-            '1a06840,1a068cc,704b7c,27b6e64,11276cc,9c2ef0,9c2b70,abb518,10bc078,13bd680,91a290,274a3c,15eca7c,9a7130,a6fd14,cc2c2c,16e4f90,7cba8c', *GEN_CODEGEN,
+            '1a06840,1a068cc,704b7c,27b6e64,11276cc,9c2ef0,9c2b70,abb518,10bc078,13bd680,91a290,274a3c,15eca7c,9a7130,a6fd14,cc2c2c,16e4f90,7cba8c,1347600,1347654,172d1bc,171323c,1713290,ba6d48,844634', *GEN_CODEGEN,
             '--vlocal', '260a970,317040,704b7c,10cfecc', '--split', ','.join(SPLIT_FUNCS)]
 GEN_SDK = ['--base', '0x7180000000', '--prefix', 's', '--plt-all', *GEN_CODEGEN]
 GEN_EXTRA = []         # --gen-args: gen.py flags added for both modules (e.g. --fz); join the key, game-var/
@@ -394,6 +399,9 @@ CRASHES = {0xC0000005: 'access violation', 0xC00000FD: 'stack overflow', 0xC0000
            0xC0000017: 'out of memory', 0xC000001D: 'illegal instruction', 0xC0000374: 'heap corruption',
            0xC000013A: 'stopped by Ctrl+C', 0xC0000135: 'a DLL not found (VC++ runtime?)',
            0xC000007B: 'bad DLL image (VC++ runtime?)', 0xC0000142: 'a DLL failed to start (VC++ runtime?)'}
+# crashes that fewer compiles at once can cure, so objects() retries even when every compile hit one: out of memory,
+# and a DLL failing to start, which too many processes at once also give
+RETRY_CRASHES = {0xC0000017, 0xC0000142}
 
 
 def exit_text(rc):
@@ -431,17 +439,19 @@ def ensure_venv():
     os.makedirs(SIG, exist_ok=True)
     if not os.path.exists(PY):
         run([sys.executable, '-m', 'venv', VENV])
-    # (wheels only, as toolchain.py: a missing wheel fails at once and says so, no source build of cryptography's Rust)
-    pip = [PY, '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', '--only-binary', ':all:']
-    wheels = kit.wheels(log)
-    if wheels and not subprocess.run(pip + ['--no-index', '--find-links', wheels, *VENV_PACKAGES]).returncode:
-        log('engine venv: packages from the download kit')
-        return
-    run(pip + VENV_PACKAGES)
+    # (toolchain.pip_install, as Setup's own packages: wheels only, a missing wheel fails at once and says so, no
+    # source build of cryptography's Rust; the download kit's wheels first; hash-pinned by wheels-venv.txt when it
+    # covers this Python)
+    import toolchain
+    try:
+        toolchain.pip_install([PY], VENV_PACKAGES, quiet=True, lock='venv')
+    except toolchain.ToolchainError as e:
+        sys.exit(f'engine venv: {e}')
 
 
-# the engine venv's packages (a download kit carries their wheels: builder.py --download-kit)
-VENV_PACKAGES = ['capstone==5.0.9', 'lz4', 'ninja', 'zstandard==0.25.0', 'cryptography==50.0.1']
+# the engine venv's packages (a download kit carries their wheels: builder.py --download-kit), each at one version
+# (lock_wheels.py pins them by hash in tools/builder/wheels-venv.txt)
+VENV_PACKAGES = ['capstone==5.0.9', 'lz4==4.4.5', 'ninja==1.13.2', 'zstandard==0.25.0', 'cryptography==50.0.1']
 
 
 def build_env():
@@ -651,11 +661,58 @@ def sha256_file(p):
 
 
 def dlss_sdk(third_party):
-    """third_party: a snapshot's engine/third_party/dlss, given the SDK when the tree has none; None: the DLLs."""
-    if third_party is None:
-        dlss_fetch(DLSS_DLLS, os.path.join(SIG, 'dlss'), flat=True)
-    elif not os.path.isfile(os.path.join(third_party, 'include', 'nvsdk_ngx_vk.h')):
+    """third_party: a snapshot's engine/third_party/dlss, given the SDK when the tree has none (compiled in: needed)"""
+    if not os.path.isfile(os.path.join(third_party, 'include', 'nvsdk_ngx_vk.h')):
         dlss_fetch(DLSS_SDK, third_party, flat=False)
+
+
+def nvidia_rtx():
+    """an NVIDIA RTX display adapter on this PC (DLSS runs on RTX's tensor cores), by the driver names in the registry's
+    display class, as tools/builder's gpus() reads them: True / False, None when they cannot be read (Linux, no
+    access, none listed)"""
+    if LINUX or os.name != 'nt':
+        return None
+    try:
+        import winreg
+        names = []
+        cls = r'SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, cls) as k:
+            for i in range(winreg.QueryInfoKey(k)[0]):
+                try:
+                    with winreg.OpenKey(k, winreg.EnumKey(k, i)) as d:
+                        names.append(winreg.QueryValueEx(d, 'DriverDesc')[0])
+                except OSError:   # (Properties and other subkeys without a driver)
+                    pass
+    except (ImportError, OSError):
+        return None
+    return any('RTX' in n.upper() for n in names) if names else None
+
+
+def dlss_dlls(force=False):
+    """DLSS's runtime DLLs (nvngx_dlss.dll, nvngx_dlssg.dll: ~66 MB) into <work>/engine/dlss, where TOTK_DLSS_DIR
+    points (boot.py, package.py's player.txt). Only for a PC with an NVIDIA RTX GPU, or one whose GPUs cannot be read
+    (LEAD 11-04: AMD / Intel PCs skip them; the rival's Setup fetches them for RTX only); NXR_DLSS=1 always, =0 never;
+    force (`build.py dlss --force`): always. Never fails a build: offline or a download error leaves DLSS unavailable
+    (the game runs without it) and Setup's next run, or `build.py dlss`, fetches them. DLLs already there are kept
+    whatever the GPU. Returns what happened, for the log."""
+    dst = os.path.join(SIG, 'dlss')
+    if all(os.path.isfile(os.path.join(dst, os.path.basename(p))) and
+           sha256_file(os.path.join(dst, os.path.basename(p))) == want for p, want in DLSS_DLLS.items()):
+        return 'DLSS: the runtime DLLs are there'
+    env = os.environ.get('NXR_DLSS', '').strip()
+    rtx = nvidia_rtx()
+    if not force and (env == '0' or env != '1' and rtx is False):
+        return ('DLSS: not fetched (NXR_DLSS=0)' if env == '0' else
+                'DLSS: not fetched (no NVIDIA RTX GPU here; with one, run Setup again or tools/engine/build.py dlss)')
+    try:
+        dlss_fetch(DLSS_DLLS, dst, flat=True)
+    except (Exception, SystemExit) as e:
+        return f'DLSS: not fetched ({e}): DLSS unavailable for now; Setup\'s next run fetches it'
+    return 'DLSS: runtime DLLs fetched' + ('' if rtx else ' (GPUs unknown here)' if rtx is None else '')
+
+
+def cmd_dlss(a):
+    log(dlss_dlls(force=a.force))
 
 
 def version_tables():
@@ -704,7 +761,7 @@ def snapshot(ref='HEAD') -> str:
             shutil.copyfile(os.path.join(REPO, p), os.path.join(d, p))
         dlss_sdk(os.path.join(d, 'engine', 'third_party', 'dlss'))
         open(os.path.join(d, 'DONE'), 'w').close()
-    dlss_sdk(None)   # the runtime DLLs: <work>/engine/dlss (boot.py and package.py point TOTK_DLSS_DIR there)
+    log(dlss_dlls())   # the runtime DLLs: <work>/engine/dlss, NVIDIA RTX only, never fatal (TOTK_DLSS_DIR points there)
     try:   # (optional: Setup's builder unpacks the same files from our release asset first, so nothing is fetched there)
         dlss_fetch(FFX_DLLS, os.path.join(SIG, 'ffx'), flat=True, url=FFX_URL, what='FidelityFX SDK')   # (TOTK_FFX_DIR)
     except (Exception, SystemExit) as e:
@@ -1400,6 +1457,21 @@ def giant_of(src):
     return (*best, split) if best[0] >= GIANT_LINES else (0, None, split)
 
 
+# a generated line at -O2 takes ~2.8x its time at COLD_OPT (f_41269c: 45 s at -O1, 128 s at -O2): objects()' start
+# order weighs a TU by it
+O2_COST = 2.8
+
+
+def start_order(rule, giant_lines, size):
+    """objects()' sort key, the longest compile first (with a pool, the end is the last start plus that compile):
+    giants by their function's lines, the rest by bytes, each times O2_COST unless at COLD_OPT. v0.1.9's 4 whole
+    giants are within 4% of each other in lines, three at -O2 (f_4d9ba0 by GIANT_HOT, h_5732d0 / h_553d80 by --hot)
+    and f_58fd70 at -O1: by lines alone the -O1 one started last only by chance, and a pool of 3 (16 GB) that started
+    it ahead of an -O2 one left the slowest compile for last, alone (setup-fast, 2026-11-03)"""
+    w = 1 if rule == 'gen_cold' else O2_COST
+    return -giant_lines * w, -size * w
+
+
 def objects(kdir, jobs, prio, cache):
     """the game objects of build.ninja (mkninja_win.py --game-only). TUs named c_* (a split key's cold functions) use a
     copy of `rule gen` at COLD_OPT, and so do giant TUs (giant_of) unless their function is in GIANT_HOT; giants build
@@ -1488,13 +1560,14 @@ def objects(kdir, jobs, prio, cache):
         with open(os.path.join(kdir, 'objs.ninja'), 'w', newline='\n') as f:
             f.write(head + ''.join(t for r, t in rules.items() if r != 'gen'))   # (`rule gen` is in head)
             f.write(''.join(grules.values()) + f'pool giant\n  depth = {giant_pool(jobs)}\n')
-            # the slowest first: ninja starts edges in file order, and the big TUs set the tail; giants (largest
-            # function first) ahead of the rest, so they start early and never more than giant_pool() at once
-            for obj, src, rule, _ in sorted(todo, key=lambda t: (-giants.get(t[0], 0),
-                                                                 -os.path.getsize(os.path.join(kdir, t[1])))):
+            # the slowest first: ninja starts edges in file order, and the big TUs set the tail; giants (the longest
+            # compile first: start_order) ahead of the rest, so they start early and never more than giant_pool() at once
+            for obj, src, rule, _ in sorted(todo, key=lambda t: start_order(t[2], giants.get(t[0], 0),
+                                                                            os.path.getsize(os.path.join(kdir, t[1])))):
                 f.write(f'build {obj}: {rule}_giant {src}\n  pool = giant\n' if obj in giants else
                         f'build {obj}: {rule}_gated {src}\n')
         rc, ladder = 0, retry_jobs(jobs)
+        exits = os.path.join(kdir, 'compile_exits.log')   # (commitgate.py: each failed compile's TU and exit code)
         for i, j in enumerate(ladder):
             if i:
                 # what failed, again with fewer at once (ninja keeps what built): a PC short of memory fails compiles
@@ -1503,10 +1576,16 @@ def objects(kdir, jobs, prio, cache):
                 log(f'game objects: some compiles failed; again with fewer at once ({ladder[i - 1]} -> {j}): on a PC '
                     'short of memory compiles fail when many run together')
                 retry_pools(os.path.join(kdir, 'objs.ninja'), j)
+            if os.path.exists(exits):
+                os.remove(exits)   # (this pass's failures only)
+            before = obj_times(kdir, todo)   # (built this pass = new or rewritten: mtimes, not the clock, review)
             rc = subprocess.call(heavy_cmd(prio, [sys.executable, os.path.abspath(__file__), '_ninja', kdir,
                                                   f'auto{j}g{ng}', 'objs.ninja']))
             if not rc:
                 break
+            why = all_crashed(kdir, todo, before) if i == 0 else None
+            if why:
+                sys.exit(why)
     stored = 0
     for obj, src, rule, oid in todo:
         o = os.path.join(kdir, obj)
@@ -1527,6 +1606,57 @@ def objects(kdir, jobs, prio, cache):
         sys.exit(f'game objects: ninja failed ({rc}) even {ladder[-1]} compile(s) at a time (the lines above name the '
                  f'one that failed); {stored} objects that did build are in the cache, so a new run picks up from there')
     return {'tus': len(edges), 'cached': hits, 'compiled': len(todo), 'minutes': round((time.time() - t0) / 60, 1)}
+
+
+def obj_times(kdir, todo):
+    """{object: its mtime_ns, or None when absent} of objects()' compiles"""
+    out = {}
+    for obj, *_ in todo:
+        try:
+            out[obj] = os.stat(os.path.join(kdir, obj)).st_mtime_ns
+        except OSError:
+            out[obj] = None
+    return out
+
+
+def all_crashed(kdir, todo, before):
+    """public #75 (Proton): every compile of objects()' first pass exited at once with the same crash (an NTSTATUS code,
+    commitgate.py's compile_exits.log) and none built: the compile step crashes as it starts, and the passes with fewer
+    at once (8 -> 4 -> 2 -> 1, ~10 min there) cannot change that. The reason to stop with, or None to go on. Which part
+    crashes is not known there (linux-port: clang++.exe, or Wine's cmd.exe running `cmd /c "clang++ ... || ..."`), so
+    clang_probe() runs clang++ --version once without cmd, and the reason says which; Wine / Proton only under Wine"""
+    try:
+        codes = [int(ln.rsplit('\t', 1)[1]) & 0xFFFFFFFF
+                 for ln in open(os.path.join(kdir, 'compile_exits.log'), encoding='utf-8') if '\t' in ln]
+    except (OSError, ValueError):
+        return None
+    if not codes or len(set(codes)) != 1 or not 0xC0000000 <= codes[0] <= 0xCFFFFFFF or codes[0] in RETRY_CRASHES:
+        return None
+    if any(t is not None and t != before.get(obj) for obj, t in obj_times(kdir, todo).items()):
+        return None   # (an object written this pass: compiles do work)
+    rc, first = clang_probe()
+    probe = (f' clang++ --version run on its own works ({first}): the compiler starts, so what crashes is the compile '
+             'command around it (cmd /c).' if rc == 0 else
+             f' clang++ --version run on its own fails too ({exit_text(rc) if rc is not None else first}): the compiler '
+             'itself does not start.')
+    hint = (' Under Wine / Proton (public #75): try another Proton version (10, or GE).' if on_wine() else
+            ' Usual causes: an antivirus blocking or quarantining clang.exe (add the install folder to its exclusions, '
+            'then run Setup again), or a processor clang cannot run on.')
+    return (f'game objects: every compile failed at once with the same crash, '
+            f'{CRASHES.get(codes[0], "unknown NTSTATUS")} (0x{codes[0]:08X}), {len(codes)} of them and none built: the '
+            'compile step crashes as it starts, which fewer compiles at once would not change, so no retry.' + probe + hint)
+
+
+def clang_probe():
+    """(exit code, its first output line) of `clang++ --version` run directly (no cmd /c), 30 s at most; (None, the
+    error) when it could not run at all"""
+    exe = os.path.join(LLVM, 'clang++' if LINUX else 'clang++.exe')
+    try:
+        r = subprocess.run([exe, '--version'], capture_output=True, text=True, timeout=30, errors='replace')
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f'{exe}: {e}'
+    lines = (r.stdout or r.stderr or '').strip().splitlines()
+    return r.returncode, lines[0] if lines else 'no output'
 
 
 def prune_cache(days=7):
@@ -1955,6 +2085,20 @@ def runtime_build(root, out, kdir, jobs, pdb=False, mapfile=False, rt_lto=False)
                 sys.exit(f'runtime + link: failed ({e.returncode}) even {j} compile(s) at a time; the lines above name '
                          'the step that failed')
     log(f'runtime + link: {time.time() - t0:.0f} s -> {os.path.join(out, EXE)}')
+    # the key it was linked against, at the exe's end: package.py and the boot / gate tools refuse an exe whose tag is
+    # not their key (exekey.py; 11-03: a slot exe from a dev key ran under player.txt's key at 2.7-3.7x) + the key's
+    # OWN patch set's features (<img>/patches.json: what its generated code has, not the --patches file). [] only for
+    # a key built without patches; a patched key whose patches.json can't be read gets NO list (None = unknown): a
+    # patched exe saying [] would make the runtime think there is no realtime step
+    feats = None
+    if not man.get('patches'):
+        feats = []
+    elif man.get('img'):
+        try:
+            feats = json.load(open(os.path.join(man['img'], 'patches.json'))).get('features')
+        except (OSError, ValueError):
+            feats = None
+    exekey.tag(os.path.join(out, EXE), man['key'], feats)
     # what this exe was built from, next to it: the key manifest's src is the snapshot its game objects were generated
     # from and stays so (canary_engine.py reads that rt.h); a runtime-only relink from a newer tree would otherwise be
     # named after the key's first commit
@@ -2061,11 +2205,11 @@ def cmd_overlay_aspect(a):
 
 
 # The aspect overlays (romfs-aspect-<set>) the game can ask for: 21:9 and 32:9, each with the HUD at the screen's edges
-# and in the middle 16:9 (-center, graphics.hud_layout; totk_engine.c overlay_sets), and 16:10 (any 16:10 canvas uses
-# 2560x1600's layouts: totk_patches.c totk_layout_set). Every one by default; a Builder install only those of its monitors'
+# and in the middle 16:9 (-center, graphics.hud_layout; totk_engine.c overlay_sets), 16:10 (any 16:10 canvas uses
+# 2560x1600's layouts: totk_patches.c totk_layout_set) and 3:2 (2160x1440's). Every one by default; a Builder install only those of its monitors'
 # shapes and those built on demand (NXR_ASPECT_SETS, tools/engine/aspect_sets.py; `overlay-aspect` builds one more)
 ASPECT_SETS = ('3440x1440', '5120x1440', '7680x1440', '3440x1440-center', '5120x1440-center', '7680x1440-center',
-               '2560x1600')
+               '2560x1600', '2160x1440')
 
 
 def aspect_overlay(romfs, size):
@@ -2235,6 +2379,8 @@ def main():
     split_args(r); debug_args(r)
     o = sub.add_parser('overlay'); o.add_argument('--force', action='store_true')
     sub.add_parser('glyphs')
+    d = sub.add_parser('dlss', help='fetch the DLSS runtime DLLs into <work>/engine/dlss (an NVIDIA RTX GPU added later)')
+    d.add_argument('--force', action='store_true', help='whatever the GPU')
     o = sub.add_parser('overlay-aspect'); o.add_argument('--set', required=True, help='<w>x<h>[-center]')
     k = sub.add_parser('key'); k.add_argument('--patches'); k.add_argument('--root')
     split_args(k)
@@ -2263,7 +2409,7 @@ def main():
     if HOT and not SPLIT:
         sys.exit('--hot needs --split')
     {'game': cmd_game, 'runtime': cmd_runtime, 'overlay': cmd_overlay, 'key': cmd_key, 'overlay-aspect': cmd_overlay_aspect,
-     'glyphs': lambda a: glyph_banks(os.path.join(SIG, 'overlay', 'romfs'))}[a.cmd](a)
+     'glyphs': lambda a: glyph_banks(os.path.join(SIG, 'overlay', 'romfs')), 'dlss': cmd_dlss}[a.cmd](a)
 
 
 if __name__ == '__main__':

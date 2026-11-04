@@ -1944,7 +1944,7 @@ class BuilderForm : Form
     readonly Row dump, keys, update, firmware, install;
     readonly Row[] rows;
     readonly PrimaryButton build;
-    readonly LinkLabel uninstall;
+    readonly LinkLabel uninstall, community;
     readonly StatusView status;
     readonly string repo;          // Builder mode: the clone this exe sits in; null in Setup mode
     Process proc;
@@ -2073,7 +2073,9 @@ class BuilderForm : Form
         keys = new Row(2, L.S("Keys"), L.S("The keys file from the same console"), f => File.Exists(f) &&
             f.EndsWith(".keys", StringComparison.OrdinalIgnoreCase) && !f.EndsWith("title.keys", StringComparison.OrdinalIgnoreCase));
         // (the game's 1.4.3 update dump: builds that version, next to a 1.0.0 one; without it, 1.0.0 as before)
-        update = new Row(3, L.S("Update (optional)"), L.S("Your {0} update dump: builds version {0}", UpdateVersion),
+        update = new Row(3, L.S("Update (optional)"), L.S(BetaNote, UpdateVersion),
+            // (D#74: what 1.4.3 runs like, BEFORE Install; the launcher's notice came only at its first start. Change it
+            //  with the launcher notice when the gate verifies 1.4.3 at full rate)
             f => IsDump(f)) { Clearable = true, Describe = f => Path.GetFileName(f) + "   " + L.S("(right-click to remove: builds 1.0.0)") };
         firmware = new Row(4, L.S("Firmware (optional)"),
             CjkWindows ? L.S("Recommended: Korean and Chinese text looks right with its fonts") : L.S("Only Korean and Chinese text needs it: its folder or .zip"),
@@ -2090,6 +2092,7 @@ class BuilderForm : Form
         update.Changed += () =>
         {
             if (update.FilePath == null || Busy) return;
+            status.Add(L.S(BetaNote, UpdateVersion));   // (the row now shows the file's name, not the note: said again here)
             status.Add(L.S(SavesNote, UpdateVersion));
             status.Add(L.S("With the {0} update the first build needs about {1} GB free (its game files are unpacked).",
                            UpdateVersion, Preflight.FirstInstallGb(repo == null, true)));
@@ -2130,13 +2133,7 @@ class BuilderForm : Form
         string installed = InstalledDir();
         if (repo == null && installed != null)
         {
-            uninstall = new LinkLabel { Text = L.S("Uninstall"), Font = T.Small, AutoSize = true, BackColor = T.Bg, LinkColor = T.TextFaint,
-                                        ActiveLinkColor = T.TextDim, VisitedLinkColor = T.TextFaint, LinkBehavior = LinkBehavior.HoverUnderline, TabStop = true };
-            uninstall.Location = new Point(W - pad - uninstall.PreferredWidth, title.Top + (title.PreferredHeight - uninstall.PreferredHeight) / 2);
-            uninstall.MouseEnter += (s, e) => uninstall.LinkColor = T.TextDim;
-            uninstall.MouseLeave += (s, e) => uninstall.LinkColor = T.TextFaint;
-            uninstall.GotFocus += (s, e) => { uninstall.LinkColor = T.Accent; uninstall.LinkBehavior = LinkBehavior.AlwaysUnderline; };
-            uninstall.LostFocus += (s, e) => { uninstall.LinkColor = T.TextFaint; uninstall.LinkBehavior = LinkBehavior.HoverUnderline; };
+            uninstall = TitleLink(L.S("Uninstall"), title, W - pad);
             uninstall.LinkClicked += (s, e) =>
             {
                 if (Busy) return;
@@ -2145,6 +2142,11 @@ class BuilderForm : Form
             };
             Controls.Add(uninstall);
         }
+        // Community: the players' subreddit, on the same line once the game is installed (Finish), left of Uninstall
+        community = TitleLink(L.S("Community"), title, uninstall != null ? uninstall.Left - T.S4 : W - pad);
+        community.Visible = false;
+        community.LinkClicked += (s, e) => OpenCommunity();
+        Controls.Add(community);
         Controls.AddRange(rows);
         Controls.Add(copy);
 
@@ -2303,6 +2305,8 @@ class BuilderForm : Form
     }
 
     public const string UpdateVersion = "1.4.3";   // (builder.py's UPDATE_VERSION)
+    // the Update row's note (D#74), and the status line when an update dump is picked
+    const string BetaNote = "Beta: builds version {0} too (about 40 more minutes); full frame rate, less tested than 1.0.0";   // (only gated claims: "full frame rate" verified in the 9.1 gate)
     const string SavesNote = "{0} keeps its own saves: the first time it starts it copies your 1.0.0 saves once. " +
         "Progress you make later in 1.0.0 does not appear in {0}, and {0} saves never go back to 1.0.0.";
     static bool IsDump(string f)
@@ -2581,6 +2585,7 @@ class BuilderForm : Form
     {
         foreach (var r in rows) r.Locked = on; copy.Locked = on || update.FilePath != null; copy.Invalidate();
         if (uninstall != null) uninstall.Visible = !on;   // (never mid-build)
+        if (on) community.Visible = false;                // (Finish shows it again when the game is installed)
     }
 
     // The newest 1.0.0 build's launcher in an install folder (game\TotK-PC-<date>-<time>-<commit>: by name, not by
@@ -3026,6 +3031,7 @@ class BuilderForm : Form
                         : noShortcut || Shortcut(launcher) ? L.S("Done: the game is on your desktop")
                         : L.S("Done: press Play (Windows refused the desktop shortcut)");
             status.Value = 1f; build.Text = L.S("Play");
+            community.Visible = true;
         }
         else
         {
@@ -3072,6 +3078,38 @@ class BuilderForm : Form
             }
         }
         catch (Exception ex) { status.Add(L.S("Could not start the game: {0}", ex.Message)); }
+    }
+
+    // the players' community; the launcher's Community button and the Discord status button open the same address
+    internal const string CommunityUrl = "https://www.reddit.com/r/WeepingOfTheEmpire/";
+
+    // in the default browser, outside this window's job as Play's game is (a browser that was not running would close
+    // with Setup): Explorer hands the address to it. Where no breakaway is allowed or under Wine, the shell's own start
+    void OpenCommunity()
+    {
+        try
+        {
+            if (Wine.Active || Win32.StartOutsideJob(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
+                                                     "\"" + CommunityUrl + "\"") == 0)
+            {
+                if (!Wine.Active) KeepChildrenOnClose();
+                Process.Start(new ProcessStartInfo(CommunityUrl) { UseShellExecute = true });
+            }
+        }
+        catch (Exception ex) { status.Add(L.S("Could not open {0}: {1}", CommunityUrl, ex.Message)); }
+    }
+
+    // a faint secondary link on the title line, its right edge at `right` (Uninstall, Community)
+    static LinkLabel TitleLink(string text, Label title, int right)
+    {
+        var l = new LinkLabel { Text = text, Font = T.Small, AutoSize = true, BackColor = T.Bg, LinkColor = T.TextFaint,
+                                ActiveLinkColor = T.TextDim, VisitedLinkColor = T.TextFaint, LinkBehavior = LinkBehavior.HoverUnderline, TabStop = true };
+        l.Location = new Point(right - l.PreferredWidth, title.Top + (title.PreferredHeight - l.PreferredHeight) / 2);
+        l.MouseEnter += (s, e) => l.LinkColor = T.TextDim;
+        l.MouseLeave += (s, e) => l.LinkColor = T.TextFaint;
+        l.GotFocus += (s, e) => { l.LinkColor = T.Accent; l.LinkBehavior = LinkBehavior.AlwaysUnderline; };
+        l.LostFocus += (s, e) => { l.LinkColor = T.TextFaint; l.LinkBehavior = LinkBehavior.HoverUnderline; };
+        return l;
     }
 
     // The desktop shortcut, pointed at the newest build (an update re-points it; saves and settings live in the user's

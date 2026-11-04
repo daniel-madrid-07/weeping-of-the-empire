@@ -26,6 +26,8 @@
 
 extern "C" void vk_ngx_request(int sr, int fg);   // nvn/vulkan/ngx.c (-1: unchanged)
 extern "C" void vk_set_fg_max(bool on);           // nvn/vulkan/device.c: frame generation 'Maximum fps'
+extern "C" void vk_ngx_set_preset(const char *name);   // nvn/vulkan/ngx.c: the DLSS model ("" / "k" / "j")
+extern "C" void vk_ngx_set_trails(int pct);        // nvn/vulkan/ngx.c: the bias mask's strength
 extern "C" void osd_toast(const char *text, int ms);   // hle_osd.cpp
 
 namespace {
@@ -77,6 +79,17 @@ const char *const V_FGPACE[] = {"", "max", nullptr};
 const char *const N_FGPACE[] = {"Smooth (matched to the refresh)", "Maximum fps", nullptr};
 void fgpace_to_env(const char *v) { _putenv_s("TOTK_FG_PACE", !strcmp(v, "max") ? "max" : ""); }
 void fgpace_apply(const char *v) { vk_set_fg_max(!strcmp(v, "max")); }
+// graphics.dlss_preset / graphics.dlss_trails: DLSS's model, NVIDIA's own per quality mode or preset K / J for all
+// (ngx.c: the features are made again, live), and how much DLSS trusts the new frame where something moved, the bias
+// mask's strength (ngx.c, every frame). DLSS / DLAA only.
+const char *const V_DLSS_PRESET[] = {"", "k", "j", nullptr};
+const char *const N_DLSS_PRESET[] = {"NVIDIA's default", "Preset K", "Preset J", nullptr};
+void preset_to_env(const char *v) { _putenv_s("TOTK_DLSS_PRESET", v); }
+void preset_apply(const char *v) { vk_ngx_set_preset(v); }   // (ngx.c maps the name to NGX's preset enum)
+const char *const V_DLSS_TRAILS[] = {"", "50", "0", nullptr};
+const char *const N_DLSS_TRAILS[] = {"Fewest trails", "Between", "Smoothest (more trails)", nullptr};
+void trails_to_env(const char *v) { _putenv_s("TOTK_DLSS_TRAILS", v); }
+void trails_apply(const char *v) { vk_ngx_set_trails(*v ? atoi(v) : 100); }
 
 const pc_setting k_dlss[] = {
     {"graphics.dlss", "Graphics", "Rendering", "Upscaler", "TOTK_DLSS_SR / TOTK_FSR_SR. DLSS (NVIDIA "
@@ -92,6 +105,12 @@ const pc_setting k_dlss[] = {
      "generation and the multiplier's generated ones after each, past the refresh rate, with VRR too (mailbox, else "
      "immediate, which can tear; the panel may leave VRR; TOTK_FG_MAX_VRR_FIFO=1 keeps VRR's FIFO).", "", V_FGPACE, N_FGPACE, 0, 0, 0, 0, nullptr, fgpace_to_env,
      fgpace_apply, nullptr},
+    {"graphics.dlss_preset", "Graphics", "Rendering", "DLSS model", "TOTK_DLSS_PRESET. The AI model DLSS and DLAA use: "
+     "NVIDIA's default for each quality, or preset K (sharpest) or J (a little less ghosting, a little more flicker) for all.",
+     "", V_DLSS_PRESET, N_DLSS_PRESET, 0, 0, 0, 0, nullptr, preset_to_env, preset_apply, nullptr},
+    {"graphics.dlss_trails", "Graphics", "Rendering", "DLSS character trails", "TOTK_DLSS_TRAILS. Where something moved "
+     "(Link, animals, a swung weapon), how much DLSS and DLAA trust the new frame over the old ones: fewest trails, or "
+     "smoother edges with more trails.", "", V_DLSS_TRAILS, N_DLSS_TRAILS, 0, 0, 0, 0, nullptr, trails_to_env, trails_apply, nullptr},
 };
 
 struct AddDlssRows {

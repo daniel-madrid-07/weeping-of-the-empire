@@ -328,8 +328,6 @@ PC_ES("Menu: left stick click",
       "Menú: pulsar el stick izquierdo")
 PC_ES("Menu: right stick click",
       "Menú: pulsar el stick derecho")
-PC_ES("Walk (hold)",
-      "Caminar (mantener)")
 PC_ES("Crouch",
       "Agacharse")
 PC_ES("Let go (a wall, a ride)",
@@ -608,14 +606,14 @@ PC_ES("DLSS x4",
       "DLSS x4")
 PC_ES("FSR x2",
       "FSR x2")
-PC_ES("Ultrahand rotation step",
-      "Paso de giro de Ultramano")
-PC_ES("TOTK_PC_ROTATE_STEP: mouse counts per 45-degree step while R is held in Ultrahand or Autobuild.",
-      "TOTK_PC_ROTATE_STEP: cuentas del ratón por cada paso de 45 grados mientras mantienes R con Ultramano o el Generador de esquemas.")
-PC_ES("20 (fast)",
-      "20 (rápido)")
-PC_ES("80 (slow)",
-      "80 (lento)")
+PC_ES("Ultrahand rotation speed",
+      "Velocidad de giro de Ultramano")
+PC_ES("TOTK_PC_ROTATE_SPEED: with R held in Ultrahand or Autobuild, the mouse moved sideways turns the object in 45-degree steps (1x: the move that turns the camera 45 degrees) and the wheel turns it vertically, a step a notch.",
+      "TOTK_PC_ROTATE_SPEED: manteniendo R en Ultramano o en el Generador de esquemas, mover el ratón a los lados gira el objeto en pasos de 45 grados (1x: el movimiento que gira la cámara 45 grados) y la rueda lo gira en vertical, un paso por muesca.")
+PC_ES("0.5x (slow)",
+      "0.5x (lento)")
+PC_ES("2x (fast)",
+      "2x (rápido)")
 PC_ES("Control scheme",
       "Esquema de control")
 PC_ES("PC: the keyboard and mouse controls of the menus (Q / E tabs, Esc back, the mouse pointer), Esc / I / M / J in the world and the prompts with PC keys. Console: the keyboard layout below in every screen.",
@@ -1091,8 +1089,8 @@ PC_ES("Automatic updates",
       "Actualizaciones automáticas")
 PC_ES("Discord status",
       "Estado en Discord")
-PC_ES("Shows \"Playing\" and the time played on your Discord profile while Discord runs. Nothing else is sent.",
-      "Muestra \"Jugando\" y el tiempo de juego en tu perfil de Discord mientras Discord está abierto. No se envía nada más.")
+PC_ES("Shows \"Playing\", the time played and a \"Join the community\" button (the game's subreddit) on your Discord profile while Discord runs. Nothing else is sent.",
+      "Muestra \"Jugando\", el tiempo de juego y un botón \"Join the community\" (el subreddit del juego) en tu perfil de Discord mientras Discord está abierto. No se envía nada más.")
 PC_ES("Checks GitHub for a newer version when the game starts (at most once a day); asks first if the update rebuilds "
       "the game.",
       "Al iniciar el juego (como mucho una vez al día), busca en GitHub una versión más reciente; pregunta antes si la "
@@ -1333,8 +1331,8 @@ PC_ES("Game patches",
       "Parches del juego")
 PC_ES("Aspect ratio",
       "Relación de aspecto")
-PC_ES("The window's: on a 16:10, 21:9, 32:9 or 48:9 window or monitor the game draws a canvas of that shape at start (1920x1200, 3440x1440, 5120x1440 or 7680x1440), the HUD laid out for it: 21:9, 32:9 and 48:9 a wider view, 16:10 a taller one (the same height of view, a little less at the sides). Other shapes, and 16:9, keep the game's 16:9 picture. 16:10 / 21:9 / 32:9 / 48:9: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9, 32:9 and 48:9 are heavier than the window's own shape: the whole canvas is drawn, then shown smaller). Needs the game patches' RomFS sets (TOTK_PATCH_SETS) and the overlay's layout for that shape. At the next start: the canvas and the game files laid out for it are chosen as the game starts. Setup prepares the layouts of this PC's monitors' shapes; another shape's are made at the start after you pick it (about 30 s, once).",
-      "Forma de la ventana: en una ventana o monitor 16:10, 21:9, 32:9 o 48:9, el juego dibuja al iniciarse un lienzo con esa forma (1920x1200, 3440x1440, 5120x1440 o 7680x1440), con la interfaz adaptada: 21:9, 32:9 y 48:9 una vista más amplia, 16:10 una más alta (la misma altura de vista, algo menos a los lados). Las demás formas, y 16:9, mantienen la imagen 16:9 del juego. 16:10 / 21:9 / 32:9 / 48:9: ese lienzo sea cual sea la ventana (en otra forma se muestra entero, con bandas; 21:9, 32:9 y 48:9 pesan más que la forma de la propia ventana: se dibuja el lienzo entero y luego se muestra más pequeño). Requiere los conjuntos RomFS de los parches del juego (TOTK_PATCH_SETS) y la disposición del overlay para esa forma. Se aplica al siguiente inicio: el lienzo y los archivos del juego adaptados a él se eligen al arrancar el juego. El instalador prepara las disposiciones de las formas de los monitores de este PC; las de otra forma se crean al iniciar después de elegirla (unos 30 s, una vez).")
+PC_ES("The window's: on a 3:2, 16:10, 21:9, 32:9 or 48:9 window or monitor the game draws a canvas of that shape at start (1920x1280, 1920x1200, 3440x1440, 5120x1440 or 7680x1440), the HUD laid out for it: 21:9, 32:9 and 48:9 a wider view, 3:2 and 16:10 a taller one (the same height of view, a little less at the sides). Other shapes, and 16:9, keep the game's 16:9 picture. 16:10 / 21:9 / 32:9 / 48:9 / 3:2: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9, 32:9 and 48:9 are heavier than the window's own shape: the whole canvas is drawn, then shown smaller). Needs the game patches' RomFS sets (TOTK_PATCH_SETS) and the overlay's layout for that shape. At the next start: the canvas and the game files laid out for it are chosen as the game starts. Setup prepares the layouts of this PC's monitors' shapes; another shape's are made at the start after you pick it (about 30 s, once).",
+      "Forma de la ventana: en una ventana o monitor 3:2, 16:10, 21:9, 32:9 o 48:9, el juego dibuja al iniciarse un lienzo con esa forma (1920x1280, 1920x1200, 3440x1440, 5120x1440 o 7680x1440), con la interfaz adaptada: 21:9, 32:9 y 48:9 una vista más amplia, 3:2 y 16:10 una más alta (la misma altura de vista, algo menos a los lados). Las demás formas, y 16:9, mantienen la imagen 16:9 del juego. 16:10 / 21:9 / 32:9 / 48:9 / 3:2: ese lienzo sea cual sea la ventana (en otra forma se muestra entero, con bandas; 21:9, 32:9 y 48:9 pesan más que la forma de la propia ventana: se dibuja el lienzo entero y luego se muestra más pequeño). Requiere los conjuntos RomFS de los parches del juego (TOTK_PATCH_SETS) y la disposición del overlay para esa forma. Se aplica al siguiente inicio: el lienzo y los archivos del juego adaptados a él se eligen al arrancar el juego. El instalador prepara las disposiciones de las formas de los monitores de este PC; las de otra forma se crean al iniciar después de elegirla (unos 30 s, una vez).")
 PC_ES("HUD position (21:9, 32:9, 48:9)",
       "Posición del HUD (21:9, 32:9, 48:9)")
 PC_ES("Where the HUD goes on a 21:9, 32:9 or 48:9 canvas: at the screen's edges, or in the middle 16:9 (closer to the eyes on a very wide screen). Menus are the same either way. Nothing changes at 16:9. At the next start: the game loads its interface layouts once, as it starts. Automatic (the default): in the middle on 48:9, at the edges otherwise.",
@@ -1601,8 +1599,8 @@ PC_ES("Your monitor's peak brightness in nits, so highlights are neither clipped
       "El brillo máximo de tu monitor en nits, para que las luces no se recorten ni queden apagadas. Usa el valor que indica el monitor.")
 PC_ES("How bright ordinary white (menus, the sky) is in HDR. Raise it if the picture looks dim, lower it if it is too bright.",
       "Cuánto brilla el blanco normal (menús, el cielo) en HDR. Súbelo si la imagen se ve apagada, bájalo si brilla demasiado.")
-PC_ES("The window's (the default): on a 16:10, 21:9, 32:9 or 48:9 window or monitor the picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9: that shape whatever the window. A new shape's layouts are made at its first start (about 30 s, once). A wider picture costs more GPU.",
-      "La de la ventana (predeterminado): en una ventana o monitor 16:10, 21:9, 32:9 o 48:9 la imagen toma esa forma, 21:9, 32:9 y 48:9 con más campo de visión; las demás formas, 16:9 entre ellas, mantienen la del juego. 16:9 / 16:10 / 21:9 / 32:9 / 48:9: esa forma sea cual sea la ventana. Las interfaces de una forma nueva se preparan en su primer arranque (unos 30 s, una vez). Una imagen más ancha exige más a la GPU.")
+PC_ES("The window's (the default): on a 3:2, 16:10, 21:9, 32:9 or 48:9 window or monitor the picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9 / 3:2: that shape whatever the window. A new shape's layouts are made at its first start (about 30 s, once). A wider picture costs more GPU.",
+      "La de la ventana (predeterminado): en una ventana o monitor 3:2, 16:10, 21:9, 32:9 o 48:9 la imagen toma esa forma, 21:9, 32:9 y 48:9 con más campo de visión; las demás formas, 16:9 entre ellas, mantienen la del juego. 16:9 / 16:10 / 21:9 / 32:9 / 48:9 / 3:2: esa forma sea cual sea la ventana. Las interfaces de una forma nueva se preparan en su primer arranque (unos 30 s, una vez). Una imagen más ancha exige más a la GPU.")
 PC_ES("On 21:9, 32:9 or 48:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a very wide screen). Nothing changes at 16:9. Automatic (the default): the middle on 48:9, the edges otherwise.",
       "En 21:9, 32:9 o 48:9: el HUD en los bordes de la pantalla, o en el centro 16:9 (más fácil de ver en una pantalla muy ancha). En 16:9 no cambia nada. Automático (predeterminado): el centro en 48:9 y los bordes en los demás.")
 PC_ES("On 21:9, 32:9 or 48:9: real-time cutscenes wide like the rest of the game, or the original 16:9 with bars at the sides.",
@@ -1615,8 +1613,8 @@ PC_ES("More grass, flowers and pebbles. Higher looks fuller and costs GPU and CP
       "Más hierba, flores y piedrecitas. Más alto se ve más lleno y cuesta GPU y CPU.")
 PC_ES("Sharper shadows: 2 doubles the shadow map's width and height, for 4x its memory and more GPU.",
       "Sombras más nítidas: 2 duplica el ancho y el alto del mapa de sombras, con 4 veces su memoria y más GPU.")
-PC_ES("Moves the lines where the sun's sharp near shadows hand over to coarser ones further away (1 = the game's, 2 = twice as far). Near shadows get a little softer: raise Shadow resolution with it. Costs a little GPU and CPU.",
-      "Aleja las líneas donde las sombras nítidas cercanas del sol pasan a otras más bastas (1 = el del juego, 2 = el doble de lejos). Las sombras cercanas se suavizan un poco: sube la Resolución de sombras a la vez. Cuesta algo de GPU y CPU.")
+PC_ES("Moves the lines where the sun's sharp near shadows hand over to coarser ones further away (1 = the game's, 2 = twice as far). Near shadows get a little softer: raise Shadow resolution with it. Costs a little GPU and CPU. With Shadow distance above 1 the two multiplied stay at 4 at most, so at Shadow distance 4 this does nothing.",
+      "Aleja las líneas donde las sombras nítidas cercanas del sol pasan a otras más bastas (1 = el del juego, 2 = el doble de lejos). Las sombras cercanas se suavizan un poco: sube la Resolución de sombras a la vez. Cuesta algo de GPU y CPU. Con Distancia de sombras por encima de 1, las dos multiplicadas no pasan de 4, así que con Distancia de sombras 4 esto no hace nada.")
 PC_ES("Fixed keeps the sun's shadow map at its largest size: steadier, sharper leaf shadows for some GPU. The game's changes its size with the view.",
       "Fijo deja el mapa de sombras del sol en su tamaño mayor: sombras de hojas más estables y nítidas a cambio de algo de GPU. El del juego cambia de tamaño con la vista.")
 PC_ES("How far the sharp shadows reach. Higher looks better in the distance and costs GPU.",
@@ -1687,8 +1685,8 @@ PC_ES("One press of the sprint key starts sprinting and the next stops it. Off: 
       "Una pulsación de la tecla de correr empieza a correr y la siguiente para. Desactivado: mantenla pulsada, como en la Switch.")
 PC_ES("One press of the shield / target key raises the shield and targets, the next lowers it. Off: hold it, as on the Switch.",
       "Una pulsación de la tecla de escudo / fijar sube el escudo y fija al enemigo, la siguiente lo baja. Desactivado: mantenla pulsada, como en la Switch.")
-PC_ES("How much mouse movement turns an object one 45° step while R is held in Ultrahand or Autobuild. Lower turns sooner.",
-      "Cuánto movimiento de ratón gira un objeto un paso de 45° con R pulsado en Ultramano o Generador de esquemas. Menos gira antes.")
+PC_ES("How fast moving the mouse sideways turns an object while R is held in Ultrahand or Autobuild (1x: as far as the camera turns). The wheel turns it vertically; moving the mouse up or down does not turn it.",
+      "Lo rápido que gira un objeto al mover el ratón a los lados manteniendo R en Ultramano o en el Generador de esquemas (1x: lo mismo que gira la cámara). La rueda lo gira en vertical; mover el ratón arriba o abajo no lo gira.")
 PC_ES("A non-Nintendo pad's face buttons: by position (the Switch layout: the right button confirms) or by label (Xbox A confirms).",
       "Los botones frontales de un mando que no es de Nintendo: por posición (la distribución de la Switch: el botón derecho confirma) o por letra (la A de Xbox confirma).")
 PC_ES("Controller vibration: off, normal, or stronger (x2 to x4).",
@@ -1781,3 +1779,35 @@ PC_ES("TOTK_FG_PACE. Smooth: the frames shown match the monitor (real ones at th
       "TOTK_FG_PACE. Suave: los fotogramas mostrados van al ritmo del monitor (los reales al límite dividido por el multiplicador). Máximos fps: los fotogramas reales como sin generación de fotogramas y los generados del multiplicador tras cada uno, por encima de la frecuencia de refresco, también con VRR (mailbox, si no immediate, que puede producir tearing; el monitor puede salir de VRR; TOTK_FG_MAX_VRR_FIFO=1 mantiene el FIFO de VRR).")
 PC_ES("Smooth keeps the frames shown in step with the monitor's refresh. Maximum fps adds the generated frames to every real frame the PC makes, even past the refresh rate: more frames than the screen shows (the fps readout counts them all), for VRR panels or low latency; Smooth looks steadier on a fixed refresh. With V-sync off the picture can tear.",
       "Suave mantiene los fotogramas mostrados al ritmo del refresco del monitor. Máximos fps suma los fotogramas generados a cada fotograma real que hace el PC, incluso por encima de la frecuencia de refresco: más fotogramas de los que muestra la pantalla (el contador de fps los cuenta todos), para monitores VRR o baja latencia; Suave se ve más estable con una frecuencia fija. Con la sincronización vertical desactivada la imagen puede cortarse.")
+PC_ES("0.1% low",
+      "0,1% mín.")
+PC_ES("game",
+      "juego")
+PC_ES("DLSS model",
+      "Modelo de DLSS")
+PC_ES("NVIDIA's default",
+      "El predeterminado de NVIDIA")
+PC_ES("Preset K",
+      "Preset K")
+PC_ES("Preset J",
+      "Preset J")
+PC_ES("TOTK_DLSS_PRESET. The AI model DLSS and DLAA use: NVIDIA's default for each quality, or preset K (sharpest) or J (a little less ghosting, a little more flicker) for all.",
+      "TOTK_DLSS_PRESET. El modelo de IA que usan DLSS y DLAA: el predeterminado de NVIDIA para cada calidad, o el preset K (el más nítido) o el J (algo menos de estelas fantasma, algo más de parpadeo) para todas.")
+PC_ES("DLSS character trails",
+      "Estelas de personajes con DLSS")
+PC_ES("Fewest trails",
+      "Menos estelas")
+PC_ES("Between",
+      "Intermedio")
+PC_ES("Smoothest (more trails)",
+      "Más suave (más estelas)")
+PC_ES("TOTK_DLSS_TRAILS. Where something moved (Link, animals, a swung weapon), how much DLSS and DLAA trust the new frame over the old ones: fewest trails, or smoother edges with more trails.",
+      "TOTK_DLSS_TRAILS. Donde algo se ha movido (Link, animales, un arma al blandirla), cuánto se fían DLSS y DLAA del fotograma nuevo frente a los anteriores: menos estelas, o bordes más suaves con más estelas.")
+PC_ES("Which AI model DLSS and DLAA use. NVIDIA's default picks one for each quality. Preset K is the sharpest; preset J ghosts a little less behind moving things but flickers a little more. Changing it rebuilds DLSS once (a short pause).",
+      "Qué modelo de IA usan DLSS y DLAA. El predeterminado de NVIDIA elige uno para cada calidad. El preset K es el más nítido; el preset J deja algo menos de estela tras lo que se mueve, pero parpadea algo más. Al cambiarlo, DLSS se reconstruye una vez (una pausa breve).")
+PC_ES("Where something moved (Link, animals, a swung weapon), DLSS and DLAA can keep blending in older frames, which leaves faint trails, or trust the new frame, which removes them but can make those edges flicker a little. Fewest trails is the default.",
+      "Donde algo se ha movido (Link, animales, un arma al blandirla), DLSS y DLAA pueden seguir mezclando fotogramas anteriores, lo que deja estelas tenues, o fiarse del fotograma nuevo, lo que las quita pero puede hacer que esos bordes parpadeen un poco. Menos estelas es el valor predeterminado.")
+PC_ES("Safe GPU mode: the graphics driver crashed in the last runs, so shaders now build the slow, safe way",
+      "Modo GPU seguro: el controlador gráfico falló en las últimas sesiones, así que los shaders se compilan ahora de la forma lenta y segura")
+PC_ES("Safe GPU mode: the graphics driver kept crashing, so shaders are also built unoptimised; the game may run slower until it has run cleanly a few times",
+      "Modo GPU seguro: el controlador gráfico siguió fallando, así que los shaders también se compilan sin optimizar; el juego puede ir más lento hasta que se haya cerrado bien unas cuantas veces")

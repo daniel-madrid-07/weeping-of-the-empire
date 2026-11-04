@@ -32,7 +32,7 @@ Legend: **Plays** = starts and plays through what was tested. **Problems** = pla
 | RX 6800 | Ryzen 5 5600X | 32 GB | v0.1.7 | Problems: some stutter, grass does not stay cut, a fine mesh on Depths roots | 3840x2160: Depths 35-45, Great Sky Island 20-30, Surface 40-50; shrines 60 (v0.1.6) | #9, #16, #41 |
 | RX 6600 | Ryzen 5 4500 | 16 GB | v0.1.7 | Plays | 1920x1080, 60 cap | #25, #18, #40 |
 | RX 550 | Pentium G4600 (no AVX) | | v0.1.7 | Plays (the build for CPUs without AVX) | low, no number given | v0.1.7 notes |
-| Radeon Vega 7 (Ryzen 7 4700U) | Ryzen 7 4700U | 16 GB | v0.1.5 | Unplayable on v0.1.5 (1-2 s per frame, shader preparation stuck): fixed in v0.1.8, not re-tested | | #23 |
+| Radeon Vega 7 (Ryzen 7 4700U) | Ryzen 7 4700U | 16 GB | v0.1.8 | Plays since v0.1.8 (the reporter confirmed it; frame times still uneven); unplayable on v0.1.5 (1-2 s per frame, shader preparation stuck) | 15-20 fps | #23 |
 | Radeon graphics of the Ryzen 7 9800X3D | Ryzen 7 9800X3D | | | Plays, low frame rate | | developer's PC |
 | Arc B580 | Ryzen 7 7700 | | v0.1.8 | Problems: crash at the title in Intel's shader compiler (a fix in v0.1.9, not yet confirmed on the reporter's PC, #34), white patches on water and in caves; FSR crashed (no longer crashes since v0.1.8.1; FSR may stay off on some GPUs) | ~2560x1440 | #34, #39, #45 |
 

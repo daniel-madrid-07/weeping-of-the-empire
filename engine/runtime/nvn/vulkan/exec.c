@@ -138,7 +138,7 @@ void vk_glitch_counters(uint64_t c[8]);
 static uint64_t stat_fb_selfreuse;
 static uint64_t stat_snap_delta, stat_snap_delta_px, stat_snap_delta_full_px, stat_snap_tiles_n;   // (LARECOMP_SNAP_DELTA: copies, their pixels, the whole images' pixels)
 static uint64_t stat_fbl_moves;   // (g_vk.fbl_layout: attachments moved to the feedback-loop layout for a pass)
-static uint64_t stat_oq_reports, stat_oq_hidden, stat_oq_visible_fallback, stat_oq_one;   // (occlusion queries: see oq_report; one: queries that counted exactly 1, a binary query's answer)   // (LARECOMP_FEEDBACK_SELFCOPY=2: same-draw read + write copies not retaken, see resolve_feedback)
+static uint64_t stat_oq_reports, stat_oq_hidden, stat_oq_visible_fallback, stat_oq_one, stat_oq_stale;   // (occlusion queries: see oq_report; one: queries that counted exactly 1, a binary query's answer)   // (LARECOMP_FEEDBACK_SELFCOPY=2: same-draw read + write copies not retaken, see resolve_feedback)
 static uint64_t stat_upload_bytes;
 // Render passes begun since the start, never reset (any thread reads it): hle_vi.cpp tells loading screens (a few passes
 // a frame) from gameplay (100+) to keep an unlocked frame rate off the loads
@@ -295,6 +295,7 @@ static bool gdev_chk_on(void);
 static VkBuffer chk_buf[2];
 static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write);
 static uint64_t gdev_stat_in, gdev_stat_regions, gdev_stat_snap, gdev_stat_host, gdev_stat_grown;  // (stats line)
+static void rawd_stats(void);   // ('[vk] raw-pointer dispatches', beside the stats line: see rawd_note)
 static void gsf_stats(void);   // (LARECOMP_GDEV_SNAPFALL: its own line beside the stats line)
 static int gdev_n;
 
@@ -932,7 +933,7 @@ static void devlost_test(VkCommandBuffer cb) {
                                           .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                                                     .module = m, .pName = "main"},
                                           .layout = layout};
-        VK_CHECK(vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipe));
+        VK_CHECK(vk_engine_compute_pipeline("device-lost test", &ci, &pipe));
         vkDestroyShaderModule(g_vk.dev, m, NULL);
     }
     uint32_t go = 0;
@@ -1205,6 +1206,8 @@ typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, u
 static Chunk *chunks;
 static int nchunks, active = -1;
 static uint64_t ring_peak, ring_made, ring_trim_n, ring_trim_bytes;   // ("[vram] slack" line)
+static int ring_need;            // ring_retire's floor: the chunks held when one was last made (a burst's size) ...
+static uint64_t ring_need_ns;    // ... and when
 
 static int new_chunk(uint64_t size) {
     // LARECOMP_VK_RING_REFUSE=1 (a check, the release gate's low-memory boot): every chunk past the first two refused, as
@@ -1234,6 +1237,7 @@ static int new_chunk(uint64_t size) {
     c->size = size;
     nchunks++;
     ring_made++;
+    ring_need = nchunks, ring_need_ns = SDL_GetTicksNS();
     uint64_t total = 0;
     for (int i = 0; i < nchunks; i++) total += chunks[i].size;
     if (total > ring_peak) ring_peak = total;
@@ -1248,8 +1252,14 @@ static int new_chunk(uint64_t size) {
 // chunk is made again by the next burst: a 64 MB vkAllocateMemory on the render thread), whose submissions completed and
 // that the open guest list did not use (guest_copy shares spans across its submissions; wider than vk_transient's
 // keep_list, which reuses rather than destroys), is freed: the newest first, one per 250 ms, never below RING_KEEP chunks.
-// A later burst makes chunks again as before. LARECOMP_VK_RING_IDLE_MS=0: never freed (old).
-enum { RING_KEEP = 2 };
+// A later burst makes chunks again as before. Hysteresis (LEAD 11-04, public #77's 8 GB 2080 S: residency short for most of
+// the session, so the 1 s rule gave a 64 MB chunk back and the next burst made it again, 'peak 1024 MB, 520 made, 518 given
+// back', a vkAllocateMemory and its first bind on the render thread each time): for RING_NEED_S after a chunk was made, the
+// ring keeps as many chunks as it held then (the burst's size), at most RING_SPARE_MAX beyond RING_KEEP while residency is
+// short (that much VRAM kept for the ring rather than given to textures: the fit-room's bound); a burst that comes back
+// within the window finds its chunks and starts the window again (vk_transient), so only a ring left unused for RING_NEED_S
+// shrinks. LARECOMP_VK_RING_IDLE_MS=0: never freed (old).
+enum { RING_KEEP = 2, RING_SPARE_MAX = 4, RING_NEED_S = 30 };
 static void ring_retire(void) {
     static int64_t idle_ns = -1;
     if (idle_ns < 0) { const char *e = getenv("LARECOMP_VK_RING_IDLE_MS"); idle_ns = (int64_t)(e ? atol(e) : 60000) * 1000000; if (idle_ns < 0) idle_ns = 0; }
@@ -1259,8 +1269,19 @@ static void ring_retire(void) {
     if (now - last_ns < 250000000ull) return;
     last_ns = now;
     extern bool vk_residency_tight(void);
+    const bool tight = vk_residency_tight();
     uint64_t lim = (uint64_t)idle_ns;
-    if (lim > 1000000000ull && vk_residency_tight()) lim = 1000000000ull;
+    if (lim > 1000000000ull && tight) lim = 1000000000ull;
+    int keep = RING_KEEP;
+    // (not while the system's commit is what is short: the chunks are commit too, and an 8 GB-RAM PC needs them back at
+    // once, as the 1 s rule gives them)
+    bool commit_short = false;
+    vk_residency_pressure(&commit_short);
+    if (!commit_short && ring_need_ns && now - ring_need_ns < RING_NEED_S * 1000000000ull) {
+        keep = ring_need;
+        if (tight && keep > RING_KEEP + RING_SPARE_MAX) keep = RING_KEEP + RING_SPARE_MAX;
+    }
+    if (nchunks <= keep) return;
     uint64_t done = vk_completed_seq();
     int pick = -1;
     for (int i = nchunks - 1; i >= 0 && pick < 0; i--)
@@ -1380,6 +1401,10 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
     for (int i = 0; i < nchunks; i++)
         if (i != active && chunks[i].seq <= done && chunks[i].size >= size && !(keep_list && chunks[i].seq >= exec_start_seq)) { pick = i; break; }
     if (pick < 0) pick = ring_grow(size, keep_list);
+    else if (pick >= RING_KEEP) {   // (a burst back on the chunks ring_retire kept: its window goes on)
+        ring_need_ns = now;
+        if (pick + 1 > ring_need) ring_need = pick + 1;
+    }
     active = pick;
     chunks[pick].used = size;
     chunks[pick].seq = pending;
@@ -1655,6 +1680,41 @@ static void dq_in(const char *what, const char *name) {
     tl_dq_in = true;
 }
 static void dq_out(void) { tl_dq_in = false; }
+static int dq_level(uint64_t key);
+static uint64_t hash_mem(uint64_t h, const void *p, size_t n);
+// The engine's own fixed pipelines (present, post / SMAA, clears, HDR encode, the overlay, texture decode, contact
+// shadows, latch, motion vectors, snapshot marks, write-backs; public #55 follow-up, LEAD v0.1.10): built inside the
+// same per-thread scope as the game's programs, keyed by their name, so a driver crash in one is recorded too
+// (vk_shader_crashed) and the next start on that GPU and driver builds it with the driver's optimizer off. They are
+// never skipped (the game cannot run without them: shader_quar.h caps "engine" at SQ_NOOPT); safe GPU mode turns the
+// optimizer off for them as for every program. The scope is saved and restored, so one inside a game build keeps it.
+static VkPipelineCreateFlags engine_build_begin(const char *name, uint64_t save[2], const char **save_what, bool *save_in) {
+    save[0] = tl_dq_key, save[1] = (uint64_t)tl_dq_lvl, *save_what = tl_dq_what, *save_in = tl_dq_in;
+    const uint64_t key = hash_mem(0x656e67696e65ull, name, strlen(name)) | 1;
+    const int lvl = dq_level(key);
+    dq_enter(key, lvl);
+    dq_in("engine pipeline", name);
+    if (lvl >= SQ_NOOPT) LOG("[vk] shader quarantine: engine pipeline %s: built with the driver's optimizer off\n", name);
+    return lvl >= SQ_NOOPT || vk_gpu_safe_noopt() ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
+}
+static void engine_build_end(const uint64_t save[2], const char *save_what, bool save_in) {
+    dq_out();
+    tl_dq_key = save[0], tl_dq_lvl = (int)save[1], tl_dq_what = save_what, tl_dq_in = save_in;
+}
+VkResult vk_engine_graphics_pipeline(const char *name, VkPipelineCache cache, VkGraphicsPipelineCreateInfo *pi, VkPipeline *out) {
+    uint64_t sv[2]; const char *sw; bool si;
+    pi->flags |= engine_build_begin(name, sv, &sw, &si);
+    const VkResult r = vkCreateGraphicsPipelines(g_vk.dev, cache, 1, pi, NULL, out);
+    engine_build_end(sv, sw, si);
+    return r;
+}
+VkResult vk_engine_compute_pipeline(const char *name, VkComputePipelineCreateInfo *ci, VkPipeline *out) {
+    uint64_t sv[2]; const char *sw; bool si;
+    ci->flags |= engine_build_begin(name, sv, &sw, &si);
+    const VkResult r = vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, ci, NULL, out);
+    engine_build_end(sv, sw, si);
+    return r;
+}
 static int dq_hung(uint64_t key, int lvl, const char *what, const char *name, double secs);
 static void dq_back(uint64_t key, int lvl, const char *what, const char *name, double secs);
 static uint64_t pc_stuck_ns(void);
@@ -1801,7 +1861,7 @@ static void gate_enter(void) {
     uint64_t wait0 = 0;
     for (;;) {
         int cur = atomic_load(&g_gate_inflight);
-        if (!gate_low()) {
+        if (!gate_low() && !vk_gpu_safe()) {   // (safe GPU mode, device.c: one build at a time, as when memory is short)
             if (atomic_compare_exchange_weak(&g_gate_inflight, &cur, cur + 1)) break;
             continue;
         }
@@ -1827,7 +1887,43 @@ static void gate_exit(void) {
     tl_in_gate = false;
 }
 // One compile on this thread: the gate, then the slow-build watch.
+// SQ_SOLO (shader_quar.h): a program built alone. Every driver build holds the build lock (g_build_mu / _cv) shared, one at the solo form holds
+// it exclusive: it waits for the builds in flight and none starts until it is done. Taken once per thread (tl_build_depth:
+// a build inside a build, e.g. a GLSL compile under a pipeline, keeps the outer hold; a nested read lock behind a waiting
+// writer would deadlock).
+// (a mutex + condition pair: the runtime's pthread shim has no rwlock)
+static pthread_mutex_t g_build_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_build_cv = PTHREAD_COND_INITIALIZER;
+static int g_build_readers;   // (builds in flight holding it shared)
+static bool g_build_writer;   // (a solo build holds it)
+static __thread int tl_build_depth;
+static __thread bool tl_build_solo;
+static _Atomic int g_solo_waiting;   // (solo builds waiting for the builds in flight: background ones start none meanwhile)
 static void build_begin(const char *what, const char *name, const char *glsl) {
+    if (!tl_build_depth++) {
+        // (our GLSL -> SPIR-V compile is not the driver's: shared. By the stage's name: the driver builds pass their GLSL
+        // too, for the slow-build watch)
+        tl_build_solo = tl_dq_lvl == SQ_SOLO && !(what && !strncmp(what, "GLSL", 4));
+        if (tl_build_solo) {
+            static _Atomic int nlog;
+            if (atomic_fetch_add(&nlog, 1) < 20) LOG("[vk] shader quarantine: %s %s built alone (no other build in flight)\n", what, name ? name : "?");
+            atomic_fetch_add(&g_solo_waiting, 1);
+            pthread_mutex_lock(&g_build_mu);
+            while (g_build_writer || g_build_readers) pthread_cond_wait(&g_build_cv, &g_build_mu);
+            g_build_writer = true;
+            pthread_mutex_unlock(&g_build_mu);
+            atomic_fetch_sub(&g_solo_waiting, 1);
+        } else {
+            // (every other build waits while a solo build waits, so its wait is the builds already in flight, not a queue
+            // that keeps refilling the lock, and the writer cannot starve whatever preference the platform's rwlock has.
+            // Solo builds are rare: a program that crashed the driver twice.)
+            while (atomic_load(&g_solo_waiting) > 0) SDL_Delay(2);
+            pthread_mutex_lock(&g_build_mu);
+            while (g_build_writer) pthread_cond_wait(&g_build_cv, &g_build_mu);
+            g_build_readers++;
+            pthread_mutex_unlock(&g_build_mu);
+        }
+    }
     gate_enter();
     dq_in(what, name);
     slow_begin(what, name, glsl);
@@ -1836,6 +1932,13 @@ static void build_end(void) {
     slow_end();
     dq_out();
     gate_exit();
+    if (!--tl_build_depth) {
+        pthread_mutex_lock(&g_build_mu);
+        if (tl_build_solo) g_build_writer = false;
+        else g_build_readers--;
+        if (!g_build_readers) pthread_cond_broadcast(&g_build_cv);   // (a waiting solo build, or readers after a writer)
+        pthread_mutex_unlock(&g_build_mu);
+    }
 }
 
 // TOTK_HELPER_PRIO=below: the pipeline workers and the translators at THREAD_PRIORITY_BELOW_NORMAL (default: normal, as
@@ -1899,6 +2002,7 @@ static const char *const tc_env_vars[] = {
     "LARECOMP_NO_RED", "LARECOMP_RSC_OWN", "LARECOMP_SAVE_MSL", "LARECOMP_TXD_HWGRAD", "LARECOMP_VP_EXACT", "LARECOMP_YDIR_POS",
     "LARECOMP_BRX_C1_ALL", "TOTK_SOFT_SHADOWS", "TOTK_SOFT_SHADOWS_MAX", "LARECOMP_FLAT_NPC", "LARECOMP_QUAD_SWAP",
     "LARECOMP_F2I_NAN",
+    "LARECOMP_GATHER_SCALE",
 };   // (LARECOMP_TEX_PRED_HOIST is read by device.c: its result, maxwell_tex_hoist, is in the device part below)
 static uint64_t tc_env;   // (hash of the translator's configuration; 0 = cache off)
 static char tc_dir[48];   // cache/glsl/<tc_env>
@@ -2512,6 +2616,7 @@ const char *renderer_stats(void) {
     stat_feedback_copies = stat_feedback_live = stat_depth_war = stat_fb_selfw = stat_fb_alias = stat_upload_bytes = 0;
     memset(stat_up_kind, 0, sizeof stat_up_kind);
     gdev_stat_in = gdev_stat_snap = gdev_stat_host = gdev_stat_grown = 0;
+    rawd_stats();
     gsf_stats();
     {
         size_t n = strlen(stats_text);
@@ -2559,11 +2664,11 @@ const char *renderer_stats(void) {
     }
     if (stat_oq_reports) {
         size_t n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, ", occlusion queries %llu (hidden %llu, kept visible %llu, count 1 %llu%s)",
+        snprintf(stats_text + n, sizeof stats_text - n, ", occlusion queries %llu (hidden %llu, kept visible %llu, count 1 %llu, slot reused before the result %llu%s)",
                  (unsigned long long)stat_oq_reports, (unsigned long long)stat_oq_hidden, (unsigned long long)stat_oq_visible_fallback,
-                 (unsigned long long)stat_oq_one, g_vk.oq_precise ? "" : ", not precise");
+                 (unsigned long long)stat_oq_one, (unsigned long long)stat_oq_stale, g_vk.oq_precise ? "" : ", not precise");
         gl_fold_oq();   // (glitch.c's per-frame counts: the totals before this window's reset)
-        stat_oq_reports = stat_oq_hidden = stat_oq_visible_fallback = stat_oq_one = 0;
+        stat_oq_reports = stat_oq_hidden = stat_oq_visible_fallback = stat_oq_one = stat_oq_stale = 0;
     }
     if (stat_fbl_moves) {
         size_t n = strlen(stats_text);
@@ -2977,7 +3082,7 @@ static bool oq_scope, oq_unsure;         // ResetCounter(1) seen and no report y
 static int oq_open = -1;                 // the query running in the open pass
 static uint32_t oq_q[OQ_SEG], oq_nq;     // the scope's queries
 static uint64_t oq_skip0;                // stat_skipped at the reset
-typedef struct { uint64_t *out; uint64_t seq; uint32_t q[OQ_SEG], n; } OqPending;
+typedef struct { uint64_t *out; uint64_t seq, ph; uint32_t q[OQ_SEG], n; } OqPending;   // (ph: the placeholder written at out[0])
 #define OQ_PEND 2048
 static OqPending oq_pend[OQ_PEND];
 static unsigned oq_ph, oq_pt;            // head (oldest), tail
@@ -3055,7 +3160,17 @@ static void oq_poll(void) {
             }
             sum += ok ? v[i] : 0;
         }
-        if (ok && p->out) { p->out[0] = sum; stat_oq_hidden += sum == 0; sync_guard_note_write((uint64_t)(uintptr_t)p->out, 8); }   // (not ready although completed: keep "visible")
+        // (not ready although completed: keep "visible"). The count replaces the placeholder only while the slot still holds
+        // it: the late write goes through a pointer the game may have reused since (a freed report table, a re-laid ring:
+        // #52 review), so a slot that now holds anything else is left alone (one compare-and-swap; the game writing it at
+        // the same moment wins).
+        if (ok && p->out) {
+            uint64_t exp = p->ph;
+            if (__atomic_compare_exchange_n(p->out, &exp, sum, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                stat_oq_hidden += sum == 0;
+                sync_guard_note_write((uint64_t)(uintptr_t)p->out, 8);
+            } else stat_oq_stale++;
+        }
         oq_free(p->q, p->n);
         oq_ph++;
     }
@@ -3102,7 +3217,7 @@ static void oq_report(uint64_t *out) {
         return;
     }
     OqPending *p = &oq_pend[oq_pt++ % OQ_PEND];
-    p->out = out; p->seq = vk_pending_seq(); p->n = oq_nq; memcpy(p->q, oq_q, sizeof oq_q);
+    p->out = out; p->ph = out[0]; p->seq = vk_pending_seq(); p->n = oq_nq; memcpy(p->q, oq_q, sizeof oq_q);   // (out[0]: the placeholder just written)
     oq_nq = 0;
 }
 static void oq_device_reset(void) {   // (vk_exec_reset: the device and its pool are gone)
@@ -3505,7 +3620,7 @@ static VkPipeline smark_pipeline(int k) {
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                                                 .module = m, .pName = "main"},
                                       .layout = smark_pl};
-    if (vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &smark_pipe[k]) != VK_SUCCESS) smark_pipe[k] = VK_NULL_HANDLE;
+    if (vk_engine_compute_pipeline("snapshot marks", &ci, &smark_pipe[k]) != VK_SUCCESS) smark_pipe[k] = VK_NULL_HANDLE;
     vkDestroyShaderModule(g_vk.dev, m, NULL);
     return smark_pipe[k];
 }
@@ -3602,6 +3717,7 @@ static const VkAttachmentFeedbackLoopInfoEXT fb_loop_info = {.sType = VK_STRUCTU
 static void debug_save_depth(TexBackend *b, const char *path);
 static uint32_t dump_layer;   // pass dumps: the array layer the target view renders to (read by raw_view)
 void vk_end_pass(void) { vk_end_pass_at(0); }
+bool vk_pass_open(void) { return in_pass; }   // (textures.c recycle_get: may it record outside a pass now)
 #define vk_end_pass() vk_end_pass_at(__LINE__)
 static void vk_end_pass_at(int line) {
     if (line >= 0) { pass_barrier_needed = true; pbn_cause = line < 8192 ? line : 0; }   // (our own work outside a pass follows: the next pass waits for it)
@@ -3886,6 +4002,49 @@ static void contact_pass_hook(VkCommandBuffer cb) {
     if (contact_pass_begin(&p)) contact_run(cb);
 }
 
+// (textures.c renderer_texture_promote) an unscaled 2D attachment of the same guest size as one at the scene's scale
+// renders at that scale; the shadow-map kind too (a square depth at TOTK_SHADOW_SCALE drawn with an unscaled colour target
+// of its size). begin_pass decides it BEFORE its promotion loop, so the pass that first meets the pair is already whole
+// (P1.4: decided after the attachments, that pass rendered the smallest attachment's area and the scaled targets' right /
+// bottom 1 - 1 / scale kept older pixels for a frame), and again after the attachments for a partner whose backend the
+// attachment loop made. LARECOMP_PROMO_FIRST=0: only after the attachments (old).
+static void promote_partners(void) {
+    extern void renderer_get_scale(float *sx, float *sy);
+    float rsx, rsy;
+    renderer_get_scale(&rsx, &rsy);
+    const int n = st.rt.ncolor;
+    NvnTexture *big = NULL;
+    for (int i = 0; i <= n && (rsx != 1 || rsy != 1); i++) {
+        NvnTexture *t = i < n ? st.rt.color[i] : st.rt.depth;
+        float sx = 1, sy = 1;
+        if (!t || !t->backend) continue;
+        renderer_texture_scale(t, &sx, &sy);
+        if (sx == rsx && sy == rsy && t->target == 1) { big = t; break; }
+    }
+    for (int i = 0; big && i <= n; i++) {
+        NvnTexture *t = i < n ? st.rt.color[i] : st.rt.depth;
+        float sx = 1, sy = 1;
+        if (!t || !t->backend || t == big) continue;
+        renderer_texture_scale(t, &sx, &sy);
+        if (sx == 1 && sy == 1 && t->width == big->width && t->height == big->height) renderer_texture_promote(t);
+    }
+    static int promo_shadow = -1;
+    if (promo_shadow < 0) { const char *e = getenv("LARECOMP_PROMO_SHADOW"); promo_shadow = !e || strcmp(e, "0"); }
+    TexBackend *db = st.rt.depth ? st.rt.depth->backend : NULL;
+    if (!big && promo_shadow && db && db->scalable && db->scale_kind == 2 && st.rt.depth->target == 1)
+        for (int i = 0; i < n; i++) {
+            NvnTexture *t = st.rt.color[i];
+            float sx = 1, sy = 1;
+            if (!t || !t->backend) continue;
+            renderer_texture_scale(t, &sx, &sy);
+            if (sx == 1 && sy == 1 && t->width == st.rt.depth->width && t->height == st.rt.depth->height) renderer_texture_promote_kind(t, 2);
+        }
+}
+static bool promo_first(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_PROMO_FIRST"); on = !(e && *e == '0'); }
+    return on;
+}
 // LARECOMP_GMEM_FLUSH=1 (a test arm, the v0.1.9 gate's one-frame foreign meshes / rain): a shader that writes global
 // memory (a compute dispatch, or a draw with STG / RED / ATOM) writes the device window, and its bytes reach host memory
 // only at the end of its submission (gdev_writeback; carried to the end of the chain with chunked submits). A later list
@@ -3963,6 +4122,7 @@ static void begin_pass(void) {
     {   // (textures.c) a promoted target that kept its unscaled backend: reallocated at the scene's scale before use
         extern bool renderer_texture_apply_promotion(NvnTexture *t);
         extern bool renderer_texture_target_kind(NvnTexture *t, bool colour);   // (a depth-format texture as a colour target)
+        if (promo_first()) promote_partners();
         for (int i = 0; i <= st.rt.ncolor; i++) {
             NvnTexture *t = i < st.rt.ncolor ? st.rt.color[i] : st.rt.depth;
             if (t && t->backend) renderer_texture_apply_promotion(t);
@@ -4090,38 +4250,7 @@ static void begin_pass(void) {
                 LOG("[pass]   (mixed pass #%llu of this kind)\n", (unsigned long long)n);
             }
         }
-        // (textures.c renderer_texture_promote) an unscaled 2D attachment of the same guest size as one at the scene's
-        // scale renders at that scale from its next backend
-        extern void renderer_get_scale(float *sx, float *sy);
-        float rsx, rsy;
-        renderer_get_scale(&rsx, &rsy);
-        NvnTexture *big = NULL;
-        for (int i = 0; i <= pass_ncolor && (rsx != 1 || rsy != 1); i++) {
-            NvnTexture *t = i < pass_ncolor ? st.rt.color[i] : st.rt.depth;
-            float sx = 1, sy = 1;
-            if (!t || !t->backend) continue;
-            renderer_texture_scale(t, &sx, &sy);
-            if (sx == rsx && sy == rsy && t->target == 1) { big = t; break; }
-        }
-        for (int i = 0; big && i <= pass_ncolor; i++) {
-            NvnTexture *t = i < pass_ncolor ? st.rt.color[i] : st.rt.depth;
-            float sx = 1, sy = 1;
-            if (!t || !t->backend || t == big) continue;
-            renderer_texture_scale(t, &sx, &sy);
-            if (sx == 1 && sy == 1 && t->width == big->width && t->height == big->height) renderer_texture_promote(t);
-        }
-        // (the shadow-map kind: a square depth at TOTK_SHADOW_SCALE drawn with an unscaled colour target of its size)
-        static int promo_shadow = -1;
-        if (promo_shadow < 0) { const char *e = getenv("LARECOMP_PROMO_SHADOW"); promo_shadow = !e || strcmp(e, "0"); }
-        TexBackend *db = st.rt.depth ? st.rt.depth->backend : NULL;
-        if (!big && promo_shadow && db && db->scalable && db->scale_kind == 2 && st.rt.depth->target == 1)
-            for (int i = 0; i < pass_ncolor; i++) {
-                NvnTexture *t = st.rt.color[i];
-                float sx = 1, sy = 1;
-                if (!t || !t->backend) continue;
-                renderer_texture_scale(t, &sx, &sy);
-                if (sx == 1 && sy == 1 && t->width == st.rt.depth->width && t->height == st.rt.depth->height) renderer_texture_promote_kind(t, 2);
-            }
+        promote_partners();   // (a partner the attachment loop made: from its next backend)
     }
     pass_w = minw; pass_h = minh;
     smark_frame_start(cb);   // (LARECOMP_SNAP_MARK)
@@ -4404,7 +4533,7 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = pc_layout()};
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p) != VK_SUCCESS) LOG("[vk] clear pipeline failed\n");
+    if (vk_engine_graphics_pipeline("clear", g_vk.pcache, &pi, &p) != VK_SUCCESS) LOG("[vk] clear pipeline failed\n");
     clear_tab[slot].key = key;
     clear_tab[slot].pipe = p;
     return p;
@@ -4635,6 +4764,7 @@ static const void *sg_pin(const ShaderInfo *si, VkShaderStageFlags stage) {
 // stages may run slower, and every other stage of the pack is under 100 cases. 0: never.
 static VkPipelineCreateFlags noopt(const ShaderInfo *a, const ShaderInfo *b) {
     if (tl_dq_lvl >= SQ_NOOPT) return VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;   // (quarantined: dq_prog / build_compute)
+    if (vk_gpu_safe_noopt()) return VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;   // (safe GPU mode's second stage: every program, device.c)
     static long max_cases = -1;
     if (max_cases < 0) { const char *e = getenv("LARECOMP_NOOPT_CASES"); max_cases = e ? atol(e) : 300; }
     extern bool maxwell_nvidia;
@@ -7197,7 +7327,8 @@ static void dq_back(uint64_t key, int lvl, const char *what, const char *name, d
 // does not crash on it again. Writes what to tell the player into msg; 0: no build of a program on this thread.
 int vk_shader_crashed(char *msg, int n) {
     if (!tl_dq_in || !tl_dq_key || !pcq_dev[0]) return 0;
-    const int next = sq_next(tl_dq_lvl, tl_dq_what, g_vk.gpl);
+    // (a background build: the precompile, the archive warm-up, the prepare pass; never moved to 'not built' from there)
+    const int next = sq_next(tl_dq_lvl, tl_dq_what, g_vk.gpl, tl_gate == GATE_BACKGROUND || tl_gate == GATE_PREPARE);
     char line[128];
     sq_format(line, sizeof line, tl_dq_key, next, tl_dq_name, tl_dq_what);
     // (an append without pcq_mu: a crash handler must never wait on a lock another thread may hold; as vk_precompile_crashed)
@@ -7730,6 +7861,7 @@ static void pc_start_workers(void) {
         int all = ncpu > 2 ? ncpu - 1 : 1;
         if (all > nt) nt = all;
     }
+    if (vk_gpu_safe()) nt = pc_nthreads_normal = pa_nload = 1;   // (safe GPU mode, device.c: one shader build at a time)
     LOG("[precompile] %d programs, %d pipelines, %d compute programs from earlier sessions, %u archive programs: building on %d threads%s\n",
         pc_nprogs, pc_npipes, pc_ncomps, pa_nprogs, nt, nt > pc_nthreads_normal ? (pc_cold ? " (first-start pass; then the usual ones)" : " (the archive's bursts; the usual ones otherwise)") : "");
     if (!pc_nprogs && !pc_npipes && !pa_nprogs && !pc_ncomps) return;
@@ -7952,7 +8084,7 @@ static TexBackend *snapshot_image(NvnTexture *t, TexBackend *src, bool mut) {
             ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
         }
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
+        VK_CHECK(vk_image_create_relieved(&ci, &ai, &d->image, &d->mem, "snapshot of nvn fmt %#x %ux%u", t->format, t->width, t->height));
         s->mut = mut || smk;
         d->usage = ci.usage; d->cflags = ci.flags;
         d->format = src->format; d->width = src->width; d->height = src->height; d->depth = 1; d->layers = 1; d->levels = nlv;
@@ -8018,7 +8150,7 @@ static void pk_take(NvnTexture *t) {   // (CMD_CLEAR_COLOR, before the clear)
                                 .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
                                 .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
+        VK_CHECK(vk_image_create_relieved(&ci, &ai, &d->image, &d->mem, "snapshot of nvn fmt %#x %ux%u", t->format, t->width, t->height));
         d->format = src->format; d->width = src->width; d->height = src->height; d->depth = 1; d->layers = 1; d->levels = 1;
         d->samples = 1; d->aspect = src->aspect; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
         vk_image_init_layout(vk_cmd(), d->image, d->aspect);
@@ -9497,7 +9629,7 @@ static bool wb_init(void) {
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                                                 .module = m, .pName = "main"},
                                       .layout = wb_layout};
-    VK_CHECK(vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &wb_pipe));
+    VK_CHECK(vk_engine_compute_pipeline("write-back", &ci, &wb_pipe));
     vkDestroyShaderModule(g_vk.dev, m, NULL);
     VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * 64};
     VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 64, .poolSizeCount = 1, .pPoolSizes = &ps};
@@ -9963,6 +10095,7 @@ static void gdev_carry(uint64_t from, uint64_t to) {
     g_gd_gen++;
 }
 
+static bool g_wb_mid;   // (raw_wb's copy-back inside a submission: the LARECOMP_GDEV_CHECK snapshot stays the submission end's)
 static void gdev_writeback(VkCommandBuffer cb) {
     uint64_t cur = submit_seq + 1;
     static VkBufferCopy bc[GDEV_REGS];   // (static: the render thread only)
@@ -9971,7 +10104,7 @@ static void gdev_writeback(VkCommandBuffer cb) {
         if (gdev_reg[i].seq == cur) bc[n++] = (VkBufferCopy){gdev_reg[i].off, gdev_reg[i].addr - HEAP_BASE, gdev_reg[i].size};
     if (!n) return;
     vk_full_barrier(cb);
-    if (gdev_chk_on()) {  // host as it is right before the copy-back
+    if (gdev_chk_on() && !g_wb_mid) {  // host as it is right before the copy-back (the submission's own, not raw_wb's)
         static VkBufferCopy hc[GDEV_REGS];
         for (uint32_t i = 0; i < n; i++) {
             hc[i] = (VkBufferCopy){bc[i].dstOffset, bc[i].srcOffset, bc[i].size};
@@ -10001,6 +10134,67 @@ static void gdev_writeback(VkCommandBuffer cb) {
                            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(cb, &di);
+}
+
+// Raw-pointer loads (ShaderInfo.ldg_raw: a compute LDG whose address does not come from the driver table's storage-buffer
+// slots, so it reads gmem_ IN PLACE; the seed census: 45 of 59 compute programs, 2033 such loads). A shader's writes
+// through the device window reach host memory only at its submission's end (gdev_writeback; with chunked submits at the
+// chain's end), so a later dispatch of the same submission reading those bytes through a loaded pointer got the OLD ones
+// (compute A writes X through the table, compute B reads X by pointer): one frame of stale instance / particle state
+// (v0.1.9.1 P1.4, RAWLDG_FIX.md option B). raw_wb: before such a dispatch, when a global-memory writer ran since the last
+// copy-back, the live regions' diff copy-back is recorded here too, with its barriers: host memory then holds the writers'
+// words (the end-of-submission copy-back copies them again, the same bytes). Off by default (9.1 gate see2: almost every
+// raw-pointer dispatch follows a writer, often itself, so each got a full copy-back with its barriers, ~20 a frame: -17 %
+// fps and 15x the frames >= 50 ms, no fewer glitches); LARECOMP_RAW_WRITEBACK=1 turns it on. Counted ('[vk] raw-pointer
+// dispatches', per stats window, always; the programs once each).
+static uint64_t g_gmem_w_seq, g_gmem_w_n, g_rawwb_at, stat_rawd, stat_rawd_afterw, stat_rawwb;
+static struct { uint64_t key, n; } stat_rawd_prog[8];
+static void rawd_writer(void) { g_gmem_w_seq = submit_seq + 1; g_gmem_w_n++; }
+static bool rawd_after_writer(void) {   // (a writer of the open submission / chain since the last copy-back)
+    const uint64_t open = gw_chain0 ? gw_chain0 : submit_seq + 1;   // (a chained submission's write-back comes at its end)
+    return g_gmem_w_n != g_rawwb_at && g_gmem_w_seq && g_gmem_w_seq >= open;
+}
+static void raw_wb(VkCommandBuffer cb) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_RAW_WRITEBACK");
+        on = e && *e == '1';
+        if (on) LOG("[vk] raw-pointer dispatches after a global-memory writer get a copy-back first (LARECOMP_RAW_WRITEBACK=1)\n");
+    }
+    if (!on || !rawd_after_writer()) return;
+    g_wb_mid = true;
+    gdev_writeback(cb);
+    g_wb_mid = false;
+    g_rawwb_at = g_gmem_w_n;
+    stat_rawwb++;
+}
+static void rawd_note(uint64_t key, const ShaderInfo *si) {
+    stat_rawd++;
+    if (g_gmem_w_seq && g_gmem_w_seq >= (gw_chain0 ? gw_chain0 : submit_seq + 1)) stat_rawd_afterw++;
+    int i = 0;
+    while (i < 8 && stat_rawd_prog[i].n && stat_rawd_prog[i].key != key) i++;
+    if (i < 8) stat_rawd_prog[i].key = key, stat_rawd_prog[i].n++;
+    static uint64_t seen[64];
+    static int nseen;
+    for (int k = 0; k < nseen; k++) if (seen[k] == key) return;
+    if (nseen < 64) {
+        seen[nseen++] = key;
+        LOG("[vk] raw-pointer compute program %llx: %u of its %u global loads by a pointer not from the driver table (read in "
+            "place on the GPU timeline)%s\n", (unsigned long long)key, si->ldg_raw, si->ldg_raw + si->ldg_table,
+            si->writes_gmem ? "; it also writes global memory" : "");
+    }
+}
+static void rawd_stats(void) {
+    if (stat_rawd) {
+        char top[256] = "";
+        int n = 0;
+        for (int i = 0; i < 8 && stat_rawd_prog[i].n && n < (int)sizeof top - 40; i++)
+            n += snprintf(top + n, sizeof top - n, " %llx x%llu", (unsigned long long)stat_rawd_prog[i].key, (unsigned long long)stat_rawd_prog[i].n);
+        LOG("[vk] raw-pointer dispatches: %llu (%llu after a global-memory writer of the same open submission, %llu copy-backs "
+            "before them);%s\n", (unsigned long long)stat_rawd, (unsigned long long)stat_rawd_afterw, (unsigned long long)stat_rawwb, top);
+    }
+    stat_rawd = stat_rawd_afterw = stat_rawwb = 0;
+    memset(stat_rawd_prog, 0, sizeof stat_rawd_prog);
 }
 
 // Vertex / index data read in place from the imported guest heap (renderer.m bind_guest does the same with
@@ -11786,8 +11980,8 @@ static void build_compute(void *arg) {   // (in its quarantine form, if any: dq_
         static _Atomic int nlog;
         if (atomic_fetch_add(&nlog, 1) < 50)
             LOG("[vk] cs_%llx: a build of it crashed or hung this GPU's driver before (cache/precompile_stuck.txt): built %s\n",
-                (unsigned long long)cp->p.code[0], sq_how(cp->p.qlvl >= SQ_WHOLE ? SQ_SKIP : cp->p.qlvl));
-        if (cp->p.qlvl >= SQ_WHOLE) { atomic_store(&cp->p.state, 2); return; }   // (no library path to try: skipped)
+                (unsigned long long)cp->p.code[0], sq_how(cp->p.qlvl));
+        if (cp->p.qlvl >= SQ_SKIP) { atomic_store(&cp->p.state, 2); return; }   // (compute: optimizer off, alone, then skipped)
     }
     dq_enter(cp->p.qkey, cp->p.qlvl);
     build_compute_(cp);
@@ -12003,12 +12197,15 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         twins_refresh(&cp->si, &cstage, 1, false);
     }
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL, cdyn, &ncdyn);
+    if (cp->si->ldg_raw) raw_wb(cb);   // (LARECOMP_RAW_WRITEBACK: an earlier writer's window bytes into host memory first)
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, ncdyn, cdyn);
     for (int k = 0; k < cp->si->ntex; k++)   // (LARECOMP_SNAP_DELTA: only image stores write images; storage buffers are guest memory)
         if (cp->si->tex[k].is_image) { snap_ndgen++; snap_nd_why = "image-store dispatch"; break; }
     vkCmdDispatch(cb, gx, gy, gz);
     stat_dispatches++; chunk_draws++;
+    if (cp->si->ldg_raw) rawd_note(cp->p.ckey ? cp->p.ckey : st.program->stages[5].code_addr, cp->si);   // (before its own writes count)
+    if (cp->si->writes_gmem) rawd_writer();
     if (g_debug_frame)   // (with LARECOMP_SAVE_MSL=1 its GLSL is build/glsl/<cs>_cs.glsl)
         LOG("[dispatch] %ux%ux%u local %ux%ux%u cs %llx gmem %d ntex %d\n", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
             (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem, cp->si->ntex);
@@ -12164,6 +12361,7 @@ static void draw_(CmdRec *r, bool indexed) {
         else smark_variant = true;
     }
     if (ind_log() && pr && pr->vi && pr->fi && (pr->vi->writes_gmem || pr->fi->writes_gmem)) { ind_wdraw++; ind_note_writes(0); ind_note_writes(1); }
+    if (pr && ((pr->vi && pr->vi->writes_gmem) || (pr->fi && pr->fi->writes_gmem))) rawd_writer();   // (a global-memory writer: rawd_note / raw_wb)
     if (pr && ((pr->vi && pr->vi->writes_gmem) || (pr->fi && pr->fi->writes_gmem)) && gmem_flush_on()) g_gmem_flush_pend = true;   // (flushed at the next pass / dispatch)
     g_prog_full_draw = false;
     g_bake_sync = false;
@@ -14052,7 +14250,7 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
                                 .extent = {gw, gh, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
                                 .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &srcimg, &small_mem, NULL));
+        VK_CHECK(vk_image_create_relieved(&ci, &ai, &srcimg, &small_mem, "copy-to-buffer source"));
         vk_image_init_layout(cb, srcimg, VK_IMAGE_ASPECT_COLOR_BIT);
         VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)level, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)hw, (int32_t)hh, 1}},
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)gw, (int32_t)gh, 1}}};
@@ -14284,7 +14482,7 @@ static VkPipeline present_pipeline(VkFormat fmt, bool color) {
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = present_layout};
     VkPipeline p;
-    VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
+    VK_CHECK(vk_engine_graphics_pipeline("present", g_vk.pcache, &pi, &p));
     for (int i = 0; i < 8; i++) if (!cache[i].p) { cache[i].f = fmt; cache[i].color = color; cache[i].p = p; break; }
     return p;
 }
@@ -14346,7 +14544,7 @@ static VkPipeline post_pipeline(const char *fs) {
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = post_layout};
     VkPipeline p;
-    VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
+    VK_CHECK(vk_engine_graphics_pipeline("post", g_vk.pcache, &pi, &p));
     for (int i = 0; i < 8; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].p = p; break; }
     return p;
 }
@@ -14368,7 +14566,7 @@ static TexBackend *post_image(int i, uint32_t w, uint32_t h) {
                                 .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
                                 .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
+        VK_CHECK(vk_image_create_relieved(&ci, &ai, &d->image, &d->mem, "post image %ux%u", w, h));
         d->format = VK_FORMAT_R8G8B8A8_UNORM; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
         d->samples = 1; d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
         vk_image_init_layout(vk_cmd(), d->image, d->aspect);
@@ -14394,7 +14592,7 @@ static VkImageView smaa_lut(int i) {
                                 .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
                                 .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
+        VK_CHECK(vk_image_create_relieved(&ci, &ai, &d->image, &d->mem, "SMAA LUT %d", i));
         d->format = f; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
         d->samples = 1; d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
         VkCommandBuffer cb = vk_cmd();
@@ -15230,14 +15428,23 @@ static void exec_list(uint64_t handle, int depth) {
             static uint64_t frame_seen = ~0ull, frame_ts;
             if (frozen && vk_frame_counter() != frame_seen) { frame_seen = vk_frame_counter(); frame_ts = SDL_GetTicksNS(); }
             // type 1 = SAMPLES_PASSED: TotK resets it (nvnCommandBufferResetCounter(1)) and reads it back as an occlusion
-            // query. Reporting 0 made every queried light / flame "occluded": Zelda's torch lit the hall only while the
-            // camera was close to it (user 2026-10-14 22:40). Until real Vulkan occlusion queries exist, report "visible":
-            // a count that grows by 4096 per report (so both "since reset" and "end - begin" reads are > 0).
-            // LARECOMP_OCCLUSION=zero = the old behaviour (A/B).
-            // (since 2026-10-30 real queries replace that value once the submission completed: oq_report)
+            // query. Reporting 0 made every queried light / flame "occluded": Zelda's torch lit the hall only while the camera
+            // was close to it (user 2026-10-14 22:40). Until real Vulkan occlusion queries exist, report "visible": a count
+            // that grows by 4096 per report (so both "since reset" and "end - begin" reads are > 0). LARECOMP_OCCLUSION=zero =
+            // the old behaviour (A/B). (since 2026-10-30 real queries replace that value once the submission completed:
+            // oq_report) The count's low 32 bits stay within [4096, 2^31) while the 64-bit count keeps rising: it grew by 4096
+            // a report forever, so after ~1M reports (~1 h at ~250 a second) its low 32 bits wrapped through 0 and then past
+            // 2^31, and a 32-bit read (unsigned 0, or signed negative) said 'hidden' for that report: a one-frame cull in long
+            // sessions, in the default path. At the 2^31 edge it jumps to the next 2^32 block + 4096: every absolute read (32
+            // or 64 bits, signed or not) stays positive, a 64-bit 'end - begin' stays > 0; only a 32-bit 'end - begin' across
+            // that one jump (once per ~524k reports) is off, and still not equal.
             static uint64_t samples;
             uint64_t v = 0;
-            if (type == 1 && oq_on() != 0) v = samples += 4096;
+            if (type == 1 && oq_on() != 0) {
+                samples += 4096;
+                if ((uint32_t)samples >= (1u << 31) || (uint32_t)samples < 4096) samples = ((samples >> 32) + 1) << 32 | 4096;
+                v = samples;
+            }
             // LARECOMP_COUNTER_TYPES=<t>[,<t>...] (probe): scale only those counter types (TotK reports 0, 1 and 16). d82
             // (OBSERVED): with the x3 clock, 64 frames >= 14 ms in the light stretch (spaced in multiples of 60 frames,
             // "other" = game threads +4 ms, 0 images, no resolution change) vs 18 unscaled: which reads cause them?

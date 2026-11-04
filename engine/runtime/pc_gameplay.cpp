@@ -22,28 +22,32 @@
 #include <windows.h>
 #endif
 
+extern "C" double pc_mouse_counts_per_degree(void);   // pc_mouse.cpp: mouse counts a degree of the camera's turn
+
 namespace {
 
 // hle_hid.cpp's action bits (pc_input.cpp's B_* values)
 constexpr uint64_t kA = 1u << 0, kB = 1u << 1, kX = 1u << 2, kY = 1u << 3, kL = 1u << 6, kR = 1u << 7, kZL = 1u << 8, kZR = 1u << 9,
                    kDL = 1u << 12, kDU = 1u << 13, kDR = 1u << 14, kDD = 1u << 15;
 constexpr int32_t kStickMax = 32767;
-// controls.ability.rotate_step (TOTK_PC_ROTATE_STEP, live): mouse counts per Ultrahand / Autobuild rotation step
-// (3.5: 40 by default)
-std::atomic<int> g_rotate_step{40};
-const char *const kSteps[] = {"20", "30", "40", "60", "80", nullptr};
-const char *const kStepNames[] = {"20 (fast)", "30", "40", "60", "80 (slow)", nullptr};
-void apply_step(const char *v) { const int n = v ? atoi(v) : 0; g_rotate_step.store(n >= 5 && n <= 400 ? n : 40); }
+// controls.ability.rotate_speed (TOTK_PC_ROTATE_SPEED, live): Ultrahand / Autobuild rotation with R held, in the game's
+// 45-degree steps (R + the d-pad). It replaced controls.ability.rotate_step, 40 raw counts a step (about a millimetre on
+// a common mouse: "tiny moves rotate a lot")
+std::atomic<double> g_rotate_speed{1.0};
+const char *const kSpeeds[] = {"0.5", "0.75", "1", "1.5", "2", nullptr};
+const char *const kSpeedNames[] = {"0.5x (slow)", "0.75x", "1x", "1.5x", "2x (fast)", nullptr};
+void apply_speed(const char *v) { const double x = v ? atof(v) : 0; g_rotate_speed.store(x >= 0.25 && x <= 4 ? x : 1.0); }
 const pc_setting kRows[] = {
-    {"controls.ability.rotate_step", "Controls", "Keyboard and mouse", "Ultrahand rotation step",
-     "TOTK_PC_ROTATE_STEP: mouse counts per 45-degree step while R is held in Ultrahand or Autobuild.", "40", kSteps,
-     kStepNames, 0, 0, 0, 0, "TOTK_PC_ROTATE_STEP", nullptr, apply_step, nullptr, nullptr},
+    {"controls.ability.rotate_speed", "Controls", "Keyboard and mouse", "Ultrahand rotation speed",
+     "TOTK_PC_ROTATE_SPEED: with R held in Ultrahand or Autobuild, the mouse moved sideways turns the object in 45-degree "
+     "steps (1x: the move that turns the camera 45 degrees) and the wheel turns it vertically, a step a notch.", "1", kSpeeds,
+     kSpeedNames, 0, 0, 0, 0, "TOTK_PC_ROTATE_SPEED", nullptr, apply_speed, nullptr, nullptr},
 };
 [[maybe_unused]] const bool g_rows = (pc_settings_add(kRows, 1), true);
-int step_px() {
+double step_counts() {   // mouse counts per rotation step
     static std::atomic<bool> read{false};
-    if (!read.exchange(true)) if (const char *e = getenv("TOTK_PC_ROTATE_STEP")) apply_step(e);
-    return g_rotate_step.load();
+    if (!read.exchange(true)) if (const char *e = getenv("TOTK_PC_ROTATE_SPEED")) apply_speed(e);
+    return fmax(5.0, 45.0 * pc_mouse_counts_per_degree() / g_rotate_speed.load());
 }
 constexpr int kVkF = 0x46, kVkQ = 0x51, kVkEscape = 0x1b;
 // Appends an action's keys at a context's level to k[n..4) and returns the new count: the rebinding API (9be86d7;
@@ -123,6 +127,7 @@ struct Run {
     double ax = 0, ay = 0;          // accumulated mouse
     int queue_x = 0, queue_y = 0;   // strip flicks / rotation steps still to play
     int step_dir_x = 0, step_dir_y = 0; uint64_t step_at = 0;   // the one being played
+    bool last_x = false;            // the last step played was a sideways one (the axes take turns)
 };
 constexpr int kRuns = 8;
 Run g_runs[kRuns];
@@ -150,25 +155,32 @@ void rstick(PcMacroOut *o, double x, double y) {
     o->sx[1] = (int32_t)lrint(x * kStickMax);
     o->sy[1] = (int32_t)lrint(y * kStickMax);
 }
-// A queued step (strip flick, rotation step): 2 frames on, 2 frames off. dx / dy: the step being played, if any.
-bool step(Run &r, uint64_t f, int *dx, int *dy) {
-    if ((r.step_dir_x || r.step_dir_y) && f - r.step_at >= 4) r.step_dir_x = r.step_dir_y = 0;
+// A queued rotation step: kStepOnMs on, kStepOffMs off (milliseconds, not frames: at 120 fps 2 frames were 17 ms,
+// under one 30 Hz game tick; 67 ms is the 2 frames at 30 fps it was tuned at). dx / dy: the step being played, if any.
+constexpr uint64_t kStepOnMs = 67, kStepOffMs = 67;
+bool step(Run &r, uint64_t now_ms, int *dx, int *dy) {
+    if ((r.step_dir_x || r.step_dir_y) && now_ms - r.step_at >= kStepOnMs + kStepOffMs) r.step_dir_x = r.step_dir_y = 0;
     if (!r.step_dir_x && !r.step_dir_y && (r.queue_x || r.queue_y)) {
-        if (r.queue_x) { r.step_dir_x = r.queue_x > 0 ? 1 : -1; r.queue_x -= r.step_dir_x; }
-        else { r.step_dir_y = r.queue_y > 0 ? 1 : -1; r.queue_y -= r.step_dir_y; }
-        r.step_at = f;
+        // (both axes queued: they take turns; x first always starved y while the mouse moved sideways at all)
+        if (r.queue_x && (!r.queue_y || !r.last_x)) { r.step_dir_x = r.queue_x > 0 ? 1 : -1; r.queue_x -= r.step_dir_x; r.last_x = true; }
+        else { r.step_dir_y = r.queue_y > 0 ? 1 : -1; r.queue_y -= r.step_dir_y; r.last_x = false; }
+        r.step_at = now_ms;
     }
-    const bool on = (r.step_dir_x || r.step_dir_y) && f - r.step_at < 2;
+    const bool on = (r.step_dir_x || r.step_dir_y) && now_ms - r.step_at < kStepOnMs;
     *dx = on ? r.step_dir_x : 0; *dy = on ? r.step_dir_y : 0;
     return r.step_dir_x || r.step_dir_y || r.queue_x || r.queue_y;
 }
-void count_steps(Run &r, double dx, double dy, bool with_y) {
-    const double step = step_px();
-    r.ax += dx; r.ay += with_y ? dy : 0;
+// The rotation's input: the mouse's sideways counts in steps (the rest kept for the next), a wheel notch a vertical step
+// (away from the player: the d-pad's up); the mouse's up / down is dropped. At most 4 steps queued each way, so a big
+// move does not keep turning long after the hand stopped
+void count_steps(Run &r, double dx, int wheel) {
+    const double step = step_counts();
+    r.ax += dx;
     while (r.ax >= step) { r.queue_x++; r.ax -= step; }
     while (r.ax <= -step) { r.queue_x--; r.ax += step; }
-    while (r.ay >= step) { r.queue_y--; r.ay -= step; }   // the mouse down: d-pad down
-    while (r.ay <= -step) { r.queue_y++; r.ay += step; }
+    r.queue_y += wheel;
+    r.queue_x = r.queue_x > 4 ? 4 : r.queue_x < -4 ? -4 : r.queue_x;
+    r.queue_y = r.queue_y > 4 ? 4 : r.queue_y < -4 ? -4 : r.queue_y;
 }
 
 bool tick_run(Run &r, const PcMacroIn *in, PcMacroOut *o);
@@ -562,17 +574,19 @@ bool tick_run(Run &r, const PcMacroIn *in, PcMacroOut *o) {
         return true;
     }
     case MAC_THROW: {
-        // G (public #36: G did not throw a carried pot). The weapon's throw reads VK 12 (ExecutePlayerThrowWeapon: hold
-        // aims, the release throws), the row this replaced. A carried object's throw (ThrowObject, started by
-        // Player.scheduler.throwobject) reads none of the bits ExecutePlayerCarry or its own class test, so while
-        // carrying (verb 44 in any slot, as MAC_SPRINT's put-away) G holds the pad R's whole set, VK 11 | 12 | 14, which
-        // is what the pad's R gives there. Decided at the press; held for as long as G is down, with a latched tap first
-        // (a G shorter than a game frame still reaches the game, as MAC_SPRINT / MAC_ATTACK). Before the hook has run
-        // once: the pad's R held
+        // G = the pad's R (public #36). The weapon's throw reads VK 12 (ExecutePlayerThrowWeapon: hold aims, the release
+        // throws); a carried object's throw reads another of the pad R's bits. 5178d183 sent the pad R's whole set, VK 11
+        // | 12 | 14, only with verb 44 Carry in a slot at the press, else VK 12 alone; #36's logs on v0.1.9
+        // (totk-20261104-100023 / -100220: 104 G presses, the verbs '1 0 0' while carrying and walking, never 44) show
+        // the verb test misses the carry, so G did nothing there. Now G holds the pad R's whole set every time, what the
+        // pad's R itself gives (on foot VK 11 is read by the carried throw only, VK 14 by a sidestep-rate check the pad's
+        // R sets too): the same as the pad, carrying or not. Held for as long as G is down, a latched tap first (a G
+        // shorter than a game frame still reaches the game, as MAC_SPRINT / MAC_ATTACK). Before the hook has run once:
+        // the pad's R held. (The log still names a Carry verb seen at the press.)
         if (first) {
             bool carrying = false;
             for (int s = 0; s < 5; s++) carrying = carrying || totk_player_verb(s) == 44;
-            const uint64_t vk = 1ull << 12 | (carrying ? 1ull << 11 | 1ull << 14 : 0);
+            const uint64_t vk = 1ull << 11 | 1ull << 12 | 1ull << 14;   // (the pad's R, carrying or not)
             if (totk_pcvk_frames() > 0) {
                 totk_pcvk_tap(vk);
                 totk_pcvk_macro_hold(vk, true);
@@ -580,8 +594,8 @@ bool tick_run(Run &r, const PcMacroIn *in, PcMacroOut *o) {
             }
             static int logs;
             if (logs++ < 100)
-                printf("[pc] throw: %s\n", !r.held_vk ? "the pad's R held (no VK hook yet)"
-                                           : carrying ? "carrying, VK 11 | 12 | 14 held (the pad's R)" : "VK 12 held");
+                printf("[pc] throw: %s%s\n", !r.held_vk ? "the pad's R held (no VK hook yet)" : "VK 11 | 12 | 14 held (the pad's R)",
+                       carrying ? ", Carry (44) in a verb slot" : "");
         }
         if (r.released) {
             if (r.held_vk) totk_pcvk_macro_hold(r.held_vk, false);
@@ -595,9 +609,9 @@ bool tick_run(Run &r, const PcMacroIn *in, PcMacroOut *o) {
         if (d < 6) { o->bits |= r.id == MAC_PULL ? kDU : kDD; return true; }
         return false;
     case MAC_ROTATE: {
-        if (!r.released) { count_steps(r, in->mouse_dx, in->mouse_dy, true); o->take_mouse = true; }
+        if (!r.released) { count_steps(r, in->mouse_dx, in->wheel); o->take_mouse = true; }
         int sx, sy;
-        const bool busy = step(r, f, &sx, &sy);
+        const bool busy = step(r, in->now_ms, &sx, &sy);
         if (sx || sy) o->bits |= sx > 0 ? kDR : sx < 0 ? kDL : sy > 0 ? kDU : kDD;
         if (!r.released || busy) { o->bits |= kR; return true; }
         return false;

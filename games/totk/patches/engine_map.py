@@ -144,6 +144,12 @@ HOOK_GROUPS = (
 HOOK_FREE = {0x704b7c: 'submesh cull (speed)', 0x27b6e64: 'load lap labels (diagnostic)',
              0x9a7130: "foot IK ground-height ease in game time: without it the game's own per-frame ease runs (feet settle faster above 30 fps)",
              0x16e4f90: "swim velocity ease in game time: without it the game's own per-frame ease runs (swimming settles faster above 30 fps)",
+             0x1347600: "the abilities' camera pitch in game time: without it the game's own per-frame add runs (the camera turns up / down faster above 30 fps with an ability, public #66)",
+             0x1347654: "the ability camera's live yaw scale for the mouse gains (read-only): without it pc_mouse uses the SpecialPower block's 0.8",
+             0x172d1bc: "Ultrahand's mouse grab stick: without it the held object moves at most at the pad's full-tilt speed with the mouse",
+             0x171323c: "calcGrab's X stick exponent for the mouse feed (read-only)",
+             0x1713290: "calcGrab's Y stick exponent for the mouse feed (read-only)",
+             0xba6d48: 'climb root-motion log (diagnostic, TOTK_DEBUG_CLIMB)',
              0x274a3c: 'Havok step log (diagnostic, TOTK_HAVOK_STEP_LOG)',
              0x11276cc: 'loader thread count (A/B)',
              0x9c2ef0: 'aal flush hold: without it the runtime keeps its 180 fps hold (hle_vi audio_fps_max), under the '
@@ -160,7 +166,9 @@ HOOK_FREE = {0x704b7c: 'submesh cull (speed)', 0x27b6e64: 'load lap labels (diag
                        'constants run, the sway is stiffer above 30 fps',
              0x15eca7c: "Ultrahand read guard (#51): without it the game reads its bound target unchecked, as before",
              0x7cba8c: "query result entries kept apart (#51): without it new requests may share a live request's entry, as "
-                       'before (the Ultrahand read guard still stops a dead target)'}
+                       'before (the Ultrahand read guard still stops a dead target)',
+             0x844634: "model scene report-row guard (#52): without it the game follows a report row index "
+                       'unchecked, as before'}
 
 
 def hook_policy(kept, hooks, version=None):
@@ -652,6 +660,14 @@ def _bodies(porter):
     return porter._pin_bodies
 
 
+def pinned_start(porter, pinned, off):
+    """The new place of a pinned function's start that the engine names as an address (a DECOMP_GUEST_FN call target,
+    e.g. the options rows' entry and heap allocations), else None. porter.map() places an address only in a CONFIRMED
+    pair, and a pin's pair need not be confirmed (that is why it was pinned), so v0.1.9's 1.4.3 table gave both
+    allocations the beta sentinel and the first call trapped at start (public #72)."""
+    return porter.fwd.get(off) if off in pinned else None
+
+
 def anchored_address(porter, n, body, version):
     """None when n is an address of the one function with masked body hash body (code) or one it completes an ADRP
     reference to (data); else why not."""
@@ -736,6 +752,11 @@ def generate(old_nso, new_nso, version, diagnostic=False, beta=False, pins=None,
         if off in porter.pinned_addrs:
             addrs[off] = porter.pinned_addrs[off]
             report['addresses'][hex(off)] = dict(new=hex(porter.pinned_addrs[off]), how='pinned')
+            continue
+        n = pinned_start(porter, pinned, off)
+        if n is not None:
+            addrs[off] = n
+            report['addresses'][hex(off)] = dict(new=hex(n), how='pinned function')
             continue
         r = porter.map(off)
         if r.get('how') in DATA_KINDS or placeable(r):

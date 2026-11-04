@@ -16,6 +16,7 @@
 #include "pc_sysinfo.h"
 #include "pc_restart.h"
 #include "pc_text.h"
+#include "exe_tag.h"
 #include "font_check.h"   // (the menu font: a damaged system font is skipped)
 #include "../third_party/imgui/imgui.h"
 #include <windows.h>
@@ -39,7 +40,7 @@
 
 // the fps readout (fps_readout below)
 extern "C" int shim_fps_overlay_mode(void);                 // shim_win.c: 0 off, 1 minimal, 2 detailed
-extern "C" uint64_t vk_fps_readout_stats(float out[4]);     // device.c: fps, frame ms, 1% low fps, worst ms
+extern "C" uint64_t vk_fps_readout_stats(float out[5]);     // device.c: fps, frame ms, 1% low fps, worst ms, 0.1% low fps
 extern "C" uint64_t vk_frames_shown(uint64_t *generated);   // device.c: frames handed to the window, real (+ generated)
 bool pc_ui_font(const char *name, std::vector<uint8_t> *otf);   // pc_ui_font.cpp
 
@@ -151,7 +152,12 @@ std::string system_info() {
     const std::string rel = package_field("release"), commit = package_field("commit"), ver = package_field("version");
     t += rel.empty() ? std::string(commit.empty() ? ", development build" : "") : ", " + rel;
     if (!commit.empty()) t += ", commit " + commit.substr(0, 9) + (package_field("dirty") == "1" ? " (dirty)" : "");
-    t += ", game " + (ver.empty() ? std::string("1.0.0") : ver) + "\n";
+    t += ", game " + (ver.empty() ? std::string("1.0.0") : ver);
+    if (const char *k = totk_link_key()) {   // (the key this exe was linked against, exe_tag.cpp: a report shows a wrong-key exe)
+        const std::string pk = package_field("key");
+        t += std::string(", exe key ") + k + (pk.empty() || pk == k ? "" : " (NOT the package's " + pk + ")");
+    }
+    t += "\n";
 #ifdef _WIN32
     typedef LONG(WINAPI * RtlGetVersionFn)(OSVERSIONINFOW *);
     OSVERSIONINFOW os = {sizeof os};
@@ -544,7 +550,8 @@ void perf_window() {
 // overlay's font if neither can be), white digits with a thin dark outline and a soft shadow, no box, a small FPS
 // label on the number's baseline, inside the HUD-safe margin. With frame generation the number is every frame shown
 // (real + generated) and a smaller "real N" line under it (device.c vk_frames_shown). Drawn over the image only while
-// on. Minimal: the number. Detailed: and the frame time, the 1% low and the worst gap (device.c vk_fps_readout_stats).
+// on. Minimal: the number. Detailed: and the frame time, the 1% and 0.1% lows and the worst gap (device.c
+// vk_fps_readout_stats), then the port's and the game's versions, so a screenshot of it carries both.
 
 namespace fps_ui {   // tokens
 constexpr ImU32 kText = IM_COL32(250, 250, 246, 255);   // the HUD's white
@@ -598,7 +605,7 @@ void fps_readout(uint32_t w, uint32_t h) {
     using namespace fps_ui;
     const int mode = shim_fps_overlay_mode();
     if (!mode || g_font_state.load() < 2) return;   // (the first frames while the font is read: nothing yet)
-    static float st[4], gen, real;
+    static float st[5], gen, real;
     static uint64_t seen = ~0ull;
     static int corner, size;   // the settings, read again with each new set of numbers (every 0.5 s)
     const uint64_t n = vk_fps_readout_stats(st);
@@ -624,13 +631,13 @@ void fps_readout(uint32_t w, uint32_t h) {
     k = k < 0.75f ? 0.75f : k > 3.0f ? 3.0f : k;
     const float N = kNumber[size] * k, L = N * kLabel, R = N * kRow;
     const bool fg = gen > 0.5f;
-    char num[16], label[16], sub[48], rows[3][2][48];
+    char num[16], label[16], sub[48], rows[4][2][48], ver[96] = "";
     snprintf(num, sizeof num, "%.0f", fg ? real + gen : st[0]);
     snprintf(label, sizeof label, "%s", pc_tr("fps"));
     for (char *q = label; *q; q++)  // (FPS ASCII only, so a UTF-8 translation stays whatever the locale)
         if ((unsigned char)*q < 0x80) *q = (char)toupper((unsigned char)*q);
     snprintf(sub, sizeof sub, "%s %.0f", pc_tr("real"), real);
-    const int nrows = mode == 2 ? 3 : 0;
+    const int nrows = mode == 2 ? 4 : 0;
     if (nrows) {
         // (with frame generation these are measured between real frames, so they say so)
         auto name = [&](char *out, const char *what) {
@@ -642,8 +649,18 @@ void fps_readout(uint32_t w, uint32_t h) {
         name(rows[1][0], pc_tr("1% low"));
         if (st[2] > 0) snprintf(rows[1][1], sizeof rows[0][0], "%.0f", st[2]);
         else snprintf(rows[1][1], sizeof rows[0][0], "--");   // (collecting: under 100 frames since it was turned on)
-        name(rows[2][0], pc_tr("worst"));
-        snprintf(rows[2][1], sizeof rows[0][0], "%.0f ms", st[3]);
+        name(rows[2][0], pc_tr("0.1% low"));
+        if (st[4] > 0) snprintf(rows[2][1], sizeof rows[0][0], "%.0f", st[4]);
+        else snprintf(rows[2][1], sizeof rows[0][0], "--");   // (collecting: under 1000 frames since it was turned on)
+        name(rows[3][0], pc_tr("worst"));
+        snprintf(rows[3][1], sizeof rows[0][0], "%.0f ms", st[3]);
+        // the versions: the release (or the commit of a development build) and the game's (player.txt, read once)
+        static const std::string rel = [] {
+            const std::string r = package_field("release"), c = package_field("commit");
+            return !r.empty() ? r : !c.empty() ? "dev " + c.substr(0, 9) : std::string("dev");
+        }();
+        static const std::string game = [] { const std::string v = package_field("version"); return v.empty() ? std::string("1.0.0") : v; }();
+        snprintf(ver, sizeof ver, "%s, %s %s", rel.c_str(), pc_tr("game"), game.c_str());
     }
     // the number keeps the width of three digits, so nothing beside it moves with the number
     const float wn = std::max(f->CalcTextSizeA(N, FLT_MAX, 0, "000").x, f->CalcTextSizeA(N, FLT_MAX, 0, num).x);
@@ -653,9 +670,10 @@ void fps_readout(uint32_t w, uint32_t h) {
         wk = std::max(wk, f->CalcTextSizeA(R, FLT_MAX, 0, rows[i][0]).x);
         wv = std::max(wv, f->CalcTextSizeA(R, FLT_MAX, 0, rows[i][1]).x);
     }
+    const float wver = nrows ? f->CalcTextSizeA(R, FLT_MAX, 0, ver).x : 0;
     const float head = N * 0.78f;   // the number line: about the digits' height
-    const float bw = std::max({wn + gap + wl, wr, nrows ? wk + 0.6f * N + wv : 0.0f});
-    const float bh = head + (fg ? 0.25f * N + R : 0.0f) + (nrows ? 0.25f * N + nrows * R * kLead : 0.0f);
+    const float bw = std::max({wn + gap + wl, wr, nrows ? wk + 0.6f * N + wv : 0.0f, wver});
+    const float bh = head + (fg ? 0.25f * N + R : 0.0f) + (nrows ? 0.25f * N + (nrows + 1) * R * kLead : 0.0f);
     const bool right = corner == 0 || corner == 2;
     const float x0 = right ? w - kMarginX * k - bw : kMarginX * k, y0 = corner < 2 ? kMarginY * k : h - kMarginY * k - bh;
     ImDrawList *dl = ImGui::GetForegroundDrawList();
@@ -674,6 +692,7 @@ void fps_readout(uint32_t w, uint32_t h) {
         hud_text(dl, f, R, ImVec2(x0 + bw - wk - 0.6f * N - wv, y), kQuiet, rows[i][0]);
         hud_text(dl, f, R, ImVec2(x0 + bw - f->CalcTextSizeA(R, FLT_MAX, 0, rows[i][1]).x, y), kText, rows[i][1]);
     }
+    if (nrows) hud_text(dl, f, R, ImVec2(right ? x0 + bw - wver : x0, y), kQuiet, ver);   // (on the readout's side)
 }
 
 // ImGui key -> hle_hid.cpp vk_from_name()'s name (NULL: not bindable by name)

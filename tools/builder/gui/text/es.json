@@ -133,7 +133,7 @@
  "Your prod.keys cannot open the dump ({0}): {1}.": "Tu prod.keys no puede abrir el volcado ({0}): {1}.",
  "Your prod.keys cannot open the update dump ({0}): {1}.": "Tu prod.keys no puede abrir el volcado de la actualización ({0}): {1}.",
  "Your saves and settings stay in {0}.": "Tus partidas guardadas y ajustes se quedan en {0}.",
- "Your {0} update dump: builds version {0}": "Tu volcado de la actualización {0}: compila la versión {0}",
+ "Beta: builds version {0} too (about 40 more minutes); full frame rate, less tested than 1.0.0": "Beta: compila también la versión {0} (unos 40 minutos más); a la frecuencia de fotogramas completa, menos probada que la 1.0.0",
  "downloading {0}": "descargando {0}",
  "dump prod.keys again on the console the game was dumped from, with a current key dumper (one that knows that console's firmware), and choose that file": "vuelve a volcar prod.keys en la consola de la que se volcó el juego, con un volcador de claves actual (uno que conozca el firmware de esa consola), y elige ese archivo",
  "exFAT: each update rebuilds from scratch": "exFAT: cada actualización recompila desde cero",
@@ -160,5 +160,7 @@
  "{0}: the copy next to Setup": "{0}: la copia que está junto al instalador",
  "{0}: the download does not match its checksum (got {1}); press Install again": "{0}: la descarga no coincide con su suma de comprobación (se obtuvo {1}); pulsa Instalar otra vez",
  "{0}: the resumed file does not match its checksum: from the start": "{0}: el archivo reanudado no coincide con su suma de comprobación: desde el principio",
- "{0}: {1}; retrying in {2} s": "{0}: {1}; se reintenta en {2} s"
+ "{0}: {1}; retrying in {2} s": "{0}: {1}; se reintenta en {2} s",
+ "Community": "Comunidad",
+ "Could not open {0}: {1}": "No se pudo abrir {0}: {1}"
 }

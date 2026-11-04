@@ -75,6 +75,12 @@ const Help k_help[] = {
                                      "frames than the screen shows (the fps readout counts them all), for VRR panels or low "
                                      "latency; Smooth looks steadier on a fixed refresh. With V-sync off the picture can "
                                      "tear.")},
+    {"graphics.dlss_preset", PC_T("Which AI model DLSS and DLAA use. NVIDIA's default picks one for each quality. Preset K "
+                                  "is the sharpest; preset J ghosts a little less behind moving things but flickers a "
+                                  "little more. Changing it rebuilds DLSS once (a short pause).")},
+    {"graphics.dlss_trails", PC_T("Where something moved (Link, animals, a swung weapon), DLSS and DLAA can keep blending "
+                                  "in older frames, which leaves faint trails, or trust the new frame, which removes them "
+                                  "but can make those edges flicker a little. Fewest trails is the default.")},
     {"graphics.upscaler_3d", PC_T("How the 3D scene is scaled up to the output: Bicubic (the port's) or FSR 1 (the game's "
                                   "own). Matters only below 100 % render resolution; either costs little.")},
     {"graphics.scene_upscaler", PC_T("The filter that scales the 3D scene when the render resolution is not 100 %: "
@@ -126,9 +132,9 @@ const Help k_help[] = {
     {"display.hdr_paper", PC_T("How bright ordinary white (menus, the sky) is in HDR. Raise it if the picture looks dim, "
                                "lower it if it is too bright.")},
     // Graphics > Game patches
-    {"graphics.aspect_ratio", PC_T("The window's (the default): on a 16:10, 21:9, 32:9 or 48:9 window or monitor the "
+    {"graphics.aspect_ratio", PC_T("The window's (the default): on a 3:2, 16:10, 21:9, 32:9 or 48:9 window or monitor the "
                                    "picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 "
-                                   "among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9: that shape "
+                                   "among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9 / 3:2: that shape "
                                    "whatever the window. A new shape's layouts are made at its first start (about "
                                    "30 s, once). A wider picture costs more GPU.")},
     {"graphics.hud_layout", PC_T("On 21:9, 32:9 or 48:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a "
@@ -146,7 +152,8 @@ const Help k_help[] = {
                                    "some GPU. The game's changes its size with the view.")},
     {"graphics.shadow_reach", PC_T("Moves the lines where the sun's sharp near shadows hand over to coarser ones further away "
                                    "(1 = the game's, 2 = twice as far). Near shadows get a little softer: raise Shadow "
-                                   "resolution with it. Costs a little GPU and CPU.")},
+                                   "resolution with it. Costs a little GPU and CPU. With Shadow distance above 1 the "
+                                   "two multiplied stay at 4 at most, so at Shadow distance 4 this does nothing.")},
     {"graphics.shadow_distance", PC_T("How far the sharp shadows reach. Higher looks better in the distance and costs GPU.")},
     {"graphics.fog_distance", PC_T("Pushes the distance fog back: clearer far mountains. Higher shows more and costs some "
                                    "GPU.")},
@@ -209,8 +216,9 @@ const Help k_help[] = {
                                     "the Switch.")},
     {"controls.lock_toggle", PC_T("One press of the shield / target key raises the shield and targets, the next lowers it. "
                                   "Off: hold it, as on the Switch.")},
-    {"controls.ability.rotate_step", PC_T("How much mouse movement turns an object one 45° step while R is held in Ultrahand "
-                                          "or Autobuild. Lower turns sooner.")},
+    {"controls.ability.rotate_speed", PC_T("How fast moving the mouse sideways turns an object while R is held in Ultrahand "
+                                           "or Autobuild (1x: as far as the camera turns). The wheel turns it vertically; "
+                                           "moving the mouse up or down does not turn it.")},
     {"controls.pad_labels", PC_T("A non-Nintendo pad's face buttons: by position (the Switch layout: the right button "
                                  "confirms) or by label (Xbox A confirms).")},
     {"controls.rumble", PC_T("Controller vibration: off, normal, or stronger (x2 to x4).")},
@@ -247,8 +255,8 @@ const Help k_help[] = {
     {"graphics.safe_mode", PC_T("For a game that crashes or hangs: the renderer without its faster paths, DLSS, FSR and "
                                 "frame generation, and without the driver paths some GPUs crash in. Slower. At the next "
                                 "start.")},
-    {"game.discord", PC_T("Shows \"Playing\" and the time played on your Discord profile while Discord runs. Nothing else "
-                          "is sent.")},
+    {"game.discord", PC_T("Shows \"Playing\", the time played and a \"Join the community\" button (the game's subreddit) on "
+                          "your Discord profile while Discord runs. Nothing else is sent.")},
 };
 }  // namespace
 

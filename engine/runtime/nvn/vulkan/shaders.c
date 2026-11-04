@@ -143,26 +143,34 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
     return out;
 }
 
-// LARECOMP_FLOAT_PRESERVE=1: every module declares OpExecutionMode SignedZeroInfNanPreserve 32 (SPIR-V 1.4+ core,
-// capability 4466 / mode 4461). Without it the driver may assume a shader never sees inf / NaN, while Maxwell code relies
-// on them (MUFU.LG2 of 0 = -inf). ScarletNX (github.com/scarletnx/ScarletNX, its notes): TotK's lighting came out as NaN
-// blocks until its SPIR-V declared it. Candidate for the black cave lighting. Applied after the disk cache (cached SPIR-V
-// stays unpatched), so the switch costs pipeline builds, not GLSL compiles. Default on for Intel GPUs. The translator's
-// NaN rules (FMNMX's NaN-select,.SAT's NaN -> 0, the prelude's fmin / fmax / saturate) are isnan() tests, and without the
-// mode a driver may fold them to false (the no-NaN licence), so a NaN from the game's lighting (0 * inf, LG2 of 0) could
-// reach the render target. NVIDIA keeps them either way (default off there: no rebuild of its pipelines). Found while
-// chasing public #39 (Arc B580, white patches on water and in caves), which it did not fix (the reporter's run with it
-// on, 2026-11-02): kept for the rules' sake. LARECOMP_FLOAT_PRESERVE=1 on every GPU, =0 never. LARECOMP_FLOAT_FTZ=1 (a
-// test, default off; public #39's white blow-outs on Arc): also DenormFlushToZero 32 (capability 4465 / mode 4460).
-// Maxwell's float ops mostly run.FTZ and NVIDIA's driver flushes 32-bit denormals, so a game value in the denormal range
-// is 0 there; a driver that keeps denormals hands 1 / x or rsqrt(x) a tiny non-zero instead: a huge finite result where
-// the game's maths expected 0 -> inf, which its clamps handle. The returned mask: 1 preserve, 2 FTZ.
+// LARECOMP_FLOAT_PRESERVE=1: every module declares OpExecutionMode SignedZeroInfNanPreserve 32 (SPIR-V 1.4+ core, capability
+// 4466 / mode 4461). Without it the driver may assume a shader never sees inf / NaN, while Maxwell code relies on them
+// (MUFU.LG2 of 0 = -inf). ScarletNX (github.com/scarletnx/ScarletNX, its notes): TotK's lighting came out as NaN blocks
+// until its SPIR-V declared it. Candidate for the black cave lighting. Applied after the disk cache (cached SPIR-V stays
+// unpatched), so the switch costs pipeline builds, not GLSL compiles. Default on for Intel GPUs. The translator's NaN rules
+// (FMNMX's NaN-select,.SAT's NaN -> 0, the prelude's fmin / fmax / saturate) are isnan() tests, and without the mode a
+// driver may fold them to false (the no-NaN licence), so a NaN from the game's lighting (0 * inf, LG2 of 0) could reach the
+// render target. NVIDIA keeps them either way (default off there: no rebuild of its pipelines). Found while chasing public
+// #39 (Arc B580, white patches on water and in caves), which it did not fix (the reporter's run with it on, 2026-11-02):
+// kept for the rules' sake. Default on for AMD GPUs too since v0.1.9.1: public #56 (RX 7600, one-frame flashes: the sky /
+// distant objects flicker, surfaces black for an instant) was 'significantly reduced' by it on v0.1.8.2, where
+// LARECOMP_OCCLUSION=visible had changed nothing. LARECOMP_FLOAT_PRESERVE=1 on every GPU, =0 never. LARECOMP_FLOAT_FTZ:
+// DenormFlushToZero 32 (capability 4465 / mode 4460), default on for AMD GPUs since v0.1.9.1 (=0 off, =1 on any GPU).
+// Maxwell's float ops mostly run.FTZ and NVIDIA's driver flushes 32-bit denormals, so a game value in the denormal range is
+// 0 there; AMD's keeps denormals and hands 1 / x or rsqrt(x) a tiny non-zero instead: a huge finite result where the game's
+// maths expected 0 -> inf, which its clamps handle, so it passes them, and bloom spreads it (Reddit, an 8 GB AMD card: white
+// specks and short white streaks with glow in a dark temple LEAD 11-04 P1.5; the same mechanism as public #39's white
+// blow-outs on Arc). With preserve above, AMD then computes float maths as NVIDIA does. A module with a 16 / 64-bit float
+// type where the driver's denormBehaviorIndependence is NONE (one mode for every width: VUID 06290; translate.c emits
+// doubles for DADD / DMUL) keeps the driver's default there. The returned mask: 1 preserve, 2 FTZ.
+static bool g_ftz_shared;   // (the denormal mode is one for every width on this device: no FTZ where 16 / 64-bit floats are)
 static int float_preserve(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("LARECOMP_FLOAT_PRESERVE"), *z = getenv("LARECOMP_FLOAT_FTZ");
         on = 0;
-        const bool want_p = e && *e ? *e == '1' : g_vk.props.vendorID == 0x8086, want_z = z && *z == '1';
+        const bool want_p = e && *e ? *e == '1' : g_vk.props.vendorID == 0x8086 || g_vk.props.vendorID == 0x1002,
+                   want_z = z && *z ? *z == '1' : g_vk.props.vendorID == 0x1002;
         if (want_p || want_z) {
             VkPhysicalDeviceFloatControlsProperties fc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
             VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &fc};
@@ -170,14 +178,14 @@ static int float_preserve(void) {
             if (want_p) {
                 on |= fc.shaderSignedZeroInfNanPreserveFloat32 ? 1 : 0;
                 LOG("[shader] float controls: SignedZeroInfNanPreserve 32 %s%s\n", on & 1 ? "on" : "NOT supported by the device: off",
-                    e && *e ? " (LARECOMP_FLOAT_PRESERVE)" : " (Intel default)");
+                    e && *e ? " (LARECOMP_FLOAT_PRESERVE)" : g_vk.props.vendorID == 0x1002 ? " (AMD default)" : " (Intel default)");
             }
             if (want_z) {
                 on |= fc.shaderDenormFlushToZeroFloat32 ? 2 : 0;
-                // (denormBehaviorIndependence NONE: one denormal mode for every width, so a 16 / 64-bit float in a module
-                // would make it invalid there (VUID 06290); translate.c emits none)
-                LOG("[shader] float controls: DenormFlushToZero 32 %s (LARECOMP_FLOAT_FTZ; denorm behaviour independence %d)\n",
-                    on & 2 ? "on" : "NOT supported by the device: off", (int)fc.denormBehaviorIndependence);
+                g_ftz_shared = fc.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+                LOG("[shader] float controls: DenormFlushToZero 32 %s%s (denorm behaviour independence %d%s)\n",
+                    on & 2 ? "on" : "NOT supported by the device: off", z && *z ? " (LARECOMP_FLOAT_FTZ)" : " (AMD default; LARECOMP_FLOAT_FTZ=0: off)",
+                    (int)fc.denormBehaviorIndependence, g_ftz_shared ? ": not in modules with 16 / 64-bit floats" : "");
             }
         }
     }
@@ -185,20 +193,25 @@ static int float_preserve(void) {
 }
 int vk_spirv_float_preserve(void) { return float_preserve(); }   // (exec.c: part of the archive warm-up stamp)
 static uint32_t *add_float_preserve(uint32_t *spv, size_t *nwords) {
-    enum { OP_CAPABILITY = 17, OP_ENTRY_POINT = 15, CAP_PRESERVE = 4466, MODE_PRESERVE = 4461, CAP_FTZ = 4465, MODE_FTZ = 4460 };
-    const int fm = spv ? float_preserve() : 0;
+    enum { OP_CAPABILITY = 17, OP_ENTRY_POINT = 15, CAP_PRESERVE = 4466, MODE_PRESERVE = 4461, CAP_FTZ = 4465, MODE_FTZ = 4460,
+           CAP_FLOAT16 = 9, CAP_FLOAT64 = 10 };
+    int fm = spv ? float_preserve() : 0;
     if (!fm) return spv;
     size_t n = *nwords, caps_end = 5, ep_end = 0;
     uint32_t entry = 0;
     for (size_t i = 5; i < n;) {
         uint32_t wc = spv[i] >> 16, op = spv[i] & 0xFFFF;
         if (!wc) return spv;
-        if (op == OP_CAPABILITY) { if (spv[i + 1] == CAP_PRESERVE || spv[i + 1] == CAP_FTZ) return spv; caps_end = i + wc; }
+        if (op == OP_CAPABILITY) {
+            if (spv[i + 1] == CAP_PRESERVE || spv[i + 1] == CAP_FTZ) return spv;
+            if (g_ftz_shared && (spv[i + 1] == CAP_FLOAT16 || spv[i + 1] == CAP_FLOAT64)) fm &= ~2;   // (VUID 06290)
+            caps_end = i + wc;
+        }
         if (op == OP_ENTRY_POINT && !ep_end) { entry = spv[i + 2]; ep_end = i + wc; }
         if (ep_end && op != OP_ENTRY_POINT) break;
         i += wc;
     }
-    if (!ep_end) return spv;
+    if (!ep_end || !fm) return spv;
     uint32_t *out = malloc((n + 12) * 4);
     size_t o = 0;
     memcpy(out, spv, caps_end * 4); o = caps_end;

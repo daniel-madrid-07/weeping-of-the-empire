@@ -59,6 +59,35 @@ static void put_f32(unsigned off, float v) {
     __atomic_store_n((uint32_t *)(g_page + off), bits, __ATOMIC_RELEASE);
 }
 
+/* Near shadow reach x Shadow distance (public #69, dd2war: reach on top of distance x4 at 4K): the reach multiplies the
+   near cascades' splits, which the shadow-<p> set (TOTK_SHADOW_DISTANCE) has already multiplied, so the near shadow
+   maps spread over far more ground than either setting alone gives: much softer near shadows, and parts of them lost
+   at some distances. The product is held at 4, the largest reach at the game's own distance, so the reach does nothing
+   from distance x4 on and the game's-distance behaviour is unchanged. Said once in the log when it holds. */
+float totk_shadow_reach_slot(float k) {
+    if (!(k > 1.0f)) return k;   /* (0: the game's own; a live 1.0: as before) */
+    const char *sd = getenv("TOTK_SHADOW_DISTANCE");
+    double d = sd && *sd ? strtod(sd, NULL) : 1.0;
+    if (d > 10.0) d /= 100.0;   /* (a percentage, as totk_engine.c reads it) */
+    {   /* the distance the game gets: totk_engine.c overlay_sets holds it at x2 on a canvas that is not 16:9 (the same
+           test on the same TOTK_OUTPUT_RES), but only after totk_patches_init has written this slot*/
+        const char *o = getenv("TOTK_OUTPUT_RES"), *c = getenv("TOTK_WIDE_SHADOW_CAP");
+        unsigned ow = 0, oh = 0;
+        if (d > 2.0 && o && sscanf(o, "%ux%u", &ow, &oh) == 2 && oh && !(c && *c == '0')) {
+            const double a = (double)ow / oh;
+            if (a < 1.74 || a > 1.81) d = 2.0;
+        }
+    }
+    if (!(d > 1.0)) return k;
+    const float cap = (float)(4.0 / d);
+    if (k <= cap) return k;
+    static int told;
+    if (!told++)
+        fprintf(stderr, "[totk] near shadow reach x%.2f held at x%.2f: Shadow distance x%.2f already moves the near "
+                        "shadows out (reach x distance at most 4, public #69)\n", k, cap > 1.0f ? cap : 1.0f, d);
+    return cap > 1.0f ? cap : 0.0f;
+}
+
 void totk_settings_default(TotkSettings *s) {
     memset(s, 0, sizeof *s);
     s->realtime = 1;
@@ -233,7 +262,8 @@ const char *totk_patches_init(void *main_base, uint64_t main_span, const TotkSet
     put_f32(TOTK_DP_FOV_SCALE, s->fov_scale);
     put_f32(TOTK_DP_SHADOW_SCALE, s->shadow_scale);
     put_f32(TOTK_DP_SHADOW_FIXED, s->shadow_fixed);
-    put_f32(TOTK_DP_SHADOW_SPLIT, s->shadow_reach);
+    const float reach = totk_shadow_reach_slot(s->shadow_reach);
+    put_f32(TOTK_DP_SHADOW_SPLIT, reach);
     __atomic_store_n((uint32_t *)(g_page + TOTK_DP_TEMP_UNIT), s->temp_unit, __ATOMIC_RELEASE);
     put_f32(TOTK_DP_LOD_SCALE, s->lod_scale);
     put_f32(TOTK_DP_ACTOR_LOD, s->actor_lod_scale);
@@ -251,7 +281,7 @@ const char *totk_patches_init(void *main_base, uint64_t main_span, const TotkSet
             s->output_w, s->output_h, s->max_w, s->max_h, totk_aspect_current(),
             totk_aspect_current() == 0 ? " (the game's own 16:9)" : "", dyn, s->fov_scale > 0 ? s->fov_scale : 1.0,
             s->shadow_scale > 0 ? s->shadow_scale : 1.0, s->shadow_fixed ? " (fixed size)" : "",
-            s->shadow_reach > 0 ? s->shadow_reach : 1.0, s->lod_scale > 0 ? s->lod_scale : 1.0);
+            reach > 0 ? reach : 1.0, s->lod_scale > 0 ? s->lod_scale : 1.0);
     return NULL;
 }
 
@@ -808,7 +838,7 @@ uint64_t totk_output_extra_bytes(const TotkSettings *s) {
 
 int totk_layout_set(unsigned w, unsigned h, char name[64]) {
     /* the shapes games/totk/overlays builds by default (DEFAULT_ASPECTS): its layouts depend on the shape alone */
-    static const unsigned built[][2] = {{3440, 1440}, {5120, 1440}, {7680, 1440}, {2560, 1600}};
+    static const unsigned built[][2] = {{3440, 1440}, {5120, 1440}, {7680, 1440}, {2560, 1600}, {2160, 1440}};
     const double a = h ? (double)w / h : 0;
     if (a > 16.0 / 9.0 * 0.99 && a < 16.0 / 9.0 * 1.01) return 0;
     for (unsigned i = 0; i < sizeof built / sizeof built[0]; i++) {

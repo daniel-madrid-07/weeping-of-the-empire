@@ -24,6 +24,7 @@ import hashlib
 import http.client
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -51,6 +52,10 @@ MSVC_PIN, SDK_PIN = '14.44.17.14', 'win11sdk_10.0.26100'
 # The release PC's versions of the packages the steps import (outputs such as the glyph bank depend on them)
 PACKAGES = ['zstandard==0.25.0', 'pillow==12.3.0', 'fonttools==4.62.1', 'numpy==2.4.4', 'cryptography==50.0.1',
             'lz4==4.4.5', 'skia-pathops==0.9.2']
+# The same packages (and tools/engine/build.py's VENV_PACKAGES) hash-pinned with every dependency, for Setup's Python
+# (lock_wheels.py writes them; its '# targets:' line names the Pythons they cover): pip installs them with
+# --require-hashes, so a wheel whose bytes are not the pinned ones is refused, from the package index or a download kit
+WHEEL_LOCKS = {'setup': 'wheels-setup.txt', 'venv': 'wheels-venv.txt'}
 UA = {'User-Agent': 'nxrecomp-setup'}
 
 
@@ -492,7 +497,7 @@ def ensure_packages(py=sys.executable):
     # Python version (a Microsoft Store Python 3.13 with these wheels) made pip say 'already satisfied' and install
     # nothing, and the import that follows failed ('No module named cryptography', a fresh v0.1.6 install, 11-01)
     pyx = pip(py)
-    pip_install(pyx, missing)
+    pip_install(pyx, missing, lock='setup')
     import importlib
     importlib.invalidate_caches()   # (this process imports them next: its finders cached site-packages without them)
     say('Python packages installed')
@@ -508,32 +513,84 @@ def pip(py=sys.executable):
     return pyx
 
 
-def pip_install(pyx, specs, quiet=False):
+def python_target(py=sys.executable):
+    """'cp313-win_amd64' / 'cp313-linux_x86_64' for the Python at py (WHEEL_LOCKS' '# targets:' names), or None"""
+    if py == sys.executable:
+        ver, mach = sys.version_info[:2], platform.machine().lower()
+    else:
+        r = subprocess.run([py, '-E', '-s', '-c', 'import sys, platform; print(*sys.version_info[:2], platform.machine())'],
+                           capture_output=True, text=True)
+        try:
+            major, minor, mach = r.stdout.split()
+        except ValueError:   # (no such Python, or it failed)
+            return None
+        ver, mach = (int(major), int(minor)), mach.lower()
+    if mach not in ('amd64', 'x86_64'):
+        return None
+    return f'cp{ver[0]}{ver[1]}-' + ('win_amd64' if sys.platform == 'win32' else 'linux_x86_64' if LINUX else '?')
+
+
+def wheel_lock(which, py=sys.executable, specs=()):
+    """WHEEL_LOCKS[which] when it covers the Python at py and pins every one of specs at its version, else None (the
+    specs unpinned: a developer's own other Python; or a list changed without lock_wheels.py, said loudly, which
+    export_public refuses to ship: the lock would install other versions than the steps check)"""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), WHEEL_LOCKS[which])
+    try:
+        text = open(p, encoding='utf-8').read()
+        targets = next(l.split(':', 1)[1].split() for l in text.splitlines() if l.startswith('# targets:'))
+    except (OSError, StopIteration):
+        return None
+    if python_target(py) not in targets:
+        return None
+    norm = lambda s: re.sub(r'[-_.]+', '-', s.split('==')[0].lower()) + '==' + s.split('==', 1)[-1]   # (lock's names)
+    stale = [s for s in specs if not re.search('^' + re.escape(norm(s)) + ' ', text, re.M)]
+    if stale:
+        say(f'WARNING: {os.path.basename(p)} does not pin {" ".join(stale)} (run tools/builder/lock_wheels.py): '
+            'these packages are installed WITHOUT their hash check')
+        return None
+    return p
+
+
+def pip_install(pyx, specs, quiet=False, lock=None):
     """pip install specs, wheels only: from the download kit's wheels alone when it has them (each checked), else (or
-    when the kit lacks one) from the package index. tools/engine/build.py's venv uses it too."""
+    when the kit lacks one) from the package index. lock ('setup' / 'venv'): when its file covers this Python, the
+    whole hash-pinned list instead of specs, --require-hashes (every wheel checked against its pinned sha256).
+    tools/engine/build.py's venv uses it too."""
     base = [*pyx, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-warn-script-location',
             '--only-binary', ':all:'] + (['--quiet'] if quiet else [])
-    wheels = kit.wheels(say)
+    lockf = wheel_lock(lock, pyx[0], specs) if lock else None
+    reqs = ['--require-hashes', '-r', lockf] if lockf else list(specs)
+    wheels, older = kit.wheels(say), ''
     if wheels:
-        r = subprocess.run(base + ['--no-index', '--find-links', wheels, *specs], capture_output=True, text=True)
+        r = subprocess.run(base + ['--no-index', '--find-links', wheels, *reqs], capture_output=True, text=True)
         if not r.returncode:
-            say('Python packages: from the download kit')
+            say('Python packages: from the download kit' + (' (hash-pinned)' if lockf else ''))
             return
-        say('Python packages: not all in the download kit; from the package index')
-    r = subprocess.run(base + list(specs), capture_output=True, text=True)
+        if lockf:  # (a kit made by an older Setup holds other wheels than this Setup pins)
+            older = ('\nThe download kit is older than this Setup: its Python packages are not the ones this Setup '
+                     'pins. Make the kit again with this Setup (Setup --download-kit) on a PC with internet.')
+        say('Python packages: not all in the download kit' + (' (it is older than this Setup)' if older else '') +
+            '; from the package index')
+    r = subprocess.run(base + reqs, capture_output=True, text=True)
     if r.returncode:
-        raise ToolchainError('installing the Python packages failed (internet?):\n' + (r.stdout + r.stderr)[-1500:] +
-                             kit.missing_note())
+        out = r.stdout + r.stderr
+        why = ('a downloaded package is not the pinned one (THESE PACKAGES DO NOT MATCH THE HASHES): a proxy or mirror '
+               'changed it, or the download broke; try again' if 'DO NOT MATCH THE HASHES' in out else 'internet?')
+        raise ToolchainError(f'installing the Python packages failed ({why}):\n' + out[-1500:] + older + kit.missing_note())
 
 
-def kit_wheels(specs, py=sys.executable):
-    """Making a download kit: the wheels of specs (and what they need) for this Python into <kit>/wheels, listed"""
+def kit_wheels(lists, py=sys.executable):
+    """Making a download kit: the wheels of each {lock name: specs} list (and what they need) for this Python into
+    <kit>/wheels, listed; a list whose lock covers this Python: exactly its pinned wheels, hashes checked"""
     d = os.path.join(kit.making(), 'wheels')
     os.makedirs(d, exist_ok=True)
-    r = subprocess.run([*pip(py), '-m', 'pip', 'download', '--disable-pip-version-check', '--only-binary', ':all:',
-                        '--dest', d, *specs], capture_output=True, text=True)
-    if r.returncode:
-        raise ToolchainError('downloading the Python packages failed (internet?):\n' + (r.stdout + r.stderr)[-1500:])
+    for which, specs in lists.items():
+        lockf = wheel_lock(which, py, specs)
+        r = subprocess.run([*pip(py), '-m', 'pip', 'download', '--disable-pip-version-check', '--only-binary', ':all:',
+                            '--dest', d] + (['--require-hashes', '-r', lockf] if lockf else list(specs)),
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise ToolchainError('downloading the Python packages failed (internet?):\n' + (r.stdout + r.stderr)[-1500:])
     kit.record_wheels(d)
     say(f'Python packages: {sum(n.endswith(".whl") for n in os.listdir(d))} wheels in the kit')
 

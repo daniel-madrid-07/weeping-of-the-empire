@@ -3,6 +3,8 @@
 #include <SDL3/SDL_timer.h>
 #include <float.h>
 #include <stddef.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -451,54 +453,145 @@ static uint32_t shadow_rung(uint32_t n) {
 // (2026-10-30: a square 512x512 D32 classed as a shadow map, at TOTK_SHADOW_SCALE 4 = 2048x2048, drawn with an unscaled
 // R8 512x512 colour target: fs c509b81e / 6c4e6d40 / 915cd25e / 123a608c rendered at 1.0 into the top-left sixteenth of
 // the depth, testing against the wrong texels): the colour target takes the depth's kind. LARECOMP_PROMO_SHADOW=0: scene
-// scale only (old).
-#define PROMO_MAX 64
-static struct { uint64_t addr; uint32_t w, h; int kind; } g_promo[PROMO_MAX];
-static int g_npromo;
+// scale only (old). The promotion and depth-grow tables (below): an entry per storage address + guest size + format,
+// written by exec.c begin_pass on the render thread, read where images are made. A full table reuses its least recently
+// matched entry (P1.4: they kept their first 64 entries for good and dropped later ones silently, so every later pair
+// stayed mixed each frame; the gate's boots made at most 3). A rewritten entry goes through an odd version, so a reader
+// never takes half of one.
+#define KT_MAX 256
+typedef struct { uint32_t ver, w, h, fmt, a, b; uint64_t addr, used; } KtEnt;
+typedef struct { KtEnt e[KT_MAX]; int n; const char *what; } KTab;
+static bool kt_get(KTab *k, const NvnTexture *t, uint32_t *a, uint32_t *b) {
+    const int n = __atomic_load_n(&k->n, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        KtEnt *e = &k->e[i];
+        if (__atomic_load_n(&e->addr, __ATOMIC_RELAXED) != t->addr) continue;
+        const uint32_t v = __atomic_load_n(&e->ver, __ATOMIC_ACQUIRE);
+        const uint64_t ad = __atomic_load_n(&e->addr, __ATOMIC_RELAXED);
+        const uint32_t w = __atomic_load_n(&e->w, __ATOMIC_RELAXED), h = __atomic_load_n(&e->h, __ATOMIC_RELAXED);
+        const uint32_t f = __atomic_load_n(&e->fmt, __ATOMIC_RELAXED), ea = __atomic_load_n(&e->a, __ATOMIC_RELAXED);
+        const uint32_t eb = __atomic_load_n(&e->b, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if ((v & 1) || __atomic_load_n(&e->ver, __ATOMIC_RELAXED) != v || ad != t->addr || w != t->width || h != t->height ||
+            f != t->format)
+            continue;
+        __atomic_store_n(&e->used, vk_frame_counter(), __ATOMIC_RELAXED);
+        if (a) *a = ea;
+        if (b) *b = eb;
+        return true;
+    }
+    return false;
+}
+static void kt_write(KtEnt *e, const NvnTexture *t, uint32_t a, uint32_t b) {   // (the render thread only)
+    const uint32_t v = e->ver;
+    __atomic_store_n(&e->ver, v + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&e->addr, t->addr, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->w, t->width, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->h, t->height, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->fmt, t->format, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->a, a, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->b, b, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->used, vk_frame_counter(), __ATOMIC_RELAXED);
+    __atomic_store_n(&e->ver, v + 2, __ATOMIC_RELEASE);
+}
+static void kt_put(KTab *k, const NvnTexture *t, uint32_t a, uint32_t b) {   // (t's own entry updated, else a new one)
+    for (int i = 0; i < k->n; i++)
+        if (k->e[i].addr == t->addr && k->e[i].w == t->width && k->e[i].h == t->height && k->e[i].fmt == t->format) {
+            kt_write(&k->e[i], t, a, b);
+            return;
+        }
+    if (k->n < KT_MAX) {
+        kt_write(&k->e[k->n], t, a, b);
+        __atomic_store_n(&k->n, k->n + 1, __ATOMIC_RELEASE);
+        return;
+    }
+    int lru = 0;
+    for (int i = 1; i < KT_MAX; i++)
+        if (__atomic_load_n(&k->e[i].used, __ATOMIC_RELAXED) < __atomic_load_n(&k->e[lru].used, __ATOMIC_RELAXED)) lru = i;
+    static int nlog;
+    if (nlog++ < 4) LOG("[tex] %s table full (%d entries): its least recently matched entry is reused\n", k->what, KT_MAX);
+    kt_write(&k->e[lru], t, a, b);
+}
+static KTab g_promo = {.what = "promotion"};
 static int tex_promoted(const NvnTexture *t) {   // (the kind it was promoted to, 0 = not promoted)
-    int n = __atomic_load_n(&g_npromo, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < n; i++)
-        if (g_promo[i].addr == t->addr && g_promo[i].w == t->width && g_promo[i].h == t->height) return g_promo[i].kind;
-    return 0;
+    uint32_t kind;
+    return kt_get(&g_promo, t, &kind, NULL) ? (int)kind : 0;
 }
 void renderer_texture_promote_kind(NvnTexture *t, int kind) {
     static int off = -1;
     if (off < 0) off = getenv("LARECOMP_NO_PROMOTE") != NULL;
-    if (off || !t || !t->addr || t->samples > 1 || t->target != 1 || g_npromo >= PROMO_MAX || tex_promoted(t)) return;
-    g_promo[g_npromo].addr = t->addr; g_promo[g_npromo].w = t->width; g_promo[g_npromo].h = t->height; g_promo[g_npromo].kind = kind;
-    __atomic_store_n(&g_npromo, g_npromo + 1, __ATOMIC_RELEASE);
+    if (off || !t || !t->addr || t->samples > 1 || t->target != 1 || tex_promoted(t)) return;
+    kt_put(&g_promo, t, (uint32_t)kind, 0);
     LOG("[tex] promoted to the %s scale (rendered next to a scaled target of its size): addr %llx %ux%u f%#x flags %#x\n",
         kind == 2 ? "shadow maps'" : "scene", (unsigned long long)t->addr, t->width, t->height, t->format, t->flags);
 }
 void renderer_texture_promote(NvnTexture *t) { renderer_texture_promote_kind(t, 1); }
 static void destroy_image(TexBackend *b);
 static void create_image(NvnTexture *t, TexBackend *b);
+// A remade image's old contents, scaled into the new one by a blit on cb (filtered colour, nearest depth / integer):
+// rescale_image's, and a promoted target's (since P1.4 promoted in the pass that first meets its scaled partner, it may
+// load there what it rendered unscaled earlier in the frame). Images a blit cannot carry (multisampled, block-compressed
+// shadows, depth / colour alternates, 3D, formats without blit support) start blank. LARECOMP_RESCALE_CARRY=0: never.
+typedef struct { VkImage img; VkFormat fmt; VkImageAspectFlags aspect; uint32_t w, h, levels, layers; bool ok; } Carry;
+static Carry carry_take(const TexBackend *b) {   // (before destroy_image, which frees the old image after this submission)
+    static int carry_on = -1;
+    if (carry_on < 0) { const char *e = getenv("LARECOMP_RESCALE_CARRY"); carry_on = !e || *e != '0'; }
+    return (Carry){b->image, b->format, b->aspect, b->width, b->height, b->levels, b->layers,
+                   carry_on && b->image && b->samples <= 1 && !b->blk && !b->alt.image && b->depth <= 1 &&
+                       format_supports(b->format, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)};
+}
+static bool carry_blit(VkCommandBuffer cb, const Carry *c, const TexBackend *b, bool *linear) {
+    if (!c->ok || !b->image || b->format != c->fmt || b->aspect != c->aspect || b->samples > 1) return false;
+    const bool depth = (c->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+    *linear = !depth && format_supports(c->fmt, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+              (c->w != b->width || c->h != b->height);
+    const uint32_t nl = c->levels < b->levels ? c->levels : b->levels, nly = c->layers < b->layers ? c->layers : b->layers;
+    VkImageBlit bl[16];
+    uint32_t n = 0;
+    for (uint32_t lv = 0; lv < nl && n < 16; lv++) {
+        const int32_t sw = (int32_t)(c->w >> lv ? c->w >> lv : 1), sh = (int32_t)(c->h >> lv ? c->h >> lv : 1);
+        const int32_t dw = (int32_t)(b->width >> lv ? b->width >> lv : 1), dh = (int32_t)(b->height >> lv ? b->height >> lv : 1);
+        bl[n++] = (VkImageBlit){.srcSubresource = {c->aspect, lv, 0, nly}, .srcOffsets = {{0, 0, 0}, {sw, sh, 1}},
+                                .dstSubresource = {c->aspect, lv, 0, nly}, .dstOffsets = {{0, 0, 0}, {dw, dh, 1}}};
+    }
+    vk_full_barrier(cb);   // (the old image's last writes; the new image's start-up clear)
+    vkCmdBlitImage(cb, c->img, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, n, bl, *linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    vk_full_barrier(cb);
+    return true;
+}
 // (exec.c begin_pass, outside a render pass) a promoted target whose object kept its unscaled backend is reallocated
-// at the scene's scale, cleared to zero
+// at the scene's scale, its contents carried (carry_blit, in order on the frame's command buffer), else cleared to
+// zero
 bool renderer_texture_apply_promotion(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
-    if (!b || b->scalable || !g_npromo || !b->image || b->samples > 1 || b->blk || b->pending_rgba || !tex_promoted(t)) return false;
+    if (!b || b->scalable || !g_promo.n || !b->image || b->samples > 1 || b->blk || b->pending_rgba || !tex_promoted(t)) return false;
     extern uint32_t vk_view_gen;
+    const Carry c = carry_take(b);
     destroy_image(b);
     b->scale_kind = tex_promoted(t);
     b->scalable = true;
     create_image(t, b);
     vk_view_gen++;   // (exec.c's per-frame view memo is keyed by the texture object)
     VkCommandBuffer cb = vk_cmd();
-    vk_full_barrier(cb);
-    VkImageSubresourceRange rg = {b->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-    if (b->aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
-        VkClearColorValue z = {{0}};
-        vkCmdClearColorImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
-    } else {
-        VkClearDepthStencilValue z = {0};
-        vkCmdClearDepthStencilImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
+    bool linear = false;
+    const bool carried = carry_blit(cb, &c, b, &linear);
+    if (!carried) {
+        vk_full_barrier(cb);
+        VkImageSubresourceRange rg = {b->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        if (b->aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
+            VkClearColorValue z = {{0}};
+            vkCmdClearColorImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
+        } else {
+            VkClearDepthStencilValue z = {0};
+            vkCmdClearDepthStencilImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
+        }
+        vk_full_barrier(cb);
     }
-    vk_full_barrier(cb);
     static int nlog;
     if (nlog++ < 32)
-        LOG("[tex] promoted target reallocated: %p addr %llx %ux%u f%#x -> %ux%u\n", (void *)t, (unsigned long long)t->addr, t->width,
-            t->height, t->format, b->width, b->height);
+        LOG("[tex] promoted target reallocated: %p addr %llx %ux%u f%#x -> %ux%u, %s\n", (void *)t, (unsigned long long)t->addr, t->width,
+            t->height, t->format, b->width, b->height, carried ? (linear ? "contents carried (filtered)" : "contents carried (nearest)") : "cleared");
     return true;
 }
 
@@ -507,15 +600,21 @@ bool renderer_texture_apply_promotion(NvnTexture *t) {
 // rows, the depth 2 x 112 = 224, so the render area cut the level's last row, never written in that pass, and the bloom
 // chain pulled the stale row in as a cyan band at the bottom; at 1.333 the same pass was the ALLOC_CEIL case). exec.c
 // begin_pass records the colour level's host extent here; the depth is then allocated at least that large (its own ratio
-// follows the allocation, as every scaled image's). LARECOMP_DEPTH_GROW=0: off.
-#define GROW_MAX 64
-static struct { uint64_t addr; uint32_t w, h, fmt, hw, hh; } g_grow[GROW_MAX];
-static int g_ngrow;
-static bool tex_grown(const NvnTexture *t, uint32_t *hw, uint32_t *hh) {
-    int n = __atomic_load_n(&g_ngrow, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < n; i++)
-        if (g_grow[i].addr == t->addr && g_grow[i].w == t->width && g_grow[i].h == t->height && g_grow[i].fmt == t->format) { *hw = g_grow[i].hw; *hh = g_grow[i].hh; return true; }
-    return false;
+// follows the allocation, as every scaled image's). LARECOMP_DEPTH_GROW=0: off. The extent is kept in guest units (the host
+// extent over the scale it was seen at) and turned back at the scale of the moment: kept in host pixels, a live render-scale
+// change (2 -> 1.5) left the depth at the old scale's size, its ratio 2.00 in a 1.50 pass, until the scale came back (public
+// #46 with DLSS: the log's '[pass] mixed scales: attachment depth1 200x112... at 2.00, pass at 1.50' every pass from the
+// change on).
+static KTab g_grow = {.what = "depth-grow"};  // (format in the key; a / b = the guest-unit extent's float bits)
+static float kind_sx(int kind), kind_sy(int kind);
+static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static float u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+static bool tex_grown(const NvnTexture *t, int kind, uint32_t *hw, uint32_t *hh) {   // (at kind's scale now)
+    uint32_t a, b;
+    if (!kt_get(&g_grow, t, &a, &b)) return false;
+    *hw = (uint32_t)ceilf(u2f(a) * kind_sx(kind) - 1e-3f);
+    *hh = (uint32_t)ceilf(u2f(b) * kind_sy(kind) - 1e-3f);
+    return true;
 }
 bool renderer_texture_grow(NvnTexture *t, uint32_t hw, uint32_t hh) {
     static int off = -1;
@@ -523,19 +622,11 @@ bool renderer_texture_grow(NvnTexture *t, uint32_t hw, uint32_t hh) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     if (off || !b || !b->scalable || !b->image || b->samples > 1 || b->blk || b->pending_rgba || t->target != 1) return false;
     if (b->width >= hw && b->height >= hh) return false;
-    uint32_t ow, oh;
-    if (!tex_grown(t, &ow, &oh)) {
-        if (g_ngrow >= GROW_MAX) return false;
-        g_grow[g_ngrow].addr = t->addr; g_grow[g_ngrow].w = t->width; g_grow[g_ngrow].h = t->height; g_grow[g_ngrow].fmt = t->format;
-        g_grow[g_ngrow].hw = hw; g_grow[g_ngrow].hh = hh;
-        __atomic_store_n(&g_ngrow, g_ngrow + 1, __ATOMIC_RELEASE);
-    } else {   // (a larger level seen later: the table keeps the largest)
-        for (int i = 0; i < g_ngrow; i++)
-            if (g_grow[i].addr == t->addr && g_grow[i].w == t->width && g_grow[i].h == t->height && g_grow[i].fmt == t->format) {
-                if (hw > g_grow[i].hw) g_grow[i].hw = hw;
-                if (hh > g_grow[i].hh) g_grow[i].hh = hh;
-            }
-    }
+    const float rsx = kind_sx(b->scale_kind), rsy = kind_sy(b->scale_kind);   // (the scale this host extent is at)
+    const float nw = rsx > 0 ? (float)hw / rsx : (float)hw, nh = rsy > 0 ? (float)hh / rsy : (float)hh;
+    uint32_t ga, gb;
+    if (!kt_get(&g_grow, t, &ga, &gb)) kt_put(&g_grow, t, f2u(nw), f2u(nh));
+    else kt_put(&g_grow, t, f2u(nw > u2f(ga) ? nw : u2f(ga)), f2u(nh > u2f(gb) ? nh : u2f(gb)));   // (the largest, in guest units)
     const uint32_t bw = b->width, bh = b->height;
     extern uint32_t vk_view_gen;
     destroy_image(b);
@@ -592,7 +683,7 @@ static int tex_scale_kind(const NvnTexture *t) {
         if (nlog++ < 8) LOG("[tex] output canvas scale: addr %llx f%#x flags %#x\n", (unsigned long long)t->addr, t->format, t->flags);
         return 3;
     }
-    if (t->samples <= 1 && t->target == 1 && g_npromo) { const int pk = tex_promoted(t); if (pk) return pk; }
+    if (t->samples <= 1 && t->target == 1 && __atomic_load_n(&g_promo.n, __ATOMIC_RELAXED)) { const int pk = tex_promoted(t); if (pk) return pk; }
     if (t->samples > 1 || !(t->flags & 8)) return 0;
     if ((t->target == 1 || t->target == 4) && t->width == t->height && t->width >= 256 && renderer_format_is_depth(t->format) &&
         (shadow_scale() != 1.0f || shadow_rungs_at1()))
@@ -801,7 +892,7 @@ static void create_image_(NvnTexture *t, TexBackend *b) {
     if (b->scalable) {
         scaled_extent(t, b->scale_kind, &tw, &th);
         uint32_t gw, gh;   // (renderer_texture_grow: at least its colour level's extent)
-        if (g_ngrow && tex_grown(t, &gw, &gh)) { if (gw > tw) tw = gw; if (gh > th) th = gh; }
+        if (__atomic_load_n(&g_grow.n, __ATOMIC_RELAXED) && tex_grown(t, b->scale_kind, &gw, &gh)) { if (gw > tw) tw = gw; if (gh > th) th = gh; }
         if (rung_kind(t, b->scale_kind)) {   // (a shadow rung: the image's own ratio is its scale)
             b->sx = (float)tw / (float)(t->width ? t->width : 1);
             b->sy = (float)th / (float)(t->height ? t->height : 1);
@@ -903,21 +994,14 @@ static void create_image_(NvnTexture *t, TexBackend *b) {
                             .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-    extern _Thread_local int vma_shim_tag;
+    extern _Thread_local int vma_shim_tag, vma_shim_cold;
     vma_shim_tag = b->astc_bw ? 1 : 2;
-    VkResult r = vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL);
-    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY) {   // (oom_relief: free what is held for nothing, once, then the old fallback)
-        static int relief = -1;
-        if (relief < 0) { const char *e = getenv("LARECOMP_OOM_RELIEF"); relief = !(e && *e == '0'); }
-        if (relief) {
-            oom_relief();
-            r = vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL);
-            static int nlog;
-            if (nlog++ < 16)
-                LOG("[vk] image creation out of device memory (nvn fmt %#x %ux%ux%u target %u): after the relief %s\n", t->format,
-                    t->width, t->height, t->depth, t->target, r == VK_SUCCESS ? "made" : "still failed");
-        }
-    }
+    // (shim_vma.c residency priority: a sampled texture the CPU fills, not a render target nor a scaled one, is what WDDM
+    // may demote first when the card is short; P1.1)
+    vma_shim_cold = !(t->flags & 8) && !tex_scalable(t) && samples <= 1;
+    // (oom_relief: free what is held for nothing, once, then the old fallback)
+    VkResult r = vk_image_create_relieved(&ci, &ai, &b->image, &b->mem, "nvn fmt %#x %ux%ux%u target %u", t->format, t->width,
+                                           t->height, t->depth, t->target);
     if (r != VK_SUCCESS) {
         LOG("[vk] image creation failed (%d): nvn fmt %#x %ux%ux%u target %u\n", r, t->format, t->width, t->height, t->depth, t->target);
         ci.format = vf = VK_FORMAT_R8G8B8A8_UNORM;
@@ -928,6 +1012,7 @@ static void create_image_(NvnTexture *t, TexBackend *b) {
         depthfmt = false;
     }
     vma_shim_tag = 0;
+    vma_shim_cold = 0;
     b->format = vf;
     b->astc_bc3 = b->astc_bw && (vf == VK_FORMAT_BC3_UNORM_BLOCK || vf == VK_FORMAT_BC3_SRGB_BLOCK);   // (not after the RGBA8 fallback)
     b->usage = ci.usage;
@@ -1033,7 +1118,8 @@ static TexBackend *twin_of(TexBackend *b) {
                             .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
                             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-    if (vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL) != VK_SUCCESS) { free(d); return NULL; }
+    if (vk_image_create_relieved(&ci, &ai, &d->image, &d->mem, "depth twin vk fmt %d %ux%u x%u", tf, b->width, b->height,
+                                  b->layers) != VK_SUCCESS) { free(d); return NULL; }
     d->format = tf; d->width = b->width; d->height = b->height; d->depth = 1; d->layers = b->layers; d->levels = b->levels;
     d->samples = 1; d->aspect = VK_IMAGE_ASPECT_DEPTH_BIT; d->base_type = b->base_type; d->usage = ci.usage; d->gpu_owned = true;
     vk_image_init_layout(vk_upload_cmd(), d->image, d->aspect);
@@ -1342,7 +1428,7 @@ static TexBackend *block_shadow(NvnTexture *t, TexBackend *b, VkFormat vf) {
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     extern _Thread_local int vma_shim_tag;
     vma_shim_tag = 3;
-    VkResult sr_ = vmaCreateImage(g_vk.vma, &ci, &ai, &s->image, &s->mem, NULL);
+    VkResult sr_ = vk_image_create_relieved(&ci, &ai, &s->image, &s->mem, "block shadow vk fmt %d %ux%ux%u", vf, w, h, d);
     vma_shim_tag = 0;
     if (sr_ != VK_SUCCESS) {
         LOG("[vk] block shadow creation failed: %ux%ux%u vk fmt %d\n", w, h, d, vf);
@@ -1395,6 +1481,13 @@ VkDeviceSize vma_shim_size(VmaAllocation al);
 static pthread_mutex_t g_recycle_lock = PTHREAD_MUTEX_INITIALIZER;
 uint64_t prof_img_reused, prof_img_same_addr;
 uint64_t cum_img_reused, cum_img_unpooled;   // (never reset: device.c's "[vram] images" line, player logs included)
+uint64_t shadow_miss[7];   // (recycle_get: shadow maps that took no pooled image, by why; never reset, device.c's "[vram] images" line)
+uint64_t shadow_open_picks, shadow_fresh_cleared;   // (recycle_get: rungs taken from the open submission / at a new size, zeroed)
+static bool shadow_open_pick_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_SHADOW_OPEN_PICK"); on = !(e && *e == '0'); }
+    return on;
+}
 static int recycle_off(void) {
     static int off = -1;
     if (off < 0) off = getenv("LARECOMP_VK_NO_RECYCLE") != NULL;
@@ -1417,22 +1510,78 @@ static int recycle_cap_fixed(void) {   // 1: LARECOMP_VK_RECYCLE_MB set (g_recyc
     return f;
 }
 static uint64_t recycle_cap(void) { recycle_cap_fixed(); return g_recycle_cap; }
+// The hot transients (LEAD 08:20 P0, v0.1.9 gate 32:9 at TOTK_RES_SCALE=1.6: 8192x2304 targets of 75-150 MB each, ours
+// + 6.5 GB of other processes past the 16 GB card): short of VRAM the cap fell to 512 MB and the pool to 0-177 MB, so the
+// targets TotK finalizes and makes again every frame were freed at each put and made again at each get (349 / 847 image
+// creations per [vram] line against 33 at 16:9; 19 / 42 fps): those frees saved nothing. The bytes taken back from the
+// pool each frame that had been pooled under 2 s, and the bytes the cap evicted that had been pooled under 2 s (the two
+// make the frame's transient set: a pool smaller than the set hits ~never), are kept for 2 s; the cap never goes under
+// 5/4 of their largest frame (at most half the budget's top), short or not, so the pool holds one frame's transients and
+// the shortage falls on idle textures and mirrors. LARECOMP_POOL_HOT=0: no floor (old).
+static uint64_t hot_frame, hot_bytes, hot_ring_b[64], hot_ring_t[64];
+static int hot_ring_n;
+static uint64_t hot_floor(void) {   // (render thread) 5/4 of the largest frame's transients in the last 2 s; 0 = off
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_POOL_HOT"); on = !(e && *e == '0'); }
+    if (!on) return 0;
+    const uint64_t now = SDL_GetTicksNS();
+    uint64_t m = 0;
+    for (int i = 0; i < hot_ring_n; i++) if (now - hot_ring_t[i] <= 2000000000ull && hot_ring_b[i] > m) m = hot_ring_b[i];
+    return m / 4 * 5;
+}
+static void hot_note(uint64_t bytes, uint64_t put_ns) {   // (recycle_get: an image taken back; recycle_put: one the cap evicted)
+    const uint64_t f = vk_frame_counter(), now = SDL_GetTicksNS();
+    if (f != hot_frame) {   // (the frame before ended: its sum into the ring, oldest out)
+        if (hot_bytes) {
+            if (hot_ring_n == 64) { memmove(hot_ring_b, hot_ring_b + 1, 63 * 8); memmove(hot_ring_t, hot_ring_t + 1, 63 * 8); hot_ring_n--; }
+            hot_ring_b[hot_ring_n] = hot_bytes; hot_ring_t[hot_ring_n++] = now;
+        }
+        hot_frame = f;
+        hot_bytes = 0;
+    }
+    if (now - put_ns < 2000000000ull) hot_bytes += bytes;
+}
+static bool pool_rung(const Recycled *r);
+static uint64_t shadow_pool_keep_mb(void);
 static void recycle_cap_update(uint64_t usage, uint64_t budget, uint64_t headroom, bool short_) {
     if (recycle_cap_fixed()) return;
     static uint64_t cmax;
     if (!cmax) { const char *e = getenv("LARECOMP_VK_RECYCLE_MAX_MB"); cmax = (uint64_t)(e ? atol(e) : 3072) << 20; if (cmax < (512ull << 20)) cmax = 512ull << 20; }
-    uint64_t pool = g_recycle_bytes;
+    uint64_t pool = g_recycle_bytes, rungs = 0;
     pthread_mutex_lock(&g_recycle_lock);   // (pooled parked images are system memory: not part of the driver's VRAM usage)
-    for (int i = 0; i < g_nrecycle; i++) if (g_recycle[i].b->parked) pool -= vma_shim_size(g_recycle[i].b->mem);
+    for (int i = 0; i < g_nrecycle; i++) {
+        if (g_recycle[i].b->parked) pool -= vma_shim_size(g_recycle[i].b->mem);
+        else if (pool_rung(&g_recycle[i])) rungs += vma_shim_size(g_recycle[i].b->mem);   // (the shadow maps' rungs, below)
+    }
     pthread_mutex_unlock(&g_recycle_lock);
     uint64_t rest = usage > pool ? usage - pool : 0, top = budget > 2 * headroom ? budget - 2 * headroom : 0;
     uint64_t c = !short_ && top > rest ? (top - rest) / 4 * 3 : 0;
     g_recycle_cap = c < (512ull << 20) ? 512ull << 20 : c > cmax ? cmax : c;
+    uint64_t hf = hot_floor();
+    if (hf > top / 2) hf = top / 2;   // (at most half the budget's top: a load's burst cannot pin the pool while short; 344-c)
+    // (plus the pooled shadow-map rungs the keep holds, up to LARECOMP_SHADOW_POOL_KEEP_MB: they sit inside the same cap,
+    // so without them the transients got cap - rungs, less than their set, and thrashed again)
+    const uint64_t keep_raw = shadow_pool_keep_mb();
+    if (hf) hf += rungs < keep_raw ? rungs : keep_raw;   // (only with pool-hot's floor on: LARECOMP_POOL_HOT=0 = the old cap; 359-c)
+    const bool floored = hf > g_recycle_cap;
+    if (floored) g_recycle_cap = hf;   // (never under one frame's transients: hot_floor)
+    if (floored && short_) {   // (amd-compat: say it loudly when the floor holds memory the budget wanted; once per 10 s)
+        static uint64_t said_ns;
+        const uint64_t now = SDL_GetTicksNS();
+        if (!said_ns || now - said_ns >= 10000000000ull) {
+            said_ns = now;
+            LOG("[vram] short of VRAM: one frame's transient targets (and the kept shadow-map rungs) need %llu MB of pool and the budget leaves %llu MB for it "
+                "(usage %llu of %llu MB): the pool keeps them (no re-creation thrash), the rest is over budget; a lower "
+                "graphics.render_scale or aspect ratio fits\n", (unsigned long long)(hf >> 20), (unsigned long long)(c >> 20),
+                (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20));
+        }
+    }
     static uint64_t logged;
     static int nlog;
     if ((g_recycle_cap > logged + (256ull << 20) || g_recycle_cap + (256ull << 20) < logged) && (nlog++ < 50 || nlog % 100 == 0)) {
-        LOG("[vram] recycle pool cap %llu MB (pool %llu MB, usage %llu of budget %llu MB%s)\n", (unsigned long long)(g_recycle_cap >> 20),
-            (unsigned long long)(pool >> 20), (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20), short_ ? ", short" : "");
+        LOG("[vram] recycle pool cap %llu MB (pool %llu MB, usage %llu of budget %llu MB%s%s)\n", (unsigned long long)(g_recycle_cap >> 20),
+            (unsigned long long)(pool >> 20), (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20), short_ ? ", short" : "",
+            floored ? ", held at 5/4 of a frame's transients (LARECOMP_POOL_HOT) + the kept shadow-map rungs" : "");
         logged = g_recycle_cap;
     }
 }
@@ -1441,6 +1590,29 @@ static uint64_t recycle_keep_ns(void) {
     static int64_t k = -1;
     if (k < 0) { const char *e = getenv("LARECOMP_VK_RECYCLE_KEEP_MS"); k = (int64_t)(e ? atol(e) : 1000) * 1000000; }
     return (uint64_t)k;
+}
+// Bow aim: while the aim zooms, the game sizes the sun's shadow map with the view, a new rung image at each step (3584^2 /
+// 4096^2 x4 at shadow scale x4: 98 / 128 MB, 8-80 ms each under VRAM contention); the first aim made ~29 such images in 12 s
+// (+3.1 GB GPU-written, over the OS budget, 145 -> 50-97 fps) because the byte cap, short of VRAM, evicted each pooled map
+// oldest-first as any other image (its 4096 map of frame 9109 was made again at the aim, 27k frames later). Pooled shadow
+// maps' rung images now stay through the byte cap and the residency rounds while together they hold at most
+// LARECOMP_SHADOW_POOL_KEEP_MB (default 384: the four rungs a x4 aim steps through, 50 + 72 + 98 + 128 MB; 0 = the old
+// rule). Out of device memory (oom_relief) still frees them. (at most half the pool's cap: 256 MB of the short 512; within
+// it the most recently pooled rungs stay, the oldest go first)
+static uint64_t shadow_pool_keep_mb(void) {   // (the setting, bytes)
+    static int64_t k = -1;
+    if (k < 0) { const char *e = getenv("LARECOMP_SHADOW_POOL_KEEP_MB"); k = (int64_t)(e ? atol(e) : 384) << 20; }
+    return (uint64_t)k;
+}
+static uint64_t shadow_pool_keep(void) {
+    const uint64_t k = shadow_pool_keep_mb(), cap = recycle_cap();
+    return cap && k > cap / 2 ? cap / 2 : k;
+}
+static bool pool_rung(const Recycled *r) { return r->scalable && r->b->scale_kind == 2 && shadow_rungs() && r->levels <= 1; }
+static uint64_t pool_rung_bytes(void) {   // (under g_recycle_lock)
+    uint64_t n = 0;
+    for (int i = 0; i < g_nrecycle; i++) if (pool_rung(&g_recycle[i])) n += vma_shim_size(g_recycle[i].b->mem);
+    return n;
 }
 static bool recycle_put(NvnTexture *t, TexBackend *b) {
     if (recycle_off() || !b->image || b->pending_rgba) return false;
@@ -1479,27 +1651,47 @@ static bool recycle_put(NvnTexture *t, TexBackend *b) {
     // LARECOMP_VK_RECYCLE_MB=<n>: a fixed cap (0 = none; 512 = the old default).
     const uint64_t cap = recycle_cap();
     TexBackend *evict[8];
+    uint64_t ev_put[8];
     int nev = 0;
     pthread_mutex_lock(&g_recycle_lock);
     g_recycle_bytes += vma_shim_size(b->mem);
+    const uint64_t keep = shadow_pool_keep();
+    uint64_t rung_bytes = keep && cap && g_recycle_bytes > (uint64_t)cap ? pool_rung_bytes() : 0, kept = 0;
     while (g_nrecycle && nev < 8 && (g_nrecycle == RECYCLE_MAX || (cap && g_recycle_bytes > (uint64_t)cap))) {
-        evict[nev] = g_recycle[0].b;
-        memmove(g_recycle, g_recycle + 1, (size_t)(g_nrecycle - 1) * sizeof *g_recycle);
+        int v = 0;   // (the oldest, past the shadow maps' kept rungs: shadow_pool_keep; a full table takes the oldest)
+        if (g_nrecycle < RECYCLE_MAX)
+            while (v < g_nrecycle && rung_bytes && rung_bytes <= keep && pool_rung(&g_recycle[v])) v++;
+        if (v) kept = rung_bytes;
+        if (v == g_nrecycle) break;   // (only kept rungs left)
+        const uint64_t sz = vma_shim_size(g_recycle[v].b->mem);
+        if (pool_rung(&g_recycle[v])) rung_bytes = rung_bytes > sz ? rung_bytes - sz : 0;
+        ev_put[nev] = g_recycle[v].put_ns;
+        evict[nev++] = g_recycle[v].b;
+        memmove(&g_recycle[v], &g_recycle[v + 1], (size_t)(g_nrecycle - 1 - v) * sizeof *g_recycle);
         g_nrecycle--;
-        g_recycle_bytes -= vma_shim_size(evict[nev++]->mem);
+        g_recycle_bytes -= sz;
     }
     g_recycle[g_nrecycle++] = (Recycled){b, t->format, t->target, t->width, t->height, t->depth, t->levels, t->samples, b->scalable, b->nsx, b->nsy,
                                          vk_pending_seq(), t->addr, b->gpu_owned, SDL_GetTicksNS()};
     pthread_mutex_unlock(&g_recycle_lock);
-    for (int i = 0; i < nev; i++) free_backend(evict[i]);
+    if (kept) {   // (the gate's bow-aim check: 1st, 2nd, 4th, 8th ... time)
+        static uint64_t nkept;
+        const uint64_t n = ++nkept;
+        if (!(n & (n - 1)))
+            LOG("[vram] recycle pool over its cap %llu MB: %.0f MB of shadow-map rungs kept (LARECOMP_SHADOW_POOL_KEEP_MB; %llu times so far)\n",
+                (unsigned long long)(cap >> 20), kept / 1048576.0, (unsigned long long)n);
+    }
+    // (a young eviction, pooled under 2 s, is a transient freed for nothing: with the set over the cap, oldest-first
+    // eviction and TotK's same order every frame make the pool a FIFO that hits ~never, so the set is hits + these)
+    for (int i = 0; i < nev; i++) { hot_note(vma_shim_size(evict[i]->mem), ev_put[i]); free_backend(evict[i]); }
     return true;
 }
 static bool g_recycle_same;   // (debug log: the last recycle_get kept the same storage's image)
 static bool recycle_shape(const Recycled *r, const NvnTexture *t, bool sc) {
     uint32_t gw, gh;   // (a grown depth, renderer_texture_grow: never handed an image of the size before it grew; the
                        // game re-creates the object every frame and the pool kept giving it the short one)
-    if (sc && g_ngrow && tex_grown(t, &gw, &gh) && (r->b->width < gw || r->b->height < gh)) return false;
     const int k = sc ? tex_scale_kind(t) : 0;
+    if (sc && __atomic_load_n(&g_grow.n, __ATOMIC_RELAXED) && tex_grown(t, k, &gw, &gh) && (r->b->width < gw || r->b->height < gh)) return false;
     if (r->format != t->format || r->target != t->target || r->d != t->depth || r->levels != t->levels || r->samples != t->samples ||
         r->scalable != sc || (sc && (r->sx != kind_sx(k) || r->sy != kind_sy(k))))
         return false;
@@ -1529,15 +1721,20 @@ static TexBackend *recycle_get(NvnTexture *t) {
     TexBackend *b = NULL;
     bool same = false, owned = false;
     uint64_t cur = vk_pending_seq();
+    // (a shadow rung taken as a fresh texture is zeroed when taken, on the main command buffer outside a pass, below: while
+    // a pass is being recorded no such pick, the texture gets a new image as before)
+    const bool rung_t = sc && rung_kind(t, tex_scale_kind(t)), can_clear = !vk_pass_open();
     pthread_mutex_lock(&g_recycle_lock);
     int pick = -1;
     if (!any && t->addr)
         for (int i = g_nrecycle - 1; i >= 0; i--) {
             Recycled *r = &g_recycle[i];
             if (r->addr == t->addr && recycle_shape(r, t, sc) && (r->gpu_owned || r->seq < cur)) {
-                // (a shadow rung at a new guest size is a fresh texture on the same image: zeroed at its first write as
-                // a new one, never the old size's depth at the old ratio)
-                pick = i; same = r->w == t->width && r->h == t->height; owned = r->gpu_owned;
+                // (a shadow rung at a new guest size is a fresh texture on the same image: zeroed when taken, never the
+                // old size's depth at the old ratio, LEAD 07:52)
+                const bool sz = r->w == t->width && r->h == t->height;
+                if (rung_t && !sz && !can_clear) continue;
+                pick = i; same = sz; owned = r->gpu_owned;
                 break;
             }
         }
@@ -1547,20 +1744,52 @@ static TexBackend *recycle_get(NvnTexture *t) {
             Recycled *r = &g_recycle[i];
             if (!recycle_shape(r, t, sc) ||
                 r->seq >= cur ||   // finalized in the open submission: its last uses may still be recorded after our uploads run
-                r->b->parked)      // (in system memory: only its own storage takes it back, for its contents; residency park)
+                r->b->parked ||    // (in system memory: only its own storage takes it back, for its contents; residency park)
+                (rung_t && !can_clear && (r->b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)))   // (zeroed when taken: not in a pass)
                 continue;
             pick = i;
             break;
         }
     }
+    // A shadow rung finalized in the open submission (gate g19_see_kak_169: the game finalizes the sun shadow map and makes
+    // its next size in the same frame, so the rule above refused the rung's own image and a 72 MB image was made again,
+    // 10-16 ms, then ~50 GPU-slow frames). Taken only when it is a depth image the GPU rendered (a render target: nothing
+    // uploads guest texels into it), and given fresh state below: its pass ended, then on this submission's main command
+    // buffer (where those uses are recorded) a barrier from UNDEFINED (contents discarded) and a clear to zero, then a full
+    // barrier; so it never shows the old depth (LEAD rule: a reused depth image never exposes old contents) and nothing
+    // writes it before those uses ran. LARECOMP_SHADOW_OPEN_PICK=0: refused.
+    bool open_pick = false;
+    if (pick < 0 && !any && rung_t && can_clear && shadow_open_pick_on())
+        for (int i = 0; i < g_nrecycle; i++) {
+            const Recycled *r = &g_recycle[i];
+            if (r->seq >= cur && r->gpu_owned && !r->b->parked && (r->b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+                r->b->scale_kind == 2 && recycle_shape(r, t, sc)) { pick = i; open_pick = true; break; }
+        }
+    if (pick < 0 && rung_t) {   // (why a shadow map found no image: device.c's "[vram] images" line)
+        // 0 its rung finalized in the open submission, same address; 1 the same, another address; 2 parked; 3 only other
+        // rungs of its format / layers; 4 none; 5 a pass was being recorded (in place of 0 / 1 / 6); 6 its rung matched,
+        // unparked, from an earlier submission, yet not taken
+        bool f[7] = {0};
+        for (int i = 0; i < g_nrecycle; i++) {
+            const Recycled *r = &g_recycle[i];
+            if (r->b->scale_kind != 2 || r->format != t->format || r->d != t->depth) continue;
+            f[!recycle_shape(r, t, sc) ? 3 : r->b->parked ? 2 : r->seq >= cur ? (r->addr == t->addr ? 0 : 1) : 6] = true;
+        }
+        int why = f[0] ? 0 : f[1] ? 1 : f[6] ? 6 : f[2] ? 2 : f[3] ? 3 : 4;
+        if (!can_clear && (why <= 1 || why == 6)) why = 5;
+        shadow_miss[why]++;
+    }
+    uint64_t pick_put_ns = 0;
     if (pick >= 0) {
         b = g_recycle[pick].b;
+        pick_put_ns = g_recycle[pick].put_ns;
         g_recycle_bytes -= vma_shim_size(b->mem);
         memmove(&g_recycle[pick], &g_recycle[pick + 1], (size_t)(g_nrecycle - 1 - pick) * sizeof *g_recycle);
         g_nrecycle--;
     }
     pthread_mutex_unlock(&g_recycle_lock);
     if (!b) return NULL;
+    hot_note(vma_shim_size(b->mem), pick_put_ns);   // (the frame's transient set: recycle_cap_update's floor)
     prof_img_reused++;
     cum_img_reused++;
     if (same) {   // same memory: keep contents and state (only the live-list slot is new)
@@ -1581,6 +1810,32 @@ static TexBackend *recycle_get(NvnTexture *t) {
     vk_full_barrier(vk_upload_cmd());
     // depth / stencil start zeroed as new images do (create_image_): cleared by the first pass that renders to it
     b->zero_on_write = (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || (b->aspect == VK_IMAGE_ASPECT_STENCIL_BIT && b->format != VK_FORMAT_S8_UINT);
+    if (b->scalable && rung_kind(t, b->scale_kind) && (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) {
+        // (a shadow rung taken as a fresh texture: from the open submission (open_pick) or at a new guest size. Zeroed
+        // now, not at its first write, so no read before that write sees the old map, outside a pass: from UNDEFINED,
+        // then the clear, then a full barrier. The GPU owns it from here: no guest upload, which the upload buffer
+        // would run before those uses.)
+        vk_end_pass();
+        VkCommandBuffer cb = vk_cmd();
+        const VkImageSubresourceRange rg = {b->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                    .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                    .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                    .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                    .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .image = b->image,
+                                    .subresourceRange = rg, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
+        vkCmdPipelineBarrier2(cb, &di);
+        const VkClearDepthStencilValue zero = {0.0f, 0};
+        vkCmdClearDepthStencilImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
+        vk_full_barrier(cb);
+        b->gpu_owned = true;
+        b->zero_on_write = false;
+        if (open_pick) shadow_open_picks++;
+        else shadow_fresh_cleared++;
+    }
     rung_ratio(t, b);
     return b;
 }
@@ -1620,6 +1875,39 @@ static uint64_t oom_relief(void) {
             "spares (LARECOMP_OOM_RELIEF)\n", n, pool / 1048576.0, held - ndead);
     return pool;
 }
+// vmaCreateImage, and on VK_ERROR_OUT_OF_DEVICE_MEMORY once oom_relief and a second try (LARECOMP_OOM_RELIEF=0: no
+// relief). The image sites on the render thread use it: here the game's images (create_image_, then its RGBA8 fallback),
+// the depth and slice twins (a failure there drops the twin: the colour view is used), the block shadows (a failure leaves
+// the BC target undrawn) and the 1x1 dummies; exec.c's snapshots, copy sources, post images and SMAA LUTs, latch.c's
+// late-latch warp image and ngx.c's DLSS / FG images (fatal as before, after the relief). All on the render thread. `what`
+// (printf) names the image, formatted only then. LARECOMP_OOM_INJECT=<n> (test, the idea): the n-th call (from 1) fails
+// once as out of device memory before any creation, so one boot on any card runs the relief and the retry (a real out of
+// device memory needs a small card).
+VkResult vk_image_create_relieved(const VkImageCreateInfo *ci, const VmaAllocationCreateInfo *ai, VkImage *img, VmaAllocation *mem,
+                                  const char *what, ...) {
+    static long inject = -1;
+    static _Atomic long calls;
+    if (inject < 0) { const char *e = getenv("LARECOMP_OOM_INJECT"); inject = e ? atol(e) : 0; }
+    const bool injected = inject > 0 && atomic_fetch_add(&calls, 1) + 1 == inject;
+    VkResult r = injected ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vmaCreateImage(g_vk.vma, ci, ai, img, mem, NULL);
+    if (r != VK_ERROR_OUT_OF_DEVICE_MEMORY) return r;
+    static int relief = -1;
+    if (relief < 0) { const char *e = getenv("LARECOMP_OOM_RELIEF"); relief = !(e && *e == '0'); }
+    if (!relief) return r;
+    oom_relief();
+    r = vmaCreateImage(g_vk.vma, ci, ai, img, mem, NULL);
+    static int nlog;
+    if (nlog++ < 16) {
+        char name[160];
+        va_list ap;
+        va_start(ap, what);
+        vsnprintf(name, sizeof name, what, ap);
+        va_end(ap);
+        LOG("[vk] image creation out of device memory (%s%s): after the relief %s\n", name, injected ? "; LARECOMP_OOM_INJECT" : "",
+            r == VK_SUCCESS ? "made" : "still failed");
+    }
+    return r;
+}
 static void recycle_flush(void) {
     pthread_mutex_lock(&g_recycle_lock);
     int n = g_nrecycle;
@@ -1636,33 +1924,13 @@ static void recycle_flush(void) {
 // carry (multisampled, block-compressed shadows, depth / colour alternates, 3D, formats without blit support) start
 // blank, as every remake did before. LARECOMP_RESCALE_CARRY=0: never carried.
 static void rescale_image(NvnTexture *t, TexBackend *b) {
-    static int carry_on = -1;
-    if (carry_on < 0) { const char *e = getenv("LARECOMP_RESCALE_CARRY"); carry_on = !e || *e != '0'; }
-    const VkFormat of = b->format;
-    const VkImageAspectFlags oa = b->aspect;
-    const VkImage oi = b->image;
-    const uint32_t ow = b->width, oh = b->height, ol = b->levels, oly = b->layers;
-    const bool carry = carry_on && oi && b->samples <= 1 && !b->blk && !b->alt.image && b->depth <= 1 &&
-                       format_supports(of, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT);
+    const Carry c = carry_take(b);
     destroy_image(b);   // (the old image is freed after this submission, which holds the copy: defer)
     create_image(t, b);
-    if (!carry || !b->image || b->format != of || b->aspect != oa || b->samples > 1) return;
-    const bool depth = (oa & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
-    const bool linear = !depth && format_supports(of, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
-                        (ow != b->width || oh != b->height);
-    const uint32_t nl = ol < b->levels ? ol : b->levels, nly = oly < b->layers ? oly : b->layers;
-    VkImageBlit bl[16];
-    uint32_t n = 0;
-    for (uint32_t lv = 0; lv < nl && n < 16; lv++) {
-        const int32_t sw = (int32_t)(ow >> lv ? ow >> lv : 1), sh = (int32_t)(oh >> lv ? oh >> lv : 1);
-        bl[n++] = (VkImageBlit){.srcSubresource = {oa, lv, 0, nly}, .srcOffsets = {{0, 0, 0}, {sw, sh, 1}},
-                                .dstSubresource = {oa, lv, 0, nly},
-                                .dstOffsets = {{0, 0, 0}, {(int32_t)level_w(b, lv), (int32_t)level_h(b, lv), 1}}};
-    }
-    VkCommandBuffer cb = vk_upload_cmd();
-    vk_full_barrier(cb);   // (the old image's last writes, earlier submissions; the new image's start-up clear)
-    vkCmdBlitImage(cb, oi, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, n, bl, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-    vk_full_barrier(cb);
+    bool linear = false;
+    if (!carry_blit(vk_upload_cmd(), &c, b, &linear)) return;
+    const uint32_t ow = c.w, oh = c.h;
+    const VkFormat of = c.fmt;
     static int nlog;
     if (nlog++ < 16)
         LOG("[tex] remade %ux%u -> %ux%u f%#x, contents carried (%s)\n", ow, oh, b->width, b->height, (unsigned)of, linear ? "filtered" : "nearest");
@@ -2165,6 +2433,10 @@ static uint64_t park_hot(NvnTexture **hot, int cap, int *nhot) {
     *nhot = k;
     return bytes;
 }
+// (res_real_budget, Windows: ours demoted in the last 10 s or the room the other processes leave being fitted; residency's
+// block shedding, step 2b, runs only then)
+static bool res_demoting;
+static uint64_t res_shed_blocks, res_shed_bytes;
 #ifdef _WIN32
 // The OS budget follows window focus, not the memory (vram-fit 2026-11-02: 15.2 GB while the game window is active, 11.5
 // then 8.6 GB a few lines after each "window inactive", back on activation, so the game runs on the background budget).
@@ -2204,6 +2476,18 @@ static uint64_t res_real_budget(uint64_t budget, uint64_t usage) {
     // (ours in system memory now for lack of room; a cumulative count would only keep the OS budget: the old behaviour).
     // Held 10 s: evictions bring the demoted bytes down at once, and the next reading would flip back
     const uint64_t now = SDL_GetTicksNS();
+    {   // (ours still demoted while the room would hold it all again: the blocks' priorities asked anew, at most every 2 s;
+        // shim_vma.c vma_shim_reassert, P1.1: the video memory manager otherwise brings them back only lazily)
+        static uint64_t reassert_ns;
+        if (g_vk.pageable && demoted > (64ull << 20) && room > ours_res + demoted && now - reassert_ns > 2000000000ull) {
+            extern uint32_t vma_shim_reassert(VmaAllocator a);
+            reassert_ns = now;
+            const uint32_t nb = vma_shim_reassert(g_vk.vma);
+            static int nlog;
+            if (nlog++ < 20) LOG("[vram] %llu MB of ours demoted with room for it back: %u blocks' residency priority asked again\n",
+                                 (unsigned long long)(demoted >> 20), nb);
+        }
+    }
     if (demoted > (64ull << 20)) contended_ns = now;
     const bool contended = contended_ns && now - contended_ns < 10000000000ull;
     uint64_t eff = !contended && room > budget ? room : budget;
@@ -2217,6 +2501,7 @@ static uint64_t res_real_budget(uint64_t budget, uint64_t usage) {
     static VramFit fit;
     if (fit_on < 0) { const char *e = getenv("LARECOMP_VRAM_FIT_ROOM"); fit_on = !(e && *e == '0'); }
     if (fit_on) eff = vram_fit_step(&fit, room, demoted > (64ull << 20), budget, eff, now);
+    res_demoting = contended || fit.room;
     if (eff > logged_eff + (256ull << 20) || eff + (256ull << 20) < logged_eff) {
         static int nlog;
         if (nlog++ < 100)
@@ -2340,11 +2625,22 @@ void vk_residency_tick(void) {
         while (na < g_nrecycle && now - g_recycle[na].put_ns >= keep_ns) pal[na] = g_recycle[na].b->mem, ptake[na] = false, na++;
         if (na && freed < need) {
             if (!evict_all) vma_shim_free_gain(g_vk.vma, pal, na, pgrp, pgain);
+            const uint64_t keep = shadow_pool_keep();   // (the shadow maps' kept rungs stay: shadow_pool_keep)
+            uint64_t rung_bytes = keep ? pool_rung_bytes() : 0;
             for (int i = 0; i < na && freed < need && pfreed < (256ull << 20); i++) {
                 if (ptake[i] || !(evict_all || pgrp[i] || pgain[i])) continue;
+                if (rung_bytes && rung_bytes <= keep) {  // (a kept rung, or a free_gain group holding one, stays whole)
+                    bool held = pool_rung(&g_recycle[i]);
+                    for (int j = i + 1; !held && !evict_all && pgrp[i] && j < na; j++) held = pgrp[j] == pgrp[i] && pool_rung(&g_recycle[j]);
+                    if (held) continue;
+                }
                 for (int j = i; j < na; j++) {
                     if (j != i && (evict_all || !pgrp[i] || pgrp[j] != pgrp[i])) continue;   // (a group: all its images)
                     TexBackend *b = g_recycle[j].b;
+                    if (pool_rung(&g_recycle[j])) {
+                        const uint64_t sz = vma_shim_size(b->mem);
+                        rung_bytes = rung_bytes > sz ? rung_bytes - sz : 0;
+                    }
                     ptake[j] = true;
                     if (!b->parked) freed += evict_all ? vma_shim_size(b->mem) : pgain[j];   // (a parked one: system memory)
                     pfreed += vma_shim_size(b->mem);
@@ -2429,6 +2725,111 @@ void vk_residency_tick(void) {
             b->checked_frame = b->full_frame = b->full_seq = 0; b->gpuw_skips = 0;
         }
         res_evicted_n += nev; res_evicted_bytes += evb;
+    }
+    // 2b. Block shedding (v0.1.9.1 P1.1 with ram-diet): while another process's VRAM gets ours demoted, idle textures
+    // that share 32 MB blocks with live ones gave nothing back (3222 idle left: their blocks hold live ones', 1.15 GB
+    // idle, 31-37 fps for 16 s at GPU waits of 1.3 s / 2 s). Once a round, the small block whose textures are ALL
+    // re-uploadable from guest memory (res_evictable: CPU-sourced, no GPU write since their hash) and at least half idle
+    // goes whole: its live textures too, which come back from guest memory at their next use (at most 32 MB a round, half
+    // of it at most live), so the block itself returns to the driver. LARECOMP_VRAM_SHED=0: off.
+    static int shed_on = -1;
+    if (shed_on < 0) { const char *e = getenv("LARECOMP_VRAM_SHED"); shed_on = !(e && *e == '0'); }
+    if (shed_on && freed < need && vneed && res_demoting && idle != ~0ull && !evict_all) {
+        int ns = 0;
+        for (int i = 0; i < g_nlive; i++) {
+            NvnTexture *t = g_live[i];
+            TexBackend *b = t->backend;
+            if (!b || b->evicted || !res_evictable(t, b)) continue;
+            if (ns == cap_cand) { cap_cand = cap_cand ? cap_cand * 2 : 1024; cand = realloc(cand, cap_cand * sizeof *cand); }
+            cand[ns++] = t;
+        }
+        // (and the pooled images pooled for keep_ns or more, never the hot transients of the last second: a block of
+        // idle textures and old pooled images goes whole too; public #77, 8 GB, 425 MB pooled with usage over budget and
+        // 'freed 0 pooled images', their blocks holding textures. Entries ns .. ns + np - 1, idle by definition.)
+        static TexBackend *pool_b[RECYCLE_MAX];
+        int np = 0;
+        pthread_mutex_lock(&g_recycle_lock);
+        for (int i = 0; i < g_nrecycle && np < RECYCLE_MAX; i++)
+            if (now - g_recycle[i].put_ns >= keep_ns && !g_recycle[i].b->parked && g_recycle[i].b->mem) pool_b[np++] = g_recycle[i].b;
+        pthread_mutex_unlock(&g_recycle_lock);
+        if (ns + np > cap_g) {
+            cap_g = ns + np > cap_cand ? ns + np : cap_cand;
+            cal = realloc(cal, cap_g * sizeof *cal); cgrp = realloc(cgrp, cap_g * sizeof *cgrp);
+            cgain = realloc(cgain, cap_g * sizeof *cgain); ev = realloc(ev, cap_g * sizeof *ev);
+        }
+        for (int i = 0; i < ns; i++) cal[i] = ((TexBackend *)cand[i]->backend)->mem;
+        for (int i = 0; i < np; i++) cal[ns + i] = pool_b[i]->mem;
+        const uint32_t ng = ns + np ? vma_shim_free_gain(g_vk.vma, cal, ns + np, cgrp, cgain) : 0;
+        static uint64_t *g_blk, *g_tot, *g_idle;
+        static uint32_t cap_ng;
+        if (ng > cap_ng) {
+            cap_ng = ng;
+            g_blk = realloc(g_blk, (ng + 1) * 8); g_tot = realloc(g_tot, (ng + 1) * 8); g_idle = realloc(g_idle, (ng + 1) * 8);
+        }
+        uint32_t best = 0;
+        if (ng) {
+            memset(g_blk, 0, (ng + 1) * 8); memset(g_tot, 0, (ng + 1) * 8); memset(g_idle, 0, (ng + 1) * 8);
+            for (int i = 0; i < ns + np; i++) {   // (groups are the blocks every live allocation of which is a candidate)
+                const uint32_t g = cgrp[i];
+                if (!g || g > ng) continue;
+                const TexBackend *b = i < ns ? cand[i]->backend : pool_b[i - ns];
+                const uint64_t sz = vma_shim_size(b->mem);
+                if (cgain[i]) g_blk[g] = cgain[i];   // (the block's size, on its first member)
+                g_tot[g] += sz;
+                if (i >= ns || fr - b->last_use >= idle) g_idle[g] += sz;
+            }
+            for (uint32_t g = 1; g <= ng; g++)
+                // (each frees its whole block: the one with the fewest live bytes re-uploads least at its next use, ASTC
+                // decodes included)
+                if (g_blk[g] && g_blk[g] <= (32ull << 20) && 2 * g_idle[g] >= g_tot[g] &&
+                    (!best || g_tot[g] - g_idle[g] < g_tot[best] - g_idle[best])) best = g;
+        }
+        if (best) {
+            int nsh = 0, npo = 0;
+            uint64_t shb = 0;
+            for (int i = 0; i < ns; i++) {
+                if (cgrp[i] != best) continue;
+                TexBackend *b = cand[i]->backend;
+                b->evicted = true;
+                shb += vma_shim_size(b->mem);
+                ev[nsh++] = i;
+            }
+            for (int i = 0; i < np; i++) {   // (its pooled images leave the pool: freed as any pooled image is)
+                if (cgrp[ns + i] != best) continue;
+                TexBackend *pb = pool_b[i];
+                bool out = false;
+                pthread_mutex_lock(&g_recycle_lock);
+                for (int k = 0; k < g_nrecycle; k++)
+                    if (g_recycle[k].b == pb) {
+                        g_recycle_bytes -= vma_shim_size(pb->mem);
+                        memmove(&g_recycle[k], &g_recycle[k + 1], (size_t)(g_nrecycle - 1 - k) * sizeof *g_recycle);
+                        g_nrecycle--;
+                        out = true;
+                        break;
+                    }
+                pthread_mutex_unlock(&g_recycle_lock);
+                if (out) { shb += vma_shim_size(pb->mem); free_backend(pb); npo++; }
+            }
+            views_forget_evicted();
+            for (int k = 0; k < nsh; k++) {
+                TexBackend *b = cand[ev[k]]->backend;
+                defer((Dead){.img = b->image, .mem = b->mem});
+                b->image = VK_NULL_HANDLE; b->mem = VK_NULL_HANDLE;
+                b->uploaded = false; b->data_hash = b->sample_hash = 0;
+                b->checked_frame = b->full_frame = b->full_seq = 0; b->gpuw_skips = 0;
+            }
+            freed += g_blk[best];
+            res_evicted_n += nsh; res_evicted_bytes += shb;
+            res_shed_blocks++; res_shed_bytes += g_blk[best];
+            static uint64_t said_ns;
+            if (!said_ns || now - said_ns >= 10000000000ull) {
+                said_ns = now;
+                LOG("[vram] block shed while ours is being demoted: %d textures and %d pooled images (%.1f MB, %.1f MB of them "
+                    "idle) of a %llu MB block back to the driver; %llu blocks / %llu MB so far (LARECOMP_VRAM_SHED)\n", nsh, npo, shb / 1048576.0,
+                    g_idle[best] / 1048576.0, (unsigned long long)(g_blk[best] >> 20), (unsigned long long)res_shed_blocks,
+                    (unsigned long long)(res_shed_bytes >> 20));
+            }
+        }
     }
     // 3. rendered images idle as long (vram-fit): moved to system memory, see park_move. Only for a VRAM shortage (system
     // memory is commit too: under the commit floor it would only move the problem, never below twice the floor, within
@@ -2686,7 +3087,7 @@ static bool ag_on(void) {
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                                                 .module = m, .pName = "main"},
                                       .layout = ag_layout};
-    VK_CHECK(vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &ag_pipe));
+    VK_CHECK(vk_engine_compute_pipeline("texture decode ag", &ci, &ag_pipe));
     vkDestroyShaderModule(g_vk.dev, m, NULL);
     VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * 256};
     VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 256, .poolSizeCount = 1, .pPoolSizes = &ps};
@@ -2770,7 +3171,7 @@ static bool bc_ready(void) {
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                                                 .module = m, .pName = "main"},
                                       .layout = bc_layout};
-    VK_CHECK(vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &bc_pipe));
+    VK_CHECK(vk_engine_compute_pipeline("texture decode bc", &ci, &bc_pipe));
     vkDestroyShaderModule(g_vk.dev, m, NULL);
     VkBufferCreateInfo sb = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = BC_OUT,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
@@ -3860,7 +4261,8 @@ static VkImageView slice_twin_view(NvnTexture *t, TexBackend *b, VkFormat fmt, V
                                 .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
                                 .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        if (vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL) != VK_SUCCESS) { free(d); return VK_NULL_HANDLE; }
+        if (vk_image_create_relieved(&ci, &ai, &d->image, &d->mem, "slice twin vk fmt %d %ux%u", b->format, b->width, b->height) !=
+            VK_SUCCESS) { free(d); return VK_NULL_HANDLE; }
         d->format = b->format; d->width = b->width; d->height = b->height; d->depth = 1; d->layers = 1; d->levels = 1;
         d->samples = 1; d->aspect = b->aspect; d->base_type = VK_IMAGE_VIEW_TYPE_2D; d->usage = ci.usage; d->cflags = ci.flags;
         d->gpu_owned = true;
@@ -4086,7 +4488,7 @@ VkImageView vk_dummy_depth_view(int textype) {
                             .arrayLayers = cube ? 6 : 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
                             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-    VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL));
+    VK_CHECK(vk_image_create_relieved(&ci, &ai, &b->image, &b->mem, "1x1 depth dummy"));
     VkCommandBuffer cb = vk_upload_cmd();
     vk_image_init_layout(cb, b->image, VK_IMAGE_ASPECT_DEPTH_BIT);
     VkClearDepthStencilValue zero = {0.0f, 0};
@@ -4116,7 +4518,7 @@ VkImageView vk_dummy_view(int textype) {
                             .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
                             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-    VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL));
+    VK_CHECK(vk_image_create_relieved(&ci, &ai, &b->image, &b->mem, "1x1 colour dummy"));
     VkCommandBuffer cb = vk_upload_cmd();
     vk_image_init_layout(cb, b->image, VK_IMAGE_ASPECT_COLOR_BIT);
     VkClearColorValue zero = {{0, 0, 0, 0}};

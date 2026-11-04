@@ -7,13 +7,13 @@
 // (TOTK_AUDIO_LIMITER=0 passes it dry). Struct layouts, AdpcmParameter u16[16], AdpcmContext 6 B, BiquadFilterParameter 0xC, PlayState
 // Play 0 / Stop 1 / Pause 2, SampleFormat PcmInt16 2 / PcmFloat 5 / Adpcm 6). Env: TOTK_AUDIO=null (no device, old pacing only),
 // TOTK_AUX=planar (default)|interleaved|bypass, TOTK_AUX_FADE=0 (an aux return's gaps step instead of fading, kAuxFade), TOTK_AUX_HOLES=0
-// (no zeros for a dropped send stretch: the return short, a late block later), TOTK_AUDIO_LOG=1 (calls), TOTK_AUDIO_LOG=graph (the mix
-// graph with per-mix peaks every 10 s, no call log), TOTK_VOLUME=<0..2> master gain. PC output: TOTK_AUDIO_CHANNELS=auto|2|6|8 (default
-// 2; the game is told 6 channels for 6 and 8 and fills its 5.1 sink), TOTK_AUDIO_LATENCY_MS (queued ahead of the device, default 20),
-// TOTK_AUDIO_FOLLOW (default 1: follow Windows default-device changes; 0 = off; a lost device is reopened either way),
-// TOTK_AUDIO_STALL_MS (default 1000: a device that takes no audio that long is reopened; 0 = off), TOTK_AUDIO_MUSIC / _SFX / _VOICE bus
-// gains over the sub mixes TOTK_AUDIO_BUSMAP names, TOTK_AUDIO_WAV capture (before the master gain). History. Both handled below (event
-// ticks per frame; empty loops produce silence).
+// (no zeros for a dropped send stretch: the return short, a late block later), TOTK_AUX_PIECES=0 (a return write takes the game's count,
+// not what its buffer was read with), TOTK_AUDIO_LOG=1 (calls), TOTK_AUDIO_LOG=graph (the mix graph with per-mix peaks every 10 s, no
+// call log), TOTK_VOLUME=<0..2> master gain. PC output: TOTK_AUDIO_CHANNELS=auto|2|6|8 (default 2; the game is told 6 channels for 6 and
+// 8 and fills its 5.1 sink), TOTK_AUDIO_LATENCY_MS (queued ahead of the device, default 20), TOTK_AUDIO_FOLLOW (default 1: follow Windows
+// default-device changes; 0 = off; a lost device is reopened either way), TOTK_AUDIO_STALL_MS (default 1000: a device that takes no audio
+// that long is reopened; 0 = off), TOTK_AUDIO_MUSIC / _SFX / _VOICE bus gains over the sub mixes TOTK_AUDIO_BUSMAP names, TOTK_AUDIO_WAV
+// capture (before the master gain). History. Both handled below (event ticks per frame; empty loops produce silence).
 #include "hle.h"
 #define NOMINMAX
 #include <windows.h>
@@ -176,6 +176,15 @@ u64 g_aux_quiet = 0;           // to 16 does not start every later aux 80 ms beh
 // Now the return gets as many zeros where the game's return reaches the dropped stretch (WriteAuxReturnBuffer), played
 // as a gap: the stretch's own length, the slack kept. TOTK_AUX_HOLES=0: as before.
 bool g_aux_holes = [] { const char* e = getenv("TOTK_AUX_HOLES"); return !e || strcmp(e, "0") != 0; }();
+// The game's pump (f_29de0e8) reads its send in 5 pieces of 6 x (GetAuxSampleCount / 30), hands each piece to its DSP
+// worker (0x29e7490) and writes back the pieces the worker has finished, each with the count of THIS call; a piece the
+// worker finishes after the call goes back a call later at that call's size. On the console every call sees one
+// renderer frame, so the sizes agree; here the game's audio thread runs slower than the 200 frames a second (Swordman14's
+// v0.1.9 log: 0.9 to 2.1 frames waiting a call), so its return was cut short or padded piece by piece: a length that
+// random-walked against the send's, late blocks at the full slack with no send drop (27 to 43 a 10 s) and return-ring
+// overflows (52 frames in one window). Now a return write takes as many samples as its buffer was read with (the same
+// buffer address, [node+0], in both calls). TOTK_AUX_PIECES=0: the game's count, as before.
+bool g_aux_pieces = [] { const char* e = getenv("TOTK_AUX_PIECES"); return !e || strcmp(e, "0") != 0; }();
 std::atomic<int> g_logs{0};
 #define ALOG(...) do { if (g_log && g_logs++ < 3000) printf(__VA_ARGS__); } while (0)
 
@@ -222,11 +231,14 @@ struct Effect {
     // aux holes (g_aux_holes): samples the send ring dropped unread; samples the game has returned; the stretches its
     // return lacks (read position, samples); the zeros standing for them in the return ring (ring position, samples)
     size_t send_lost = 0, ret_game = 0; std::deque<std::pair<size_t, size_t>> holes, zeros;
+    // aux pieces (g_aux_pieces): the game's buffers read and not yet returned (buffer address, samples read into it)
+    std::deque<std::pair<u64, size_t>> pieces;
 };
 std::unordered_map<u64, Mix*> g_mixes;
 // level meters (peak since the last [audio] line): raw decoded voice, voice after volume/filters, mixes, device out
 float g_pk_raw = 0, g_pk_voice = 0, g_pk_sub = 0, g_pk_final = 0, g_pk_out = 0; double g_render_us = 0, g_render_max = 0; u64 g_render_n = 0;
 u64 g_starved = 0, g_nodest = 0, g_aux_wild = 0, g_aux_muted = 0, g_aux_late = 0, g_aux_send_drops = 0, g_aux_ret_drops = 0, g_overs = 0;   // send drops: renderer frames an aux's send ring dropped unread (the game's pump behind); return drops: frames its return ring dropped unplayed (a burst past 32 blocks)
+u64 g_aux_resized = 0;   // return writes whose count was not what their buffer was read with (g_aux_pieces: written as read)
 u64 g_paced = 0, g_pace_late = 0; double g_pace_max = 0;   // frames that waited for the game's update; waits that ran out; the longest (ms)
 u64 g_dry = 0, g_low = 0, g_cap_dropped = 0; double g_wake_max = 0, g_pad_min_ms = 1e9;   // device found empty at a wake; under a renderer frame queued at a wake (a click risk); longest gap between wakes (ms); the least queued at a wake (ms); capture frames dropped
 float peak(const float* x, int n) { float p = 0; for (int i = 0; i < n; i++) p = std::max(p, std::fabs(x[i])); return p; }
@@ -899,17 +911,18 @@ void frame_done() {
         static double t_prev = 0; static u64 f_prev = 0;
         double now = qpc_s();
         if (t_prev > 0 && now > t_prev)
-            rt_log("[audio]   clock: %.1f Hz over %.2f s wall | out %d ch, queue %u frames, device opened %d x | overs %llu, wild aux returns %llu (%llu blocks muted, %llu late) | dry %llu, low %llu, least queued %.1f ms, longest wake %.1f ms | paced %llu (%llu late, %.1f ms max) | aux slack %d, send drops %llu, return drops %llu\n",
+            rt_log("[audio]   clock: %.1f Hz over %.2f s wall | out %d ch, queue %u frames, device opened %d x | overs %llu, wild aux returns %llu (%llu blocks muted, %llu late) | dry %llu, low %llu, least queued %.1f ms, longest wake %.1f ms | paced %llu (%llu late, %.1f ms max) | aux slack %d, send drops %llu, return drops %llu, resized returns %llu\n",
                    (double)(g_frames.load() - f_prev) * g_count / (now - t_prev), now - t_prev, g_out_ch.load(), g_out_target.load(), g_dev_opens.load(),
                    (unsigned long long)g_overs, (unsigned long long)g_aux_wild, (unsigned long long)g_aux_muted, (unsigned long long)g_aux_late, (unsigned long long)g_dry,
                    (unsigned long long)g_low, g_pad_min_ms < 1e8 ? g_pad_min_ms : 0.0, g_wake_max,
-                   (unsigned long long)g_paced, (unsigned long long)g_pace_late, g_pace_max, g_aux_need, (unsigned long long)g_aux_send_drops, (unsigned long long)g_aux_ret_drops);
+                   (unsigned long long)g_paced, (unsigned long long)g_pace_late, g_pace_max, g_aux_need, (unsigned long long)g_aux_send_drops, (unsigned long long)g_aux_ret_drops,
+                   (unsigned long long)g_aux_resized);
         t_prev = now; f_prev = g_frames.load();
         // (the learned aux slack: a block less per 60 s without a late block, down to the 2-block start)
         if (g_aux_need > 2 && g_frames.load() - g_aux_quiet >= (u64)g_rate * 60 / g_count) g_aux_need--, g_aux_quiet = g_frames.load();
         if (g_graph) graph_log();
         g_pk_raw = g_pk_voice = g_pk_sub = g_pk_final = g_pk_out = 0; g_render_us = g_render_max = 0; g_render_n = 0; g_starved = g_nodest = 0;
-        g_overs = g_aux_wild = g_aux_muted = g_aux_late = g_aux_send_drops = g_aux_ret_drops = g_dry = g_low = 0; g_wake_max = 0; g_pad_min_ms = 1e9;
+        g_overs = g_aux_wild = g_aux_muted = g_aux_late = g_aux_send_drops = g_aux_ret_drops = g_aux_resized = g_dry = g_low = 0; g_wake_max = 0; g_pad_min_ms = 1e9;
         g_paced = g_pace_late = 0; g_pace_max = 0;
     }
 }
@@ -1852,6 +1865,11 @@ HLE_AS(audio_ReadAuxSendBuffer, "_ZN2nn5audio17ReadAuxSendBufferEPNS0_7AuxTypeEP
         memcpy(out + i, e.send.data() + o, k * sizeof(s32));
     }
     e.send_r += n; c->x[0] = n / mul;
+    if (g_aux_pieces && n) {   // (a buffer read again before its return: the game dropped that piece, its record goes)
+        for (auto it = e.pieces.begin(); it != e.pieces.end(); ++it) if (it->first == (u64)out) { e.pieces.erase(it); break; }
+        if (e.pieces.size() >= 16) e.pieces.pop_front();
+        e.pieces.push_back({(u64)out, n});
+    }
     auxcap_record(1, e, c->x[30], c->x[19], out, n);
     static std::atomic<int> logged{0};
     int k = logged++;
@@ -1864,6 +1882,9 @@ HLE_AS(audio_WriteAuxReturnBuffer, "_ZN2nn5audio20WriteAuxReturnBufferEPNS0_7Aux
     int count = std::max(0, (int)c->x[2]); size_t mul = g_aux_total ? 1 : (size_t)std::max(1, e.count);
     size_t n = (size_t)count * mul, cap = e.ret.size();
     if (!cap) { c->x[0] = 0; return; }
+    if (g_aux_pieces)   // (as many samples as this buffer was read with: g_aux_pieces; a buffer never read keeps the count)
+        for (auto it = e.pieces.begin(); it != e.pieces.end(); ++it)
+            if (it->first == (u64)in) { g_aux_resized += it->second != n; n = it->second; e.pieces.erase(it); break; }
     auto put = [&](const s32* src, size_t len) {   // (in pieces up to the ring's end, in order; no src: zeros)
         for (size_t i = 0, o = e.ret_w % cap, k; i < len; i += k, o = 0) {
             k = std::min(len - i, cap - o);

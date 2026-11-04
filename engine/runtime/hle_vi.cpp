@@ -5,6 +5,7 @@
 #include "totk_version.h"
 #include "pace_adapt.h"
 #include "pace_ladder.h"
+#include "step_check.h"
 #include "fg_auto.h"
 #include "totk_menu_cursor.h"   // (totk_menu_screen: the archive warm-up's governor, load_track)
 #include <algorithm>
@@ -1182,8 +1183,38 @@ static void vi_pace_wait(int interval) {
 // an EMA of 0.08 (instant jumps crashed Astro). TOTK_SPEED_FIX=0: old behaviour (fixed step); [speedfix] logs k every
 // 300 calls.
 void f_7a83e4_orig(Ctx* __restrict c);
+// Is the game reading the realtime step? (v0.1.10, LEAD 12:52.) A slot exe generated from an UNPATCHED image ran with
+// TOTK_IMG naming the patched one: totk_engine.c's main_has_realtime read the patched image's words, TOTK_SPEED_FIX=0
+// came from the package's player.txt, and the game took its own interval step (1/60 s a frame), 2.7-3.7x speed at
+// 160-224 fps, while '[totk] game speed' said 1.00x (that line is the step the runtime writes, not the one the game
+// reads). So right after the game's frame-delta setter its ratio (this+8) is compared with the data page's: the realtime
+// patch makes them the same, the unpatched setter stores interval / 2. Decided over 60 frames whose page ratio is at least
+// 20 % away from interval / 2 (near the interval's own rate both read alike, and nothing runs fast there); not read in 9
+// of 10: a loud line, and the speed fix below goes on (it scales the interval step to measured time). A page ratio that
+// moved between the setter's read and this one (the present thread writes it) is within the 5 % tolerance or a minority.
+// TOTK_STEP_CHECK=0: neither the check nor the switch.
+extern "C" void* totk_data_page_current(void);   // games/totk/runtime/totk_patches.c
+static int step_check(const float* g, u32 interval) {   // 1: the game reads the page's step, -1: it does not, 0: not yet known
+    static StepCheck sc;
+    if (sc.verdict) return sc.verdict;
+    const uint8_t* p = (const uint8_t*)totk_data_page_current();
+    if (!p || g_dpad_switch_timing) return 0;
+    const u32 bits = __atomic_load_n((const u32*)p, __ATOMIC_ACQUIRE);   // TOTK_DP_FRAME_RATIO (+0)
+    float pr;
+    memcpy(&pr, &bits, 4);
+    if (!sc.vote(g[2], pr, interval)) return 0;
+    if (sc.verdict > 0)
+        printf("[totk] the game reads the realtime step (%d of %d frames)\n", sc.reads, sc.reads + sc.misses);
+    else
+        printf("[totk] WARNING: the game is NOT reading the realtime step (%d of %d frames: its ratio %.3f, the page's %.3f): "
+               "main was generated without the realtime patch (wrong key?), so the game would run at fps / 60 x speed\n",
+               sc.misses, sc.reads + sc.misses, g[2], pr);
+    return sc.verdict;
+}
+
 void hook_f_7a83e4(Ctx* __restrict c) {
-    static const bool on = !getenv("TOTK_SPEED_FIX") || strcmp(getenv("TOTK_SPEED_FIX"), "0");
+    static bool on = !getenv("TOTK_SPEED_FIX") || strcmp(getenv("TOTK_SPEED_FIX"), "0");
+    static const bool check = !getenv("TOTK_STEP_CHECK") || strcmp(getenv("TOTK_STEP_CHECK"), "0");
     u64 self = c->x[0];
     u32 interval = (u32)c->x[1];
     f_7a83e4_orig(c);
@@ -1198,6 +1229,11 @@ void hook_f_7a83e4(Ctx* __restrict c) {
             if ((fabsf(m - tm) > 0.01f || gap > 100) && tlogs++ < 400)
                 printf("[timemult] %.3f -> %.3f (gap %.0f ms, dpad timing %d)\n", tm, m, gap, (int)g_dpad_switch_timing);
             tm = m; tl = tn;
+            static bool switched;
+            if (check && !on && !switched && step_check(g, interval) < 0) {
+                switched = on = true;
+                printf("[totk] the engine's speed fix is ON instead (TOTK_SPEED_FIX=0 ignored; TOTK_STEP_CHECK=0 keeps it off)\n");
+            }
         }
     }
     if (!on || interval < 1 || interval > 4) return;

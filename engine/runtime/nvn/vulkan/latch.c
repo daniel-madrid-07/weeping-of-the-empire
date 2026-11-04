@@ -308,7 +308,7 @@ static VkPipeline ll_pipeline(VkFormat fmt) {
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = ll_layout};
     VkPipeline p;
-    VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
+    VK_CHECK(vk_engine_graphics_pipeline("late latch", g_vk.pcache, &pi, &p));
     vkDestroyShaderModule(g_vk.dev, mv, NULL);
     vkDestroyShaderModule(g_vk.dev, mf, NULL);
     for (int i = 0; i < 4; i++) if (!cache[i].p) { cache[i].f = fmt; cache[i].p = p; break; }
@@ -326,7 +326,7 @@ static void tmp_image(VkCommandBuffer cb, uint32_t w, uint32_t h, VkFormat fmt) 
                             .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-    VK_CHECK(vmaCreateImage(g_vk.vma, &ic, &ai, &ll_tmp.img, &ll_tmp.mem, NULL));
+    VK_CHECK(vk_image_create_relieved(&ic, &ai, &ll_tmp.img, &ll_tmp.mem, "late latch warp image %ux%u", w, h));   // (render thread)
     VkImageViewCreateInfo vc = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = ll_tmp.img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
                                 .format = fmt, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     VK_CHECK(vkCreateImageView(g_vk.dev, &vc, NULL, &ll_tmp.view));

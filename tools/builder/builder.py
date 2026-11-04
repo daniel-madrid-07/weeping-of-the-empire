@@ -1364,7 +1364,7 @@ def download_kit(argv):
     sys.path.insert(0, os.path.join(REPO, 'tools', 'engine'))
     import build
     say('download kit: the Python packages')
-    toolchain.kit_wheels(toolchain.PACKAGES + build.VENV_PACKAGES)
+    toolchain.kit_wheels({'setup': toolchain.PACKAGES, 'venv': build.VENV_PACKAGES})
     for what, asset in (('the release\'s profile (PGO)', PGO), ('the profile\'s training record', PGO_RECORD),
                         ('the shader seed', SEED), ('the FSR runtime (AMD FidelityFX)', FFX)):
         if asset:
@@ -1715,6 +1715,14 @@ def main(argv=None):
             for f in glob.glob(os.path.join(work, 'engine', 'overlay', 'romfs-aspect-*.failed')):
                 os.remove(f)
         stamps.done(7, 'overlay', in7)
+    # DLSS's runtime DLLs (~66 MB): an NVIDIA RTX GPU only (build.py dlss_dlls), at every run, so an RTX card added
+    # later gets them at the next Setup; never stops Setup (offline: DLSS unavailable until a run that is online).
+    # Before step 8: package.py writes TOTK_DLSS_DIR only when the DLLs are there, and in8 says whether they are, so
+    # the run that fetches them packages again
+    ok, out_dlss = run('DLSS (NVIDIA RTX only)', [py, build, 'dlss'], env, a.dry_run, quiet=True, tolerate=True)
+    if not a.dry_run:
+        said = [ln.split('] ', 1)[-1] for ln in out_dlss.splitlines() if 'DLSS' in ln]
+        say(said[-1] if ok and said else 'DLSS: not checked this time (above); the next Setup tries again')
     # 8. package (package.py points the launcher at <work>/overlays itself, and copies <work>/engine/seed as cache-seed)
     if not update:   # (1.4.3: package.py ships no seed)
         shader_seed(work, a.dry_run)
@@ -1732,9 +1740,11 @@ def main(argv=None):
     aspect = (f'"{py}" "{os.path.join(REPO, "tools", "engine", "aspect_sets.py")}" '
               + (f'--install "{install}"' if install else f'--work "{work}"'))
     # (reused: the newest game folder is this key's, from this source, and the stamp says it was packaged so)
-    # (and whether the firmware's fonts are there: a failed read is optional now (#26), a later success must repackage)
+    # (and whether the firmware's fonts are there: a failed read is optional now (#26), a later success must repackage;
+    #  the same for DLSS's DLLs: player.txt names TOTK_DLSS_DIR only when they are there)
     in8 = dict(base, key=key, release=rel, out=os.path.normcase(out), exefs=exefs, aspect=aspect,
-               fonts=os.path.isfile(os.path.join(vdir, 'fonts-report.json')))
+               fonts=os.path.isfile(os.path.join(vdir, 'fonts-report.json')),
+               dlss=os.path.isfile(os.path.join(work, 'engine', 'dlss', 'nvngx_dlss.dll')))   # (TOTK_DLSS_DIR)
     tag = UPDATE_DIR if update else ''
     newest = None if a.dry_run else newest_package(out, tag)
     pt = player_txt(newest) if newest else {}

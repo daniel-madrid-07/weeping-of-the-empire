@@ -1,7 +1,8 @@
 // Discord status (Rich Presence), opt-in: Game > PC > "Discord status", off by default (TOTK_DISCORD). While on and
 // Discord's desktop app runs, the player's profile shows "Playing <the port's Discord application>" and the time played
-// this session; nothing else is sent (no location, no save, no account data). Off clears the status at once; the status
-// also goes when the process ends (Discord drops a closed pipe's activity).
+// this session, with a "Join the community" link button (the port's subreddit); nothing else is sent (no location, no
+// save, no account data). Off clears the status at once; the status also goes when the process ends (Discord drops a
+// closed pipe's activity).
 //
 // Discord's local IPC, no SDK: the named pipe \\.\pipe\discord-ipc-0..9, frames of { uint32 opcode, uint32 length }
 // + JSON (0 handshake, 1 frame, 2 close, 3 ping, 4 pong), the handshake answered by a READY dispatch, then a
@@ -93,12 +94,17 @@ int poll_frame(HANDLE h, uint32_t &op, std::string &body) {
 }
 
 unsigned g_nonce = 0;
+// The status's link button (Discord allows two, a label of up to 32 characters): the players' community, as the
+// launcher's and Setup's Community buttons. In English: the people who see it are the player's Discord friends, whose
+// language the game does not know.
+const char kCommunityUrl[] = "https://www.reddit.com/r/WeepingOfTheEmpire/";
 std::string activity(bool on, long long start) {
-    char b[512];
+    char b[640];
     if (on)
         snprintf(b, sizeof b, "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":%lu,\"activity\":{\"timestamps\":{\"start\":%lld},"
-                 "\"assets\":{\"large_image\":\"logo\",\"large_text\":\"Weeping of the Empire\"}}},\"nonce\":\"%u\"}",
-                 GetCurrentProcessId(), start, ++g_nonce);
+                 "\"assets\":{\"large_image\":\"logo\",\"large_text\":\"Weeping of the Empire\"},"
+                 "\"buttons\":[{\"label\":\"Join the community\",\"url\":\"%s\"}]}},\"nonce\":\"%u\"}",
+                 GetCurrentProcessId(), start, kCommunityUrl, ++g_nonce);
     else   // no activity: Discord clears the status
         snprintf(b, sizeof b, "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":%lu},\"nonce\":\"%u\"}", GetCurrentProcessId(),
                  ++g_nonce);
@@ -205,8 +211,8 @@ void discord_apply(const char *v) { set(!strcmp(v, "1")); }   // present thread:
 const char *const V_DISCORD[] = {"0", "1", nullptr};
 const char *const N_DISCORD[] = {"Off", "On", nullptr};
 const pc_setting k_rows[] = {
-    {"game.discord", "Game", "PC", "Discord status", "Shows \"Playing\" and the time played on your Discord profile "
-     "while Discord runs. Nothing else is sent.", "0", V_DISCORD, N_DISCORD, 0, 0, 0, 0, "TOTK_DISCORD",
+    {"game.discord", "Game", "PC", "Discord status", "Shows \"Playing\", the time played and a \"Join the community\" "
+     "button (the game's subreddit) on your Discord profile while Discord runs. Nothing else is sent.", "0", V_DISCORD, N_DISCORD, 0, 0, 0, 0, "TOTK_DISCORD",
      nullptr, discord_apply, nullptr},
 };
 struct Rows {

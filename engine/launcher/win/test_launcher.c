@@ -472,7 +472,7 @@ int main(int argc, char **argv) {
         swprintf(s143, MAX_PATH, L"%ls\\userdata-v143\\save\\slot_00\\progress.sav", g_base);
         CHECK(exists(s143));
         CHECK(log_has("v143: version 1.4.3, its own saves in") && log_has("the 1.0.0 saves copied there (ok)"));
-        CHECK(log_has("(beta). This version plays at 30 fps") || log_has("(beta). Esta versi"));   /* the notice, once */
+        CHECK(log_has("(beta). This version runs at full frame rate") || log_has("(beta). Esta versi"));   /* the notice, once */
         CHECK(log_has("Your 1.0.0 saves were copied") || log_has("Tus partidas de 1.0.0 se han copiado"));   /* (it copied) */
         { wchar_t mk[MAX_PATH]; swprintf(mk, MAX_PATH, L"%ls\\userdata-v143\\beta-notice-shown", g_base); CHECK(exists(mk)); }
         { FILE *f = _wfopen(s143, L"w"); fprintf(f, "v143 wrote this"); fclose(f); }   /* the game saves in 1.4.3 */
@@ -502,22 +502,28 @@ int main(int argc, char **argv) {
         int real = vp9_mft_present();   /* the real probe runs (either answer is fine on a test PC) */
         CHECK(real == 1 || real == 0 || real == -1);
     }
-    {   /* lang_init: game.language pt-BR -> Brazilian Portuguese (text_pt.inc by the English, English where it lacks
-         * one), es-419 Spanish, en-US English; Spanish again after (the texts the checks above expect) */
+    {   /* lang_init: game.language pt-BR / ru / zh-Hans -> text_pt / ru / zh.inc by the English (English where a table
+         * lacks one), es-419 Spanish, en-US and zh-Hant English; Spanish again after (the texts the checks above expect) */
         swprintf(p, MAX_PATH, L"%ls\\settings.ini", g_base);
-        const wchar_t *vals[] = {L"pt-BR", L"es-419", L"en-US"};
-        for (int i = 0; i < 3; i++) {
+        const wchar_t *vals[] = {L"pt-BR", L"es-419", L"en-US", L"ru", L"zh-Hans", L"zh-Hant"};
+        const int want[] = {TR_PT, TR_EN, TR_EN, TR_RU, TR_ZH, TR_EN};
+        for (int i = 0; i < 6; i++) {
             FILE *f = _wfopen(p, L"w, ccs=UTF-8");
             fwprintf(f, L"[game]\ngame.language = %ls\n", vals[i]);
             fclose(f);
             lang_init();
-            CHECK(g_es == (i == 1) && g_pt == (i == 0));
+            CHECK(g_es == (i == 1) && g_tr == want[i]);
         }
-        g_es = 0, g_pt = 1;
+        g_es = 0, g_tr = TR_PT;
         CHECK(!wcscmp(ES_EN(L"El juego ya está en marcha.", L"The game is already running."), L"O jogo já está em execução."));
         CHECK(!wcscmp(ES_EN(L"x", L"not in the table"), L"not in the table"));
-        CHECK(pt_of(L"Off") != NULL && wcscmp(pt_of(L"Off"), L"Off"));   /* (preplay's choices too) */
-        g_es = 1, g_pt = 0;
+        CHECK(wcscmp(tr_of(TR_PT, L"Off"), L"Off"));   /* (preplay's choices too) */
+        g_tr = TR_RU;
+        CHECK(!wcscmp(ES_EN(L"El juego ya está en marcha.", L"The game is already running."), L"Игра уже запущена."));
+        g_tr = TR_ZH;
+        CHECK(!wcscmp(ES_EN(L"El juego ya está en marcha.", L"The game is already running."), L"游戏已在运行。"));
+        CHECK(!wcscmp(tr_of(TR_EN, L"Off"), L"Off") && !wcscmp(tr_of(TR_ZH, L"not in the table"), L"not in the table"));
+        g_es = 1, g_tr = TR_EN;
         DeleteFileW(p);
     }
     fclose(g_log);

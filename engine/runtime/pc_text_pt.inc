@@ -132,7 +132,7 @@ PC_TR("How far the map moves under the reticle for the mouse's motion: 1 = like 
 PC_TR("Menu keys",
       "Teclas de menu")
 PC_TR("In the pause menu and the Purah Pad: Esc goes back, PageUp / PageDown (and the wheel in the pause menu) switch tabs, and in the pause menu clicks select (left) and go back (right).",
-      "No menu de pausa e no Purah Pad: Esc volta, PageUp / PageDown (e a roda no menu de pausa) trocam de aba, e no menu de pausa os cliques selecionam (esquerdo) e voltam (direito).")
+      "No menu de pausa e na Tabuleta da Purah: Esc volta, PageUp / PageDown (e a roda no menu de pausa) trocam de aba, e no menu de pausa os cliques selecionam (esquerdo) e voltam (direito).")
 PC_TR("Rumble curve",
       "Curva da vibração")
 PC_TR("How light rumbles feel next to strong ones: below 1 light rumbles come through stronger, above 1 only strong ones; 1 = the game's own.",
@@ -146,7 +146,7 @@ PC_TR("Light",
 PC_TR("Full strength",
       "Máxima")
 PC_TR("Camera speed (right stick)",
-      "Velocidade da câmera (analógico direito)")
+      "Velocidade da câmera (analógico dir.)")
 PC_TR("The camera's turn with the right stick (and the camera keys) times this, at each of the game's own camera speeds, top speed included; the mouse keeps its own sensitivity. At the next start.",
       "O giro da câmera com o analógico direito (e com as teclas de câmera) multiplicado por este valor, em cada uma das velocidades de câmera do próprio jogo, incluindo a máxima; o mouse mantém sua própria sensibilidade. Na próxima inicialização.")
 PC_TR("Rumble strength",
@@ -422,7 +422,7 @@ PC_TR("Pause menu",
 PC_TR("Abilities",
       "Habilidades")
 PC_TR("Purah Pad camera",
-      "Câmera do Purah Pad")
+      "Câmera da Tabuleta da Purah")
 PC_TR("Ability wheel",
       "Roda de habilidades")
 PC_TR("Use the ability",
@@ -617,20 +617,16 @@ PC_TR("Graphics",
       "Gráficos")
 PC_TR("Rendering",
       "Renderização")
-PC_TR("TOTK_DLSS_SR. NVIDIA RTX only: DLSS upscales the 3D scene to the output in place of the game's upscaler (DLAA when Render resolution matches the output).",
-      "TOTK_DLSS_SR. Só NVIDIA RTX: o DLSS escala a cena 3D até a saída no lugar do upscaler do jogo (DLAA quando a Resolução de renderização é igual à da saída).")
-PC_TR("DLSS Frame Generation",
-      "Geração de quadros DLSS")
-PC_TR("TOTK_DLSS_FG. NVIDIA RTX 40 series and newer: x2 shows one generated frame between real frames; x3 and x4 (RTX 50 series) two and three. The frame cap counts the frames shown (at a 30 cap: x2, 60 shown). Adds some input latency.",
-      "TOTK_DLSS_FG. NVIDIA RTX série 40 ou mais nova: x2 mostra um quadro gerado entre os reais; x3 e x4 (RTX série 50) dois e três. O limite de quadros conta os exibidos (com limite 30: x2, 60 exibidos). Adiciona alguma latência de entrada.")
-PC_TR("Ultrahand rotation step",
-      "Passo de rotação do Ultrahand")
-PC_TR("TOTK_PC_ROTATE_STEP: mouse counts per 45-degree step while R is held in Ultrahand or Autobuild.",
-      "TOTK_PC_ROTATE_STEP: contagens do mouse por passo de 45 graus com R segurado no Ultrahand ou Autobuild.")
-PC_TR("20 (fast)",
-      "20 (rápido)")
-PC_TR("80 (slow)",
-      "80 (lento)")
+PC_TR("Frame generation",
+      "Geração de quadros")
+PC_TR("Ultrahand rotation speed",
+      "Velocidade de rotação da Ultramão")
+PC_TR("TOTK_PC_ROTATE_SPEED: with R held in Ultrahand or Autobuild, the mouse moved sideways turns the object in 45-degree steps (1x: the move that turns the camera 45 degrees) and the wheel turns it vertically, a step a notch.",
+      "TOTK_PC_ROTATE_SPEED: com R segurado na Ultramão ou na Autoconstrução, mover o mouse para os lados gira o objeto em passos de 45 graus (1x: o movimento que gira a câmera 45 graus) e a roda o gira na vertical, um passo por clique da roda.")
+PC_TR("0.5x (slow)",
+      "0.5x (lento)")
+PC_TR("2x (fast)",
+      "2x (rápido)")
 PC_TR("Automatic (a dedicated GPU first)",
       "Automático (GPU dedicada primeiro)")
 PC_TR("Display",
@@ -687,10 +683,8 @@ PC_TR("Lowers the 3D resolution only when the GPU falls behind, never below the 
       "Reduz a resolução 3D só quando a GPU não acompanha, nunca abaixo do mínimo escolhido, para manter a taxa de quadros. Desligado mantém a imagem nítida o tempo todo; Ligado é mais suave numa GPU mais lenta.")
 PC_TR("Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the game's 1080p stretched. Sharper text for a little GPU. Off by default for now: at some resolutions it can show broken text (being fixed).",
       "Acima de 1080p, menus, textos e HUD são desenhados na resolução da janela em vez dos 1080p do jogo esticados. Texto mais nítido por um pouco de GPU. Desligado por padrão por enquanto: em algumas resoluções pode mostrar texto quebrado (correção a caminho).")
-PC_TR("NVIDIA RTX only: DLSS upscales the 3D scene with AI, sharper and steadier than the other upscalers. At 100 % render resolution it is DLAA: the best image, for more GPU.",
-      "Só NVIDIA RTX: o DLSS escala a cena 3D com IA, mais nítido e estável que os outros upscalers. Com resolução de renderização em 100 % é DLAA: a melhor imagem, por mais GPU.")
-PC_TR("NVIDIA RTX 40 series or newer: generated frames between the real ones (x2; x3 and x4 on RTX 50) make motion look smoother, but the game itself does not run faster and input latency rises a little. Best when the game already runs well.",
-      "NVIDIA RTX série 40 ou mais nova: quadros gerados entre os reais (x2; x3 e x4 na RTX 50) deixam o movimento mais suave, mas o jogo em si não fica mais rápido e a latência de entrada sobe um pouco. Melhor quando o jogo já roda bem.")
+PC_TR("Generated frames between the real ones make motion look smoother, but the game itself does not run faster and input latency rises a little. DLSS x2: RTX 40 and newer, x3 and x4: RTX 50; FSR x2: any GPU. Best when the game already runs well.",
+      "Os quadros gerados entre os reais deixam o movimento mais suave, mas o jogo em si não fica mais rápido e a latência de entrada sobe um pouco. DLSS x2: RTX 40 ou mais nova, x3 e x4: RTX 50; FSR x2: qualquer GPU. Melhor quando o jogo já roda bem.")
 PC_TR("How the 3D scene is scaled up to the output: Bicubic (the port's) or FSR 1 (the game's own). Matters only below 100 % render resolution; either costs little.",
       "Como a cena 3D é ampliada até a saída: Bicúbico (o do port) ou FSR 1 (o do próprio jogo). Só importa abaixo de 100 % de resolução de renderização; ambos custam pouco.")
 PC_TR("The filter that scales the 3D scene when the render resolution is not 100 %: Catmull-Rom, or FSR 1 EASU (sharper edges). Either costs little.",
@@ -733,8 +727,8 @@ PC_TR("Your monitor's peak brightness in nits, so highlights are neither clipped
       "O brilho máximo do seu monitor em nits, para que os realces não estourem nem fiquem fracos. Use o valor informado pelo monitor.")
 PC_TR("How bright ordinary white (menus, the sky) is in HDR. Raise it if the picture looks dim, lower it if it is too bright.",
       "Quão brilhante é o branco comum (menus, o céu) em HDR. Aumente se a imagem parecer escura, diminua se estiver clara demais.")
-PC_TR("The window's (the default): on a 16:10, 21:9, 32:9 or 48:9 window or monitor the picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9: that shape whatever the window. A new shape's layouts are made at its first start (about 30 s, once). A wider picture costs more GPU.",
-      "A da janela (padrão): numa janela ou monitor 16:10, 21:9, 32:9 ou 48:9 a imagem assume esse formato, 21:9, 32:9 e 48:9 com visão mais ampla; os outros formatos, 16:9 entre eles, mantêm a do próprio jogo. 16:9 / 16:10 / 21:9 / 32:9 / 48:9: esse formato seja qual for a janela. A interface de um formato novo é preparada no primeiro início (uns 30 s, uma vez). Uma imagem mais larga exige mais da GPU.")
+PC_TR("The window's (the default): on a 3:2, 16:10, 21:9, 32:9 or 48:9 window or monitor the picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9 / 3:2: that shape whatever the window. A new shape's layouts are made at its first start (about 30 s, once). A wider picture costs more GPU.",
+      "A da janela (padrão): numa janela ou monitor 3:2, 16:10, 21:9, 32:9 ou 48:9 a imagem assume esse formato, 21:9, 32:9 e 48:9 com visão mais ampla; os outros formatos, 16:9 entre eles, mantêm a do próprio jogo. 16:9 / 16:10 / 21:9 / 32:9 / 48:9 / 3:2: esse formato seja qual for a janela. A interface de um formato novo é preparada no primeiro início (uns 30 s, uma vez). Uma imagem mais larga exige mais da GPU.")
 PC_TR("On 21:9, 32:9 or 48:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a very wide screen). Nothing changes at 16:9. Automatic (the default): the middle on 48:9, the edges otherwise.",
       "Em 21:9, 32:9 ou 48:9: o HUD nas bordas da tela ou no meio em 16:9 (mais fácil de ver numa tela muito larga). Nada muda em 16:9. Automático (padrão): o centro em 48:9 e as bordas nos outros.")
 PC_TR("On 21:9, 32:9 or 48:9: real-time cutscenes wide like the rest of the game, or the original 16:9 with bars at the sides.",
@@ -747,8 +741,8 @@ PC_TR("More grass, flowers and pebbles. Higher looks fuller and costs GPU and CP
       "Mais grama, flores e pedrinhas. Maior fica mais cheio e custa GPU e CPU.")
 PC_TR("Sharper shadows: 2 doubles the shadow map's width and height, for 4x its memory and more GPU.",
       "Sombras mais nítidas: 2 dobra a largura e a altura do mapa de sombras, por 4x a memória e mais GPU.")
-PC_TR("Moves the lines where the sun's sharp near shadows hand over to coarser ones further away (1 = the game's, 2 = twice as far). Near shadows get a little softer: raise Shadow resolution with it. Costs a little GPU and CPU.",
-      "Afasta as linhas onde as sombras nítidas próximas do sol passam para outras mais grosseiras (1 = o do jogo, 2 = o dobro da distância). As sombras próximas ficam um pouco mais suaves: aumente a Resolução das sombras junto. Custa um pouco de GPU e CPU.")
+PC_TR("Moves the lines where the sun's sharp near shadows hand over to coarser ones further away (1 = the game's, 2 = twice as far). Near shadows get a little softer: raise Shadow resolution with it. Costs a little GPU and CPU. With Shadow distance above 1 the two multiplied stay at 4 at most, so at Shadow distance 4 this does nothing.",
+      "Afasta as linhas onde as sombras nítidas próximas do sol passam para outras mais grosseiras (1 = o do jogo, 2 = o dobro da distância). As sombras próximas ficam um pouco mais suaves: aumente a Resolução das sombras junto. Custa um pouco de GPU e CPU. Com Distância das sombras acima de 1, as duas multiplicadas ficam em no máximo 4, então com Distância das sombras 4 isto não faz nada.")
 PC_TR("Fixed keeps the sun's shadow map at its largest size: steadier, sharper leaf shadows for some GPU. The game's changes its size with the view.",
       "Fixo mantém o mapa de sombras do sol no maior tamanho: sombras de folhas mais estáveis e nítidas por um pouco de GPU. O do jogo muda o tamanho conforme a visão.")
 PC_TR("How far the sharp shadows reach. Higher looks better in the distance and costs GPU.",
@@ -792,7 +786,7 @@ PC_TR("The button pictures in prompts and menus. Automatic follows the device yo
 PC_TR("In menus a mouse pointer shows and selects what it points at; left click is A, Esc goes back.",
       "Nos menus, um ponteiro do mouse aparece e seleciona o que aponta; clique esquerdo é A, Esc volta.")
 PC_TR("In the pause menu and the Purah Pad: Esc goes back, PageUp / PageDown or the wheel switch tabs, left click selects and right click goes back.",
-      "No menu de pausa e no Purah Pad: Esc volta, PageUp / PageDown ou a roda trocam de aba, clique esquerdo seleciona e clique direito volta.")
+      "No menu de pausa e na Tabuleta da Purah: Esc volta, PageUp / PageDown ou a roda trocam de aba, clique esquerdo seleciona e clique direito volta.")
 PC_TR("How fast the mouse turns the camera (click the window to capture the pointer; Esc, F10 or Alt+Tab frees it). 0 = off; above 1 turns faster.",
       "A velocidade com que o mouse gira a câmera (clique na janela para capturar o ponteiro; Esc, F10 ou Alt+Tab o libera). 0 = desligado; acima de 1 gira mais rápido.")
 PC_TR("How fast the mouse turns the camera and aims. Higher turns faster.",
@@ -821,8 +815,8 @@ PC_TR("One press of the sprint key starts sprinting and the next stops it. Off: 
       "Um toque na tecla de corrida começa a correr e o seguinte interrompe. Desligado: segure, como no Switch.")
 PC_TR("One press of the shield / target key raises the shield and targets, the next lowers it. Off: hold it, as on the Switch.",
       "Um toque na tecla de escudo / mira levanta o escudo e fixa o alvo, o seguinte o baixa. Desligado: segure, como no Switch.")
-PC_TR("How much mouse movement turns an object one 45° step while R is held in Ultrahand or Autobuild. Lower turns sooner.",
-      "Quanto movimento do mouse gira um objeto um passo de 45° com R segurado no Ultrahand ou Autobuild. Menor gira mais cedo.")
+PC_TR("How fast moving the mouse sideways turns an object while R is held in Ultrahand or Autobuild (1x: as far as the camera turns). The wheel turns it vertically; moving the mouse up or down does not turn it.",
+      "Quão rápido mover o mouse para os lados gira um objeto com R segurado na Ultramão ou na Autoconstrução (1x: o mesmo que a câmera gira). A roda o gira na vertical; mover o mouse para cima ou para baixo não o gira.")
 PC_TR("A non-Nintendo pad's face buttons: by position (the Switch layout: the right button confirms) or by label (Xbox A confirms).",
       "Os botões frontais de um controle não Nintendo: por posição (layout do Switch: o botão direito confirma) ou por rótulo (A do Xbox confirma).")
 PC_TR("Controller vibration: off, normal, or stronger (x2 to x4).",
@@ -850,7 +844,7 @@ PC_TR("Docked (default) or handheld: handheld renders at the Switch's lower hand
 PC_TR("Pauses the game, picture and sound, while its window is not in front.",
       "Pausa o jogo, imagem e som, enquanto sua janela não está em primeiro plano.")
 PC_TR("The temperature on the Purah Pad's map: °C or °F. Automatic follows the game's language.",
-      "A temperatura no mapa do Purah Pad: °C ou °F. Automático segue o idioma do jogo.")
+      "A temperatura no mapa da Tabuleta da Purah: °C ou °F. Automático segue o idioma do jogo.")
 PC_TR("How many older copies of your saves are kept, in case a save goes wrong.",
       "Quantas cópias antigas dos seus saves são mantidas, caso um save dê problema.")
 PC_TR("F12 saves a screenshot as a PNG in the Screenshots folder.",
@@ -1157,8 +1151,8 @@ PC_TR("TOTK_OUT_SCALE: above 1080p, menus, text and the HUD drawn at the window'
       "TOTK_OUT_SCALE: acima de 1080p, menus, texto e HUD são desenhados na resolução da janela, em vez dos 1920 x 1080 do jogo esticados. Desligado por padrão: em algumas resoluções pode mostrar texto quebrado (correção a caminho). Vale na hora.")
 PC_TR("Dynamic resolution",
       "Resolução dinâmica")
-PC_TR("Off: the scene always at the render resolution. On: the game lowers it only when the GPU is short of time, never below the chosen floor, aiming at the frame rate (that aim takes effect at the next start).",
-      "Desligada: a cena sempre na resolução de renderização. Ligada: o jogo a reduz só quando a GPU está sem tempo, nunca abaixo do piso escolhido, visando a taxa de quadros (essa meta vale na próxima inicialização).")
+PC_TR("Off: the scene always at the render resolution. On: the game lowers it only when the GPU is short of time, never below the chosen floor, aiming at the frame rate. Applies at once.",
+      "Desligada: a cena sempre na resolução de renderização. Ligada: o jogo a reduz só quando a GPU está sem tempo, nunca abaixo do piso escolhido, visando a taxa de quadros. Vale na hora.")
 PC_TR("Off (fixed size)",
       "Desligada (fixa)")
 PC_TR("On, never below 90 %",
@@ -1318,7 +1312,7 @@ PC_TR("LARECOMP_ASTC_BC3: the game's textures kept in a quarter of the video mem
       "LARECOMP_ASTC_BC3: as texturas do jogo ocupam um quarto da memória de vídeo (BC3), com o detalhe de cor um "
       "pouco mais suave. Automático: ligado só em placas de vídeo de 4 GB ou menos. Vale na próxima inicialização.")
 PC_TR("Automatic (on with 4 GB of VRAM or less)",
-      "Automático (ligado com 4 GB de VRAM ou menos)")
+      "Automático (ligado com até 4 GB de VRAM)")
 PC_TR("For graphics cards with 4 GB of video memory or less: the textures take a quarter of the memory, so the game "
       "no longer runs out of it (stutters, blurry or late textures). Fine colour detail gets a little softer. "
       "Automatic turns it on only on such cards.",
@@ -1339,8 +1333,8 @@ PC_TR("TOTK_PC_SHOT: PNGs in the Screenshots folder.",
       "TOTK_PC_SHOT: PNGs na pasta Screenshots.")
 PC_TR("Temperature unit",
       "Unidade de temperatura")
-PC_TR("TOTK_TEMP_UNIT: the temperature on the Purah Pad's map. Automatic: the game's (°F in English (US), °C in the other languages).",
-      "TOTK_TEMP_UNIT: a temperatura no mapa do Purah Pad. Automática: a do jogo (°F em English (US), °C nos outros idiomas).")
+PC_TR("TOTK_TEMP_UNIT: the temperature on the Purah Pad's map. Automatic: the game's (°F in English (US), °C in the other languages). The number changes at once, the °C / °F sign beside it the next time the map is opened.",
+      "TOTK_TEMP_UNIT: a temperatura no mapa da Tabuleta da Purah. Automática: a do jogo (°F em English (US), °C nos outros idiomas). O número muda na hora; o símbolo °C / °F ao lado dele, na próxima vez que o mapa for aberto.")
 PC_TR("Automatic (by the game's language)",
       "Automática (pelo idioma do jogo)")
 PC_TR("Crash reports",
@@ -1351,8 +1345,8 @@ PC_TR("Automatic updates",
       "Atualização automática")
 PC_TR("Discord status",
       "Status no Discord")
-PC_TR("Shows \"Playing\" and the time played on your Discord profile while Discord runs. Nothing else is sent.",
-      "Mostra \"Jogando\" e o tempo de jogo no seu perfil do Discord enquanto o Discord está aberto. Nada mais é enviado.")
+PC_TR("Shows \"Playing\", the time played and a \"Join the community\" button (the game's subreddit) on your Discord profile while Discord runs. Nothing else is sent.",
+      "Mostra \"Jogando\", o tempo de jogo e um botão \"Join the community\" (o subreddit do jogo) no seu perfil do Discord enquanto o Discord está aberto. Nada mais é enviado.")
 PC_TR("Key bindings (Custom layout)",
       "Atribuições (layout Personalizado)")
 PC_TR("TOTK_KBM_A. Used by the console scheme, and in the world with Gameplay keys: Console. Empty: the PC layout's keys.",
@@ -1559,32 +1553,32 @@ PC_TR("Game patches",
       "Patches do jogo")
 PC_TR("Aspect ratio",
       "Proporção de tela")
-PC_TR("The window's: on a 16:10, 21:9, 32:9 or 48:9 window or monitor the game draws a canvas of that shape at start (1920x1200, 3440x1440, 5120x1440 or 7680x1440), the HUD laid out for it: 21:9, 32:9 and 48:9 a wider view, 16:10 a taller one (the same height of view, a little less at the sides). Other shapes, and 16:9, keep the game's 16:9 picture. 16:10 / 21:9 / 32:9 / 48:9: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9, 32:9 and 48:9 are heavier than the window's own shape: the whole canvas is drawn, then shown smaller). Needs the game patches' RomFS sets (TOTK_PATCH_SETS) and the overlay's layout for that shape. At the next start: the canvas and the game files laid out for it are chosen as the game starts.",
-      "A da janela: em uma janela ou monitor 16:10, 21:9, 32:9 ou 48:9 o jogo desenha, ao iniciar, uma tela com esse formato (1920x1200, 3440x1440, 5120x1440 ou 7680x1440), com o HUD disposto para ela: 21:9, 32:9 e 48:9 uma visão mais larga, 16:10 uma mais alta (a mesma altura de visão, um pouco menos nas laterais). Outros formatos, e 16:9, mantêm a imagem 16:9 do jogo. 16:10 / 21:9 / 32:9 / 48:9: essa tela, seja qual for a janela (em outro formato ela aparece inteira, com barras; 21:9, 32:9 e 48:9 são mais pesadas que o formato da própria janela: a tela inteira é desenhada e depois exibida menor). Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS) e do layout do overlay para esse formato. Na próxima inicialização: a tela e os arquivos do jogo preparados para ela são escolhidos quando o jogo inicia.")
+PC_TR("The window's: on a 3:2, 16:10, 21:9, 32:9 or 48:9 window or monitor the game draws a canvas of that shape at start (1920x1280, 1920x1200, 3440x1440, 5120x1440 or 7680x1440), the HUD laid out for it: 21:9, 32:9 and 48:9 a wider view, 3:2 and 16:10 a taller one (the same height of view, a little less at the sides). Other shapes, and 16:9, keep the game's 16:9 picture. 16:10 / 21:9 / 32:9 / 48:9 / 3:2: that canvas whatever the window (on another shape it is shown whole, with bars; 21:9, 32:9 and 48:9 are heavier than the window's own shape: the whole canvas is drawn, then shown smaller). Needs the game patches' RomFS sets (TOTK_PATCH_SETS) and the overlay's layout for that shape. At the next start: the canvas and the game files laid out for it are chosen as the game starts. Setup prepares the layouts of this PC's monitors' shapes; another shape's are made at the start after you pick it (about 30 s, once).",
+      "A da janela: em uma janela ou monitor 3:2, 16:10, 21:9, 32:9 ou 48:9 o jogo desenha, ao iniciar, uma tela com esse formato (1920x1280, 1920x1200, 3440x1440, 5120x1440 ou 7680x1440), com o HUD disposto para ela: 21:9, 32:9 e 48:9 uma visão mais larga, 3:2 e 16:10 uma mais alta (a mesma altura de visão, um pouco menos nas laterais). Outros formatos, e 16:9, mantêm a imagem 16:9 do jogo. 16:10 / 21:9 / 32:9 / 48:9 / 3:2: essa tela, seja qual for a janela (em outro formato ela aparece inteira, com barras; 21:9, 32:9 e 48:9 são mais pesadas que o formato da própria janela: a tela inteira é desenhada e depois exibida menor). Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS) e do layout do overlay para esse formato. Na próxima inicialização: a tela e os arquivos do jogo preparados para ela são escolhidos quando o jogo inicia. O Setup prepara os layouts dos formatos dos monitores deste PC; os de outro formato são feitos na inicialização depois que você o escolhe (cerca de 30 s, uma vez).")
 PC_TR("HUD position (21:9, 32:9, 48:9)",
       "Posição do HUD (21:9, 32:9, 48:9)")
-PC_TR("Where the HUD goes on a 21:9, 32:9 or 48:9 canvas: at the screen's edges, or in the middle 16:9 (closer to the eyes on a very wide screen). Menus are the same either way. Nothing changes at 16:9. At the next start: it picks game files the game reads once, as it starts.",
-      "Onde o HUD fica em uma tela 21:9, 32:9 ou 48:9: nas bordas da tela, ou no meio em 16:9 (mais perto dos olhos em uma tela muito larga). Os menus são iguais nos dois casos. Nada muda em 16:9. Na próxima inicialização: escolhe arquivos do jogo que ele lê uma vez, ao iniciar.")
+PC_TR("Where the HUD goes on a 21:9, 32:9 or 48:9 canvas: at the screen's edges, or in the middle 16:9 (closer to the eyes on a very wide screen). Menus are the same either way. Nothing changes at 16:9. At the next start: the game loads its interface layouts once, as it starts. Automatic (the default): in the middle on 48:9, at the edges otherwise.",
+      "Onde o HUD fica em uma tela 21:9, 32:9 ou 48:9: nas bordas da tela, ou no 16:9 central (mais perto dos olhos em uma tela muito larga). Os menus são iguais nos dois casos. Nada muda em 16:9. Na próxima inicialização: o jogo carrega seus layouts de interface uma vez, ao iniciar. Automático (o padrão): no centro em 48:9, nas bordas nos outros casos.")
 PC_TR("Texture cache",
       "Cache de texturas")
-PC_TR("Multiplier of the game's texture cache (fewer blurry textures when turning back; 490 MiB more per step). Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: it picks game files the game reads once, as it starts.",
-      "Multiplicador do cache de texturas do jogo (menos texturas borradas ao se virar; 490 MiB a mais por passo). Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS). Na próxima inicialização: escolhe arquivos do jogo que ele lê uma vez, ao iniciar.")
+PC_TR("Multiplier of the game's texture cache (fewer blurry textures when turning back; 490 MiB more per step). Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: the game sizes its memory once, as it starts.",
+      "Multiplicador do cache de texturas do jogo (menos texturas borradas ao se virar; 490 MiB a mais por passo). Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS). Na próxima inicialização: o jogo dimensiona sua memória uma vez, ao iniciar.")
 PC_TR("Grass density",
       "Densidade de grama")
-PC_TR("Multiplier of grass, flowers and pebbles. Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: it picks game files the game reads once, as it starts.",
-      "Multiplicador de grama, flores e pedrinhas. Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS). Na próxima inicialização: escolhe arquivos do jogo que ele lê uma vez, ao iniciar.")
+PC_TR("Multiplier of grass, flowers and pebbles. Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: the game reads its grass table once, as it starts.",
+      "Multiplicador de grama, flores e pedrinhas. Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS). Na próxima inicialização: o jogo lê sua tabela de grama uma vez, ao iniciar.")
 PC_TR("Shadow distance",
       "Distância das sombras")
-PC_TR("Multiplier of the sharp shadow cascades' distances. Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: it picks game files the game reads once, as it starts.",
-      "Multiplicador das distâncias das cascatas de sombras nítidas. Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS). Na próxima inicialização: escolhe arquivos do jogo que ele lê uma vez, ao iniciar.")
+PC_TR("Multiplier of the sharp shadow cascades' distances. Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: the value is in the shader package, which the game reads once, as it starts.",
+      "Multiplicador das distâncias das cascatas de sombras nítidas. Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS). Na próxima inicialização: o valor está no pacote de shaders, que o jogo lê uma vez, ao iniciar.")
 PC_TR("Fog distance",
       "Distância da névoa")
-PC_TR("Multiplier of the distance fog's start and end (clearer distant mountains). Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: it picks game files the game reads once, as it starts.",
-      "Multiplicador do início e do fim da névoa de distância (montanhas distantes mais nítidas). Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS). Na próxima inicialização: escolhe arquivos do jogo que ele lê uma vez, ao iniciar.")
+PC_TR("Multiplier of the distance fog's start and end (clearer distant mountains). Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: the game reads its sky and fog palettes once, as it starts.",
+      "Multiplicador do início e do fim da névoa de distância (montanhas distantes mais nítidas). Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS). Na próxima inicialização: o jogo lê suas paletas de céu e névoa uma vez, ao iniciar.")
 PC_TR("Fast-travel speed",
       "Viagem rápida: velocidade")
-PC_TR("Fast: Link's departure when travelling is about 2.5 s shorter (its long waits halved, his dissolve as on the Switch); Normal is the game's own. Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: it picks game files the game reads once, as it starts.",
-      "Rápida: a partida de Link ao viajar é cerca de 2,5 s mais curta (suas esperas longas pela metade, a dissolução dele como no Switch); Normal é a do jogo. Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS). Na próxima inicialização: escolhe arquivos do jogo que ele lê uma vez, ao iniciar.")
+PC_TR("Fast: Link's departure when travelling is about 2.5 s shorter (its long waits halved, his dissolve as on the Switch); Normal is the game's own. Needs the game patches' RomFS sets (TOTK_PATCH_SETS). At the next start: the game loads the travel scene the first time you travel and keeps it.",
+      "Rápida: a partida de Link ao viajar é cerca de 2,5 s mais curta (suas esperas longas pela metade, a dissolução dele como no Switch); Normal é a do jogo. Precisa dos conjuntos RomFS dos patches do jogo (TOTK_PATCH_SETS). Na próxima inicialização: o jogo carrega a cena da viagem na primeira vez que você viaja e a mantém.")
 PC_TR("On a 21:9, 32:9 or 48:9 canvas, real-time cutscenes and conversations: wide like the rest of the game, or the original 16:9 framing with bars at the sides (for a scene that looks odd at the edges). Pre-rendered movies are 16:9 video: always shown in the middle with bars.",
       "Em uma tela 21:9, 32:9 ou 48:9, cutscenes e conversas em tempo real: largas como o resto do jogo, ou o enquadramento 16:9 original com barras nas laterais (para uma cena que fica estranha nas bordas). Os vídeos pré-renderizados são 16:9: sempre exibidos no meio, com barras.")
 PC_TR("Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR: any GPU. All cost some GPU; Off is the game's own.",
@@ -1609,3 +1603,99 @@ PC_TR("TOTK_FG_PACE. Smooth: the frames shown match the monitor (real ones at th
       "TOTK_FG_PACE. Suave: os quadros exibidos acompanham o monitor (os reais no limite dividido pelo multiplicador). Máximo de fps: os quadros reais como sem geração de quadros e os gerados do multiplicador após cada um, acima da taxa de atualização, também com VRR (mailbox, senão immediate, que pode causar tearing; o monitor pode sair do VRR; TOTK_FG_MAX_VRR_FIFO=1 mantém o FIFO do VRR).")
 PC_TR("Smooth keeps the frames shown in step with the monitor's refresh. Maximum fps adds the generated frames to every real frame the PC makes, even past the refresh rate: more frames than the screen shows (the fps readout counts them all), for VRR panels or low latency; Smooth looks steadier on a fixed refresh. With V-sync off the picture can tear.",
       "Suave mantém os quadros exibidos no ritmo da atualização do monitor. Máximo de fps soma os quadros gerados a cada quadro real que o PC produz, mesmo acima da taxa de atualização: mais quadros do que a tela mostra (o contador de fps conta todos), para monitores VRR ou baixa latência; Suave fica mais estável com taxa fixa. Com o V-sync desligado a imagem pode apresentar tearing.")
+PC_TR("5.1 (experimental)",
+      "5.1 (experimental)")
+PC_TR("7.1 (experimental)",
+      "7.1 (experimental)")
+PC_TR("PC (WASD, mouse)",
+      "PC (WASD, mouse)")
+PC_TR("+ (menu)",
+      "+ (menu)")
+PC_TR("Ultrahand",
+      "Ultramão")
+PC_TR("Fuse",
+      "Fusão")
+PC_TR("Ascend",
+      "Ascensão")
+PC_TR("Recall",
+      "Reversão")
+PC_TR("Autobuild",
+      "Autoconstrução")
+PC_TR("Menus",
+      "Menus")
+PC_TR(", %d nits",
+      ", %d nits")
+PC_TR("Upscaler",
+      "Upscaler")
+PC_TR("TOTK_DLSS_SR / TOTK_FSR_SR. DLSS (NVIDIA RTX) or FSR (any GPU) upscales the 3D scene to the output in place of the game's upscaler and its FXAA (DLAA / native AA when Render resolution matches the output).",
+      "TOTK_DLSS_SR / TOTK_FSR_SR. O DLSS (NVIDIA RTX) ou o FSR (qualquer GPU) escala a cena 3D até a saída no lugar do upscaler do jogo e do seu FXAA (DLAA / AA nativo quando a Resolução de renderização é igual à da saída).")
+PC_TR("FSR (any GPU)",
+      "FSR (qualquer GPU)")
+PC_TR("TOTK_DLSS_FG / TOTK_FSR_FG. Generated frames between real ones: DLSS x2 on NVIDIA RTX 40 series and newer, x3 and x4 on RTX 50; FSR x2 on any GPU. The frame cap counts the frames shown (at a 30 cap: x2, 60 shown). Adds some input latency.",
+      "TOTK_DLSS_FG / TOTK_FSR_FG. Quadros gerados entre os reais: DLSS x2 na NVIDIA RTX série 40 ou mais nova, x3 e x4 na RTX 50; FSR x2 em qualquer GPU. O limite de quadros conta os exibidos (com limite 30: x2, 60 exibidos). Adiciona alguma latência de entrada.")
+PC_TR("Console",
+      "Console")
+PC_TR("cheats",
+      "cheats")
+PC_TR("Mods",
+      "Mods")
+PC_TR("Cheats",
+      "Cheats")
+PC_TR("Preset",
+      "Predefinição")
+PC_TR("Bilinear",
+      "Bilinear")
+PC_TR("1x (Switch)",
+      "1x (Switch)")
+PC_TR("Volume",
+      "Volume")
+PC_TR("Normal",
+      "Normal")
+PC_TR("PC (WASD)",
+      "PC (WASD)")
+PC_TR("Saves",
+      "Saves")
+PC_TR("°C (Celsius)",
+      "°C (Celsius)")
+PC_TR("°F (Fahrenheit)",
+      "°F (Fahrenheit)")
+PC_TR("Vsync",
+      "Sincronização vertical")
+PC_TR("Shaders",
+      "Shaders")
+PC_TR("HDR",
+      "HDR")
+PC_TR("Cutscenes (21:9, 32:9, 48:9)",
+      "Cutscenes (21:9, 32:9, 48:9)")
+PC_TR("0.1% low",
+      "0,1% baixo")
+PC_TR("game",
+      "jogo")
+PC_TR("DLSS model",
+      "Modelo do DLSS")
+PC_TR("NVIDIA's default",
+      "O padrão da NVIDIA")
+PC_TR("Preset K",
+      "Preset K")
+PC_TR("Preset J",
+      "Preset J")
+PC_TR("TOTK_DLSS_PRESET. The AI model DLSS and DLAA use: NVIDIA's default for each quality, or preset K (sharpest) or J (a little less ghosting, a little more flicker) for all.",
+      "TOTK_DLSS_PRESET. O modelo de IA que o DLSS e o DLAA usam: o padrão da NVIDIA para cada qualidade, ou o preset K (o mais nítido) ou o J (um pouco menos de fantasmas, um pouco mais de cintilação) para todas.")
+PC_TR("DLSS character trails",
+      "Rastros de personagens no DLSS")
+PC_TR("Fewest trails",
+      "Menos rastros")
+PC_TR("Between",
+      "Intermediário")
+PC_TR("Smoothest (more trails)",
+      "Mais suave (mais rastros)")
+PC_TR("TOTK_DLSS_TRAILS. Where something moved (Link, animals, a swung weapon), how much DLSS and DLAA trust the new frame over the old ones: fewest trails, or smoother edges with more trails.",
+      "TOTK_DLSS_TRAILS. Onde algo se moveu (Link, animais, uma arma sendo brandida), o quanto o DLSS e o DLAA confiam no quadro novo em vez dos anteriores: menos rastros, ou bordas mais suaves com mais rastros.")
+PC_TR("Which AI model DLSS and DLAA use. NVIDIA's default picks one for each quality. Preset K is the sharpest; preset J ghosts a little less behind moving things but flickers a little more. Changing it rebuilds DLSS once (a short pause).",
+      "Qual modelo de IA o DLSS e o DLAA usam. O padrão da NVIDIA escolhe um para cada qualidade. O preset K é o mais nítido; o preset J deixa um pouco menos de rastro atrás do que se move, mas cintila um pouco mais. Ao trocá-lo, o DLSS é reconstruído uma vez (uma pausa curta).")
+PC_TR("Where something moved (Link, animals, a swung weapon), DLSS and DLAA can keep blending in older frames, which leaves faint trails, or trust the new frame, which removes them but can make those edges flicker a little. Fewest trails is the default.",
+      "Onde algo se moveu (Link, animais, uma arma sendo brandida), o DLSS e o DLAA podem continuar misturando quadros anteriores, o que deixa rastros leves, ou confiar no quadro novo, o que os remove mas pode fazer essas bordas cintilarem um pouco. Menos rastros é o padrão.")
+PC_TR("Safe GPU mode: the graphics driver crashed in the last runs, so shaders now build the slow, safe way",
+      "Modo seguro de GPU: o driver gráfico travou nas últimas sessões, então os shaders agora são compilados do jeito lento e seguro")
+PC_TR("Safe GPU mode: the graphics driver kept crashing, so shaders are also built unoptimised; the game may run slower until it has run cleanly a few times",
+      "Modo seguro de GPU: o driver gráfico continuou travando, então os shaders também são compilados sem otimização; o jogo pode ficar mais lento até rodar sem problemas algumas vezes")

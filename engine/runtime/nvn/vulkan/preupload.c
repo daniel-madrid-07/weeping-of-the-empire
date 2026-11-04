@@ -96,8 +96,52 @@ void backend_texture_created(NvnTexture *t) {
     pthread_mutex_unlock(&pre_mu);
 }
 
+// The flag-skipped textures among a load's first uploads (LEAD 04:56, for v0.1.10's wider pre-upload): each one's NVN
+// flags (pre_kind's 0xdd: DISPLAY 0x1, IMAGE 0x4, COMPRESSIBLE 0x8, LINEAR 0x10, LINEAR_RENDER_TARGET 0x40,
+// ADAPTIVE_ZCULL 0x80) and, at the account (240 frames on), what its backend is: a scaled kind, rendered / written by the
+// GPU since (gpu_owned: a render target or storage image in use), or sampled only. Which classes a wider pre-upload
+// could take safely is read from that line. Render thread only (first_sight, forget, the account).
+typedef struct { NvnTexture *t; uint32_t flags; uint64_t bytes; } FsEnt;
+enum { FS_MAX = 2048 };
+static FsEnt fs_e[FS_MAX];
+static int fs_en;
+static uint64_t fs_over, fs_gone;   // (beyond FS_MAX or the 16 flag classes; finalized before the account)
+static void fs_class_report(void) {
+    typedef struct { uint32_t flags; uint64_t n, bytes, scaled, rendered, plain, plain_bytes; } Cls;
+    Cls c[16];
+    int nc = 0;
+    for (int i = 0; i < fs_en; i++) {
+        const FsEnt *e = &fs_e[i];
+        int k = 0;
+        while (k < nc && c[k].flags != e->flags) k++;
+        if (k == nc) { if (nc == 16) { fs_over++; continue; } c[nc++] = (Cls){.flags = e->flags}; }
+        const TexBackend *b = e->t->backend;
+        c[k].n++; c[k].bytes += e->bytes;
+        if (b && b->scalable) c[k].scaled++;
+        else if (b && b->gpu_owned) c[k].rendered++;
+        else { c[k].plain++; c[k].plain_bytes += e->bytes; }
+    }
+    if (!nc && !fs_gone && !fs_over) return;
+    char line[1024];
+    int n = snprintf(line, sizeof line, "[tex] pre-upload account, flag-skipped first uploads by flags (scaled kind / rendered or "
+                                        "written by the GPU since / sampled only):");
+    for (int done = 0; done < nc && n < (int)sizeof line - 120; done++) {
+        int best = -1;
+        for (int k = 0; k < nc; k++) if (c[k].n && (best < 0 || c[k].bytes > c[best].bytes)) best = k;
+        if (best < 0) break;
+        n += snprintf(line + n, sizeof line - n, " flags %#x: %llu (%.1f MB) %llu / %llu / %llu (%.1f MB);", c[best].flags,
+                      (unsigned long long)c[best].n, c[best].bytes / 1048576.0, (unsigned long long)c[best].scaled,
+                      (unsigned long long)c[best].rendered, (unsigned long long)c[best].plain, c[best].plain_bytes / 1048576.0);
+        c[best].n = 0;
+    }
+    LOG("%s finalized before the account %llu, not classified (over the list) %llu\n", line, (unsigned long long)fs_gone,
+        (unsigned long long)fs_over);
+}
+
 // backend_texture_destroyed (textures.c, render thread): before the NvnTexture is freed
 void vk_preupload_forget(NvnTexture *t) {
+    for (int i = 0; i < fs_en; i++)
+        if (fs_e[i].t == t) { fs_e[i] = fs_e[--fs_en]; fs_gone++; break; }
     if (!pre_n) return;   // (a racy read: a push of this very texture cannot be in flight, it is being destroyed)
     pthread_mutex_lock(&pre_mu);
     for (int i = 0; i < pre_n; i++)
@@ -140,9 +184,13 @@ void vk_preupload_first_sight(NvnTexture *t, uint64_t bytes) {
     if (!pre_end_frame || pre_loading) return;
     const uint64_t frame = vk_frame_counter();
     if (frame - pre_end_frame < 240) {
-        const int k = t->debug_id >= pre_end_id ? 2 : pre_kind(t) ? 1 : 0;
+        const int pk = pre_kind(t), k = t->debug_id >= pre_end_id ? 2 : pk ? 1 : 0;
         fs_n[k]++;
         fs_bytes[k] += bytes;
+        if (k == 1 && pk == SK_FLAGS) {
+            if (fs_en < FS_MAX) fs_e[fs_en++] = (FsEnt){t, t->flags & 0xdd, bytes};
+            else fs_over++;
+        }
         return;
     }
     LOG("[tex] pre-upload account, 240 frames after the load: first uploads not pre-uploaded: made before its end and "
@@ -150,6 +198,9 @@ void vk_preupload_first_sight(NvnTexture *t, uint64_t bytes) {
         "the first use %llu (%.1f MB)\n",
         (unsigned long long)fs_n[0], fs_bytes[0] / 1048576.0, (unsigned long long)fs_n[1], fs_bytes[1] / 1048576.0,
         (unsigned long long)fs_n[2], fs_bytes[2] / 1048576.0, (unsigned long long)re_n, re_bytes / 1048576.0);
+    fs_class_report();
+    fs_en = 0;
+    fs_over = fs_gone = 0;
     pre_end_frame = 0;
 }
 
@@ -163,6 +214,8 @@ static void pre_load_end(void) {
     pre_end_id = vk_preupload_next_id();
     memset(fs_n, 0, sizeof fs_n);
     memset(fs_bytes, 0, sizeof fs_bytes);
+    fs_en = 0;   // (a new load: the flag-skipped list starts again)
+    fs_over = fs_gone = 0;
     re_n = re_bytes = 0;
     LOG("[tex] pre-upload account, load end: %llu textures, %.1f MB pre-uploaded; %llu left (%s); skipped: %s %llu, "
         "%s %llu, %s %llu, %s %llu, %s %llu, %s %llu\n",

@@ -197,7 +197,7 @@ static bool make_pipeline(VkFormat fmt) {
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = layout};
     VkPipeline p = VK_NULL_HANDLE;
-    ok = ok && vkCreateGraphicsPipelines(g_vk.dev, VK_NULL_HANDLE, 1, &gi, NULL, &p) == VK_SUCCESS;
+    ok = ok && vk_engine_graphics_pipeline("overlay", VK_NULL_HANDLE, &gi, &p) == VK_SUCCESS;
     if (vs) vkDestroyShaderModule(g_vk.dev, vs, NULL);
     if (fs) vkDestroyShaderModule(g_vk.dev, fs, NULL);
     if (!ok) return false;
