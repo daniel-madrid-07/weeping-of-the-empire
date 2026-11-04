@@ -853,14 +853,19 @@ static int rsc_own_mode(void) {
 // composite upsamples across depth edges by gathering its low-resolution depth and colour and keeping the taps whose depth
 // matches the pixel's: with one guest texel in all four taps it found no match across an edge and took the sky's colour,
 // a bright, stair-stepped fringe one low-resolution texel wide around distant silhouettes at render scale 2 (public #53,
-// RX 7900 XTX at 4K: gone at 100 %; likely #19's squares in torch glow too). Now (default; LARECOMP_GATHER_SCALE=0: the
+// RX 7900 XTX at 4K: gone at 100 %; likely #19's squares in torch glow too). With LARECOMP_GATHER_SCALE=1 (else the
 // hardware gather everywhere) a gather from a 2D / 2D-array texture whose scale is not 1 reads the guest's 2x2 texels,
 // each at the centre of its host footprint (rsc's mapping), in textureGather's order, clamped to the edge (a gather's
 // wrap is not applied: screen buffers clamp); at scale 1 the hardware gather as before. A register offset counts in guest
 // texels there (the shared path divides it by the host size: half a texel at scale 2).
+// OFF by default after v0.1.9.1 (LARECOMP_GATHER_SCALE=1: on): on v0.1.9.1 the same #53 player saw the outlines WORSE at
+// render scales other than 100 % (blocky, darker steps one low-resolution texel wide around distant silhouettes): a
+// guest texel has no host texel at its centre at scale 2 (each fetch is a quarter guest texel off), so the depth match
+// still misses at edges, now in guest-sized steps. The hardware gather of v0.1.9 is back; the fix belongs in how the
+// reduced-resolution buffers are scaled, not in the gather.
 static bool gather_scale_on(void) {
     static int on = -1;   // (read at translation: the shader text, so the pipeline cache key, follows it)
-    if (on < 0) { const char *e = getenv("LARECOMP_GATHER_SCALE"); on = !(e && *e == '0'); }
+    if (on < 0) { const char *e = getenv("LARECOMP_GATHER_SCALE"); on = e && *e == '1'; }
     return on;
 }
 static bool rsc_own(Ctx *c, char *o, size_t n, const char *inner, int k) {

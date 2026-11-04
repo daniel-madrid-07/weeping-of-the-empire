@@ -118,7 +118,12 @@ OVERLAY_SETS = ['--texture-cache', '1.5,2,2.5,3',
 HEARTBEAT_S = 60     # a step silent this long prints a 'still working' line (step 4 can be quiet for minutes)
 
 
+NESTED = []   # (non-empty while an --update install also brings its 1.0.0 game up to date: main_100)
+
+
 def say(msg):
+    if NESTED:   # (that pass's lines: '1.0.0: ...', its steps as 'step N of M', so Setup's progress (StepLine 'step N/M')
+        msg = '1.0.0: ' + re.sub(r'\bstep (\d+)/(\d+)', r'step \1 of \2', msg)   # does not go back)
     print(f'[Builder] {msg}', flush=True)
 
 
@@ -1382,6 +1387,47 @@ def download_kit(argv):
     say(f'KIT: {d}')
 
 
+def main_100(argv, out, head):
+    """An --update install builds only UPDATE_VERSION, and Setup offers the update dump again at every run (Builder.cs
+    RestoreChoices): a 1.0.0 game folder from an older Setup would stay on its old code for good. So when this install
+    has a 1.0.0 folder that another commit made, the same run builds 1.0.0 too (main() again without --update: its
+    steps reuse what is there, minutes with the object cache); a failure there leaves the UPDATE_VERSION build done and
+    says how to update 1.0.0. No 1.0.0 folder: none is made (a player who chose UPDATE_VERSION only), only the line
+    saying how."""
+    old = newest_package(out, '')
+    if not old:
+        say(f'1.0.0: not built (this run builds {UPDATE_VERSION} only): to play 1.0.0 too, run Setup again without the '
+            f'{UPDATE_VERSION} update')
+        return
+    if same_100_package(out, head):
+        return
+    # (minutes when its build reuses the earlier objects; tens of minutes when it can't: exFAT, a cleared cache)
+    say(f'1.0.0: your 1.0.0 game ({os.path.basename(old)}) is from an older Setup: updating it too (usually a few '
+        'minutes; up to 45 minutes when its earlier build files are gone or the drive is exFAT)')
+    rest, skip = [], 0
+    for x in argv:   # (the same inputs and folders, without the update and without the window's pid: this run follows it)
+        if skip:
+            skip -= 1
+        elif x in ('--update', '--gui-pid'):
+            skip = 1
+        elif not x.startswith(('--update=', '--gui-pid=')):
+            rest.append(x)
+    NESTED.append(1)
+    ok = False
+    try:
+        main(rest)
+        ok = True
+    except SystemExit as e:   # (fail(): its ERROR line is above)
+        ok = not e.code
+    except Exception as e:
+        say(f'ERROR: {type(e).__name__}: {e}')
+    finally:
+        NESTED.clear()
+    if not ok:
+        say(f'1.0.0: not updated (see the 1.0.0 lines above); your {UPDATE_VERSION} game is ready. To update 1.0.0, run '
+            f'Setup again without the {UPDATE_VERSION} update')
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ['--download-kit']:
@@ -1774,6 +1820,13 @@ def main(argv=None):
     if a.dry_run:
         say('check done (--dry-run): nothing was built')
         return
+    if NESTED:   # (the 1.0.0 pass of an --update install: the --update run says DONE, with its own folder)
+        if install:
+            prune(out, newest)
+        say(f'updated: {newest}')
+        return
+    if update and install:
+        main_100(argv, out, head)
     if install:
         prune(out, newest)
         try:   # (what a later update does not need: earlier builds, unused cached objects; tools/builder/tidy.py)

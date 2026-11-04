@@ -2478,14 +2478,22 @@ static uint64_t res_real_budget(uint64_t budget, uint64_t usage) {
     const uint64_t now = SDL_GetTicksNS();
     {   // (ours still demoted while the room would hold it all again: the blocks' priorities asked anew, at most every 2 s;
         // shim_vma.c vma_shim_reassert, P1.1: the video memory manager otherwise brings them back only lazily)
-        static uint64_t reassert_ns;
-        if (g_vk.pageable && demoted > (64ull << 20) && room > ours_res + demoted && now - reassert_ns > 2000000000ull) {
+        // Room in the OS budget too, with 128 MB to spare (public #86, RX 5600 XT on v0.1.9.1: the OS gave 4022 MB of the
+        // 6103 MB card, ours held all of it; the card's room said yes, so it asked every 2 s while the budget was full, in
+        // the 15-24 fps stretch). An ask that brought nothing back doubles the wait (2 .. 64 s) until ours is back.
+        static uint64_t reassert_ns, reassert_wait = 2000000000ull, reassert_demoted;
+        if (demoted <= (64ull << 20)) reassert_wait = 2000000000ull;
+        if (g_vk.pageable && demoted > (64ull << 20) && room > ours_res + demoted && budget > ours_res + demoted + (128ull << 20) &&
+            now - reassert_ns > reassert_wait) {
             extern uint32_t vma_shim_reassert(VmaAllocator a);
+            if (reassert_ns && demoted >= reassert_demoted && reassert_wait < 60000000000ull) reassert_wait *= 2;
             reassert_ns = now;
+            reassert_demoted = demoted;
             const uint32_t nb = vma_shim_reassert(g_vk.vma);
             static int nlog;
-            if (nlog++ < 20) LOG("[vram] %llu MB of ours demoted with room for it back: %u blocks' residency priority asked again\n",
-                                 (unsigned long long)(demoted >> 20), nb);
+            if (nlog++ < 20) LOG("[vram] %llu MB of ours demoted with room for it back: %u blocks' residency priority asked again"
+                                 " (next ask in %llu s at the earliest)\n", (unsigned long long)(demoted >> 20), nb,
+                                 (unsigned long long)(reassert_wait / 1000000000ull));
         }
     }
     if (demoted > (64ull << 20)) contended_ns = now;

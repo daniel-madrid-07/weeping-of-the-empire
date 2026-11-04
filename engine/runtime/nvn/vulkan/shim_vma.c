@@ -19,17 +19,20 @@ struct VmaAllocation_T { VkDeviceMemory mem; void *mapped; uint32_t type; VkDevi
 // Live bytes per caller tag (Deck d16 2026-10-16: 3 GB asked for in a 1 GB VRAM carve-out; which kind of image holds it?).
 // The caller sets vma_shim_tag around a create (textures.c: 1 ASTC decoded to RGBA8, 2 other texture images, 3 block shadows).
 _Thread_local int vma_shim_tag;
-// Residency priority (P1.1: other apps took the card, WDDM demoted ours to system RAM, render targets as readily as
-// textures unused for minutes GPU waits 1.3 s per 2 s). textures.c sets vma_shim_cold around the creation of a sampled
-// texture the CPU fills (not a render target): those are the bytes a frame can lose to system RAM at the least cost. With
-// VK_EXT_memory_priority an allocation of its own gets PRIO_COLD or PRIO_HOT, a block PRIO_BLOCK (neutral: both classes
-// share kind 1 / 2 blocks, so a block made by a cold texture can hold render targets later, which a cold priority fixed at
-// creation would demote first); with VK_EXT_pageable_device_local_memory a block follows what it holds: PRIO_HOT while any
-// hot resource lives in it, PRIO_COLD once only cold ones do (vkSetDeviceMemoryPriorityEXT, when that count crosses 0).
-// device.c LARECOMP_MEM_PRIORITY=0: none of it.
+// Residency priority (P1.1: other apps took the card, WDDM demoted ours to system RAM, render targets as readily as textures
+// unused for minutes GPU waits 1.3 s per 2 s). textures.c sets vma_shim_cold around the creation of a sampled texture the CPU
+// fills (not a render target): those are the bytes a frame can lose to system RAM at the least cost. With
+// VK_EXT_memory_priority an allocation of its own gets PRIO_COLD or PRIO_HOT, a block PRIO_BLOCK (neutral: both classes share
+// kind 1 / 2 blocks, so a block made by a cold texture can hold render targets later, which a cold priority fixed at creation
+// would demote first); with VK_EXT_pageable_device_local_memory a block follows what it holds: PRIO_HOT while any hot
+// resource lives in it, PRIO_COLD once only cold ones do (vkSetDeviceMemoryPriorityEXT, when that count crosses 0). device.c
+// LARECOMP_MEM_PRIORITY=0: none of it. Cold is the OS default's middle, not below it (public #86, RX 5600 XT on v0.1.9.1, a 4
+// GB budget full: at 0.25 the 'minimum' class went first, 128-256 MB of texture blocks the frames sample all the time, paged
+// in every frame at 15-24 fps; "not a render target" is no sign of "not in use"): only render targets are raised, and the
+// video memory manager picks among the rest by use, as on v0.1.9.
 _Thread_local int vma_shim_cold;
 #define PRIO_HOT 1.0f
-#define PRIO_COLD 0.25f
+#define PRIO_COLD 0.5f
 #define PRIO_BLOCK 0.5f   // (every block at its creation, spares too: the OS default's middle)
 static _Atomic uint64_t tag_bytes[8];
 static _Atomic uint32_t tag_count[8];
@@ -115,6 +118,7 @@ struct SubBlock {
     VkDeviceMemory mem;
     uint8_t *mapped;
     uint32_t type, kind, nfree, capfree, nlive, nhot;   // (nhot: live hot resources, the block's priority)
+    float prio;   // (the priority last set; 0: PRIO_BLOCK, as made)
     uint32_t cand, gid;   // (vma_shim_free_gain's scratch, under sub_mu)
     VkDeviceSize live_bytes;
     struct { VkDeviceSize off, size; } *fr;   // free ranges, by offset
@@ -210,6 +214,7 @@ uint32_t vma_shim_reassert(VmaAllocator a) {
         const float p = b->nhot ? PRIO_HOT : PRIO_COLD;
         a->set_prio(a->dev, b->mem, p - 0.01f);
         a->set_prio(a->dev, b->mem, p);
+        b->prio = p;
         n++;
     }
     pthread_mutex_unlock(&sub_mu);
@@ -363,8 +368,12 @@ static void sub_give(SubBlock *b, VkDeviceSize off, VkDeviceSize size) {
 // allocates it alone)
 // a block's priority from what lives in it (pageable only; sub_mu held)
 static void block_prio(VmaAllocator a, SubBlock *b) {
-    if (a->set_prio && (a->mp.memoryTypes[b->type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
-        a->set_prio(a->dev, b->mem, b->nhot ? PRIO_HOT : PRIO_COLD);
+    const float p = b->nhot ? PRIO_HOT : PRIO_COLD;
+    if ((b->prio ? b->prio : PRIO_BLOCK) == p) return;   // (unchanged: a cold first resident of a block made at PRIO_BLOCK)
+    if (a->set_prio && (a->mp.memoryTypes[b->type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+        a->set_prio(a->dev, b->mem, p);
+        b->prio = p;
+    }
 }
 static VmaAllocation sub_alloc(VmaAllocator a, uint32_t t, uint32_t kind, VkMemoryRequirements req, bool cold) {
     VmaAllocation al = NULL;
