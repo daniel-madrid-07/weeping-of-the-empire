@@ -37,6 +37,7 @@ SEED = os.path.join(ENG, 'seed')  # the precompile seed: programs and pipelines 
 ARCHIVE = os.path.join(ENG, 'archive_shaders.bin')
 DLSS = os.path.join(ENG, 'dlss')
 FFX = os.path.join(ENG, 'ffx')   # (AMD's FidelityFX runtime for FSR, fetched by tools/engine/build.py)
+XESS = os.path.join(ENG, 'xess')   # (Intel's XeSS runtime libxess.dll, fetched by tools/engine/build.py)
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 ENV = {'NXR_PC_OVERLAY': '1',   # the F10 overlay and settings.ini (engine-overlay.md)
        'TOTK_MOUSE_CAMERA': '1',  # the mouse camera
@@ -52,6 +53,7 @@ display.fps_cap = 120  # 120 fps; F10 > Gráficos ofrece 30 a 240 (40, 45, 60, 7
 graphics.render_scale = auto  # Resolución de render: la altura de la ventana
 game.screenshots = 1  # F12 guarda una captura en Imágenes\\Capturas de pantalla
 game.crash_reports = 1  # Informe y minivolcado si el juego se cierra por un fallo
+graphics.aspect_ratio = window  # La forma de la imagen: la de la ventana (3:2, 16:10, 21:9, 32:9, 48:9); 16:9 la fija
 """
 
 
@@ -269,6 +271,8 @@ def main():
         env['TOTK_DLSS_DIR'] = DLSS
     if os.path.isfile(os.path.join(FFX, 'amd_fidelityfx_vk.dll')):
         env['TOTK_FFX_DIR'] = FFX
+    if os.path.isfile(os.path.join(XESS, 'libxess.dll')):
+        env['TOTK_XESS_DIR'] = XESS
     if version == '1.0.0' and archive_pack():   # (--env TOTK_PRECOMPILE_ARCHIVE=0 turns the warm-up off)
         env['TOTK_ARCHIVE_SHADERS'] = ARCHIVE
     env.update(kv.split('=', 1) for kv in a.env)

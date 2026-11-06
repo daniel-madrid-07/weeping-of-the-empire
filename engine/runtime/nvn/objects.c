@@ -294,7 +294,12 @@ static void sync_wait_body(Cpu *c) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     // for that previous fence, as with the lag alone. Relies on the game not rewriting frame N's command memory and the
     // data the replay reads (guest_copy / guest_direct) while it builds N+1.
     static int tlag = -1;
-    if (tlag < 0) { const char *e = getenv("LARECOMP_SYNC_TICKET_LAG"); tlag = !(e && *e == '0'); if (!tlag) LOG("[nvn] SyncWait ticket lag off (LARECOMP_SYNC_TICKET_LAG=0)\n"); }
+    // LARECOMP_REPLAY_BOUND=1 (exec.c, default off): the ticket lag off, the GPU lag kept (frame N replayed before its wait returns)
+    if (tlag < 0) {
+        const char *e = getenv("LARECOMP_SYNC_TICKET_LAG");
+        tlag = !(e && *e == '0') && !backend_replay_bound();
+        if (!tlag) LOG("[nvn] SyncWait ticket lag off (%s)\n", backend_replay_bound() ? "LARECOMP_REPLAY_BOUND=1" : "LARECOMP_SYNC_TICKET_LAG=0");
+    }
     const bool site = (lag || tlag) && sync_site_lags(c->x[30]);   // (this call site keeps the lags: LARECOMP_SYNC_EXACT_SITES)
     const int lag_here = lag && site, tlag_here = tlag && site;
     if (backend_async_on() && tlag_here && lag_here && !flush && !whole) {
@@ -308,6 +313,7 @@ static void sync_wait_body(Cpu *c) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
             // write to one of them waits for the replay there; not armed (the first frames, too many page runs, off
             // Windows): this frame's replay is waited for here, as with LARECOMP_SYNC_TICKET_LAG=0
             if (sync_guard_on() && !sync_guard_arm(s, s->ticket)) backend_async_wait(s->ticket);
+            backend_async_released(s->ticket);   // (the game takes frame N as done now: lists replayed after this are counted)
         } else {   // a sync's first fence: the whole wait
             backend_async_wait(s->ticket);
             renderer_wait_seq(s->seq);
@@ -729,11 +735,13 @@ static void zombie_release(NvnTexture *t) {  // (exec lock held)
 }
 static void zombie_release_cb(void *t) { zombie_release((NvnTexture *)t); }
 uint32_t g_pool_gen;   // bumped by every texture / sampler pool entry write (exec.c stage_set memo key)
+uint64_t g_nvn_submit_seq;
 void nvn_pool_entry_set(NvnTexEntry *e, NvnTexture *nt) {  // every write of NvnTexEntry.tex goes through here
     NvnTexture *old = e->tex;
     if (old == nt) return;
     __atomic_add_fetch(&g_pool_gen, 1, __ATOMIC_RELAXED);
     if (nt) __atomic_add_fetch(&nt->pool_refs, 1, __ATOMIC_RELAXED);
+    e->wseq = __atomic_load_n(&g_nvn_submit_seq, __ATOMIC_RELAXED);
     e->tex = nt;
     // (async: this runs on a game thread while the render thread may be in texture_finalize_locked for `old`. Both
     // sides store their half (refs / zombie) seq-cst before reading the other's, so at least one sees both:
@@ -1029,16 +1037,80 @@ NVN(nvnTexturePoolSetDebugLabel) { (void)c; }
 NVN(nvnTexturePoolGetMemoryPool) { RET(G(uint64_t, A(0), 8)); }
 NVN(nvnTexturePoolGetMemoryOffset) { RET(G(uint64_t, A(0), 16)); }
 NVN(nvnTexturePoolGetSize) { RET(G(uint32_t, A(0), 24)); }
+// LARECOMP_POOL_SNAP=1 (FIX program 11-06 item a, hdr; off until its arm decides): texture pool entries as the replayed
+// list's submit left them. The async replay reads an entry when it draws, after the game may have re-registered the slot
+// during the logic of its next frame: the list then drew with the next tile's texture, which has the same shape. Each
+// change keeps the entry's previous value with the submit count at the change (prev[], two deep); a list replayed with
+// count s takes the value before the first change at or after s. No reference is held: a finalize or release of the old
+// texture is an async call queued after the change, so after every list submitted before it, and alive while those replay.
+// A slot changed three times since a list's submit falls back to its current value (exec.c counts those).
+static atomic_flag g_plog = ATOMIC_FLAG_INIT;   // (the entries' history: registrations here, the replay's reads)
+#ifdef _WIN32
+__declspec(dllimport) int __stdcall SwitchToThread(void);   // (kernel32; not windows.h here)
+#define plog_yield() SwitchToThread()
+#else
+#include <sched.h>
+#define plog_yield() sched_yield()
+#endif
+static void plog_lock(void) {  // (held for a few stores or one entry copy: a spin, then yields, a holder
+                                // preempted inside would otherwise cost the spinning render thread a whole quantum)
+    for (int n = 0; atomic_flag_test_and_set_explicit(&g_plog, memory_order_acquire); n++) {
+        if (n >= 64) { plog_yield(); continue; }
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+    }
+}
+static void plog_unlock(void) { atomic_flag_clear_explicit(&g_plog, memory_order_release); }
+int nvn_pool_snap_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_POOL_SNAP");
+        on = e && *e == '1';
+        if (on) LOG("[nvn] pool snapshot on (LARECOMP_POOL_SNAP=1): replays read texture pool entries as their list's submit left them\n");
+    }
+    return on;
+}
+bool nvn_pool_entry_at(const NvnTexEntry *e, uint64_t seq, NvnTexEntry *out) {
+    bool ok = false;
+    plog_lock();
+    if (e->wseq >= seq && e->prev[0].cv > seq) {   // (changed at or after the list's submit: cv = change + 1 > seq)
+        int k = -1;
+        if (e->prev[1].cv <= seq) k = 0;           // (the older change was before it: the value before the newer one)
+        else if (e->cv_lost <= seq) k = 1;         // (both after it, the one before them was not: the value before the older)
+        if (k >= 0) {
+            *out = *e;
+            out->tex = e->prev[k].tex; out->view = e->prev[k].view; out->has_view = e->prev[k].has_view;
+            ok = true;
+        }
+    }
+    plog_unlock();
+    return ok;
+}
 static void register_texture(Cpu *c) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     int id = (int)A(1);
     if (id < 0 || id >= d->count) return;
     NvnTexEntry *e = &((NvnTexEntry *)d->entries)[id];
-    nvn_pool_entry_set(e, A(2) ? HOST(NvnTexture, A(2)) : NULL);   // (bumps g_pool_gen when the texture changes)
+    NvnTexture *nt = A(2) ? HOST(NvnTexture, A(2)) : NULL;
     bool hv = A(3) != 0;
-    if (hv != e->has_view || (hv && memcmp(&e->view, AP(3), sizeof e->view))) __atomic_add_fetch(&g_pool_gen, 1, __ATOMIC_RELAXED);
+    const bool view_changed = hv != e->has_view || (hv && memcmp(&e->view, AP(3), sizeof e->view));
+    const bool snap = (nt != e->tex || view_changed) && nvn_pool_snap_on() && backend_async_on();
+    if (snap) plog_lock();
+    if (snap) {   // (the value queued lists submitted before this change still draw with: nvn_pool_entry_at)
+        e->cv_lost = e->prev[1].cv;
+        e->prev[1] = e->prev[0];
+        e->prev[0].tex = e->tex; e->prev[0].view = e->view; e->prev[0].has_view = e->has_view;
+        e->prev[0].cv = __atomic_load_n(&g_nvn_submit_seq, __ATOMIC_RELAXED) + 1;
+    }
+    nvn_pool_entry_set(e, nt);   // (bumps g_pool_gen when the texture changes)
+    if (view_changed) {
+        __atomic_add_fetch(&g_pool_gen, 1, __ATOMIC_RELAXED);
+        e->wseq = __atomic_load_n(&g_nvn_submit_seq, __ATOMIC_RELAXED);
+    }
     e->has_view = hv;
     if (e->has_view) memcpy(&e->view, AP(3), sizeof e->view);
+    if (snap) { e->wseq = e->prev[0].cv - 1; plog_unlock(); }   // (one count for the history and the late test)
     e->dbg_regs++;
     e->dbg_reg_frame = renderer_present_count() + 1;
     if (e->tex) {
@@ -1065,11 +1137,43 @@ NVN(nvnSamplerPoolGetSize) { RET(G(uint32_t, A(0), 24)); }
 // A pool entry keeps its VkSampler (backend) when re-registered with the same parameters: the compare covers the
 // parameters only. Comparing whole descriptors (backend included: set on the entry, NULL on the incoming one) found
 // every identical re-register different, dropped the entry's VkSampler (never destroyed) and bumped g_pool_gen.
+// LARECOMP_POOL_SNAP=1, sampler pools: a re-register with other parameters keeps the entry's previous parameters and
+// VkSampler (samplers are never destroyed) with the submit count at the change, two deep, and a list replayed with
+// count s takes the value before the first change at or after s. A slot changed three times since a list's submit falls
+// back to its current value.
+bool nvn_sampler_entry_at(const NvnSamplerDesc *e, uint64_t seq, NvnSamplerDesc *out) {
+    bool ok = false;
+    plog_lock();
+    if (e->wseq >= seq && e->prev[0].cv > seq) {   // (changed at or after the list's submit: cv = change + 1 > seq)
+        int k = -1;
+        if (e->prev[1].cv <= seq) k = 0;
+        else if (e->cv_lost <= seq) k = 1;
+        if (k >= 0) {
+            *out = *e;
+            memcpy(out, &e->prev[k], offsetof(NvnSamplerDesc, backend));
+            out->backend = e->prev[k].backend;
+            ok = true;
+        }
+    }
+    plog_unlock();
+    return ok;
+}
 static void register_sampler(NvnDescPool *d, int id, const NvnSamplerDesc *nd) {
     if (id < 0 || id >= d->count) return;
     NvnSamplerDesc *e = &((NvnSamplerDesc *)d->entries)[id];
     if (!memcmp(e, nd, offsetof(NvnSamplerDesc, backend))) return;
-    *e = *nd; e->backend = NULL;
+    const bool snap = nvn_pool_snap_on() && backend_async_on();
+    if (snap) {   // (the value queued lists submitted before this change still sample with: nvn_sampler_entry_at)
+        plog_lock();
+        e->cv_lost = e->prev[1].cv;
+        e->prev[1] = e->prev[0];
+        memcpy(&e->prev[0], e, offsetof(NvnSamplerDesc, backend));
+        e->prev[0].backend = e->backend;
+        e->prev[0].cv = __atomic_load_n(&g_nvn_submit_seq, __ATOMIC_RELAXED) + 1;
+    }
+    memcpy(e, nd, offsetof(NvnSamplerDesc, backend));   // (the parameters; the history fields stay this entry's)
+    e->backend = NULL;
+    if (snap) { e->wseq = e->prev[0].cv - 1; plog_unlock(); }
     __atomic_add_fetch(&g_pool_gen, 1, __ATOMIC_RELAXED);
 }
 NVN(nvnSamplerPoolRegisterSampler) { register_sampler(HOST(NvnDescPool, A(0)), (int)A(1), HOST(NvnSamplerDesc, A(2))); }

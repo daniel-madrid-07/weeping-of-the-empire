@@ -2,6 +2,7 @@
 #include "hle.h"
 #include "nxr_game.h"   // (NXR_GAME_TOTK: forms TotK's build leaves out)
 #include "host_wine.h"
+#include "alias_overlap.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +26,9 @@ static u64 g_heap_base, g_heap_size, g_heap_used;
 // for the Vulkan backend (runtime/nvn/shim/las.h): the heap is imported as one GPU buffer (VK_EXT_external_memory_host)
 extern "C" u64 g_rt_heap_base;
 u64 g_rt_heap_base;
-extern "C" u64 kernel_heap_size(void) { return g_heap_used; }   // committed bytes from g_rt_heap_base
+extern "C" u64 kernel_heap_size(void) { return __atomic_load_n(&g_heap_used, __ATOMIC_ACQUIRE); }   // committed bytes from g_rt_heap_base
+static u64 g_heap_holes;   // (FreeMemoryBlock decommitted a block below the top: [base, base + used) has holes)
+extern "C" int heap_committed_whole(void) { return __atomic_load_n(&g_heap_holes, __ATOMIC_RELAXED) == 0; }   // (frame_snap.c)
 static std::mutex g_heap_mtx;
 
 extern "C" u64 totk_engine_extra_memory(void);   // nvn/totk_game_patches.c: game patches' grown heaps (0 by default)
@@ -215,7 +218,7 @@ HLE_AS(os_AllocateMemoryBlock, "_ZN2nn2os19AllocateMemoryBlockEPmm") {
     if (g_heap_used + size > g_heap_size) { printf("[os] AllocateMemoryBlock(%llx): out of heap\n", size); c->x[0] = 0x1A01; return; }
     u64 a = g_heap_base + g_heap_used;
     if (!VirtualAlloc((void*)a, size, MEM_COMMIT, PAGE_READWRITE)) rt_trap(c, c->x[30], "AllocateMemoryBlock: commit failed");
-    g_heap_used += size;
+    __atomic_store_n(&g_heap_used, g_heap_used + size, __ATOMIC_RELEASE);   // (after the commit: kernel_heap_size readers)
     *(u64*)c->x[0] = a;
     printf("[os] AllocateMemoryBlock(%llx) -> %llx\n", size, a);
     c->x[0] = 0;
@@ -225,8 +228,11 @@ HLE_AS(os_FreeMemoryBlock, "_ZN2nn2os15FreeMemoryBlockEmm") {
     std::lock_guard<std::mutex> l(g_heap_mtx);
     const u64 a = c->x[0], size = (c->x[1] + 0x1FFFFF) & ~0x1FFFFFull;
     if (a < g_heap_base || a + size > g_heap_base + g_heap_used) { printf("[os] FreeMemoryBlock(%llx, %llx): not a block\n", a, c->x[1]); return; }
+    // (the bookkeeping first: frame_snap.c's capture reads [base, base + used) without VirtualQuery while there is no hole,
+    // so it must see the smaller top / the hole before the pages go)
+    if (a + size == g_heap_base + g_heap_used) __atomic_store_n(&g_heap_used, g_heap_used - size, __ATOMIC_RELEASE);
+    else __atomic_add_fetch(&g_heap_holes, 1, __ATOMIC_SEQ_CST);
     VirtualFree((void*)a, size, MEM_DECOMMIT);
-    if (a + size == g_heap_base + g_heap_used) g_heap_used -= size;
     printf("[os] FreeMemoryBlock(%llx, %llx)\n", a, size);
 #endif
 }
@@ -636,6 +642,10 @@ HLE_AS(os_AllocateAddressRegion, "_ZN2nn2os21AllocateAddressRegionEPmm") {
         break;
     }
     if (!got) { printf("[os] AllocateAddressRegion(%llx): alias region full\n", c->x[1]); c->x[0] = 0x1A01; return; }
+    // (a live region overlapping the new one = a double hand-out: never expected, said loudly; public #52)
+    if (u64 ob, on; alias_overlap(g_alias_used, got, size, &ob, &on))
+        printf("[os] AllocateAddressRegion(%llx) -> %llx OVERLAPS the live region %llx + %llx (lr=%llx)\n", c->x[1], got, ob, on,
+               c->x[30]);
     g_alias_used[got] = size;
     if (got + size - g_alias_base > g_alias_hw) g_alias_hw = got + size - g_alias_base;
     static int n; if (n++ < 16 || size >= (1ull << 20)) printf("[os] AllocateAddressRegion(%llx) -> %llx lr=%llx\n", c->x[1], got, c->x[30]);
@@ -654,6 +664,9 @@ HLE_AS(os_FreeAddressRegion, "_ZN2nn2os17FreeAddressRegionEm") {
     if (it == g_alias_used.end()) { printf("[os] FreeAddressRegion(%llx): not a region\n", c->x[0]); c->x[0] = 0; return; }
     u64 a = it->first, n = it->second;
     g_alias_used.erase(it);
+    // (logged as the allocations are, the big ones always, so a reused address in the log is told from a double hand-out;
+    // public #52)
+    static int nfree; if (nfree++ < 16 || n >= (1ull << 20)) printf("[os] FreeAddressRegion(%llx) size %llx lr=%llx\n", a, n, c->x[30]);
     if (in_window(a, n)) window_map(a, n, false);   // the import pins these pages: keep them committed
     else if (g_alias_import_size && a < g_alias_import_base + g_alias_import_size) {   // straddles the window end
         u64 we = g_alias_import_base + g_alias_import_size;

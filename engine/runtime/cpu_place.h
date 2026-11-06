@@ -17,6 +17,13 @@
 //   LARECOMP_ASYNC_EXEC=0, a capture).
 // A CPU with one kind of core and one L3 (the 9800X3D, most 6 / 8-core parts) places nothing else.
 // TOTK_CPU_PLACE=0: no hot / helper split (A/B); the plan is logged at start either way ("[cpu] ...").
+//   guest TOTK_CORE_MODEL=switch only: the Switch's 3 guest cores as
+//           3 logical processors of their own, one on each of three physical cores of hot (fastest class first) other
+//           than the render core's, out of every other set (their SMT siblings too, when 2 physical cores are still
+//           left for the rest).
+//           hle_os_thread.cpp holds each guest thread to its core mask's ones at a host priority from its guest one, so
+//           two threads of one guest core never run at once and a low-priority one waits for the higher, as on the
+//           console (the #51 / #52 race family). Not placed (logged) without CPU Sets, on Wine, or without the cores.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -45,6 +52,11 @@ int cpu_place_hot(uint32_t *ids, int n);
 // 1: the fastest class's cores in the process affinity have SMT siblings; 0: none (an i7-9700K's 8c/8t, a 285K's
 // P-cores, a 4c/4t); -1: unknown (no topology, not Windows). hle_os_thread.cpp's yield default reads it.
 int cpu_place_smt(void);
+// TOTK_CORE_MODEL=switch placed (the guest cores reserved at cpu_place_init); false: off or not placed.
+bool cpu_place_core_model(void);
+// Thread h (a real handle, or GetCurrentThread() for the caller) onto the guest cores of mask bits 0..2; false (nothing
+// done): the model is off / not placed, or the mask has none of them.
+bool cpu_place_guest_thread(void *h, uint64_t mask);
 
 // The planner on its own (tools/engine/test_cpu_place.py): one entry per logical processor.
 typedef struct cpu_lp {
@@ -67,6 +79,11 @@ void cpu_place_plan(const cpu_lp *in, int n, cpu_plan *plan, uint32_t *hot, uint
 // in[n] + the plan's hot[n_hot] (0: unrestricted) -> the render core's logical processors into render[] (room for 4),
 // their count (0: none, or fewer than min_smt SMT cores to choose from)
 int cpu_place_render_core(const cpu_lp *in, int n, const uint32_t *hot, int n_hot, int min_smt, uint32_t *render);
+// TOTK_CORE_MODEL=switch's guest cores: in[n] + hot[n_hot] (0: unrestricted) + render[n_render] -> guest[3] (guest core
+// k's id) and the ids out of every other set into reserve[] (room for n), their count in *n_reserve. Returns 2: whole
+// physical cores reserved (siblings idle), 1: the 3 logical processors only, 0: not placed (too few cores).
+int cpu_place_guest_cores(const cpu_lp *in, int n, const uint32_t *hot, int n_hot, const uint32_t *render, int n_render,
+                          uint32_t *guest, uint32_t *reserve, int *n_reserve);
 
 #ifdef __cplusplus
 }

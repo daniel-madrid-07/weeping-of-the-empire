@@ -25,7 +25,7 @@ MAIN_SPAN = 0x3adf000
 TEXT_END = 0x2bb9c00        # 1024 bytes of padding to the next page (1.0.0: 1520)
 DATA_PAGE_OFFSET = (MAIN_SPAN + 0x3fff) & ~0x3fff
 
-# Text padding use, from layout.pad (the rest, +528 .. +1024, is free)
+# Text padding use, from layout.pad (the rest, +756 .. +1024, is free)
 PAD_REALTIME = 0      # 20-byte frame-step veneer
 PAD_BOUNCE = 32       # 16-byte trampoline veneer
 PAD_CLOTH = 64        # 2 x 28-byte clock veneers, 2 x 20-byte call veneers (to +160)
@@ -34,6 +34,7 @@ PAD_DYNRES = 240      # 20-byte dynamic-resolution floor veneer
 PAD_ASPECT = 272      # 4 x 32-byte aspect stubs (to +400)
 PAD_FOV = 400         # 2 x 64-byte field-of-view veneers (to +528)
 PAD_SHADOW = 528      # 76 + 44 + 60-byte shadow map size veneers (to +708)
+PAD_REPORT = 720      # 16 + 20-byte report-row veneers (to +756)
 
 
 def layout():
@@ -347,6 +348,42 @@ def shadowres(lay):
     return p
 
 
+# The model scene report-row read (1.0.0's hook on main+0x844634, engine/runtime/totk_report_guard.cpp, public #52 /
+# #73): 1.4.3 inlines that function into its caller (1.0.0 main+0x8442d8 = 1.4.3 main+0xa1f84, found by the 0.95
+# threshold both read), the per-object loop 0xa22bc..0xa234c, so there is no function to hook. Per object: h = int16
+# [obj+0x98 + 2 * side] (1.0.0 +0x90), coverage [obj+0x9c] = 0, -1 exits to the next object (0xa2344); x17 = row 2h+1
+# is read at 0xa22e0, n = u32 row 2h at 0xa230c, then row 2n at 0xa2318. Nothing bounds n (#52: n = the float 0.05,
+# a read 32 GB past the rows). The veneers take the loop's own -1 exit (coverage 0, the handle never written: the
+# hook's 'no handle' path) for a negative handle before row 2h+1 is read, and for n >= 0x8000 (h is an int16, so a row
+# pair index is too) before row 2n is. ldrsh sign-extends: bit 31 of w1 is the handle's sign. The veneers write no
+# register, only read w1 (the handle, then n), and set the flags, which are dead at both sites (the fcmp before is
+# read by its cset; the next compare is at 0xa2324). Every exit to the loop is a b (the padding is ~45 MB away); the
+# tbnz / b.hs jump inside their veneer. No readability check (the hook's
+# VirtualQuery): a row up to 1 MB past the rows is trusted.
+REPORT_LOOP_NEXT = 0xa2344    # add x9, x9, #8 (the next object; the original's -1 exit)
+REPORT_H_SITE = 0xa22d8       # orr w17, w11, w1, lsl #1 (2h + 1: the first use of the handle)
+REPORT_N_SITE = 0xa2310       # lsl w1, w1, #1 (w1 = n, read from row 2h)
+
+
+def reportguard(lay):
+    """Model scene report rows checked before they are followed (#52 / #73), as 1.0.0's report-row guard hook."""
+    p = Patch('reportguard')
+    h = lay.pad + PAD_REPORT
+    n = h + 16
+    p.put(REPORT_H_SITE, a.b(REPORT_H_SITE, h), 'reportguard: orr w17, w11, w1, lsl #1 (2h + 1) -> b <handle veneer>')
+    p.code(h, [a.tbnz(1, 31, h, h + 12),                 # a negative handle (-1 left already): the next object
+               Orig(REPORT_H_SITE),
+               a.b(h + 8, REPORT_H_SITE + 4),
+               a.b(h + 12, REPORT_LOOP_NEXT)], 'report handle veneer')
+    p.put(REPORT_N_SITE, a.b(REPORT_N_SITE, n), 'reportguard: lsl w1, w1, #1 (n) -> b <row index veneer>')
+    p.code(n, [a.cmp_w_imm(1, 8, lsl12=True),            # cmp w1, #0x8000
+               a.b_cond('hs', n + 4, n + 16),           # n >= 0x8000: the next object
+               Orig(REPORT_N_SITE),
+               a.b(n + 12, REPORT_N_SITE + 4),
+               a.b(n + 16, REPORT_LOOP_NEXT)], 'report row index veneer')
+    return p
+
+
 FEATURES = {
     # name: (builder, default on, needs); the names are the 1.0.0 set's where the fix is the same
     'realtime': (realtime, True, ()),
@@ -358,6 +395,7 @@ FEATURES = {
     'fov': (fov, True, ()),
     'aspect': (aspect, True, ()),
     'shadowres': (shadowres, True, ()),
+    'reportguard': (reportguard, True, ()),
     'vk_guard': (vk_guard, False, ()),
 }
 

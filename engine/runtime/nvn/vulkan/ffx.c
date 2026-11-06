@@ -78,8 +78,8 @@ static bool ffx_load(void) {
     while (n && exe[n - 1] != L'\\' && exe[n - 1] != L'/') n--;
     exe[n ? n - 1 : 0] = 0;
     HMODULE m = load_from(exe);
-    const char *d = getenv("TOTK_FFX_DIR");
-    if (!m && d && *d && MultiByteToWideChar(CP_UTF8, 0, d, -1, dir, MAX_PATH)) m = load_from(dir);
+    const wchar_t *d = _wgetenv(L"TOTK_FFX_DIR");   /* (wide: getenv's ANSI bytes read as UTF-8 named another folder, #94) */
+    if (!m && d && *d && wcslen(d) < MAX_PATH) { wcscpy(dir, d); m = load_from(dir); }
     if (!m) { LOG("[fsr] amd_fidelityfx_vk.dll not found (beside totk.exe or TOTK_FFX_DIR): FSR unavailable\n"); return false; }
     p_create = (PfnFfxCreateContext)(void *)GetProcAddress(m, "ffxCreateContext");
     p_destroy = (PfnFfxDestroyContext)(void *)GetProcAddress(m, "ffxDestroyContext");

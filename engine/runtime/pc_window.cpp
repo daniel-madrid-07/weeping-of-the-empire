@@ -111,6 +111,8 @@ void hdr_apply(const char *) {
     const char *m = pc_settings_get("display.hdr"), *pk = pc_settings_get("display.hdr_peak"), *pw = pc_settings_get("display.hdr_paper");
     vk_present_set_hdr(m && !strcmp(m, "hdr10") ? VKP_HDR10 : m && !strcmp(m, "scrgb") ? VKP_HDR_SCRGB : VKP_HDR_OFF,
                        pk ? (float)atof(pk) : 1000.0f, pw ? (float)atof(pw) : 200.0f);
+    const char *hu = pc_settings_get("display.hdr_hue");
+    vk_present_set_hdr_hue(hu && *hu ? (float)atof(hu) / 100.0f : 0.0f);
 }
 
 const char *const V_WINDOW[] = {"windowed", "borderless", "exclusive", nullptr};
@@ -412,6 +414,8 @@ const pc_setting k_present[] = {
      nullptr, 400.0f, 4000.0f, 50.0f, 0, "TOTK_HDR_PEAK", nullptr, hdr_apply, nullptr},
     {"display.hdr_paper", "Graphics", "HDR", "Paper white (nits)", "TOTK_HDR_PAPER: the brightness of SDR white.", "200",
      nullptr, nullptr, 80.0f, 500.0f, 10.0f, 0, "TOTK_HDR_PAPER", nullptr, hdr_apply, nullptr},
+    {"display.hdr_hue", "Graphics", "HDR", "Highlight colour", "TOTK_HDR_HUE: the hue of bright lights from the game's HDR "
+     "scene, 0 to 100.", "0", nullptr, nullptr, 0.0f, 100.0f, 10.0f, 0, "TOTK_HDR_HUE", nullptr, hdr_apply, nullptr},
 };
 
 struct AddPresent {

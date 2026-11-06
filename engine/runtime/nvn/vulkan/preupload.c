@@ -301,6 +301,7 @@ void vk_preupload_frame(void) {
         TexBackend *b = vk_tex(t, false);
         if (b && b->uploaded) {
             b->preuploaded = true;
+            b->first_pre = true;   // (textures.c's late-fill line: its first upload was this one)
             done++;
             bytes += sz;
         }

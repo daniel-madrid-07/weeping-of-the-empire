@@ -15,8 +15,9 @@
 // against the guest's own fields: state 1 queued or 2 delivered; same slot; one of its entries). A taken
 // entry is swapped for the next ticket from the game's own counter that no live request holds (at most [mgr+0x24]
 // tries; the pass has not looked at the request yet: +0x37 = 2). If every entry is taken the game's ticket stays.
-// Counters in the log: '[query-tickets] collisions avoided N / unavoidable M'. 1.0.0 only (another version: the
-// original). gen.py --hook 7cba8c in GEN_MAIN; on by default, TOTK_QUERY_TICKETS=0 turns it off.
+// Counters in the log: '[query-tickets] collisions avoided N / unavoidable M'. Another version runs it where its table
+// pins 0x7cba8c (1.4.3: main+0x2a0d3c, pins_v143.json) and places every offset above (totk_field, fields_v143.json;
+// else the original). gen.py --hook 7cba8c in GEN_MAIN; on by default, TOTK_QUERY_TICKETS=0 turns it off.
 // tools/oracle/test_query_tickets.py.
 #include "rt.h"
 #include "totk_globals.h"
@@ -33,13 +34,19 @@ extern "C" u64 g_rt_heap_base;           // hle_os_mem.cpp
 extern "C" u64 kernel_heap_size(void);   // hle_os_mem.cpp: committed bytes from g_rt_heap_base
 
 namespace {
-#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
-constexpr bool kHere = false;
-#else
-constexpr bool kHere = true;
-#endif
-constexpr u64 kMgrCount = 0x8, kMgrSlots = 0x10, kMgrEntries = 0x24, kSlotSize = 0x150, kSlotTicket = 0x140;
-constexpr u64 kState = 0x28, kPersist = 0x2c, kSlotIdx = 0x34, kEntry0 = 0x35, kWait = 0x37;   // a request
+constexpr u64 kMgrCount = totk_field(QueryMgr, 0x8), kMgrSlots = totk_field(QueryMgr, 0x10),
+              kMgrEntries = totk_field(QueryMgr, 0x24);                                  // a query manager
+constexpr u64 kSlotTicket = totk_field(QuerySlot, 0x140);                                // a request slot
+// the slot's size: a mov immediate in the enqueue, not a field; in both builds the ticket counter sits 0x10 before
+// the slot's end (1.0.0: +0x140 of 0x150, 1.4.3: +0x148 of 0x158; the slot grew by 8 from +0xb8 on)
+constexpr u64 kSlotSize = kSlotTicket + 0x10;
+constexpr u64 kState = totk_field(QueryRequest, 0x28), kSlotIdx = totk_field(QueryRequest, 0x34),
+              kEntry0 = totk_field(QueryRequest, 0x35), kWait = totk_field(QueryRequest, 0x37);   // a request
+// (another version: the hook runs where its table placed every field it reads, else the game's tickets as before)
+constexpr bool kHere = totk_field_known(QueryMgr, 0x8) && totk_field_known(QueryMgr, 0x10) &&
+                       totk_field_known(QueryMgr, 0x24) && totk_field_known(QuerySlot, 0x140) &&
+                       totk_field_known(QueryRequest, 0x28) && totk_field_known(QueryRequest, 0x34) &&
+                       totk_field_known(QueryRequest, 0x35) && totk_field_known(QueryRequest, 0x37);
 constexpr u32 kMaxEntries = 256;   // (the entries are bytes in the request)
 
 struct Table { u64 owner[kMaxEntries]; };
@@ -78,7 +85,7 @@ bool enabled() {
     static const bool on = [] {
         const char *e = getenv("TOTK_QUERY_TICKETS");
         const bool v = !e || strcmp(e, "0");
-        printf("[query-tickets] result entries %s\n", !kHere ? "as the game (1.0.0 only)"
+        printf("[query-tickets] result entries %s\n", !kHere ? "as the game (its fields are not placed in this version)"
                : v ? "kept apart for live requests (the default)" : "as the game (TOTK_QUERY_TICKETS=0)");
         return v && kHere;
     }();

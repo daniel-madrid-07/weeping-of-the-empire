@@ -17,7 +17,7 @@ int pc_lang_es(void);             // the port's own texts in Spanish (es, es-419
 // 1.4.3 update in place of USen (English when Setup made none)
 const char *pc_lang_text(void);
 // the port's own texts' language (pc_text.cpp): "es", "ru", "pt" (Brazilian Portuguese: a Portuguese Windows, the game
-// following it), "zh-Hans"; "" English (and the few texts of pc_text_langs.inc in the game's other languages)
+// following it), "zh-Hans", "zh-Hant"; "" English (and the few texts of pc_text_langs.inc in the game's other languages)
 const char *pc_ui_lang(void);
 
 #ifdef __cplusplus

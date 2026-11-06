@@ -29,6 +29,17 @@ def v100_set():
 SHIFT = 0x1230 * 4               # code moved by this much (inserted functions before every site)
 
 
+class VeneerTest(unittest.TestCase):
+    def test_veneers_disjoint(self):
+        """every 1.0.0 feature's veneer ranges (text padding and extra area), pairwise apart: build() checks none"""
+        spans = sorted((a, b, p.feature) for p in sites_v100.build(layout_v100(), list(sites_v100.FEATURES))
+                       for a, b in p.veneers)
+        for (a0, b0, f0), (a1, b1, f1) in zip(spans, spans[1:]):
+            self.assertLessEqual(b0, a1, f'{f0} {a0:#x}..{b0:#x} overlaps {f1} {a1:#x}..{b1:#x}')
+        lay = layout_v100()
+        self.assertLessEqual(spans[-1][1], lay.extra[1], 'a veneer past the extra veneer area')
+
+
 class PcrelTest(unittest.TestCase):
     @unittest.skipUnless(IMAGE, 'no 1.0.0 main image in the work folder')
     def test_round_trip_every_word(self):

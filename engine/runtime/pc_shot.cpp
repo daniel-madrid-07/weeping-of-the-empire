@@ -38,9 +38,11 @@ namespace {
 
 bool screenshot_path(wchar_t* out, size_t n) {
     PWSTR dir = nullptr;
-    if (const char* e = getenv("TOTK_PC_SHOT_DIR"); e && *e) {   // tests and the boot harness: their own folder
-        dir = (PWSTR)CoTaskMemAlloc(MAX_PATH * sizeof(wchar_t));
-        if (!dir || !MultiByteToWideChar(CP_UTF8, 0, e, -1, dir, MAX_PATH)) { CoTaskMemFree(dir); return false; }
+    if (const wchar_t* e = _wgetenv(L"TOTK_PC_SHOT_DIR"); e && *e) {   // tests and the boot harness: their own folder
+        dir = (PWSTR)CoTaskMemAlloc(MAX_PATH * sizeof(wchar_t));   // (wide: not getenv's ANSI read as UTF-8, #94)
+        if (!dir) return false;
+        wcsncpy(dir, e, MAX_PATH - 1);
+        dir[MAX_PATH - 1] = 0;
         CreateDirectoryW(dir, nullptr);
     } else if (FAILED(SHGetKnownFolderPath(FOLDERID_Screenshots, KF_FLAG_CREATE, nullptr, &dir))) {
         CoTaskMemFree(dir); dir = nullptr;

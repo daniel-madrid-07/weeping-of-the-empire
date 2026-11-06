@@ -47,7 +47,8 @@ rm -rf "$P/test" "$P/idlelib" "$P/turtledemo" "$P/tkinter/test" "$P/lib2to3" "$A
        "$APP/usr/python/share/man" "$P/config-3.13-x86_64-linux-gnu/libpython3.13.a"
 find "$APP/usr/python" -name '__pycache__' -prune -exec rm -rf {} +
 
-cp "$HERE/appimage/setup_gui.py" "$APP/usr/app/"
+PEEL=$(mktemp -d); trap 'rm -rf "$PEEL"' EXIT   # (a scratch repository: the commit the AppImage is made for)
+git -C "$PEEL" init -q
 if [ -n "${NXR_BUNDLE_DIR:-}" ]; then
     # a test build (a version with no public tag or Linux assets yet): src.bundle (a git bundle holding refs/tags/$TAG)
     # and the two toolchain archives go inside; Setup fetches and unpacks those instead of downloading
@@ -55,11 +56,9 @@ if [ -n "${NXR_BUNDLE_DIR:-}" ]; then
     for f in src.bundle setup-linux-llvm.tar.zst setup-linux-sdk.tar.zst; do cp "$NXR_BUNDLE_DIR/$f" "$APP/usr/bundle/"; done
     git bundle list-heads "$APP/usr/bundle/src.bundle" | grep -q " refs/tags/$TAG\$" || { echo "src.bundle has no tag $TAG" >&2; exit 1; }
     # the tag's commit, peeled (list-heads gives an annotated tag's own object, which Setup's FETCH_HEAD^{commit} never
-    # matches): the bundle's tag fetched into a scratch repository
-    PEEL=$(mktemp -d)
-    git -C "$PEEL" init -q && git -C "$PEEL" fetch -q "$APP/usr/bundle/src.bundle" "refs/tags/$TAG:refs/tags/$TAG"
+    # matches): the bundle's tag fetched into the scratch repository
+    git -C "$PEEL" fetch -q "$APP/usr/bundle/src.bundle" "refs/tags/$TAG:refs/tags/$TAG"
     FOUND=$(git -C "$PEEL" rev-parse --verify -q "refs/tags/$TAG^{commit}") || { echo "src.bundle: $TAG names no commit" >&2; exit 1; }
-    rm -rf "$PEEL"
     BUNDLE=', "bundle": true'
 else
     # the public tag's commit (annotated: its peeled ^{} line), when it is already published
@@ -76,8 +75,18 @@ if [ -n "${NXR_COMMIT:-}" ] && [ -n "$FOUND" ] && [ "$COMMIT" != "$FOUND" ]; the
     echo "NXR_COMMIT $COMMIT is not the commit $TAG names ($FOUND)" >&2; exit 1
 fi
 printf '{"tag": "%s", "repo": "%s", "commit": "%s"%s}\n' "$TAG" "$REPO_GH" "$COMMIT" "$BUNDLE" > "$APP/usr/app/release.json"
-install -m 755 "$HERE/appimage/AppRun" "$APP/AppRun"
-cp "$HERE/appimage/weeping-of-the-empire.desktop" "$HERE/appimage/weeping-of-the-empire.svg" "$APP/"
+# The window's own files as that commit has them, not this tree's copy (which can differ from the published blob:
+# release-audit 11-04, a comment in setup_gui.py). The published tag is fetched (one commit); before it is public
+# (NXR_COMMIT alone) nothing can be fetched: this tree's files, said so.
+[ -n "$BUNDLE" ] || [ -z "$FOUND" ] || git -C "$PEEL" fetch -q --depth 1 "https://github.com/$REPO_GH.git" "refs/tags/$TAG:refs/tags/$TAG"
+if git -C "$PEEL" cat-file -e "$COMMIT^{commit}" 2>/dev/null; then SRCREV=$COMMIT
+else SRCREV=''; echo "$COMMIT is not public yet: the window's files are this tree's (check them against the export)" >&2; fi
+appfile() {   # tools/linux/appimage/<name> -> stdout
+    if [ -n "$SRCREV" ]; then git -C "$PEEL" cat-file blob "$SRCREV:tools/linux/appimage/$1"; else cat "$HERE/appimage/$1"; fi
+}
+appfile setup_gui.py > "$APP/usr/app/setup_gui.py"
+appfile AppRun > "$APP/AppRun"; chmod 755 "$APP/AppRun"
+for f in weeping-of-the-empire.desktop weeping-of-the-empire.svg; do appfile "$f" > "$APP/$f"; done
 ln -sf weeping-of-the-empire.svg "$APP/.DirIcon"
 mkdir -p "$APP/usr/share/licenses"
 cp "$APP/usr/python/lib/python3.13/LICENSE.txt" "$APP/usr/share/licenses/python.txt"

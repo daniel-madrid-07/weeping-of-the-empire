@@ -334,6 +334,7 @@ static void create_instance(void) {
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
     n_ext = vk_ngx_instance_exts(ext, n_ext, 22);   // ngx.c: what DLSS asks for (TOTK_DLSS only)
+    n_ext = vk_xess_instance_exts(ext, n_ext, 22);   // xess.c: what XeSS asks for (libxess.dll present; usually none new)
     // present.c: HDR colour spaces (before debug utils: the retry below drops the last extension)
     n_ext += (uint32_t)vk_present_instance_exts(ext + n_ext, 23 - (int)n_ext);
     bool validate = getenv("LARECOMP_VK_VALIDATION") != NULL;
@@ -881,6 +882,14 @@ static void create_device(void) {
     if (g_vk.dbias_unorm) ext[n_ext++] = VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME;
     vk_present_device_exts(ep, ne, ext, &n_ext);   // present.c: present id / wait, HDR metadata (when used)
     vk_ngx_device_exts(ep, ne, ext, &n_ext, 48);   // ngx.c: what DLSS asks for on this GPU (TOTK_DLSS only)
+    // XeSS (xess.c, libxess.dll beside the game): its device extensions and features are enabled at the start whenever the
+    // DLL is there and the GPU has all of them, so the Upscaler row can choose it live; else XeSS is unavailable, said once
+    const char *const *xess_ext = NULL;
+    const uint32_t xess_n = vk_xess_device_exts(&xess_ext);
+    bool xess_dev = xess_n > 0;
+    for (uint32_t i = 0; i < xess_n && xess_dev; i++) xess_dev = has_ext(ep, ne, xess_ext[i]);
+    const bool mdt_ext = has_ext(ep, ne, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+    const uint32_t xess_feat = xess_dev ? vk_xess_features() : 0;
     free(ep);
 
     // features the backend relies on. Every bit enabled below is one the device reports (present's audit, 2026-10-27: an
@@ -912,6 +921,8 @@ static void create_device(void) {
     VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT have_pg = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT};
     if (g_vk.pageable) { have_pg.pNext = have13.pNext; have13.pNext = &have_pg; }
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT have_mdt = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT};
+    if (mdt_ext) { have_mdt.pNext = have13.pNext; have13.pNext = &have_mdt; }
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
     if (g_vk.pageable && !have_pg.pageableDeviceLocalMemory) { g_vk.pageable = false; drop_ext(ext, &n_ext, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME); }
     if (g_vk.mem_priority && !have_mp.memoryPriority) {
@@ -922,6 +933,15 @@ static void create_device(void) {
     LOG("[vk] memory residency priority: %s\n", g_vk.pageable ? "on, per block as its contents change (VK_EXT_memory_priority + pageable_device_local_memory)"
         : g_vk.mem_priority ? "on, set when an allocation is made (VK_EXT_memory_priority)"
         : !(mpe && *mpe == '1') ? "off (the default; LARECOMP_MEM_PRIORITY=1: on)" : "off: not on this driver (VK_EXT_memory_priority)");
+    // (XeSS: every structure it asks for known (bit 31 clear), the storage-image write and mutable descriptors it needs on
+    // the device, its extensions added once)
+    xess_dev = xess_dev && !(xess_feat & (1u << 31)) && (!(xess_feat & 1) || have.features.shaderStorageImageWriteWithoutFormat) &&
+               (!(xess_feat & 2) || (mdt_ext && have_mdt.mutableDescriptorType));
+    for (uint32_t i = 0; i < xess_n && xess_dev; i++) {
+        bool dup = false;
+        for (uint32_t j = 0; j < n_ext && !dup; j++) dup = !strcmp(ext[j], xess_ext[i]);
+        if (!dup) { if (n_ext < 48) ext[n_ext++] = xess_ext[i]; else xess_dev = false; }
+    }
     if (g_vk.dbias_unorm && !(have_dbc.depthBiasControl && have_dbc.leastRepresentableValueForceUnormRepresentation)) {
         g_vk.dbias_unorm = false;
         drop_ext(ext, &n_ext, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
@@ -1039,6 +1059,12 @@ static void create_device(void) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT, .pageableDeviceLocalMemory = VK_TRUE};
     if (g_vk.pageable) { pgf.pNext = f13.pNext; f13.pNext = &pgf; }
     f13.pNext = vk_present_features(f13.pNext);
+    // XeSS (xess_dev above): mutable descriptors, and its faster int8 / dot-product paths where the GPU has them
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mdtf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT,
+                                                             .mutableDescriptorType = VK_TRUE};
+    if (xess_dev && (xess_feat & 2)) { mdtf.pNext = f13.pNext; f13.pNext = &mdtf; }
+    if (xess_dev && (xess_feat & 4)) f12.shaderInt8 = have12.shaderInt8;
+    if (xess_dev && (xess_feat & 8)) f13.shaderIntegerDotProduct = have13.shaderIntegerDotProduct;
     // vendor binary = the driver's own GPU crash dump (NVIDIA 617: supported), saved by vk_device_fault_report
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .deviceFaultVendorBinary = have_ff.deviceFaultVendorBinary, .pNext = &f11};
@@ -1061,6 +1087,7 @@ static void create_device(void) {
     b->depthBiasClamp = h->depthBiasClamp;
     b->depthClamp = h->depthClamp;
     b->largePoints = h->largePoints;
+    if (xess_dev && (xess_feat & 1)) b->shaderStorageImageWriteWithoutFormat = VK_TRUE;   // (XeSS: queried above)
     // Occlusion queries with exact sample counts (public #16, the camera recognised nothing): without
     // VK_QUERY_CONTROL_PRECISE_BIT a driver may answer any non-zero value for "some samples passed" (a binary
     // occlusion query: 1 NVIDIA counts anyway). LARECOMP_OQ_PRECISE=0: off (the old non-precise queries).
@@ -1134,6 +1161,7 @@ static void create_device(void) {
     vk_present_queue_init(pq, g_queue_shared);
     vk_present_device_ready();
     vk_ngx_device_ready();   // ngx.c: NGX on our device, capability map logged (TOTK_DLSS only)
+    vk_xess_device_ready(xess_dev);   // xess.c: the Upscaler row's XeSS entry can run
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
@@ -1813,10 +1841,16 @@ void vk_frame_end(const char *shot_path) {
         const uint32_t *px = osd_banner((int)g_vk.sc_extent.height, &bw, &bh);
         if (px) osd_blit(cb, px, bw, bh, bh / 2, (int)g_vk.sc_extent.height - bh - bh / 2);
     }
-    {   // shader precompile progress (hle_osd.cpp osd_precompile), bottom right
+    {   // shader precompile progress (hle_osd.cpp osd_precompile), bottom right; with the PC overlay its compile
+        // indicator shows it instead (pc_overlay.cpp, display.compile_osd), play-time compiles too
         extern const uint32_t *osd_precompile(int target_h, int *w, int *h);
         int bw = 0, bh = 0;
-        const uint32_t *px = osd_precompile((int)g_vk.sc_extent.height, &bw, &bh);
+        // (it yields only to an overlay that draws: a failed overlay Vulkan setup or the indicator off keep the banner,
+        // so a first start always shows its progress)
+        extern int pc_overlay_vk_ok(void);
+        extern bool pc_compile_osd_on(void);
+        const bool yield = pc_overlay_enabled() && pc_overlay_vk_ok() && pc_compile_osd_on();
+        const uint32_t *px = yield ? NULL : osd_precompile((int)g_vk.sc_extent.height, &bw, &bh);
         if (px) osd_blit(cb, px, bw, bh, (int)g_vk.sc_extent.width - bw - bh / 3, (int)g_vk.sc_extent.height - bh - bh / 3);
     }
     {   // fps readout without the PC overlay (NXR_PC_OVERLAY=0: hle_osd.cpp's box), top right (top left covers the
@@ -2297,8 +2331,10 @@ void backend_present(NvnTexture *t) {
         // the top-left of its 1920x1080 window textures and crops to it; without this the window showed that corner 1:1
         extern int g_present_crop[4];
         int pc[4]; memcpy(pc, g_present_crop, sizeof pc);
+        bool wcrop = false;   // (the scene fills that crop: present.c's HDR hue maps it so)
         if (pc[2] > 0 && pc[3] > 0 && t->width && t->height &&
             (pc[0] || pc[1] || (uint32_t)pc[2] != t->width || (uint32_t)pc[3] != t->height)) {
+            wcrop = true;
             crop[0] = (float)pc[0] / t->width; crop[1] = (float)pc[1] / t->height;
             crop[2] = (float)pc[2] / t->width; crop[3] = (float)pc[3] / t->height;
         }
@@ -2323,6 +2359,7 @@ void backend_present(NvnTexture *t) {
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
         memcpy(g_shot_crop, crop, sizeof crop);
         vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);
+        vk_present_hue_map((float)vx, (float)vy, (float)vw, (float)vh, pv, wcrop);
         static long menu_at = -1;
         if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
         if (menu_at && real && (long)total_frames + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
@@ -2937,6 +2974,8 @@ void backend_present(NvnTexture *t) {
             LOG("[vram] images since the last line: created %llu, from the recycle pool %llu, finalized but freed (soft limit, "
                 "LARECOMP_VK_SOFT_EVICT=0) %llu%s\n",(unsigned long long)(cum_img_n - l_n), (unsigned long long)(cum_img_reused - l_r),
                 (unsigned long long)(cum_img_unpooled - l_u), slow);
+            extern void vk_recycle_recheck_line(void);   // (textures.c, LARECOMP_RECYCLE_RECHECK only)
+            vk_recycle_recheck_line();
             l_n = cum_img_n; l_r = cum_img_reused; l_u = cum_img_unpooled; l_sn = cum_img_slow_n; l_sns = cum_img_slow_ns;
             img_slow_worst_ns = 0;
             {   // (shadow rungs: why a re-sized sun shadow map still got a new image; gate g19_see_kak_169, 11-03: 3072 x4

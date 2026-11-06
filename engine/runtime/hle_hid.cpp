@@ -1664,6 +1664,7 @@ static void hidpad_read(HostInput* in) {
 
 extern "C" volatile int g_debug_frame_request;   // nvn/vulkan/totk_hooks.c (device.c dumps the next frame)
 extern "C" volatile int g_skip_opening, g_title_phase, g_in_opening;   // hle_fs.cpp (skip-opening overlay; banner in hle_osd.cpp)
+extern "C" int skip_opening_works(void);   // hle_fs.cpp: 0 on another game version (no skip set)
 extern "C" volatile int g_title_stage;                                 // hle_fs.cpp: the title's stage is up
 extern "C" { volatile uint64_t g_title_burst_end = 0; }                // TOTK_TITLE_FPS until this present (hle_vi.cpp)
 static const uint64_t kTitleBurst = 240;
@@ -3368,7 +3369,7 @@ static HostInput host_input() {
         // Skip opening toggle while the title screen is up: F2 or Minus (the title menu has no use for Minus)
         static bool was = false;
         bool now_down = g_f2_down || ((in.buttons | scripted_buttons()) & BtnMinus);
-        if (now_down && !was && g_title_phase) {
+        if (now_down && !was && g_title_phase && skip_opening_works()) {   // (1.0.0 only, hle_fs.cpp)
             g_skip_opening = !g_skip_opening;
             printf("[hid] skip opening %s\n", g_skip_opening ? "ON" : "OFF");
         }
@@ -3377,9 +3378,9 @@ static HostInput host_input() {
         // (TOTK_AUTO_NEWGAME presses New Game -> Start; the skip overlay then ends the prologue at once).
         static u64 minus_since = 0;
         bool minus = ((in.buttons | scripted_buttons()) & BtnMinus) != 0;
-        if (g_in_opening && minus) { if (!minus_since) minus_since = now; } else minus_since = 0;
+        if (g_in_opening && minus && skip_opening_works()) { if (!minus_since) minus_since = now; } else minus_since = 0;
         g_skip_hold_ms = minus_since ? (int)(now - minus_since) : 0;
-        if (g_in_opening && ((g_f2_down && !was) || g_skip_hold_ms >= 1500)) skip_restart();
+        if (g_in_opening && skip_opening_works() && ((g_f2_down && !was) || g_skip_hold_ms >= 1500)) skip_restart();
         was = now_down;
         if (!osd_open && ctl_first) {   // (ctl_read's own rule: its buttons OR-ed in, a stick it holds off centre wins)
             cur.buttons |= ctl_in.buttons;
@@ -3610,7 +3611,9 @@ static void jump_option_set(int v, const char* where) {
                v ? "swapped (the keyboard sends B for Space, X for Shift)" : "as shipped");
 }
 static void jump_option_task(void*, bool ran) {   // eui's thread inside the bridge when ran, else no guest call
-    if (ran) jump_option_set(IsChangeJumpButton() ? 1 : 0, "the UI thread");
+    // (the getter unplaced in another version's table: never called, the sentinel would trap - public #72's class;
+    // jump_option_poll posts nothing there either)
+    if (ran && totk_main_known(0x1a3e83c)) jump_option_set(IsChangeJumpButton() ? 1 : 0, "the UI thread");
     g_jump_pending = false;
 }
 static void jump_option_poll(Ctx* c) {
@@ -3619,6 +3622,12 @@ static void jump_option_poll(Ctx* c) {
     static std::atomic<bool> busy{false};
     const int ctx = pc_ctx();
     if (!on || !pc_scheme_on() || pc_ctx_is_ui(ctx) || ctx == PCX_OVERLAY || ctx == PCX_LOADING || g_title_phase) return;
+    if (!totk_main_known(0x1a3e83c)) {   // (another version's table without the getter: the option stays as shipped)
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            printf("[pc] the game's Jump / Sprint option: its getter has no place in this game version, as shipped\n");
+        return;
+    }
     const u64 now = GetTickCount64();
     if (now < next.load()) return;
     next = now + 500;
@@ -3629,7 +3638,6 @@ static void jump_option_poll(Ctx* c) {
 #ifdef _WIN32
     // no UI hook: the main thread's own pad read, when the game makes one
     if ((unsigned long)GetCurrentThreadId() != os_main_thread_tid() || busy.exchange(true)) return;
-    if (!totk_main_known(0x1a3e83c)) { busy = false; return; }   // (a diagnostic build of another version)
     Ctx saved = *c;
     guest_call(c, totk_main(0x1a3e83c));
     const int v = (c->x[0] & 1) ? 1 : 0;

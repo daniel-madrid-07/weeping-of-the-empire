@@ -195,11 +195,11 @@ def lsr_w(rd, rn, shift):
     return 0x53007c00 | shift << 16 | _reg(rn) << 5 | _reg(rd)
 
 
-def cmp_w_imm(rn, imm):
-    """cmp w<rn>, #imm (subs wzr, w<rn>, #imm)."""
+def cmp_w_imm(rn, imm, lsl12=False):
+    """cmp w<rn>, #imm[, lsl #12] (subs wzr, w<rn>, #imm)."""
     if not 0 <= imm < 0x1000:
         raise ValueError(f'cmp w, #{imm}')
-    return 0x7100001f | imm << 10 | _reg(rn) << 5
+    return 0x7100001f | bool(lsl12) << 22 | imm << 10 | _reg(rn) << 5
 
 
 def fadd_s(rd, rn, rm):

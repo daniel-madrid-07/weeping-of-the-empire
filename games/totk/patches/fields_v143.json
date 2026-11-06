@@ -268,6 +268,18 @@
    "for": [
     "0x1d0d174"
    ]
+  },
+  "0x6a0": {
+   "new": "0x6a0",
+   "for": [
+    "0x15ecad4"
+   ]
+  },
+  "0x6b0": {
+   "new": "0x6b0",
+   "for": [
+    "0x15ecb04"
+   ]
   }
  },
  "BaseProcLink": {
@@ -308,6 +320,19 @@
    "for": [
     "0xbc0f5c",
     "0xbc0fa8"
+   ]
+  },
+  "0x10": {
+   "new": "0x10",
+   "for": [
+    "0x749620"
+   ]
+  },
+  "0x1a8": {
+   "new": "0x1a8",
+   "for": [
+    "0x74963c",
+    "0x749678"
    ]
   }
  },
@@ -454,6 +479,29 @@
     "0x222ea00",
     "0x222ea1c"
    ]
+  },
+  "0x20": {
+   "new": "0x20",
+   "for": [
+    "0x2239238",
+    "0xf2082c"
+   ],
+   "ro": true
+  },
+  "0x40": {
+   "new": "0x40",
+   "for": [
+    "0x222ed58",
+    "0x223919c"
+   ],
+   "ro": true
+  },
+  "0x60": {
+   "new": "0x60",
+   "for": [
+    "0xf2099c"
+   ],
+   "ro": true
   }
  },
  "Ui2dPane": {
@@ -474,6 +522,44 @@
    "for": [
     "0x223b0a4"
    ]
+  },
+  "0x18": {
+   "new": "0x18",
+   "for": [
+    "0xf933e0",
+    "0x462a8"
+   ],
+   "ro": true
+  },
+  "0x20": {
+   "new": "0x20",
+   "for": [
+    "0x468b4",
+    "0x7482c0"
+   ],
+   "ro": true
+  },
+  "0x58": {
+   "new": "0x58",
+   "for": [
+    "0x462b8",
+    "0x1069890"
+   ],
+   "ro": true
+  },
+  "0x59": {
+   "new": "0x59",
+   "for": [
+    "0x4668c"
+   ],
+   "ro": true
+  },
+  "0xb0": {
+   "new": "0xb0",
+   "for": [
+    "0x6f4d44"
+   ],
+   "ro": true
   }
  },
  "EquipmentUser": {
@@ -484,11 +570,386 @@
    ]
   }
  },
- "CameraStickInput": {
-  "0x154": {
-   "new": "0x15c",
+ "BoxCursorControl": {
+  "0x58": {
+   "new": "0x58",
    "for": [
-    "0x1ce6ee8"
+    "0xf6c7fc"
+   ],
+   "ro": true
+  },
+  "0x60": {
+   "new": "0x60",
+   "for": [
+    "0xf6bcec"
+   ]
+  }
+ },
+ "BoxCursorMgr": {
+  "0x14": {
+   "new": "0x14",
+   "for": [
+    "0x2230438"
+   ],
+   "ro": true
+  },
+  "0x28": {
+   "new": "0x28",
+   "for": [
+    "0x2230440"
+   ],
+   "ro": true
+  }
+ },
+ "BoxCursorNode": {
+  "0x18": {
+   "new": "0x18",
+   "for": [
+    "0x11cd130"
+   ],
+   "ro": true
+  },
+  "0x20": {
+   "new": "0x20",
+   "for": [
+    "0xf6bdc0"
+   ],
+   "ro": true
+  }
+ },
+ "EuiScreen": {
+  "0x148": {
+   "new": "0x148",
+   "for": [
+    "0x1ab0370",
+    "0x22308ec"
+   ],
+   "ro": true
+  },
+  "0x150": {
+   "new": "0x150",
+   "for": [
+    "0x1aafddc"
+   ]
+  },
+  "0x16e": {
+   "new": "0x16e",
+   "for": [
+    "0x117d700",
+    "0x1949a08"
+   ],
+   "ro": true
+  },
+  "0x175": {
+   "new": "0x175",
+   "for": [
+    "0x121ed30",
+    "0xe1abcc"
+   ]
+  },
+  "0x28": {
+   "new": "0x28",
+   "for": [
+    "0x1aa7410",
+    "0x1ac942c"
+   ],
+   "ro": true
+  },
+  "0x60": {
+   "new": "0x60",
+   "for": [
+    "0xe1ac64",
+    "0x8ce28c"
+   ],
+   "ro": true
+  },
+  "0x88": {
+   "new": "0x88",
+   "for": [
+    "0x1216c7c",
+    "0x1ab9658"
+   ],
+   "ro": true
+  }
+ },
+ "ScreenMgr": {
+  "0x10": {
+   "new": "0x10",
+   "for": [
+    "0x1a3ae10",
+    "0x1a3b678"
+   ],
+   "ro": true
+  },
+  "0x3f8": {
+   "new": "0x3f8",
+   "for": [
+    "0xf5e0a8",
+    "0x1a40154"
+   ],
+   "ro": true
+  },
+  "0x8": {
+   "new": "0x8",
+   "for": [
+    "0x1a3ae08",
+    "0x1a3b670"
+   ]
+  }
+ },
+ "SeadListNode": {
+  "0x8": {
+   "new": "0x8",
+   "for": [
+    "0x1ab9684"
+   ]
+  }
+ },
+ "UIController": {
+  "0x114": {
+   "new": "0x114",
+   "for": [
+    "0x83eaa8",
+    "0x83e440"
+   ]
+  },
+  "0x128": {
+   "new": "0x128",
+   "for": [
+    "0x83eadc"
+   ]
+  },
+  "0x8": {
+   "new": "0x8",
+   "for": [
+    "0x83eaac",
+    "0xf932b4"
+   ]
+  }
+ },
+ "UIModule": {
+  "0x198": {
+   "new": "0x198",
+   "for": [
+    "0xf93290"
+   ],
+   "ro": true
+  }
+ },
+ "Ui2dDrawInfo": {
+  "0x10": {
+   "new": "0x10",
+   "for": [
+    "0x910fec"
+   ],
+   "ro": true
+  },
+  "0x50": {
+   "new": "0x50",
+   "for": [
+    "0x115eea4"
+   ],
+   "ro": true
+  }
+ },
+ "Ui2dLayout": {
+  "0x18": {
+   "new": "0x18",
+   "for": [
+    "0x22317cc",
+    "0x40808"
+   ],
+   "ro": true
+  },
+  "0x28": {
+   "new": "0x28",
+   "for": [
+    "0x22371c8",
+    "0x7482dc"
+   ],
+   "ro": true
+  },
+  "0x30": {
+   "new": "0x30",
+   "for": [
+    "0x7482e8",
+    "0x729b44"
+   ],
+   "ro": true
+  },
+  "0x91": {
+   "new": "0x91",
+   "for": [
+    "0xeff2d4"
+   ],
+   "ro": true
+  }
+ },
+ "RecipePart": {
+  "0x20": {
+   "new": "0x20",
+   "for": [
+    "0x1a75944",
+    "0x1a7a5ac"
+   ],
+   "ro": true
+  }
+ },
+ "ShortCutParts": {
+  "0x50": {
+   "new": "0x50",
+   "for": [
+    "0x1a8088c",
+    "0x1ad09b0"
+   ],
+   "ro": true
+  }
+ },
+ "SlideListControl": {
+  "0x40": {
+   "new": "0x40",
+   "for": [
+    "0x19ea94c"
+   ],
+   "ro": true
+  },
+  "0x50": {
+   "new": "0x50",
+   "for": [
+    "0x19ea944"
+   ],
+   "ro": true
+  },
+  "0x88": {
+   "new": "0x88",
+   "for": [
+    "0x1ab675c"
+   ],
+   "ro": true
+  },
+  "0x8c": {
+   "new": "0x8c",
+   "for": [
+    "0x1a80894",
+    "0x1a82880"
+   ],
+   "ro": true
+  },
+  "0x98": {
+   "new": "0x98",
+   "for": [
+    "0x19ec1a4"
+   ],
+   "ro": true
+  },
+  "0xbc": {
+   "new": "0xbc",
+   "for": [
+    "0x11e3998"
+   ],
+   "ro": true
+  },
+  "0xbe": {
+   "new": "0xbe",
+   "for": [
+    "0x19ea304"
+   ]
+  },
+  "0xc3": {
+   "new": "0xc3",
+   "for": [
+    "0x19ea368"
+   ]
+  }
+ },
+ "UIRecipeCardScreen": {
+  "0x1a0": {
+   "new": "0x1a0",
+   "for": [
+    "0x1ac8d78",
+    "0x1ac8cf8"
+   ],
+   "ro": true
+  },
+  "0x1a8": {
+   "new": "0x1a8",
+   "for": [
+    "0x1ac8d98",
+    "0x1ac8d4c"
+   ],
+   "ro": true
+  }
+ },
+ "UIShortCutScreen": {
+  "0x1a8": {
+   "new": "0x1a8",
+   "for": [
+    "0x1acfccc",
+    "0x1acfd24"
+   ],
+   "ro": true
+  },
+  "0x1b8": {
+   "new": "0x1b8",
+   "for": [
+    "0x1acf7bc",
+    "0x197f3cc"
+   ],
+   "ro": true
+  }
+ },
+ "QueryMgr": {
+  "0x8": {
+   "new": "0x8",
+   "for": [
+    "0x7cbaa4"
+   ]
+  },
+  "0x10": {
+   "new": "0x10",
+   "for": [
+    "0x7cbab0"
+   ]
+  },
+  "0x24": {
+   "new": "0x24",
+   "for": [
+    "0x7cbb40"
+   ]
+  }
+ },
+ "QuerySlot": {
+  "0x140": {
+   "new": "0x148",
+   "for": [
+    "0x7cbb2c"
+   ]
+  }
+ },
+ "QueryRequest": {
+  "0x28": {
+   "new": "0x28",
+   "for": [
+    "0x7cba90"
+   ]
+  },
+  "0x34": {
+   "new": "0x34",
+   "for": [
+    "0x7cbb10"
+   ],
+   "ro": true
+  },
+  "0x35": {
+   "new": "0x35",
+   "for": [
+    "0x7cbb4c"
+   ]
+  },
+  "0x37": {
+   "new": "0x37",
+   "for": [
+    "0x7cbb74"
    ]
   }
  }

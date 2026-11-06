@@ -32,7 +32,8 @@ constexpr bool kGamePt = false;
 
 const pc_setting k_lang[] = {
     {"game.language", "Game", "Language", "Language", "TOTK_LANG: the game's texts and voices' subtitles, and the PC "
-     "settings' own texts (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese). Português (Brasil): "
+     "settings' own texts (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese, Traditional Chinese). "
+     "Português (Brasil): "
      "1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. "
      "Automatic: Windows' display language if the game has it, else English.",
      "", V_LANG, N_LANG, 0, 0, 0, PC_SET_RESTART, "TOTK_LANG", nullptr, nullptr, nullptr},
@@ -144,14 +145,14 @@ extern "C" const char *pc_lang_text(void) {
     return g_text_pt ? "pt-BR" : c;
 }
 
-// The PC port's own texts follow the game's language where they have it (Spanish, Russian, Simplified Chinese), and
-// Brazilian Portuguese when the texts are (1.4.3's own, or 1.0.0's from the player's 1.4.3 update) or would be (1.0.0
-// without them: the game in English, the port in Portuguese, as before)
+// The PC port's own texts follow the game's language where they have it (Spanish, Russian, Simplified and Traditional
+// Chinese), and Brazilian Portuguese when the texts are (1.4.3's own, or 1.0.0's from the player's 1.4.3 update) or
+// would be (1.0.0 without them: the game in English, the port in Portuguese, as before)
 extern "C" const char *pc_ui_lang(void) {
     static const char *ui = [] {
         const char *c = pc_lang_text();
         if (c[0] == 'e' && c[1] == 's') return "es";
-        if (!strcmp(c, "ru") || !strcmp(c, "zh-Hans")) return c;
+        if (!strcmp(c, "ru") || !strcmp(c, "zh-Hans") || !strcmp(c, "zh-Hant")) return c;
         if (!strcmp(c, "pt-BR")) return "pt";
         return "";
     }();

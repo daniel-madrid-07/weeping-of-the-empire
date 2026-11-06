@@ -628,7 +628,7 @@ ENTRIES = [
                   'zht': '高於 1080p 時，選單、文字和\n'
                          'HUD 依螢幕解析度繪製，更清晰\n'
                          '（PC）。立即生效。'},
-         choices=[OFF, ON]),   # "" (the default since 2026-11-03, public #62) = off, "1" = on
+         choices=[ON, OFF]),   # "" (the default; off 2026-11-03 to v0.1.10, public #62) = on, "0" = off
     dict(type=53, key='controls.mouse_sensitivity',
          label={'en': 'Mouse sensitivity', 'es': 'Sensibilidad del ratón', 'fr': 'Sensibilité de la souris',
                 'de': 'Mausempfindlichkeit', 'it': 'Sensibilità del mouse', 'nl': 'Muisgevoeligheid',

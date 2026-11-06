@@ -42,6 +42,11 @@
 extern "C" int shim_fps_overlay_mode(void);                 // shim_win.c: 0 off, 1 minimal, 2 detailed
 extern "C" uint64_t vk_fps_readout_stats(float out[5]);     // device.c: fps, frame ms, 1% low fps, worst ms, 0.1% low fps
 extern "C" uint64_t vk_frames_shown(uint64_t *generated);   // device.c: frames handed to the window, real (+ generated)
+extern "C" int vk_last_hitch(float *ms, float *part_ms, float *age_s);   // exec.c: the last [hitch]'s largest part (-1: none)
+extern "C" int vk_sr_last(int *backend, unsigned *iw, unsigned *ih, unsigned *ow, unsigned *oh);   // ngx.c: the last SR
+extern "C" int vk_post_last(unsigned *iw, unsigned *ih, unsigned *ow, unsigned *oh, int *fsr1);   // exec.c: the last present
+extern "C" int vk_sr_idle(int *backend, int *reason, unsigned *iw, unsigned *ih, unsigned *ow, unsigned *oh);   // ngx.c
+extern "C" int vk_sr_wanted(int *backend);                                                                     // ngx.c
 bool pc_ui_font(const char *name, std::vector<uint8_t> *otf);   // pc_ui_font.cpp
 
 namespace {
@@ -326,13 +331,16 @@ pc_draw g_draw;
 // The port's texts in Russian or Chinese (pc_ui_lang) need glyphs the menu's font (Bahnschrift) and the game's Rodin
 // NTLG lack: a Windows font of the player's is merged into each font for them (the first font's glyphs stay first),
 // checked like the menu font (font_check.h); never a font of ours. Russian: Segoe UI (then Arial); Simplified Chinese:
-// Microsoft YaHei (then DengXian, SimHei). None there: those texts show as boxes, the rest as before.
+// Microsoft YaHei (then DengXian, SimHei); Traditional Chinese: Microsoft JhengHei (then MingLiU, then YaHei, which
+// has the traditional characters in mainland shapes). None there: those texts show as boxes, the rest as before.
 const pl_fonts::bytes &lang_font() {
     static const pl_fonts::bytes f = [] {
         const char *ui = pc_ui_lang();
         std::vector<const char *> c;
         if (!strcmp(ui, "zh-Hans"))
             c = {"C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\Deng.ttf", "C:\\Windows\\Fonts\\simhei.ttf"};
+        else if (!strcmp(ui, "zh-Hant"))
+            c = {"C:\\Windows\\Fonts\\msjh.ttc", "C:\\Windows\\Fonts\\mingliu.ttc", "C:\\Windows\\Fonts\\msyh.ttc"};
         else if (!strcmp(ui, "ru"))
             c = {"C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\arial.ttf"};
         for (const char *path : c) {
@@ -381,7 +389,7 @@ std::vector<ImWchar> g_warm_chars;   // (written by the thread before g_warm = 2
 constexpr size_t kWarmPerFrame = 48;
 void warm_start() {
     const char *ui = pc_ui_lang();
-    if (strcmp(ui, "ru") && strcmp(ui, "zh-Hans")) return (void)(g_warm = 3);
+    if (strcmp(ui, "ru") && strncmp(ui, "zh-", 3)) return (void)(g_warm = 3);
     g_warm = 1;
     std::thread([] {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
@@ -540,6 +548,49 @@ void perf_window() {
         if (ng > 1) ImGui::PlotLines("##ft", graph, ng, 0, nullptr, 0.0f, 50.0f, ImVec2(240.0f * g_scale, 48.0f * g_scale));
         const uint32_t vu = g_vram_used.load(std::memory_order_relaxed), vb = g_vram_budget.load(std::memory_order_relaxed);
         if (vb) ImGui::Text("VRAM %.1f / %.1f GB", vu / 1024.0f, vb / 1024.0f);
+        {  // the upscaler the last frames really ran: "so he can tell DLSS is really
+            // running"): the temporal one (ngx.c vk_sr_last: DLSS / FSR 3.1 / XeSS, in the last half second, its quality
+            // named from its ratio as the presets are), else FSR 1 or the plain scale of the present (exec.c vk_post_last)
+            int be = 0, f1 = 0, why = 0;
+            unsigned iw = 0, ih = 0, ow = 0, oh = 0;
+            char u[192];
+            static const char *const kBe[4] = {"?", "DLSS", "FSR 3.1", "XeSS"};
+            if (vk_sr_last(&be, &iw, &ih, &ow, &oh)) {
+                const float r = iw ? (float)ow / (float)iw : 1.0f;
+                const char *q = r < 1.05f ? (be == 1 ? "DLAA" : "Native AA") : r < 1.6f ? pc_tr("Quality")
+                              : r < 1.8f ? pc_tr("Balanced") : r < 2.5f ? pc_tr("Performance") : pc_tr("Ultra Performance");
+                snprintf(u, sizeof u, "%s %s %s %ux%u -> %ux%u", pc_tr("Upscaler:"), kBe[be & 3], q, iw, ih, ow, oh);
+            } else if (vk_sr_idle(&be, &why, &iw, &ih, &ow, &oh)) {   // (wanted, not running: say why, hdr CANVAS1080 (b))
+                // (the game's 1080p canvas under a larger window: the native-resolution interface is off; on a 1080p
+                // monitor that hint would mislead)
+                if (why == 1 && oh <= 1080 && ImGui::GetIO().DisplaySize.y > 1080.0f)
+                    snprintf(u, sizeof u, "%s %s: %s %ux%u (%s %s)", kBe[be & 3], pc_tr("idle"), pc_tr("3D output is"), ow, oh,
+                             pc_tr("Native-resolution interface"), pc_tr("Off"));
+                else if (why == 1)
+                    snprintf(u, sizeof u, "%s %s: %s %ux%u, %s %ux%u", kBe[be & 3], pc_tr("idle"), pc_tr("3D output is"), ow, oh,
+                             pc_tr("scene"), iw, ih);
+                else snprintf(u, sizeof u, "%s %s: %s", kBe[be & 3], pc_tr("idle"), why == 2 ? pc_tr("it failed to start")
+                              : why == 3 ? pc_tr("starting") : pc_tr("no 3D view this frame"));
+            } else if (vk_sr_wanted(&be)) {   // (asked for, but no upscale pass reached it lately: a menu, a load)
+                snprintf(u, sizeof u, "%s %s: %s", kBe[be & 3], pc_tr("idle"), pc_tr("no scene seen"));
+            } else if (vk_post_last(&iw, &ih, &ow, &oh, &f1) && f1) {
+                snprintf(u, sizeof u, "%s FSR 1 %ux%u -> %ux%u", pc_tr("Upscaler:"), iw, ih, ow, oh);
+            } else if (iw && (iw != ow || ih != oh)) {
+                snprintf(u, sizeof u, "%s %s (%s %ux%u -> %ux%u)", pc_tr("Upscaler:"), pc_tr("off"), pc_tr("plain scaling"), iw, ih, ow, oh);
+            } else if (iw) {
+                snprintf(u, sizeof u, "%s %s (%s %ux%u)", pc_tr("Upscaler:"), pc_tr("off"), pc_tr("native"), iw, ih);
+            } else snprintf(u, sizeof u, "%s %s", pc_tr("Upscaler:"), pc_tr("off"));
+            ImGui::TextUnformatted(u);
+        }
+        // the last logged hitch and its largest part (exec.c vk_last_hitch, from the [hitch] line's sums)
+        static const char *const kPart[8] = {PC_T("GPU wait"), PC_T("shader builds"), PC_T("texture uploads"),
+                                             PC_T("new images"), PC_T("file reads"), PC_T("present (driver / window)"),
+                                             PC_T("game CPU"), PC_T("render CPU")};
+        float hm = 0, pm = 0, age = 0;
+        const int part = vk_last_hitch(&hm, &pm, &age);
+        if (part >= 0 && part < 8)
+            ImGui::Text("%s %.0f ms: %s %.0f ms (%.0f %s)", pc_tr("Last hitch"), hm, pc_tr(kPart[part]), pm, age, pc_tr("s ago"));
+        else ImGui::TextDisabled("%s", pc_tr("No hitch yet"));
         ImGui::TextDisabled("%s", pc_tr("frame time 0-50 ms  (F9)"));
     }
     ImGui::End();
@@ -558,6 +609,9 @@ constexpr ImU32 kText = IM_COL32(250, 250, 246, 255);   // the HUD's white
 constexpr ImU32 kEdge = IM_COL32(0, 0, 0, 150);         // its thin dark outline (eight taps)
 constexpr ImU32 kShade = IM_COL32(0, 0, 0, 70);         // and soft drop shadow (two taps)
 constexpr ImU32 kQuiet = IM_COL32(222, 224, 218, 235);  // the label, the second line, the detailed rows
+constexpr ImU32 kTrack = IM_COL32(250, 250, 246, 70);   // a bar's unfilled track (the compile indicator)
+constexpr float kCornerGap = 6;                          // the compile indicator's gap to the window corner at 1080p
+constexpr float kUnderMap = 6;                           // and its clearance below the HUD-safe margin (the map's edge)
 constexpr float kNumber[3] = {22, 30, 40};              // the number's size at 1080p: small, medium, large
 constexpr float kLabel = 0.42f, kRow = 0.46f, kLead = 1.3f;   // of the number's size
 constexpr float kEdgeW = 0.045f, kShadeX = 0.05f, kShadeY = 0.07f;   // of the size drawn
@@ -588,17 +642,23 @@ void fps_fonts() {   // before NewFrame: read the first time the readout shows, 
     }
 }
 
-// Text in the HUD's style at p (its top left): the shadow, the outline, then the white
-void hud_text(ImDrawList *dl, ImFont *f, float size, ImVec2 p, ImU32 col, const char *t) {
+// a colour with its alpha scaled by k (0..1): a fading element
+ImU32 faded(ImU32 c, float k) {
+    const ImU32 a = (ImU32)(((c >> IM_COL32_A_SHIFT) & 0xff) * (k < 0 ? 0 : k > 1 ? 1 : k) + 0.5f);
+    return (c & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT);
+}
+
+// Text in the HUD's style at p (its top left): the shadow, the outline, then the white; k fades all three
+void hud_text(ImDrawList *dl, ImFont *f, float size, ImVec2 p, ImU32 col, const char *t, float k = 1.0f) {
     using namespace fps_ui;
     const float e = std::max(1.0f, kEdgeW * size);
     for (const float s : {0.6f, 1.0f})
-        dl->AddText(f, size, ImVec2(p.x + kShadeX * size * s, p.y + kShadeY * size * s), kShade, t);
+        dl->AddText(f, size, ImVec2(p.x + kShadeX * size * s, p.y + kShadeY * size * s), faded(kShade, k), t);
     for (int i = 0; i < 8; i++) {
         const float a = i * 0.7853982f;
-        dl->AddText(f, size, ImVec2(p.x + e * cosf(a), p.y + e * sinf(a)), kEdge, t);
+        dl->AddText(f, size, ImVec2(p.x + e * cosf(a), p.y + e * sinf(a)), faded(kEdge, k), t);
     }
-    dl->AddText(f, size, p, col, t);
+    dl->AddText(f, size, p, faded(col, k), t);
 }
 
 void fps_readout(uint32_t w, uint32_t h) {
@@ -693,6 +753,92 @@ void fps_readout(uint32_t w, uint32_t h) {
         hud_text(dl, f, R, ImVec2(x0 + bw - f->CalcTextSizeA(R, FLT_MAX, 0, rows[i][1]).x, y), kText, rows[i][1]);
     }
     if (nrows) hud_text(dl, f, R, ImVec2(right ? x0 + bw - wver : x0, y), kQuiet, ver);   // (on the readout's side)
+}
+
+// ---- The compile indicator: every compile a frame may wait for or skip draws for, bottom right in the HUD's style
+// (the readout's font, white with the thin outline, no box). The recorded / seed phase has a total: its percentage
+// and a thin bar. First-seen programs and pipelines in play have none: how many are left, no bar (never a made-up
+// percentage). It shows after 0.5 s of work without a break, so a shader or two never flickers it, stays while the
+// work does, and fades over 2 s once the queue is empty (back at once if work returns meanwhile). It replaces
+// hle_osd.cpp's banner while this overlay is on (device.c). Presenting thread, like the rest of this file.
+extern "C" int vk_compile_activity(int *done, int *total, int *pending);   // exec.c
+extern "C" int vk_precompile_cold_active(void);                            // exec.c: the first-start pass
+extern "C" int vk_precompile_mem_paused(void);                             // exec.c: paused while free RAM is short
+extern "C" size_t g_vk_pcache_loaded;                                      // device.c: 0 = no pipeline cache loaded
+struct CompileShown { int done, total, pending; float alpha; };
+CompileShown g_cind;
+std::atomic<bool> g_cind_on{true};   // the row / TOTK_COMPILE_OSD (pc_compile_osd_on: device.c)
+
+// this frame's state and fade (0: not drawn); called before the overlay decides whether it draws at all
+float compile_indicator_update() {
+    using clk = std::chrono::steady_clock;
+    static bool busy_was, shown;
+    static clk::time_point cfg_t, busy_t0, idle_t0;
+    const clk::time_point now = clk::now();
+    if (now - cfg_t > std::chrono::milliseconds(500)) {   // (the F10 row, read twice a second)
+        cfg_t = now;
+        // (=0: off whatever the row says, the A/B's off arm; =2: always shown at 42 %, the placement shots per aspect)
+        static const char *const env = getenv("TOTK_COMPILE_OSD");
+        const char *v = pc_settings_get("display.compile_osd");
+        g_cind_on = !(env && *env == '0') && (!v || strcmp(v, "0") != 0);
+    }
+    if (!g_cind_on.load()) return g_cind.alpha = 0, shown = busy_was = false, 0.0f;
+    static const bool force = getenv("TOTK_COMPILE_OSD") && getenv("TOTK_COMPILE_OSD")[0] == '2';
+    if (force) return g_cind = {42, 100, 0, 1.0f}, 1.0f;
+    int d = 0, n = 0, p = 0;
+    const bool busy = vk_compile_activity(&d, &n, &p) != 0;
+    if (busy && !busy_was) busy_t0 = now;
+    if (!busy && busy_was) idle_t0 = now;
+    busy_was = busy;
+    if (busy) {
+        if (now - busy_t0 >= std::chrono::milliseconds(500)) shown = true;
+        g_cind.done = d, g_cind.total = n, g_cind.pending = p;   // (kept while it fades: the last numbers)
+        return g_cind.alpha = shown ? 1.0f : 0.0f;
+    }
+    if (!shown) return g_cind.alpha = 0.0f;
+    const float t = std::chrono::duration<float>(now - idle_t0).count(), a = 1.0f - t / 2.0f;
+    if (a <= 0) shown = false;
+    return g_cind.alpha = a > 0 ? a : 0.0f;
+}
+
+void compile_indicator(uint32_t w, uint32_t h) {
+    using namespace fps_ui;
+    const float k0 = g_cind.alpha;
+    if (k0 <= 0) return;
+    ImFont *f = g_fps_font ? g_fps_font : ImGui::GetFont();   // (the overlay's font while the game's is still read)
+    float s = h / 1080.0f;
+    s = s < 0.75f ? 0.75f : s > 3.0f ? 3.0f : s;
+    // In the corner strip under the minimap, as hle_osd.cpp's banner was (LEAD 10:58): the HUD-safe margin would put it on the
+    // map, so the whole block stays below that margin's line by kUnderMap (assumes the HUD keeps that margin at 21:9 / 32:9 and
+    // with the native UI: the A/B's shots per aspect check it)
+    const float bar = std::max(2.0f, 3.0f * s), m = kCornerGap * s, room = (kMarginY - kUnderMap) * s - m;
+    float T = 18.0f * s;   // (one size step up from 16, LEAD 16:12: "read at a glance"; the strip still fits it)
+    char t[192];
+    const bool phase = g_cind.total > 0;
+    if (phase) {   // (the banner's texts, hle_osd.cpp; their translations exist)
+        const int pct = g_cind.done * 100 / g_cind.total;
+        snprintf(t, sizeof t, vk_precompile_cold_active() ? pc_tr("Preparing the shaders for this PC (first start): %d %%")
+                              : g_vk_pcache_loaded == 0 ? pc_tr("Compiling shaders %d %%") : pc_tr("Loading shaders %d %%"), pct);
+        if (vk_precompile_mem_paused()) {
+            const size_t l = strlen(t);
+            snprintf(t + l, sizeof t - l, " %s", pc_tr("(paused: low memory)"));
+        }
+    } else snprintf(t, sizeof t, "%s %d", pc_tr("Shaders left to compile:"), g_cind.pending);   // (a translation is never a format)
+    ImVec2 ts = f->CalcTextSizeA(T, FLT_MAX, 0, t);
+    const float need = ts.y + (phase ? bar * 2.0f : 0.0f);
+    if (need > room && ts.y > 0) {   // (a font whose line is taller: the text shrinks, the strip stays)
+        T *= std::max(0.5f, (room - (need - ts.y)) / ts.y);
+        ts = f->CalcTextSizeA(T, FLT_MAX, 0, t);
+    }
+    const float x0 = w - m - ts.x, y0 = h - m - ts.y - (phase ? bar * 2.0f : 0.0f);
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    hud_text(dl, f, T, ImVec2(x0, y0), kQuiet, t, k0);
+    if (phase) {   // a thin bar under the text, as wide as it: the track faint, the fill the HUD's white, a dark edge
+        const float yb = y0 + ts.y + bar * 0.6f, xf = x0 + ts.x * g_cind.done / (float)g_cind.total;
+        dl->AddRectFilled(ImVec2(x0 - 1, yb - 1), ImVec2(x0 + ts.x + 1, yb + bar + 1), faded(kEdge, k0));
+        dl->AddRectFilled(ImVec2(x0, yb), ImVec2(x0 + ts.x, yb + bar), faded(kTrack, k0));
+        dl->AddRectFilled(ImVec2(x0, yb), ImVec2(xf, yb + bar), faded(kText, k0));
+    }
 }
 
 // ImGui key -> hle_hid.cpp vk_from_name()'s name (NULL: not bindable by name)
@@ -1225,6 +1371,8 @@ extern "C" bool pc_overlay_enabled(void) {
     return on;
 }
 
+// device.c: the compile indicator is on (hle_osd.cpp's banner shows the first-start / seed progress otherwise)
+extern "C" bool pc_compile_osd_on(void) { return g_cind_on.load(); }
 extern "C" bool pc_overlay_open(void) { return g_open.load() || g_welcome.load(); }
 extern "C" void pc_overlay_open_keys(void) {
     g_open_keys = true;
@@ -1342,7 +1490,8 @@ extern "C" const pc_draw *pc_overlay_build(uint32_t w, uint32_t h) {
         if (pc_settings_first_run() && done && !strcmp(done, "0") && !(off && *off == '0') && !scripted) g_welcome = true;
     }
     const bool readout = shim_fps_overlay_mode() != 0;   // (the fps readout: F3, display.fps_readout)
-    const bool visible = open_now || g_perf.load() || g_welcome.load() || readout;
+    const bool compiling = compile_indicator_update() > 0;   // (the compile indicator: display.compile_osd)
+    const bool visible = open_now || g_perf.load() || g_welcome.load() || readout || compiling;
     if (g_warm.load() == 0) warm_start();
     if (!visible) {
         if (was_visible) {   // drop what was queued while closing, so nothing replays at the next open
@@ -1369,12 +1518,13 @@ extern "C" const pc_draw *pc_overlay_build(uint32_t w, uint32_t h) {
     else io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     feed_pad();
     pc_settings_tick(false);
-    if (readout) fps_fonts();
+    if (readout || compiling) fps_fonts();
     ImGui::NewFrame();
     welcome_window(w, h);
     settings_window(w, h);
     perf_window();
     fps_readout(w, h);
+    compile_indicator(w, h);
     ImGui::Render();
     ImDrawData *dd = ImGui::GetDrawData();
     handle_textures(dd);

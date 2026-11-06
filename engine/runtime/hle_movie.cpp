@@ -191,6 +191,10 @@ static void x_set_source(Ctx* c) {      // SetDataSource(const char* path)
     if (hle_fs_pack_slice(hp, &ph, &poff, &psize)) ok = e->wm.open_slice((HANDLE)ph, poff, psize, err, sizeof err);
     else if (hle_fs_pack_bytes(hp, &bytes)) ok = e->wm.open_bytes(std::move(bytes), err, sizeof err);
     else
+#else   // (Linux: no slice mapping; a packed movie read whole, hle_fs_pack_bytes; linux-test D#83)
+    std::vector<u8> bytes;
+    if (hle_fs_pack_bytes(hp, &bytes)) ok = e->wm.open_bytes(std::move(bytes), err, sizeof err);
+    else
 #endif
         ok = e->wm.open(hp.c_str(), err, sizeof err);
     if (!ok) { MLOG("[movie] SetDataSource %s: %s\n", hp.c_str(), err); c->x[0] = kErr; return; }

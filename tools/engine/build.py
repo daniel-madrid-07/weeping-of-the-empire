@@ -116,31 +116,42 @@ GEN_CODEGEN = ['--simd', '--nanrun', '--vdirect', '--lso-abi', 'auto']
 # ExecuteWaitCreateActor / ExecuteEventWaitResourceStableForTerrainAndCave: event waits in game time. 120ec94 the move-toward helper at Recall's two velocity calls: the step per 30 Hz of game time. 171fafc
 # ReverseRecorderExtension::getNextVelocity: 1.4.3 inlines 120ec94 there, the hook scales its steps (1.0.0: the original). 9d8d00 SpecialPowerReceiver::postCalcUltraHand: the settle window after an Autobuild in game time. 704b7c the
 # submesh AABB vs view-volume cull (totk_hot_native.cpp, native hot functions; TOTK_NATIVE_HOT). 1b3ebac 1a4f0ac 1c73fbc 1dbdcf0 the cooking pot's settle, the extra-stamina pause, tar Like Like spots, flying enemies' path probes in
-# game time. 1aa6a94 UIHorseGaugeScreen's update: the bar tween in game time. 1b7ba58 ExecuteCalculateAverageVec3f: the followers' ring sampled at 30 Hz of game time. 212b740 SelectorPouchPlayer's update: the inventory Link's tab
-# debounce in game time. 1f61d6c QueryControllerGetStick's worker: the UI stick scaled to 30 Hz of game time for the AI programs. 2833b60 ExecuteBlackboardSetToBase::updateImpl_: listed AI-program integrators step per 30 Hz of AI
-# time. 200f61c 200f8b0 20147f4 27dcb98 the ChaseF32 / ChaseVec3f / LerpF32 / AddF32 calcs: listed easers / adders of drawn values scaled by the step. 27b6e64 SeqOneShotPrintLoadLapTimeForPatrol's oneShot: the game's load lap labels
-# logged with TOTK_LOAD_LAPS=1. 11276cc ares::System::initializeThreads: the resource loader thread count, TOTK_LOADER_THREADS=<n> for the A/B. 9c2ef0 aal's per-frame command-list flush: a full game -> audio ring keeps the frame's
-# commands instead of dropping them above 200 fps. 9c2b70 the watchdog step AudioRendererController::calc tail-calls: aal's jam watchdog fires after 10 s of jam, not 300 calls (1.25 s at 240 fps). 10bc078
-# game::event::Actor::initialize: the cutscene actors' 600-frame equipment fallback in game time. 13bd680 game::event::EventContext::isLoadFinished: the 61-frame 'surroundings stable' count before a cutscene starts in game time.
-# 91a290 the layout-animation binder: the Purah Pad map's temperature sign follows game.temperature_unit. 15eca7c the Player component's Ultrahand update: its bound target is read only while it is a live actor, 1.0.0 only. 7cba8c the
-# query manager's enqueue: a new request's result entries are never ones a live request still uses (Ultrahand's persistent request, public #51), 1.0.0 only. 844634 a model scene's per-object coverage from the frame's report rows: a
-# row index that is not a row is not followed, 1.0.0 only. abb518 the EnvSound one-shot emitter step: the 200-frame settle between two ambient one-shots in game time. 9a7130 FootIKParam's GroundPositionLerpFacror getter at the foot IK
-# controller's call: the ground-height ease per 30 Hz of game time (totk_footik_ease.cpp, fps360). a6fd14 engine::actor::PlacementMgr::calc: the placement request cooldown and refresh period in game time, not frames
-# (totk_placement_timers.cpp, rival-034 per-frame sweep). cc2c2c the call right after the 'Basic2' sway spring's k1 / k2 load (lr 0x13b10a0): its constants per call so the spring keeps the Switch's modes in game time
-# (totk_effect_sway.cpp, rival-034 per-frame sweep R4). 16e4f90 the swim speed getter at the swim-move physics' call: Link's swim velocity eased per 30 Hz of game time (totk_swim_ease.cpp, fps360). 1347600 the camera mode parameter's
-# LatStickScale getter at the ability camera's pitch (lr 0x1ce78fc): the abilities' camera pitch per 30 Hz of game time (totk_ability_pitch.cpp, fps360; public #66). 1347654 the camera mode parameter's LngStickScale getter at the
-# ability camera's yaw (lr 0x1ce7684): read-only, the live value on the data page for pc_mouse's ability gains (totk_ability_pitch.cpp, fps360; Ultrahand with the mouse). 172d1bc UltraHand::calcGrab: the mouse's unclamped grab stick
-# from the data page at +0x11c / +0x120 for the call. 171323c / 1713290 calcGrab's stick exponents for X / Y (lr 0x172d6d4 / 0x172d6f0): read-only, to the data page (totk_grab_stick.cpp). ba6d48 Player::getAdjustedRetargetPosAndRot at
-# the climb's updatePhysics call (lr 0x1cf6334): TOTK_DEBUG_CLIMB=1 logs the climb's root motion once a second, read-only (totk_climb_log.cpp, fps360; public #59). --vlocal: V registers in locals in these functions (stages 1-2;
-# verified only on top of --vdirect; not `all`: the giant functions grow 20-60% in x86) --split: these functions as chunks (gen.py Emitter.split_text): every 1.0.0 function of 10,000+ guest instructions with no count in the release
-# profile (855fd396: every block 0; 553d80, 5732d0, 58fd70, 4d9ba0, 6e5b38, ae4c40, 719acc, ee92d8 have counts and stay whole, so no hot path crosses a chunk). They were 2.6k of a cold key's ~9.8k s of compile CPU and its 2.3
-# GB-a-compile peaks (setup-fast, 2026-11-02). Another version / game: none (its own list).
+# game time. 1aa6a94 UIHorseGaugeScreen's update: the bar tween in game time. b8fd30 eui::Screen::invokeSoundLink2AnimPlayEvent: a UI animation's sound event once per animation frame. 1b7ba58 ExecuteCalculateAverageVec3f: the
+# followers' ring sampled at 30 Hz of game time. 212b740 SelectorPouchPlayer's update: the inventory Link's tab debounce in game time. 1f61d6c QueryControllerGetStick's worker: the UI stick scaled to 30 Hz of game time for the AI
+# programs. 2833b60 ExecuteBlackboardSetToBase::updateImpl_: listed AI-program integrators step per 30 Hz of AI time. 200f61c 200f8b0 20147f4 27dcb98 the ChaseF32 / ChaseVec3f / LerpF32 / AddF32 calcs: listed easers / adders of drawn
+# values scaled by the step. 27b6e64 SeqOneShotPrintLoadLapTimeForPatrol's oneShot: the game's load lap labels logged with TOTK_LOAD_LAPS=1. 11276cc ares::System::initializeThreads: the resource loader thread count,
+# TOTK_LOADER_THREADS=<n> for the A/B. 9c2ef0 aal's per-frame command-list flush: a full game -> audio ring keeps the frame's commands instead of dropping them above 200 fps. 9c2b70 the watchdog step AudioRendererController::calc
+# tail-calls: aal's jam watchdog fires after 10 s of jam, not 300 calls (1.25 s at 240 fps). 10bc078 game::event::Actor::initialize: the cutscene actors' 600-frame equipment fallback in game time. 13bd680
+# game::event::EventContext::isLoadFinished: the 61-frame 'surroundings stable' count before a cutscene starts in game time. 91a290 the layout-animation binder: the Purah Pad map's temperature sign follows game.temperature_unit.
+# 15eca7c the Player component's Ultrahand update: its bound target is read only while it is a live actor, 1.0.0 only. 7cba8c the query manager's enqueue: a new request's result entries are never ones a live request still uses
+# (Ultrahand's persistent request, public #51), 1.0.0 only. 844634 a model scene's per-object coverage from the frame's report rows: a row index that is not a row is not followed, 1.0.0 only. abb518 the EnvSound one-shot emitter step:
+# the 200-frame settle between two ambient one-shots in game time. 9a7130 FootIKParam's GroundPositionLerpFacror getter at the foot IK controller's call: the ground-height ease per 30 Hz of game time (totk_footik_ease.cpp, fps360).
+# a6fd14 engine::actor::PlacementMgr::calc: the placement request cooldown and refresh period in game time, not frames (totk_placement_timers.cpp, rival-034 per-frame sweep). cc2c2c the call right after the 'Basic2' sway spring's k1 /
+# k2 load (lr 0x13b10a0): its constants per call so the spring keeps the Switch's modes in game time (totk_effect_sway.cpp, rival-034 per-frame sweep R4). 16e4f90 the swim speed getter at the swim-move physics' call: Link's swim
+# velocity eased per 30 Hz of game time (totk_swim_ease.cpp, fps360). 1347600 the camera mode parameter's LatStickScale getter at the ability camera's pitch (lr 0x1ce78fc): the abilities' camera pitch per 30 Hz of game time
+# (totk_ability_pitch.cpp, fps360; public #66). 1347654 the camera mode parameter's LngStickScale getter at the ability camera's yaw (lr 0x1ce7684): read-only, the live value on the data page for pc_mouse's ability gains
+# (totk_ability_pitch.cpp, fps360; Ultrahand with the mouse). 172d1bc UltraHand::calcGrab: the mouse's unclamped grab stick from the data page at +0x11c / +0x120 for the call. 171323c / 1713290 calcGrab's stick exponents for X / Y (lr
+# 0x172d6d4 / 0x172d6f0): read-only, to the data page (totk_grab_stick.cpp). ba6d48 Player::getAdjustedRetargetPosAndRot at the climb's updatePhysics call (lr 0x1cf6334): TOTK_DEBUG_CLIMB=1 logs the climb's root motion once a second,
+# read-only (totk_climb_log.cpp, fps360; public #59). 7d7a98 / e12b0c the calls behind the actor frame staggers (% 10 / % 60 turns): TOTK_STAGGER_PROBE=1 logs their count and time every 10 s (totk_stagger_probe.cpp, rival-034 v0.1.10
+# diagnostic; unset: the call only). --vlocal: V registers in locals in these functions (stages 1-2; verified only on top of --vdirect; not `all`: the giant functions grow 20-60% in x86) --split: these functions as chunks (gen.py
+# Emitter.split_text): every 1.0.0 function of 10,000+ guest instructions with no count in the release profile (855fd396: every block 0; 553d80, 5732d0, 58fd70, 4d9ba0, 6e5b38, ae4c40, 719acc, ee92d8 have counts and stay whole, so no
+# hot path crosses a chunk). They were 2.6k of a cold key's ~9.8k s of compile CPU and its 2.3 GB-a-compile peaks (setup-fast, 2026-11-02). Another version / game: none (its own list).
 SPLIT_FUNCS = ['433b78', '48429c', '5ad300', '5346a0', '516d00', '4f8610', '4cad70', '564b60', '426084', '546ce0',
                '477234', '50a1a0', '4ebab0', '5a14f0', '528890', '584890', '41269c']
+# --split-loops: the 4 counted giants of 18k+ lines (21.7-23.7k guest instructions), cut only where no loop crosses
+# (gen.py split_text): each is three ~7k-instruction loops in a row, so three chunks with two switches a call, none
+# inside a loop. They set a 6-core / 16 GB PC's objects step (a pool of 3, the fourth after the first: ~20 min,
+# v0.1.10). Their chunks have no data in a profile trained before this list (new names): compiled without it until
+# pgo_train.py runs again; the v0.1.10 gate's fps A/B decides. all four are h_ TUs (hot by --hot's profile; v0.1.9
+# gate's key) and stay -O2 there, f_4d9ba0 is GIANT_HOT too (a t_ TU without --hot: -O2 by objects()); a split
+# function's chunks are one block with its entry, which tusplit.py names it by (its first definition), so a --hot one's
+# chunks are in its h_ TU.
+SPLIT_LOOPS = ['5732d0', '553d80', '4d9ba0', '58fd70']
 GEN_MAIN = ['--hook', '7a83e4,f6092c,1a862e4,1a86420,1a85b3c,1a8604c,1a85e4c,83e3f8,1ccf894,'
-            'b6afc8,75718c,18fb7d0,18fbf18,18fbf68,18fc0ac,279a77c,2798a1c,f15364,16e4728,8f689c,1cd0260,16e4610,f0fdec,1aa3e44,16e4b80,1d23614,a5f010,1d97648,1c17fb0,120ec94,171fafc,9d8d00,212b740,1b7ba58,1aa6a94,1f61d6c,2833b60,200f61c,200f8b0,20147f4,27dcb98,1b3ebac,1a4f0ac,1c73fbc,1dbdcf0,'
-            '1a06840,1a068cc,704b7c,27b6e64,11276cc,9c2ef0,9c2b70,abb518,10bc078,13bd680,91a290,274a3c,15eca7c,9a7130,a6fd14,cc2c2c,16e4f90,7cba8c,1347600,1347654,172d1bc,171323c,1713290,ba6d48,844634', *GEN_CODEGEN,
-            '--vlocal', '260a970,317040,704b7c,10cfecc', '--split', ','.join(SPLIT_FUNCS)]
+            'b6afc8,75718c,18fb7d0,18fbf18,18fbf68,18fc0ac,279a77c,2798a1c,f15364,16e4728,8f689c,1cd0260,16e4610,f0fdec,1aa3e44,16e4b80,1d23614,a5f010,1d97648,1c17fb0,120ec94,171fafc,9d8d00,212b740,1b7ba58,1aa6a94,b8fd30,1f61d6c,2833b60,200f61c,200f8b0,20147f4,27dcb98,1b3ebac,1a4f0ac,1c73fbc,1dbdcf0,'
+            '1a06840,1a068cc,704b7c,27b6e64,11276cc,9c2ef0,9c2b70,abb518,10bc078,13bd680,91a290,274a3c,15eca7c,9a7130,a6fd14,cc2c2c,16e4f90,7cba8c,1347600,1347654,172d1bc,171323c,1713290,ba6d48,844634,7d7a98,e12b0c', *GEN_CODEGEN,
+            '--vlocal', '260a970,317040,704b7c,10cfecc', '--split', ','.join(SPLIT_FUNCS),
+            '--split-loops', ','.join(SPLIT_LOOPS)]
 GEN_SDK = ['--base', '0x7180000000', '--prefix', 's', '--plt-all', *GEN_CODEGEN]
 GEN_EXTRA = []         # --gen-args: gen.py flags added for both modules (e.g. --fz); join the key, game-var/
 REF = None             # --ref: snapshot this commit / branch instead of HEAD; its commit joins the key, game-var/
@@ -287,7 +298,8 @@ if GAME_VERSION != '1.0.0':
     DIAGNOSTIC = bool(_diag)
     _alias = {int(k, 16): int(v, 16) for k, v in _eng['alias'].items()}
     HOOKED_V100 = {f'{_alias[int(h, 16)]:x}' for h in _eng['hook']}
-    _lists = {'--hook': _eng['hook'], '--vlocal': _eng['vlocal'], '--split': _eng.get('split', [])}
+    _lists = {'--hook': _eng['hook'], '--vlocal': _eng['vlocal'], '--split': _eng.get('split', []),
+              '--split-loops': _eng.get('split_loops', [])}
     _gm, _skip = [], False
     for _i, _a in enumerate(GEN_MAIN):
         if _skip:
@@ -625,6 +637,19 @@ FFX_DLLS = {
 }
 
 
+# Intel's XeSS SDK (runtime/nvn/vulkan/xess.c: XeSS super resolution on any Vulkan GPU) at v3.0.2: the C API headers
+# (MIT) are in engine/third_party/xess; the runtime libxess.dll (Intel Simplified Software License: redistributable in
+# binary form, unmodified, with its notice: licenses/XeSS.txt at the public root; its 'Third party software' clause:
+# the SDK's third-party-programs.txt goes with it) goes to <work>/engine/xess, where boot.py and package.py point
+# TOTK_XESS_DIR; Setup unpacks the same files from our release asset setup-xess.zip.
+XESS_URL = 'https://github.com/intel/xess/raw/v3.0.2/'
+XESS_DLLS = {
+    'bin/libxess.dll': '251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7',
+    'LICENSE.txt': '784be42c39a4a4d03cf85d88e15e59d75828fca773ce45b8dbfffbd7eaf208df',
+    'third-party-programs.txt': 'e8d8899dbfc4de0e8ca25560be9358e03c1405d7c956d20a1838c3c709b9b51c',
+}
+
+
 def dlss_fetch(files, dst, flat, url=DLSS_URL, what='DLSS SDK'):
     """files {upstream path: sha256} into dst (flat: by base name, else lib/ files as lib/<name>), downloaded once and
     checked; a file already there with the right hash is kept. url / what: FidelityFX's too."""
@@ -695,6 +720,8 @@ def dlss_dlls(force=False):
     force (`build.py dlss --force`): always. Never fails a build: offline or a download error leaves DLSS unavailable
     (the game runs without it) and Setup's next run, or `build.py dlss`, fetches them. DLLs already there are kept
     whatever the GPU. Returns what happened, for the log."""
+    if LINUX:   # (DLSS_DLLS are Windows DLLs, and the Linux build has no NGX yet, ngx.c: ~66 MB fetched for nothing)
+        return 'DLSS: not on Linux yet (nothing fetched)'
     dst = os.path.join(SIG, 'dlss')
     if all(os.path.isfile(os.path.join(dst, os.path.basename(p))) and
            sha256_file(os.path.join(dst, os.path.basename(p))) == want for p, want in DLSS_DLLS.items()):
@@ -709,6 +736,32 @@ def dlss_dlls(force=False):
     except (Exception, SystemExit) as e:
         return f'DLSS: not fetched ({e}): DLSS unavailable for now; Setup\'s next run fetches it'
     return 'DLSS: runtime DLLs fetched' + ('' if rtx else ' (GPUs unknown here)' if rtx is None else '')
+
+
+def ffx_dlls():
+    """FSR's runtime DLL (amd_fidelityfx_vk.dll) into <work>/engine/ffx (TOTK_FFX_DIR), optional: Setup's builder unpacks
+    the same files from our release asset first, so nothing is fetched there. Linux: nothing (a Windows DLL; ffx.c has
+    no runtime off Windows). Returns what happened, for the log."""
+    if LINUX:
+        return 'FidelityFX SDK: not on Linux (nothing fetched)'
+    try:
+        dlss_fetch(FFX_DLLS, os.path.join(SIG, 'ffx'), flat=True, url=FFX_URL, what='FidelityFX SDK')   # (TOTK_FFX_DIR)
+    except (Exception, SystemExit) as e:
+        return f'FidelityFX SDK: not fetched ({e}): FSR unavailable in this build'
+    return 'FidelityFX SDK: the runtime DLL is there'
+
+
+def xess_dlls():
+    """XeSS's runtime DLLs (XESS_DLLS) into <work>/engine/xess (TOTK_XESS_DIR), optional as FidelityFX's: Setup's builder
+    unpacks setup-xess.zip first. Linux: nothing (Windows DLLs; xess.c has no runtime off Windows). Returns what
+    happened, for the log."""
+    if LINUX:
+        return 'XeSS SDK: not on Linux (nothing fetched)'
+    try:
+        dlss_fetch(XESS_DLLS, os.path.join(SIG, 'xess'), flat=True, url=XESS_URL, what='XeSS SDK')   # (TOTK_XESS_DIR)
+    except (Exception, SystemExit) as e:
+        return f'XeSS SDK: not fetched ({e}): XeSS unavailable in this build'
+    return 'XeSS SDK: the runtime DLLs are there'
 
 
 def cmd_dlss(a):
@@ -762,10 +815,8 @@ def snapshot(ref='HEAD') -> str:
         dlss_sdk(os.path.join(d, 'engine', 'third_party', 'dlss'))
         open(os.path.join(d, 'DONE'), 'w').close()
     log(dlss_dlls())   # the runtime DLLs: <work>/engine/dlss, NVIDIA RTX only, never fatal (TOTK_DLSS_DIR points there)
-    try:   # (optional: Setup's builder unpacks the same files from our release asset first, so nothing is fetched there)
-        dlss_fetch(FFX_DLLS, os.path.join(SIG, 'ffx'), flat=True, url=FFX_URL, what='FidelityFX SDK')   # (TOTK_FFX_DIR)
-    except (Exception, SystemExit) as e:
-        log(f'FidelityFX SDK: not fetched ({e}): FSR unavailable in this build')
+    log(ffx_dlls())
+    log(xess_dlls())
     log(f'sources: {ref} {c[:12]} -> {d}')
     return os.path.join(d, 'engine')
 
@@ -1437,10 +1488,11 @@ SPLIT_CHUNK = re.compile(r'_[0-9a-f]+_c\d+$')
 
 def giant_of(src):
     """(lines, name, split) of the TU's largest function when it has GIANT_LINES lines or more, else (0, None, split);
-    split: the TU holds a --split function's chunks. TUs under GIANT_LINES * 50 bytes are not read (generated code runs
-    ~65 bytes a line; a split function has 10k+ guest instructions)"""
+    split: the names of the --split / --split-loops functions whose chunks the TU holds (f_<off>, a frozenset: empty,
+    so false, for none). TUs under GIANT_LINES * 50 bytes are not read (generated code runs ~65 bytes a line; a split
+    function has 10k+ guest instructions)"""
     if not GIANT_LINES or os.path.getsize(src) < GIANT_LINES * 50:
-        return 0, None, False
+        return 0, None, frozenset()
     data = open(src, 'rb').read()
     defs, i = [], data.find(b'\nvoid ')
     while i >= 0:     # (bytes.find, not a multiline regex over the whole TU: 1176 TUs in a few seconds)
@@ -1453,8 +1505,13 @@ def giant_of(src):
         n = data.count(b'\n', start, nxt)
         if n > best[0]:
             best = (n, name)
-    split = any(SPLIT_CHUNK.search(name) for _, name in defs)
+    split = frozenset(chunk_base(name) for _, name in defs if SPLIT_CHUNK.search(name))
     return (*best, split) if best[0] >= GIANT_LINES else (0, None, split)
+
+
+def chunk_base(name):
+    """a --split chunk's function (f_<off>_c<k> -> f_<off>), any other name as it is"""
+    return re.sub(r'_c\d+$', '', name) if name and SPLIT_CHUNK.search(name) else name
 
 
 # a generated line at -O2 takes ~2.8x its time at COLD_OPT (f_41269c: 45 s at -O1, 128 s at -O2): objects()' start
@@ -1464,10 +1521,10 @@ O2_COST = 2.8
 
 def start_order(rule, giant_lines, size):
     """objects()' sort key, the longest compile first (with a pool, the end is the last start plus that compile):
-    giants by their function's lines, the rest by bytes, each times O2_COST unless at COLD_OPT. v0.1.9's 4 whole
-    giants are within 4% of each other in lines, three at -O2 (f_4d9ba0 by GIANT_HOT, h_5732d0 / h_553d80 by --hot)
-    and f_58fd70 at -O1: by lines alone the -O1 one started last only by chance, and a pool of 3 (16 GB) that started
-    it ahead of an -O2 one left the slowest compile for last, alone (setup-fast, 2026-11-03)"""
+    giants by their function's lines, the rest by bytes, each times O2_COST unless at COLD_OPT: with giants of both
+    kinds in a pool of 3 (16 GB), an -O1 one started ahead of an -O2 one of about its lines left the slowest compile for
+    last, alone. A guard: in v0.1.9's key all 4 whole giants were -O2 h_ TUs (the gate's log) and --split-loops splits
+    them since"""
     w = 1 if rule == 'gen_cold' else O2_COST
     return -giant_lines * w, -size * w
 
@@ -1501,8 +1558,11 @@ def objects(kdir, jobs, prio, cache):
         lines, name, split = giant_of(s)
         if lines:
             giants[obj] = lines
-        if (lines and name not in GIANT_HOT or split) and rule == hot and not os.path.basename(src).startswith('h_'):
-            rule = 'gen_cold'    # (an h_ TU: hot by --hot's profile, stays at -O2)
+        # a giant or a split function's TU at COLD_OPT unless its function is GIANT_HOT (f_4d9ba0 whole, or its
+        # --split-loops chunks: their TU stays -O2 as the whole function's did); an h_ TU: hot by --hot's profile, -O2
+        cold = lines and chunk_base(name) not in GIANT_HOT or split and not split <= GIANT_HOT
+        if cold and rule == hot and not os.path.basename(src).startswith('h_'):
+            rule = 'gen_cold'
         placed.add(os.path.normcase(os.path.abspath(o)))
         oid = None
         if cache:
@@ -1639,7 +1699,9 @@ def all_crashed(kdir, todo, before):
              'command around it (cmd /c).' if rc == 0 else
              f' clang++ --version run on its own fails too ({exit_text(rc) if rc is not None else first}): the compiler '
              'itself does not start.')
-    hint = (' Under Wine / Proton (public #75): try another Proton version (10, or GE).' if on_wine() else
+    hint = (' Under Wine / Proton (public #75): try another Proton version (10, or GE), or on Linux the native '
+            'AppImage test build, no Wine (the newest linux-test pre-release, not a release): '
+            'https://github.com/daniel-madrid-07/weeping-of-the-empire/releases' if on_wine() else
             ' Usual causes: an antivirus blocking or quarantining clang.exe (add the install folder to its exclusions, '
             'then run Setup again), or a processor clang cannot run on.')
     return (f'game objects: every compile failed at once with the same crash, '

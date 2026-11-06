@@ -7,11 +7,13 @@
 // +-3 read-back pixels a frame = +-128 x +-48 at 2560 wide; integration's review: a 40 px/frame pan hid the see-through frame). Each one is logged
 // '[glitch] frame N score S' with that frame's draws, skipped draws, passes, dispatches and occlusion reports (zero counts / kept visible), and its
 // window image with both neighbours goes to build/glitch_<N>_{prev,frame,next}.png (GL_MAXLOG per session). Costs, when on: ~30 MB of VRAM, a few blits
-// and a 57 KB read back a frame, and a short wait for each saved anomaly.
+// and a 57 KB read back a frame, and for each saved anomaly a 11 MB copy (its PNGs are written on their own thread: written on the render thread they
+// made the frame after a hit a 46-53 ms one in every soak, an fps drop the detector made itself).
 #include "vk.h"
 #include "glitch_match.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,6 +29,8 @@
 #define GL_NCTR 8
 
 void vk_glitch_counters(uint64_t c[GL_NCTR]);   // exec.c: cumulative draws, skipped, passes, dispatches, oq reports / zero / kept visible
+void vk_cov_frame(uint64_t frame);   // exec.c: the pass coverage ring, closed per presented frame
+void vk_cov_dump(uint64_t frame);    // exec.c: a judged frame's targets its passes drew only in part
 
 typedef struct {
     VkImage img;
@@ -122,7 +126,44 @@ static GlSlot *gl_find(uint64_t frame) {
     return s->used && s->frame == frame ? s : NULL;
 }
 
-// Completed read-backs into their grids, and the saved anomaly's images into PNGs (render thread, each presented frame)
+// The PNG writer: one anomaly's three images in flight (gl_png_busy: no new save until they are on disk)
+static pthread_mutex_t gl_png_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gl_png_cv = PTHREAD_COND_INITIALIZER;
+static uint8_t *gl_png_px;   // (the writer's job; NULL: free)
+static uint64_t gl_png_frame;
+static bool gl_png_started;
+static void *gl_png_main(void *arg) {
+    (void)arg;
+    static const char *const part[3] = {"prev", "frame", "next"};
+    for (;;) {
+        pthread_mutex_lock(&gl_png_mu);
+        while (!gl_png_px) pthread_cond_wait(&gl_png_cv, &gl_png_mu);
+        uint8_t *px = gl_png_px;
+        const uint64_t frame = gl_png_frame;
+        pthread_mutex_unlock(&gl_png_mu);
+        char path[96], tmp[104];
+        for (int k = 0; k < 3; k++) {   // (to <path>.tmp, then renamed: a game killed mid-write leaves no truncated PNG under its name)
+            snprintf(path, sizeof path, "build/glitch_%06llu_%s.png", (unsigned long long)frame, part[k]);
+            snprintf(tmp, sizeof tmp, "%s.tmp", path);
+            vk_save_png(tmp, px + (size_t)k * GL_W * GL_H * 4, GL_W, GL_H);
+            remove(path);
+            if (rename(tmp, path)) LOG("[glitch] saving %s failed: rename\n", path);
+        }
+        free(px);
+        pthread_mutex_lock(&gl_png_mu);
+        gl_png_px = NULL;
+        pthread_mutex_unlock(&gl_png_mu);
+    }
+    return NULL;
+}
+static bool gl_png_busy(void) {
+    pthread_mutex_lock(&gl_png_mu);
+    const bool b = gl_png_px != NULL;
+    pthread_mutex_unlock(&gl_png_mu);
+    return b;
+}
+
+// Completed read-backs into their grids, and the saved anomaly's images to the PNG writer (render thread, each presented frame)
 static void gl_poll(void) {
     const uint64_t done = vk_completed_seq();
     for (int i = 0; i < GL_N; i++) {
@@ -135,11 +176,27 @@ static void gl_poll(void) {
         s->pending = false, s->sig_ok = true;
     }
     if (g_gl_pngq.on && g_gl_pngq.seq <= done) {
-        static const char *const part[3] = {"prev", "frame", "next"};
-        char path[96];
-        for (int k = 0; k < 3; k++) {
-            snprintf(path, sizeof path, "build/glitch_%06llu_%s.png", (unsigned long long)g_gl_pngq.frame, part[k]);
-            vk_save_png(path, g_gl_pngmap + (size_t)k * GL_W * GL_H * 4, GL_W, GL_H);
+        const size_t n = (size_t)3 * GL_W * GL_H * 4;
+        uint8_t *px = malloc(n);
+        if (px) memcpy(px, g_gl_pngmap, n);
+        if (px && !gl_png_started) {
+            pthread_t th;
+            gl_png_started = pthread_create(&th, NULL, gl_png_main, NULL) == 0;
+            if (gl_png_started) pthread_detach(th);
+        }
+        if (px && gl_png_started) {
+            pthread_mutex_lock(&gl_png_mu);
+            gl_png_px = px, gl_png_frame = g_gl_pngq.frame;
+            pthread_cond_signal(&gl_png_cv);
+            pthread_mutex_unlock(&gl_png_mu);
+        } else {   // (no memory / no thread: on this thread, as before)
+            static const char *const part[3] = {"prev", "frame", "next"};
+            char path[96];
+            for (int k = 0; k < 3; k++) {
+                snprintf(path, sizeof path, "build/glitch_%06llu_%s.png", (unsigned long long)g_gl_pngq.frame, part[k]);
+                vk_save_png(path, g_gl_pngmap + (size_t)k * GL_W * GL_H * 4, GL_W, GL_H);
+            }
+            free(px);
         }
         g_gl_pngq.on = false;
     }
@@ -185,8 +242,9 @@ static void gl_eval(VkCommandBuffer cb) {
             "passes %llu, dispatches %llu | occlusion reports %llu: zero %llu, kept visible %llu%s\n", (unsigned long long)f, score,
             dp, dn, dnb, moved ? " (compared after the camera's move)" : "", (unsigned long long)c[0], (unsigned long long)c[1], (unsigned long long)c[2], (unsigned long long)c[3],
             (unsigned long long)c[4], (unsigned long long)c[5], (unsigned long long)c[6],
-            g_gl_logged < GL_MAXLOG && !g_gl_pngq.on ? ", images saved" : "");
-        if (g_gl_logged >= GL_MAXLOG || g_gl_pngq.on) continue;
+            g_gl_logged < GL_MAXLOG && !g_gl_pngq.on && !gl_png_busy() ? ", images saved" : "");
+        vk_cov_dump(f);   // (its targets drawn only in part that the frame before drew whole: a stale band's pass and rect)
+        if (g_gl_logged >= GL_MAXLOG || g_gl_pngq.on || gl_png_busy()) continue;
         g_gl_logged++;
         const GlSlot *trio[3] = {pv, s, nx};
         for (int k = 0; k < 3; k++) {
@@ -202,7 +260,9 @@ static void gl_eval(VkCommandBuffer cb) {
 // device.c vk_frame_end, a presented game frame (not a generated one), after the window image was drawn and before its
 // present: sc in COLOR_ATTACHMENT_OPTIMAL, left so
 void vk_glitch_frame(VkCommandBuffer cb, VkImage sc, VkFormat sc_fmt, uint32_t w, uint32_t h, uint64_t frame) {
-    if (!vk_glitch_on() || !sc || !w || !h) return;
+    if (!vk_glitch_on()) return;
+    vk_cov_frame(frame);   // (the passes since the last presented frame were this one's)
+    if (!sc || !w || !h) return;
     const bool srgb = sc_fmt == VK_FORMAT_B8G8R8A8_SRGB || sc_fmt == VK_FORMAT_R8G8B8A8_SRGB;
     const VkFormat want = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     if (g_gl_fmt == VK_FORMAT_UNDEFINED) g_gl_fmt = want;

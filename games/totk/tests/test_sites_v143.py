@@ -41,6 +41,21 @@ class EncodingTest(unittest.TestCase):
         self.assertEqual(a.lsr_w(11, 11, 5), 0x53057d6b)
         with self.assertRaises(ValueError):
             a.lsr_w(1, 1, 32)
+        self.assertEqual(a.cmp_w_imm(1, 8, lsl12=True), 0x7140203f)   # cmp w1, #8, lsl #12
+        self.assertEqual(a.cmp_w_imm(1, 8), 0x7100203f)
+
+    def test_reportguard_words(self):
+        """the two sites branch to their veneers; each veneer re-runs its site and leaves to the loop's next object"""
+        rg = words_of('reportguard')
+        h = LAY.pad + s.PAD_REPORT
+        n = h + 16
+        self.assertEqual(rg[s.REPORT_H_SITE], a.b(s.REPORT_H_SITE, h))
+        self.assertEqual(rg[s.REPORT_N_SITE], a.b(s.REPORT_N_SITE, n))
+        self.assertEqual([rg[h + 4 * i] for i in range(4)],
+                         [0x37f80061, Orig(s.REPORT_H_SITE), a.b(h + 8, s.REPORT_H_SITE + 4), a.b(h + 12, s.REPORT_LOOP_NEXT)])
+        self.assertEqual([rg[n + 4 * i] for i in range(5)],
+                         [0x7140203f, 0x54000062, Orig(s.REPORT_N_SITE), a.b(n + 12, s.REPORT_N_SITE + 4),
+                          a.b(n + 16, s.REPORT_LOOP_NEXT)])
 
     def test_mac_native_games_words(self):
         """the words MacNativeGames' 1.4.3 replacements hold (their @page adrp and the re-run original aside)"""
@@ -89,12 +104,19 @@ class LayoutTest(unittest.TestCase):
                 self.assertEqual(engine.branch(words[o], o), ('b', s.CLOTH_UPDATE if br[0] == 'bl' else site + 4),
                                  f'{p.feature} {site:#x}')
                 seen += 1
-        self.assertEqual(seen, 1 + 4 + 1 + 4 + 1 + 2 + 4 + 3)
+        self.assertEqual(seen, 1 + 4 + 1 + 4 + 1 + 2 + 4 + 3 + 2)
 
     def test_no_overlap(self):
         offs = [w.offset for p in ALL for w in p.words]
         self.assertEqual(len(offs), len(set(offs)))
-        self.assertLessEqual(max(e for p in ALL for _, e in p.veneers), LAY.pad + 708)   # the rest stays free
+        self.assertLessEqual(max(e for p in ALL for _, e in p.veneers), LAY.pad + 756)   # the rest stays free
+
+    def test_veneers_disjoint(self):
+        """every feature's veneer ranges, pairwise apart (build() checks only that they end before pad_end)"""
+        spans = sorted((a_, b_, p.feature) for p in ALL for a_, b_ in p.veneers)
+        for (a0, b0, f0), (a1, b1, f1) in zip(spans, spans[1:]):
+            self.assertLessEqual(b0, a1, f'{f0} {a0:#x}..{b0:#x} overlaps {f1} {a1:#x}..{b1:#x}')
+        self.assertGreaterEqual(s.PAD_REPORT, s.PAD_SHADOW + 76 + 44 + 60)
 
     def test_data_page(self):
         """every adrp reaches the data page after 1.4.3's span"""
@@ -118,10 +140,13 @@ class LayoutTest(unittest.TestCase):
                0x2daa00: 0x100, 0x2b0300: 0x100, 0x585e00: 0x100, 0x584800: 0x100, 0x628c00: 0x100,
                0xb43400: 0x100, 0x1ff0400: 0x200, 0x253fb00: 0x200,
                0x23eb000: 0x1000, 0x23f5100: 0x200, 0x2789000: 0x400, 0x3e3d00: 0x600,   # (vk_guard's)
-               0xbfca8: 448, 0x68318c: 3692}   # (shadowres's two writers)
+               0xbfca8: 448, 0x68318c: 3692,   # (shadowres's two writers)
+               0xa1f84: 0x568}   # (reportguard's loop)
         lay = engine.layout(table, list(s.FEATURES), fde)
         self.assertEqual(sorted(lay['fde_add']), [LAY.pad + s.PAD_CLOTH + 56, LAY.pad + s.PAD_CLOTH + 76])
-        self.assertEqual(sum(len(v) for v in lay['ext'].values()), 1 + 2 + 1 + 4 + 1 + 2 + 4 + 3)
+        self.assertEqual(sum(len(v) for v in lay['ext'].values()), 1 + 2 + 1 + 4 + 1 + 2 + 4 + 3 + 2)
+        self.assertEqual(lay['ext'][0xa1f84], [(LAY.pad + s.PAD_REPORT, LAY.pad + s.PAD_REPORT + 16),
+                                               (LAY.pad + s.PAD_REPORT + 16, LAY.pad + s.PAD_REPORT + 36)])
 
     def test_needs(self):
         with self.assertRaises(ValueError):
@@ -268,6 +293,79 @@ class ShadowresTest(unittest.TestCase):
                         self.assertEqual((mu.reg_read(R.UC_ARM64_REG_X10), mu.reg_read(R.UC_ARM64_REG_Q31),
                                           mu.reg_read(R.UC_ARM64_REG_SP), mu.reg_read(R.UC_ARM64_REG_NZCV)),
                                          (0x3333, 0x0123456789abcdef0011223344556677, 0x70004000, 0x60000000))
+
+
+class ReportguardTest(unittest.TestCase):
+    """reportguard on the real 1.4.3 main under Unicorn: one object through the inlined report-row loop
+    (0xa22bc .. its exit 0xa2350), patched against the original: a good handle (n up to 0x7fff) gives the same coverage,
+    handle and registers; -1 is skipped by both; a negative handle or n >= 0x8000 is skipped by the patched loop
+    (coverage 0, handle untouched), and #52's n (the float 0.05) faults the original."""
+    LOOP, EXIT = 0xa22bc, 0xa2350
+    ROWS, OBJ, ARR, THIS = 0x10000000, 0x20000000, 0x20001000, 0x20002000
+
+    @classmethod
+    def setUpClass(cls):
+        if not v143_main():
+            raise unittest.SkipTest('no 1.4.3 main in the work folder')
+        from unicorn import Uc, UcError, UC_ARCH_ARM64, UC_MODE_ARM, arm64_const as R
+        cls.R, cls.Uc, cls.UcError, cls.modes = R, Uc, UcError, (UC_ARCH_ARM64, UC_MODE_ARM)
+        with tempfile.TemporaryDirectory() as t:
+            out = os.path.join(t, 'v143.toml')
+            args = SimpleNamespace(old=None, new=v143_main(), version='1.4.3', out=out, report=None, diagnostic=False)
+            assert port.main_port(args) == 0
+            table = read_table(out)
+        cls.original = bytes(load_main_image(v143_main(), table['game']))
+        img = load_main_image(v143_main(), table['game'])
+        apply(img, table, ['reportguard'])
+        cls.patched = bytes(img)
+
+    def run_loop(self, image, h, n, ref=0):
+        """one object, handle h on side 1, row 2h's index n, row 2h+1 = {3, 5, 50, 100}, row 2n's total ref.
+        Returns (coverage bits, handle, x17, w0, pc) or 'fault'."""
+        R = self.R
+        mu = self.Uc(*self.modes)
+        mu.mem_map(0, (len(image) + 0xfff) & ~0xfff)
+        mu.mem_write(0, image)
+        mu.mem_map(self.ROWS - 0x100000, 0x300000)    # 1 MB before the rows, 2 MB from them (n up to 0xffff)
+        mu.mem_map(self.OBJ, 0x3000)
+        rows = self.ROWS
+        if 0 <= h:
+            mu.mem_write(rows + h * 32, struct.pack('<I', n))
+            mu.mem_write(rows + (2 * h + 1) * 16, struct.pack('<4I', 3, 5, 50, 100))
+        if 0 <= n < 0x10000:
+            mu.mem_write(rows + n * 32, struct.pack('<I', ref))
+        mu.mem_write(self.OBJ + 0x98, struct.pack('<hh', 0x1234, h))   # side 0's handle, side 1's
+        mu.mem_write(self.OBJ + 0x9c, struct.pack('<f', 0.75))           # (zeroed by the loop first)
+        mu.mem_write(self.ARR, struct.pack('<Q', self.OBJ))
+        mu.mem_write(self.THIS + 0x122, bytes([1]))
+        for reg, v in (('X9', self.ARR), ('X10', 8), ('X11', 1), ('X12', rows), ('X13', 0xffff), ('X19', self.THIS),
+                       ('X8', 1280 * 720)):
+            mu.reg_write(getattr(R, 'UC_ARM64_REG_' + reg), v)
+        mu.reg_write(R.UC_ARM64_REG_S0, 0x3f733333)   # 0.95 (the threshold the loop keeps in s0)
+        try:
+            mu.emu_start(self.LOOP, self.EXIT, count=200)
+        except self.UcError:
+            return 'fault'
+        cov, = struct.unpack('<I', mu.mem_read(self.OBJ + 0x9c, 4))
+        hd, = struct.unpack('<h', mu.mem_read(self.OBJ + 0x9a, 2))
+        return cov, hd, mu.reg_read(R.UC_ARM64_REG_X17), mu.reg_read(R.UC_ARM64_REG_X0) & 1, mu.reg_read(R.UC_ARM64_REG_PC)
+
+    def test_good_handles_unchanged(self):
+        for h, n, ref in ((1, 3, 0), (1, 3, 7), (0, 0, 2), (5, 0x7fff, 0), (5, 0x7fff, 9), (0x7fff, 1, 0)):
+            got = self.run_loop(self.patched, h, n, ref)
+            self.assertEqual(got, self.run_loop(self.original, h, n, ref), (h, n, ref))
+            self.assertEqual(got[4], self.EXIT)
+            self.assertNotEqual(got[1], h, 'a good handle is consumed (0xffff) as in the original')
+
+    def test_none_handle(self):
+        for image in (self.patched, self.original):
+            self.assertEqual(self.run_loop(image, -1, 0)[:2], (0, -1))
+
+    def test_bad_handles_skipped(self):
+        for h, n in ((-2, 0), (-0x8000, 0), (1, 0x8000), (1, 0xffff), (1, 0x3d4ccccd), (1, 0xffffffff)):
+            cov, hd, _, _, pc = self.run_loop(self.patched, h, n)
+            self.assertEqual((cov, hd, pc), (0, h, self.EXIT), (h, n))
+        self.assertEqual(self.run_loop(self.original, 1, 0x3d4ccccd), 'fault')   # public #52's n
 
 
 if __name__ == '__main__':

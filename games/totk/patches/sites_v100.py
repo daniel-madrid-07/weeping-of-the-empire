@@ -999,6 +999,43 @@ def effectease(lay):
     return p
 
 
+# The model scene report-row read main+0x844634 (public #52 / #73): the runtime's hook (engine/runtime/
+# totk_report_guard.cpp) checks the handle's rows, then runs this function, which reads h (0x844638) and n (row 2h,
+# 0x844654) again: a row rewritten in between still hands it a bad n. These veneers check the values the function
+# itself uses, as 1.4.3's reportguard (sites_v143.py) does in its inlined copy: a negative handle at its first use
+# (0x844648; -1 has left already at 0x844644) and n >= 0x8000 before row 2n is read (0x844660) take the function's own
+# exit (0x8446cc, ret: the coverage was zeroed at 0x84463c, the handle is not written = the hook's no-handle path).
+# ldrsh sign-extends: bit 31 of w9 is the handle's sign. The veneers write no register, only read w9 (the handle, then
+# n), and set the flags, dead at both sites (the cmn is read by the b.eq at 0x844644; the next compare is the fcmp at
+# 0x84468c). Every exit to the function is a b; the tbnz / b.hs jump inside their veneer. The hook stays: it checks
+# the rows' readability and logs; this closes its check-then-read window for the index.
+REPORT_EXIT = 0x8446cc        # ret (the -1 handle's exit)
+REPORT_H_SITE = 0x844648      # lsl w10, w9, #1 (2h: the first use of the handle)
+REPORT_N_SITE = 0x844658      # lsl w9, w9, #1 (w9 = n, read from row 2h)
+EXTRA_REPORT = 496            # extra veneer area: 16 + 20 bytes (after effectease's +432..+484), to +532
+
+
+def reportguard(lay):
+    """Model scene report rows checked where they are followed (#52 / #73), beside the report-row guard hook."""
+    p = Patch('reportguard')
+    if lay.extra is None:
+        raise ValueError('reportguard needs the extra veneer area (Layout.span)')
+    h = lay.extra[0] + EXTRA_REPORT
+    n = h + 16
+    p.put(REPORT_H_SITE, a.b(REPORT_H_SITE, h), 'reportguard: lsl w10, w9, #1 (2h) -> b <handle veneer>')
+    p.code(h, [a.tbnz(9, 31, h, h + 12),                 # a negative handle: the function's exit
+               Orig(REPORT_H_SITE),
+               a.b(h + 8, REPORT_H_SITE + 4),
+               a.b(h + 12, REPORT_EXIT)], 'report handle veneer')
+    p.put(REPORT_N_SITE, a.b(REPORT_N_SITE, n), 'reportguard: lsl w9, w9, #1 (n) -> b <row index veneer>')
+    p.code(n, [a.cmp_w_imm(9, 8, lsl12=True),            # cmp w9, #0x8000
+               a.b_cond('hs', n + 4, n + 16),           # n >= 0x8000: the function's exit
+               Orig(REPORT_N_SITE),
+               a.b(n + 12, REPORT_N_SITE + 4),
+               a.b(n + 16, REPORT_EXIT)], 'report row index veneer')
+    return p
+
+
 FEATURES = {
     # name: (builder, default on, needs)
     'fps60': (lambda lay: fps60(), True, ()),
@@ -1027,6 +1064,7 @@ FEATURES = {
     'havok_dt': (havok_dt, False, ()),  # v0.1.9 A/B only: Havok's dt floored at 1/240, physics fast under it
     'havok_tau': (havok_tau, False, ()),   # v0.1.9 A/B: tau held at its 1/240 value; the fix if it alone is clean
     'effectease': (effectease, True, ()),   # per-frame sweep R5 (v0.1.9): 0 on the page = the game's frames
+    'reportguard': (reportguard, True, ()),   # public #52 / #73 (v0.1.10): beside the hook, closes its re-read window
 }
 
 

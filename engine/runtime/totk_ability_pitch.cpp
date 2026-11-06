@@ -59,8 +59,9 @@ static void log_path(u64 node) {
     if (!on || lines >= 60 || !totk_ptr_ok(node)) { prev_b1e0 = -1; return; }
     const int b1e0 = prev_b1e0, bit8 = prev_bit8;   // the previous update, now complete
     const u64 block = ld64(node + 0x20);
-    // (the mode word: the input block's +0x154 on 1.0.0, +0x15c on 1.4.3, fields_v143.json CameraStickInput; a version
-    // without the field: the bit is not read)
+    // (the mode word: the input block's +0x154 on 1.0.0, +0x15c on 1.4.3, but no 1.4.3 entry in fields_v143.json
+    // until the function's pin passes (the evidence check refused it): a version without the field places it
+    // nowhere and the bit is not read)
     const u64 mode_off = totk_field_known(CameraStickInput, 0x154) ? totk_field(CameraStickInput, 0x154) : 0;
     prev_b1e0 = ld8(node + 0x1e0), prev_bit8 = mode_off && totk_ptr_ok(block) ? (int)(ld32(block + mode_off) >> 8 & 1) : -1;
     if (b1e0 < 0) return;   // (the first update seen, or after a bad node: judged at the next call)

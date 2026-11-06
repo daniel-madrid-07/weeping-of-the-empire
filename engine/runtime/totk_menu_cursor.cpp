@@ -49,6 +49,7 @@ extern "C" {
 #endif
 
 #include <atomic>
+#include <initializer_list>
 #include <mutex>
 #include <cmath>
 #include <cstdio>
@@ -79,7 +80,7 @@ const pc_setting kRows[] = {
      "1", kOffOn, kOffOnNames, 0, 0, 0, 0, "TOTK_MENU_CURSOR", nullptr, apply, nullptr, nullptr},
 };
 [[maybe_unused]] const bool g_rows = (pc_settings_add(kRows, 1), true);
-bool mc_fields_known();   // (kMcFieldsKnown, below the field list; true where the cursor has no Windows side)
+bool mc_fields_known();   // (kMcCoreKnown, below the field list; true where the cursor has no Windows side)
 #ifndef _WIN32
 bool mc_fields_known() { return true; }
 #endif
@@ -116,18 +117,20 @@ constexpr u64 kScreenMgr = totk_main(0x4640010);   // eui::ScreenMgr::sInstance
 #define MAIN_U64(off) rd<u64>(totk_main(off))
 #endif
 
-// Every guest struct offset below is a 1.0.0 offset through totk_field (totk_version.h), so another version's table maps
-// it or leaves it unknown; kMcFieldsKnown, after the list, turns the whole cursor off unless each one is placed. A fixed
-// sub-member inside one field (a size's height, a matrix element) is that field + its distance. eui::ScreenMgr,
-// BoxCursorMgr, BoxCursorControl
+// Every guest struct offset below is a 1.0.0 offset through totk_field (totk_version.h), so another version's table maps it or leaves it unknown; the
+// gates after the list turn the cursor off without its core, and each extra screen's reads off without theirs. A fixed sub-member inside one field (a
+// size's height, a matrix element) is that field + its distance (field_plus: unknown stays unknown).
+constexpr u64 field_plus(u64 f, long long d) { return f == TOTK_FIELD_UNKNOWN ? f : (u64)((long long)f + d); }
+// eui::ScreenMgr, BoxCursorMgr, BoxCursorControl
 constexpr u64 kSmBoxCursorMgr = totk_field(ScreenMgr, 0x3f8), kSmCount = totk_field(ScreenMgr, 0x8),
               kSmScreens = totk_field(ScreenMgr, 0x10), kBmScreenIndex = totk_field(BoxCursorMgr, 0x14),
               kBmControls = totk_field(BoxCursorMgr, 0x28), kCtlActive = totk_field(BoxCursorControl, 0x58),
               kCtlReserved = totk_field(BoxCursorControl, 0x60);
 // eui::Screen (its box-cursor node list: a sead OffsetList at +0x80, its node-to-link offset 0x14 into it); a sead
-// list node's next
+// list node's next. The list head is inline: the game only ever loads its next (+0x88; 0x1ab9648 walks head +0x80 /
+// next +0x88 / link +0x94), so the head is placed through that load, 8 bytes before it
 constexpr u64 kScrDrawInfo = totk_field(EuiScreen, 0x60), kScrLayout = totk_field(EuiScreen, 0x28),
-              kScrNodes = totk_field(EuiScreen, 0x80),
+              kScrNodes = field_plus(totk_field(EuiScreen, 0x88), -8),
               kScrActive = totk_field(EuiScreen, 0x148), kScrReserved = totk_field(EuiScreen, 0x150),
               kScrState = totk_field(EuiScreen, 0x16e), kScrRequest = totk_field(EuiScreen, 0x175);
 constexpr u64 kListNext = totk_field(SeadListNode, 0x8);
@@ -170,36 +173,62 @@ constexpr u64 kAbBorn = totk_field(UIAutoBuilderScreen, 0x1b8), kAbBtnHeight = t
               kAbRowIndex = totk_field(AutoBuilderRow, 0xc);
 constexpr u64 kRideStateRide = totk_field(RideState, 0x67a), kRideStateKind = totk_field(RideState, 0x6b8);
 constexpr u64 kUiModController = totk_field(UIModule, 0x198), kCmSlot0 = totk_field(ControllerModule, 0xa0),
-              kCmSlot1 = totk_field(ControllerModule, 0xa8), kCmSlot2 = totk_field(ControllerModule, 0xb0),
-              kUcTrigger = totk_field(UIController, 0x8), kUcRelease = totk_field(UIController, 0xc),
+              kCmSlot1 = field_plus(kCmSlot0, 8), kCmSlot2 = field_plus(kCmSlot0, 16),   // (an array of 3 pointers)
+              kUcTrigger = totk_field(UIController, 0x8),
+              kUcRelease = field_plus(kUcTrigger, 4),   // (written with the trigger by one stp, cleared by one 64-bit str)
               kUcHold = totk_field(UIController, 0x114), kUcStickX = totk_field(UIController, 0x128),
-              kUcStickY = totk_field(UIController, 0x12c);
+              kUcStickY = field_plus(kUcStickX, 4);   // (the stick's y next to its x: one ldp / stp pair)
 constexpr u64 kPouchSlideListF = totk_field(UIPouchScreen, 0x1e0), kSlideElementsF = totk_field(PouchTabList, 0x58),
               kElemLayoutF = totk_field(PaneScrollElement, 0x20), kTbFields[] = {
                   totk_field(TextBox, 0xd8), totk_field(TextBox, 0x110), totk_field(TextBox, 0x112),
                   totk_field(TextBox, 0x114), totk_field(TextBox, 0x5c), totk_field(ScalableFontTextBoxEx, 0x168),
                   totk_field(SystemActionGuideScreen, 0x1b8), totk_field(ActionGuideDiagram, 0x68)};
-// Every field above placed (1.0.0: always): otherwise the cursor stands down whole (enabled(), the frame, the
-// UIController hook after the original), as the field table's other users do; one gate, since its reads chain screen to
-// node to button to pane and a half-placed chain would read garbage
-constexpr bool kMcFieldsKnown = [] {
-    for (const u64 f : {kSmBoxCursorMgr, kSmCount, kSmScreens, kBmScreenIndex, kBmControls, kCtlActive, kCtlReserved,
-                        kScrDrawInfo, kScrLayout, kScrNodes, kScrActive, kScrReserved, kScrState, kScrRequest, kListNext,
-                        kNodeButton, kNodeScreen, kBtnLayout, kBtnFlags, kBtnHitPane, kBtnCursorPane, kDiProj, kDiView, kLytRoot, kLytSize, kLytName, kLytAnimState, kPaneParent,
-                        kPaneChildren, kPaneSize, kPaneFlag, kPaneAlpha, kPaneBase, kPaneMtx, kPaneName,
-                        kPouchActionWindow, kActionWindowLayout, kShortCutParts, kShortCutCategory, kPartsSlideList,
-                        kPartsLabel, kSlWindowHi, kSlWindowLo, kSlCount, kSlIndex, kSlSnap, kSlWindowFlags, kSlFlags,
-                        kSlRequest, kWheelCircleIndex, kWheelAbilityMap, kRecipeCards, kRecipeHistory, kRecipePartLayout,
-                        kAbBorn, kAbBtnHeight, kAbHeaderHeight, kAbCapacity, kAbRows, kAbCount, kAbScroll, kAbInfoPanel,
-                        kBornFrame, kAbRowMode, kAbRowIndex, kRideStateRide, kRideStateKind, kUiModController, kCmSlot0,
-                        kCmSlot1, kCmSlot2, kUcTrigger, kUcRelease, kUcHold, kUcStickX, kUcStickY, kPouchSlideListF,
-                        kSlideElementsF, kElemLayoutF})
+// The gates (1.0.0: all true). The core is what pointing needs: the open screens' census, the focus, the hit test, the
+// click, the UI controller's A / L / R and the requests; without it the cursor stands down whole (enabled(), the frame,
+// the UIController hook after the original and its posted tasks), and its reads chain screen to node to button to pane,
+// so the core is one gate. Each extra screen's reads have a gate of their own and stand down alone (the router's
+// pad-level path where it has one, as with the cursor off): another version's table can place the core first and the
+// extras as they are proven
+constexpr bool all_known(std::initializer_list<u64> fields) {
+    for (const u64 f : fields)
         if (f == TOTK_FIELD_UNKNOWN) return false;
+    return true;
+}
+constexpr bool kMcCoreKnown = all_known({kSmBoxCursorMgr, kSmCount, kSmScreens, kBmScreenIndex, kBmControls, kCtlActive,
+                                         kCtlReserved, kScrDrawInfo, kScrLayout, kScrNodes, kScrActive, kScrReserved,
+                                         kScrState, kScrRequest, kListNext, kNodeButton, kNodeScreen, kBtnLayout, kBtnFlags,
+                                         kBtnHitPane, kDiProj, kDiView, kLytRoot, kLytSize, kLytName, kPaneParent, kPaneSize,
+                                         kPaneFlag, kPaneAlpha, kPaneBase, kPaneMtx, kPaneName, kUiModController, kUcTrigger,
+                                         kUcRelease, kUcHold});
+// the weapon / shield / bow strips (and the census's strip kind, quick_of: the generic weapons' without it), their
+// right stick
+constexpr bool kMcStripKnown = kMcCoreKnown && all_known({kShortCutParts, kShortCutCategory, kPartsSlideList,
+                                                          kSlWindowHi, kSlWindowLo, kSlCount, kSlIndex, kSlSnap,
+                                                          kSlWindowFlags, kSlFlags, kSlRequest, kUcStickX, kUcStickY});
+// the ability wheel's pick by the mouse
+constexpr bool kMcWheelKnown = kMcCoreKnown && all_known({kWheelCircleIndex, kWheelAbilityMap, kUcStickX, kUcStickY});
+// the inventory's tab icons (tab_at, its model) and its item popup (the action window: no hover under it)
+constexpr bool kMcPouchKnown = kMcCoreKnown && all_known({kPouchSlideListF, kSlideElementsF, kElemLayoutF,
+                                                          kPouchActionWindow, kActionWindowLayout, kLytAnimState});
+// Autobuild's draft list
+constexpr bool kMcAutobuildKnown = kMcCoreKnown && all_known({kAbBorn, kAbBtnHeight, kAbHeaderHeight, kAbCapacity, kAbRows,
+                                                              kAbCount, kAbScroll, kAbInfoPanel, kBornFrame, kAbRowMode,
+                                                              kAbRowIndex});
+// the recipe book's cards / history part (pc_ctx's recipe context)
+constexpr bool kMcRecipeKnown = kMcCoreKnown && all_known({kRecipeCards, kRecipeHistory, kRecipePartLayout});
+// the PC key glyphs in text boxes and the controls diagrams (the pane tree's children, the text boxes, the action guide)
+constexpr bool kMcGlyphKnown = kMcCoreKnown && all_known({kPaneChildren}) && [] {
     for (const u64 f : kTbFields)
         if (f == TOTK_FIELD_UNKNOWN) return false;
     return true;
 }();
-bool mc_fields_known() { return kMcFieldsKnown; }
+// the ride state the glyph pass reads for the horse / vehicle labels (inside the glyph pass only)
+constexpr bool kMcRideKnown = kMcGlyphKnown && all_known({kRideStateRide, kRideStateKind});
+// (logged only: ControllerModule's three controllers; the node dump's cursor pane; the strip diag's parts +0x148)
+constexpr bool kCmSlotsKnown = all_known({kCmSlot0, kCmSlot1, kCmSlot2});
+constexpr bool kBtnCursorPaneKnown = kBtnCursorPane != TOTK_FIELD_UNKNOWN;
+constexpr bool kPartsLabelKnown = kPartsLabel != TOTK_FIELD_UNKNOWN;   // (TOTK_MC_STRIP_DIAG's log only)
+bool mc_fields_known() { return kMcCoreKnown; }
 // The two vtable slots press_down calls (a slot moves when the class gains a virtual), apart: unplaced, press_down
 // declines and a click is the UI controller's A, the rest of the cursor on
 constexpr bool kVcallsKnown = kNodeVtDecidable != TOTK_FIELD_UNKNOWN && kBtnVtDown != TOTK_FIELD_UNKNOWN;
@@ -567,7 +596,7 @@ void dump_nodes(u64 scr) {
                (unsigned long long)node, rd<u32>(btn + kBtnFlags), m03, m13, fabsf(w * m00) / 2, fabsf(h * m11) / 2, m00, m11,
                rd<u8>(pane + kPaneBase), pane_shown(pane) ? "shown" : "hidden");
         const u64 blyt = rd<u64>(btn + kBtnLayout), root = ptr_ok(blyt) ? rd<u64>(blyt + kLytRoot) : 0;
-        const u64 cur = rd<u64>(btn + kBtnCursorPane);
+        const u64 cur = kBtnCursorPaneKnown ? rd<u64>(btn + kBtnCursorPane) : 0;
         for (u64 q : {root, cur})
             if (ptr_ok(q))
                 printf("[menu-cursor]     %s pane at %.0f,%.0f half %.0f x %.0f %s\n", q == root ? "button" : "cursor",
@@ -655,7 +684,7 @@ int options_arrow_at(u64 scr, float x, float y, u64* at) {
 // The tab whose icon is under (x, y) (the pouch screen's layout coordinates), -1 if none. The icons' parts panes
 // are 316 wide, 80 apart (mc_tabs1: they overlap), so the nearest centre wins, within half the spacing.
 int tab_at(u64 pouch, float x, float y) {
-    if (!ptr_ok(pouch)) return -1;
+    if (!kMcPouchKnown || !ptr_ok(pouch)) return -1;
     const u64 slide = rd<u64>(pouch + kPouchSlideList);
     if (!ptr_ok(slide)) return -1;
     float cx[9], cy[9], hh[9];
@@ -681,7 +710,7 @@ int tab_at(u64 pouch, float x, float y) {
 // Tests (verbose): the tab icons' boxes, once per pouch screen
 void dump_tabs(u64 pouch) {
     static u64 done;
-    if (!ptr_ok(pouch) || done == pouch) return;
+    if (!kMcPouchKnown || !ptr_ok(pouch) || done == pouch) return;
     done = pouch;
     const u64 slide = rd<u64>(pouch + kPouchSlideList);
     printf("[menu-cursor]   pouch tabs (slide list %#llx):\n", (unsigned long long)slide);
@@ -715,7 +744,7 @@ int active_tab() {
 // The pouch's item popup (the action window) is open: UIPouchScreen +0x1f0 mpPa_ActionWindow_00 -> its layout
 // (+0x20) -> LayoutEx +0x91 mAnimState non-zero, the game's own test
 bool pouch_popup_open(u64 pouch) {
-    if (!ptr_ok(pouch)) return false;
+    if (!kMcPouchKnown || !ptr_ok(pouch)) return false;   // (unplaced: not known, the pause screen's keys)
     const u64 win = rd<u64>(pouch + kPouchActionWindow), lyt = ptr_ok(win) ? rd<u64>(win + kActionWindowLayout) : 0;
     return ptr_ok(lyt) && rd<u8>(lyt + kLytAnimState) != 0;
 }
@@ -784,6 +813,9 @@ int quick_of(u64 scr, const char* nm) {
     if (!ptr_ok(root) || !pane_shown(root)) return -1;
     if (wheel) return TMS_QM_WHEEL;
     if (build) return TMS_QM_AUTOBUILD;
+    // (the strip's category unplaced: still a quickmenu, so the census keeps it gameplay-class and the cursor off over
+    // it; the generic kind, the weapons', where the category is unknown - qm_feed / qm_apply decline it: hle_hid's flicks)
+    if (!kMcStripKnown) return TMS_QM_WEAPON;
     const s32 cat = rd<s32>(scr + kShortCutCategory);
     return cat == 1 ? TMS_QM_SHIELD : cat == 2 ? TMS_QM_ARROW : cat == 3 ? TMS_QM_MATERIAL : TMS_QM_WEAPON;
 }
@@ -933,7 +965,7 @@ void glyph_textbox(u64 tb, GlyphPass& gp) {
     // diagram (gi 2): totk_controls_page_set.
 #ifdef PC_HAS_GLYPH_GAME_SET
     if (gp.gi == 2) {  // (the fields the page's own refresh 0x1001a84a4c reads)
-        const u64 g = totk_global(0x4558440);
+        const u64 g = kMcRideKnown ? totk_global(0x4558440) : 0;   // (unplaced: the fallback below, ride < 0)
         const int ride = ptr_ok(g) ? rd<u8>(g + kRideStateRide) : -1, kind = ptr_ok(g) ? rd<s32>(g + kRideStateKind) : 0;
         set = totk_controls_page_set(ride, kind, pc_glyph_game_set(), totk_player_state());
     }
@@ -1079,8 +1111,8 @@ void sub_label_textbox(u64 tb, const char* part) {
     const u64 buf = rd<u64>(tb + kTbBuf);
     const u16 cap = rd<u16>(tb + kTbCap), len = rd<u16>(tb + kTbLen);
     if (!ptr_ok(buf) || len >= cap || cap > 2048 || len >= 64) return;
-    const u64 g = totk_global(0x4558440);
-    if (!ptr_ok(g) || rd<u8>(g + kRideStateRide) != 0) return;   // (another page, or unreadable: the game's text)
+    const u64 g = kMcRideKnown ? totk_global(0x4558440) : 0;
+    if (!ptr_ok(g) || rd<u8>(g + kRideStateRide) != 0) return;   // (another page, unreadable or unplaced: the game's text)
     u16 cur[64];
     for (u16 i = 0; i < len; i++) cur[i] = rd<u16>(buf + 2ull * i);
     const unsigned epoch = pc_glyph_epoch_in(PCX_WORLD);
@@ -1191,7 +1223,7 @@ void glyph_pass() {
     // TOTK_MC_GLYPH=0: the pass off (it writes the diagrams' text boxes in gameplay too, CtrlGuide_00: the fight-crash
     // A/B)
     static const bool off = getenv("TOTK_MC_GLYPH") && !strcmp(getenv("TOTK_MC_GLYPH"), "0");
-    if (off) return;
+    if (off || !kMcGlyphKnown) return;   // (the text boxes' fields unplaced: the game's own glyphs)
     g_glyph_tick++;
     static int lines;
     static unsigned logged_epoch = ~0u;
@@ -1315,6 +1347,7 @@ u64 open_screen(const char* name);
 // the part's root pane (flag bit 0, 0x1001ac8d68), so a shown root is that part up. Its update (0x1001ac8e30): in the
 // Food tab the UI controller's Y opens the history, B there goes back to the cards.
 [[maybe_unused]] int recipe_state() {
+    if (!kMcRecipeKnown) return -1;   // (its parts unplaced: no recipe context, the menu's own keys)
     const u64 scr = open_screen("RecipeCard_00");
     if (!scr) return -1;
     auto part_up = [&](u64 off) {
@@ -1327,7 +1360,9 @@ u64 open_screen(const char* name);
 }
 void update_menu_screen(const u64 focus_screen) {
     static ULONGLONG menu_seen;
+    static bool pouch_last;   // the last focus box was the pouch's, and the pouch has not closed since (its Link view)
     const ULONGLONG now = GetTickCount64();
+    if (focus_screen) pouch_last = is_pouch(focus_screen);
     // A quickmenu: the focused screen itself, or, with no menu focused (a quickmenu opens from gameplay), one
     // the census saw shown
     int q = -1;
@@ -1390,6 +1425,20 @@ void update_menu_screen(const u64 focus_screen) {
         const int pg = g_pad_page.load();
         v = pg == 2 || (pg == -1 && g_pad_map.load()) ? (TMS_MAP | 2u << 8)
           : pg >= 0 ? (TMS_PURAH_PAD | (uint32_t)pg << 8) : (TMS_PURAH_PAD | 0xff00u);
+    } else if (pouch_last && (pouch_last = open_screen("Pouch_00") != 0)) {
+        // The inventory's Link view (the pouch's rotate mode, its R stick click: Mouse Middle): the pouch stays open
+        // with no focus box, and only the UI controller's B steps back out. A level over the pause menu, not the
+        // world: read as NONE, Esc was the world's + and a click the world's attack, neither of which the paused game
+        // reads, so nothing left it. From the pouch's own focus only: a menu opening (no box yet) or a screen over
+        // the pouch closing reads as before; the pause menu's close takes Pouch_00 out of the open screens (census,
+        // 11-03 logs)
+        const int t = active_tab();
+        v = TMS_PAUSE | (t >= 0 ? (uint32_t)t : 0xffu) << 8 | TOTK_MENU_F_SUB;
+        static int lines;
+        if (!(g_menu_screen.load(std::memory_order_relaxed) & TOTK_MENU_F_SUB) && lines < 50) {
+            lines++;
+            printf("[menu-cursor] pouch open with no focus box (its Link view): a pause sub-level, Esc / RMB the B\n");
+        }
     }
     publish_screen(v);
 }
@@ -1577,6 +1626,8 @@ bool mc_answers_click(int ctx, int vk) {
 bool qm_feed(double dx, double dy, int notches, int sub) {
     if (qm_off() || !enabled() || !hook_alive(GetTickCount64()) || sub < TMS_QM_WHEEL || sub > TMS_QM_AUTOBUILD)
         return false;
+    // (an extra whose fields are unplaced: the router's pad-level feed instead)
+    if (sub == TMS_QM_WHEEL ? !kMcWheelKnown : sub == TMS_QM_AUTOBUILD ? !kMcAutobuildKnown : !kMcStripKnown) return false;
     if (sub != TMS_QM_WHEEL && sub != TMS_QM_AUTOBUILD && !g_qm_strip_usable.load(std::memory_order_relaxed))
         return false;   // (a strip whose control the direct set cannot use: hle_hid's flicks step it)
     std::lock_guard<std::mutex> l(g_qm_lock);
@@ -1693,7 +1744,7 @@ u64 walk_step(const Focus& f, ULONGLONG now) {
 bool verbose();
 // An open screen by its layout's name (0: none)
 u64 open_screen(const char* name) {
-    if (!kMcFieldsKnown) return 0;   // (totk_menu_layout_focus calls it from outside the frame: an unplaced field is
+    if (!kMcCoreKnown) return 0;   // (totk_menu_layout_focus calls it from outside the frame: an unplaced field is
                                      // 0x7ffffff0, not 0)
     const u64 sm = SCREEN_MGR();
     if (!game_object(sm)) return 0;
@@ -1764,6 +1815,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
         else if (opened && now - opened > 1000) notches += atoi(t), opened = 0;
     }
     if (sub == TMS_QM_WHEEL) {
+        if (!kMcWheelKnown) return 0;   // (its fields unplaced: the pad's own wheel, qm_feed declines the motion)
         const u64 scr = open_screen("ShortCutMainItem_00");
         // A pad's right stick steers the wheel too: while it is out (the original copied it in), the notches' slot
         // yields and the next notch starts from the game's slot
@@ -1856,6 +1908,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
     // row below, the strip's item to the right, the wheel's slot clockwise
     const int fresh = -notches;   // (down / right +)
     if (sub != TMS_QM_AUTOBUILD) {
+        if (!kMcStripKnown) return 0;   // (its fields unplaced: hle_hid's flicks step it, qm_feed declines)
         // The D-pad strips: the parts at the screen's +0x1a8, its SlideListControl at +0x50 (the index +0x8c, the item
         // count +0x88). N notches = N items, wrapping on the strip's own count; the release commits +0x8c
         // (onOutBefore). With the game's own slide: a single notch is the game's own step, the control's request byte
@@ -1934,7 +1987,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
             }
             static u64 last[8];
             const u64 now_v[8] = {rd<u64>(scr + kScrActive), rd<u64>(scr + kScrReserved), c[0], cs[0], c[1], cs[1],
-                                  ptr_ok(slide) ? rd<u64>(slide + kPartsLabel) : 0, slc};
+                                  kPartsLabelKnown && ptr_ok(slide) ? rd<u64>(slide + kPartsLabel) : 0, slc};
             if (memcmp(last, now_v, sizeof last)) {
                 memcpy(last, now_v, sizeof last);
                 printf("[menu-cursor] strip diag: scr active %#llx reserved %#llx | ctl0 %#llx (screen %#llx) ctl1 %#llx "
@@ -1957,6 +2010,7 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
         }
         return 0;
     }
+    if (!kMcAutobuildKnown) return 0;   // (its fields unplaced: the router's own steps, qm_feed declines)
     // The Autobuild list: all the queued notches in one jump. Its rows are the screen's array (+0x248, 0x14 each: +8 the
     // mode, +0xc the draft's index, < 0 a category header; the count +0x250 within the capacity +0x240), in the order up
     // / down walks them; headers are never selected and the walk clamps at either end, no wrap (updateImpl_). The jump
@@ -2292,9 +2346,9 @@ template <class T> T rd(u64 a) {
 }
 // (the two the shared code below names from the Windows field list: the Autobuild row's draft index, and the field
 // table's verdict over the one field this side reads: another version's table may leave it unplaced, and the row
-// helpers would then read rows + TOTK_FIELD_UNKNOWN)
+// helpers would then read rows + TOTK_FIELD_UNKNOWN; the frame's gate below is named as the Windows side's core)
 constexpr u64 kAbRowIndex = totk_field(AutoBuilderRow, 0xc);
-constexpr bool kMcFieldsKnown = totk_field_known(AutoBuilderRow, 0xc);
+constexpr bool kMcCoreKnown = totk_field_known(AutoBuilderRow, 0xc);
 }  // namespace
 #endif
 // The Autobuild list's rows (UIAutoBuilderScreen +0x248: 0x14 each, +0xc the draft's index, < 0 a category header)
@@ -2401,7 +2455,8 @@ extern "C" bool totk_menu_cursor_rstick(int32_t* rx) {
 
 extern "C" int totk_attach_screen_open(void) {
 #ifdef _WIN32
-    if (!hook_alive(GetTickCount64())) return -1;   // (no hook in this key, or eui not updating: unknown)
+    // (no hook in this key, eui not updating, or no core to read the screens with: unknown)
+    if (!kMcCoreKnown || !hook_alive(GetTickCount64())) return -1;
     return g_attach_open.load(std::memory_order_relaxed);
 #else
     return -1;
@@ -2451,14 +2506,21 @@ extern "C" u64 totk_menu_cursor_frame(void) {
         const u64 offs[] = {0x44fcd00, 0x44fd0b0, 0x44fc2c8, 0x11cd0fc};
         int unplaced = 0;
         for (const u64 o : offs) unplaced += !totk_main_known_rt(o);
-        printf("[menu-cursor] fields: %s; vcalls %s; compared addresses unplaced: %d of 4\n",
-               kMcFieldsKnown ? "all placed" : "not all placed (cursor off)", kVcallsKnown ? "placed" : "unplaced (A fallback)",
-               unplaced);
+        // (the extra screens each stand down alone: named here when off)
+        char off[96] = "";
+        const struct { bool on; const char* n; } ex[] = {{kMcStripKnown, " strips"}, {kMcWheelKnown, " wheel"},
+            {kMcPouchKnown, " pouch"}, {kMcAutobuildKnown, " autobuild"}, {kMcRecipeKnown, " recipe"},
+            {kMcGlyphKnown, " glyphs"}, {kMcRideKnown, " ride"}};
+        for (const auto& x : ex)
+            if (!x.on) strncat(off, x.n, sizeof off - strlen(off) - 1);
+        printf("[menu-cursor] fields: core %s; extras off:%s; vcalls %s; compared addresses unplaced: %d of 4\n",
+               kMcCoreKnown ? "all placed" : "not all placed (cursor off)", off[0] ? off : " none",
+               kVcallsKnown ? "placed" : "unplaced (A fallback)", unplaced);
         return true;
     }();
     (void)said;
 #endif
-    if (!kMcFieldsKnown) return 0;   // (a field table without every eui / ui2d field: nothing read)
+    if (!kMcCoreKnown) return 0;   // (a field table without the core's eui / ui2d fields: nothing read)
 #ifdef _WIN32
     static std::atomic<u64> last{0};
     // Design A: eui's thread runs it all; the pad gets only the hook's Purah Pad page walk (L / R)
@@ -2573,10 +2635,13 @@ u64 frame(const Focus& f) {
     const bool pad = (hid_screen_now() == 1 || ms == TMS_MAP) && hid_mouse_map_on();
     // (a quickmenu or the Scope, as the context says: no cursor, the mouse stays the router's)
     const bool quick = ms == TMS_QUICKMENU || ms == TMS_SCOPE;
-    const bool cursor = seen && now - seen < 300 && !pad && !quick;
+    // (the inventory without the pouch extra takes no hover or click below: no pointer drawn there either)
+    const bool dead = !kMcPouchKnown && is_pouch(f.screen);
+    const bool cursor = seen && now - seen < 300 && !pad && !quick && !dead;
     if (cursor != was && logs < 400) {
         logs++;
-        printf("[menu-cursor] cursor %s\n", cursor ? "on" : pad ? "off (Purah Pad: the map's mouse)" : "off");
+        printf("[menu-cursor] cursor %s\n", cursor ? "on" : pad ? "off (Purah Pad: the map's mouse)"
+                                            : dead ? "off (the inventory: its fields unplaced, keys only)" : "off");
     }
     static ULONGLONG on_since;   // when the cursor last came on
     if (cursor && !was) on_since = now;
@@ -2683,7 +2748,9 @@ u64 frame(const Focus& f) {
         if (ax >= 0 && (!on || !is_options(f.screen) || fabsf(px - ax) > 0.02f || fabsf(py - ay) > 0.02f)) ax = ay = -1;
         if (ax >= 0) moved = false;
     }
-    if (on && !g_drag.on && (moved || (edge & 1))) {   // (no hover or click while the model's drag lasts)
+    // (no hover or click while the model's drag lasts; none in the inventory without the pouch extra: an item under its
+    // popup would take a click the popup should, so there it is the keys only, as with the cursor off)
+    if (on && !g_drag.on && (moved || (edge & 1)) && (kMcPouchKnown || !is_pouch(f.screen))) {
         float lw = 1920, lh = 1080;   // the screen's layout size
         const u64 lyt = rd<u64>(f.screen + kScrLayout);
         if (ptr_ok(lyt)) {
@@ -2952,19 +3019,28 @@ u64 frame(const Focus& f) {
 void f_83e3f8_orig(Ctx *__restrict c);
 void mc_orig_stub(Ctx *__restrict) {}
 #pragma comment(linker, "/alternatename:?f_83e3f8_orig@@YAXPEIAUCtx@@@Z=?mc_orig_stub@@YAXPEIAUCtx@@@Z")
+// Posted tasks (totk_ui_post), on eui's thread, inside the bridge, no lock of ours held
+static void run_posted(ULONGLONG now) {
+    UiTask run[16], drop[16];
+    int nrun, ndrop;
+    take_tasks(now, run, &nrun, drop, &ndrop);
+    for (int i = 0; i < ndrop; i++) drop[i].fn(drop[i].arg, false);
+    for (int i = 0; i < nrun; i++) run[i].fn(run[i].arg, true);
+}
 void hook_f_83e3f8(Ctx *__restrict c) {   // UIController::updateState(this, src)
     const u64 self = c->x[0], src = c->x[1];
     f_83e3f8_orig(c);
-    if (!kMcFieldsKnown || !ptr_ok(self)) return;
+    if (!ptr_ok(self)) return;
     // The shared UIController, by address: UIModule (main+0x4563120, the instance or the slot that holds it) +0x198
-    // (the object, or a pointer to it). Another controller is left alone (logged once); if the module cannot be
-    // read, the first controller seen.
+    // (the object, or a pointer to it). Another controller is left alone (logged once); if the module cannot be read
+    // (or +0x198 is unplaced), the first controller seen.
     static u64 first;
     u64 ui = 0;
     {
         u64 mod = MAIN_U64(0x4563120);
         if (!game_object(mod) && ptr_ok(mod)) mod = rd<u64>(mod);
-        if (game_object(mod)) ui = self == mod + kUiModController || self == rd<u64>(mod + kUiModController) ? self : 0;
+        if (game_object(mod) && kUiModController != TOTK_FIELD_UNKNOWN)
+            ui = self == mod + kUiModController || self == rd<u64>(mod + kUiModController) ? self : 0;
         else { if (!first) first = self; ui = self == first ? self : 0; }
     }
     if (!ui) {
@@ -2986,7 +3062,7 @@ void hook_f_83e3f8(Ctx *__restrict c) {   // UIController::updateState(this, src
         // ControllerModule's custom controllers (sInstance; main +0xa0, all players +0xa8, combined +0xb0), to tell
         // which one is the BoxCursor's "UI" controller and which one gameplay reads
         const u64 cm = MAIN_U64(0x46490c0);
-        if (ptr_ok(cm))
+        if (kCmSlotsKnown && ptr_ok(cm))
             printf("[menu-cursor]   ControllerModule (sInstance) controllers: main %#llx, all players %#llx, "
                    "combined %#llx\n",
                    (unsigned long long)rd<u64>(cm + kCmSlot0), (unsigned long long)rd<u64>(cm + kCmSlot1),
@@ -2994,6 +3070,13 @@ void hook_f_83e3f8(Ctx *__restrict c) {   // UIController::updateState(this, src
     }
     g_hook_at.store(now);
     guest_bridge::Enter e(c);
+    if (!kMcCoreKnown) {
+        // Another version's table without the core: no screen is read, but the posted tasks (totk_ui_post: the ability
+        // keys' GameData commit, the Options sections' step) need no field, so they still run here (1.4.3 in v0.1.9.1
+        // refused every one: '[pc] ability N: not queued', the hook returning before its liveness stamp)
+        run_posted(now);
+        return;
+    }
     u64 out;
     {
         std::lock_guard<std::mutex> l(g_frame_lock);
@@ -3013,12 +3096,7 @@ void hook_f_83e3f8(Ctx *__restrict c) {   // UIController::updateState(this, src
         out = frame(f);
         g_in_hook = false;
     }
-    // Posted tasks (totk_ui_post), on this thread, inside the bridge, no lock of ours held
-    UiTask run[16], drop[16];
-    int nrun, ndrop;
-    take_tasks(now, run, &nrun, drop, &ndrop);
-    for (int i = 0; i < ndrop; i++) drop[i].fn(drop[i].arg, false);
-    for (int i = 0; i < nrun; i++) run[i].fn(run[i].arg, true);
+    run_posted(now);
     // The Purah Pad's page walk: its L / R on the pad (whether the page bar reads the UI controller is not known; the
     // pad reaches both, the UI controller through its source), only while the Pad is open
     const u64 lr = out & ((1u << 6) | (1u << 7));

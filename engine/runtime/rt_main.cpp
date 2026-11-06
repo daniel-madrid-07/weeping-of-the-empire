@@ -517,12 +517,22 @@ extern "C" void pc_gpu_safe_notice(int stage) {
                          : pc_tr("Safe GPU mode: the graphics driver crashed in the last runs, so shaders now build the slow, safe way"),
               20000);
 }
+static thread_local bool t_crash_unhandled;   // (on_crash_unhandled: nobody handled it, report it now)
 static LONG WINAPI on_crash(EXCEPTION_POINTERS* ep) {
     auto* er = ep->ExceptionRecord;
     if (er->ExceptionCode < 0xC0000000u || t_prof_unwind) return EXCEPTION_CONTINUE_SEARCH;
     if (t_fault_guard > 0 && er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
     bool pc = pc_crash_enabled();
     if (pc && er->ExceptionCode == 0xE06D7363u) return EXCEPTION_CONTINUE_SEARCH;
+    // An exception in another loaded module (a GPU driver, an overlay, a system DLL) is first that module's: some raise
+    // and catch their own, and this vectored handler runs before their __except, so ending the game here turned a
+    // handled fault into a crash. With crash reports on it comes back only if nobody handles it: pc_crash's unhandled
+    // filter calls on_crash_unhandled, the same report. (Code at no module, a call to 0: reported at once, as before.)
+    if (pc && !t_crash_unhandled && er->ExceptionCode != EXCEPTION_STACK_OVERFLOW) {
+        char m[MAX_PATH + 40];
+        const HMODULE mod = crash_module((u64)er->ExceptionAddress, m, sizeof m);
+        if (mod && mod != GetModuleHandleW(nullptr)) return EXCEPTION_CONTINUE_SEARCH;
+    }
     if (pc && er->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
         pc_crash_report(ep, "stack overflow", "(stack overflow: no runtime report; the guest registers are in the minidump)\n");
         TerminateProcess(GetCurrentProcess(), 3);
@@ -650,6 +660,12 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS* ep) {
     pc_input_keys_restore();   // (TOTK_PC_CRASH=0: no report, which restores them first; a no-op after it)
     TerminateProcess(GetCurrentProcess(), 3);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+// pc_crash's unhandled filter: an exception on_crash left to its module's own handlers and nobody handled. Returns only
+// for what on_crash does not report (pc_crash's own report follows).
+static long on_crash_unhandled(void* ep) {
+    t_crash_unhandled = true;
+    return on_crash((EXCEPTION_POINTERS*)ep);
 }
 #endif
 
@@ -1543,15 +1559,27 @@ int main(int argc, char** argv) {
 
 #ifdef _WIN32
     AddVectoredExceptionHandler(0, on_crash);
-    // nxrecomp: TOTK_PC_CRASHTEST=<s> writes to address 0 from a host thread after <s> seconds, =abort:<s> calls abort():
-    // checks the crash report and minidump path (TOTK_PC_CRASH=1) without waiting for a real crash
+    pc_crash_set_runtime_filter(on_crash_unhandled);   // (another module's exception nobody handled: on_crash's report)
+    // nxrecomp: TOTK_PC_CRASHTEST=<s> writes to address 0 from a host thread after <s> seconds, =abort:<s> calls abort(),
+    // =dll:<s> faults inside system DLLs: first one lstrlenA (kernelbase) handles itself (the game goes on: '[crash]
+    // TOTK_PC_CRASHTEST: a handled fault in lstrlenA survived'), then one nobody handles in ntdll (the report names
+    // ntdll.dll and our caller): checks the crash report and minidump path (TOTK_PC_CRASH=1) without a real crash
     if (const char* ct = getenv("TOTK_PC_CRASHTEST")) {
-        static bool ct_abort = strncmp(ct, "abort:", 6) == 0;
-        static DWORD ct_ms = (DWORD)(atof(ct_abort ? ct + 6 : ct) * 1000);
+        static bool ct_abort = strncmp(ct, "abort:", 6) == 0, ct_dll = strncmp(ct, "dll:", 4) == 0;
+        static DWORD ct_ms = (DWORD)(atof(ct_abort ? ct + 6 : ct_dll ? ct + 4 : ct) * 1000);
         CloseHandle(CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
             Sleep(ct_ms);
-            fprintf(stderr, "[crash] TOTK_PC_CRASHTEST: %s now\n", ct_abort ? "abort()" : "writing to address 0");
+            fprintf(stderr, "[crash] TOTK_PC_CRASHTEST: %s now\n",
+                    ct_abort ? "abort()" : ct_dll ? "faulting in system DLLs" : "writing to address 0");
             if (ct_abort) abort();
+            if (ct_dll) {
+                static volatile uintptr_t bad = 1;
+                lstrlenA((LPCSTR)bad);   // (kernelbase catches its own access violation and returns 0)
+                fprintf(stderr, "[crash] TOTK_PC_CRASHTEST: a handled fault in lstrlenA survived\n");
+                fflush(stderr);
+                auto nt_strlen = (size_t(__cdecl*)(const char*))(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "strlen");
+                if (nt_strlen) nt_strlen((const char*)bad);
+            }
             static volatile uintptr_t zero;   // (not a literal null: the compiler may turn that into ud2)
             *(volatile int*)zero = 1;
             return 0;

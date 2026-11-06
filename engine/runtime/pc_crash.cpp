@@ -278,8 +278,11 @@ void prune() {
     }
 }
 
+long (*g_runtime_filter)(void*);   // (pc_crash_set_runtime_filter)
+
 LONG WINAPI unhandled_filter(EXCEPTION_POINTERS* ep) {
     if (g_on != 1) return EXCEPTION_CONTINUE_SEARCH;   // switched off after the install: Windows' own handling
+    if (g_runtime_filter) g_runtime_filter(ep);         // (the runtime's report ends the process when it takes it)
     pc_crash_report(ep, "unhandled exception", nullptr);
     TerminateProcess(GetCurrentProcess(), 3);
     return EXCEPTION_EXECUTE_HANDLER;
@@ -300,6 +303,8 @@ void on_invalid_parameter(const wchar_t*, const wchar_t*, const wchar_t*, unsign
 void on_purecall() { on_abort(SIGABRT); }
 }   // namespace
 
+extern "C" void pc_crash_set_runtime_filter(long (*filter)(void*)) { g_runtime_filter = filter; }
+
 extern "C" bool pc_crash_enabled(void) {
     if (g_on < 0) { const char* e = getenv("TOTK_PC_CRASH"); g_on = !(e && *e == '0'); }   // on unless "0" (db-pc1)
     return g_on;
@@ -307,8 +312,9 @@ extern "C" bool pc_crash_enabled(void) {
 
 extern "C" void pc_crash_install(void) {
     if (!pc_crash_enabled() || InterlockedExchange(&g_installed, 1)) return;
-    const char* d = getenv("TOTK_CRASH_DIR");
-    if (d && *d) MultiByteToWideChar(CP_UTF8, 0, d, -1, g_dir, MAX_PATH);
+    // (wide: getenv's ANSI bytes read as UTF-8 named another folder for a non-ASCII path, public #94)
+    const wchar_t* d = _wgetenv(L"TOTK_CRASH_DIR");
+    if (d && *d) wcsncpy(g_dir, d, MAX_PATH - 1);
     else {
         DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", g_dir, MAX_PATH);
         if (!n || n >= MAX_PATH - 40) wcscpy(g_dir, L".");
@@ -390,4 +396,5 @@ extern "C" bool pc_crash_enabled(void) { return false; }
 extern "C" void pc_crash_install(void) {}
 extern "C" void pc_crash_set_enabled(bool) {}
 extern "C" void pc_crash_report(void*, const char*, const char*) {}
+extern "C" void pc_crash_set_runtime_filter(long (*)(void*)) {}
 #endif

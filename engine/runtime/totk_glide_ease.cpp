@@ -38,6 +38,10 @@ constexpr u64 kParaCall = totk_main(0x1d0d16c);     // return address of its app
 constexpr u64 kParaVt = totk_main(0x437ec50);       // its vtable (slot 1 getRuntimeTypeInfo 0x1d0d7f0, 26 updateImpl_);
                                                     // not placed in 1.4.3: there the call site alone (its x20 is always the node)
 constexpr u64 kParaCap = totk_main(0x3746b38);      // f32[2]: 0.4, 0.74
+// A scripted paraglide: after the same call it eases the node's velocity (+0x24..0x2c) toward 0, v += (0 - v) *
+// ScaleWithGravity(0.1, 0.1) (main+0x1c0d008.. 0x1c0d044; its target is s x 0, so s itself does not matter): a scripted
+// glide's speed dies 2-8x as fast above 30 fps
+constexpr u64 kEventCall = totk_main(0x1c0cff8);    // return address of its approachTargetSpeed call (x21 = the node)
 
 void stf(u64 a, float v) { u32 w; memcpy(&w, &v, 4); st32(a, w); }
 }  // namespace
@@ -66,6 +70,14 @@ extern "C" int totk_glide_ease_step_cap(float *sp, float T, float a, float d, fl
 }
 extern "C" int totk_glide_ease_step(float *sp, float T, float a, float d, float r, float r0, const float dir[3], float v[3]) {
     return totk_glide_ease_step_cap(sp, T, a, d, r, r0, INFINITY, dir, v);
+}
+
+// The scripted glide's decay for one call (tools/oracle/test_glide_ease.py): the factor to pre-scale v by so that the
+// caller's v += (0 - v) * k lands on v (1 - k)^r, the per-30-Hz-frame decay at the frame's ratio r. 1 where the original
+// stays (r >= 1, 30 fps and below, or k outside (0, 1)).
+extern "C" float totk_glide_decay_keep(float k, float r) {
+    if (!(r > 0.01f && r < 1.0f) || !(k > 0.0f && k < 1.0f)) return 1.0f;
+    return (float)(pow(1.0 - (double)k, (double)r) / (1.0 - (double)k));
 }
 
 // VFRMgr::getCounter(this) -> the counter in use. Named as a function so another version's engine map aliases it (pinned)
@@ -116,6 +128,29 @@ static void paraglide(Ctx *__restrict c, float T, float a, float d) {
     c->v[0] = vS(s);
 }
 
+// The scripted glide's call (kEventCall): v pre-scaled by totk_glide_decay_keep, only where the caller's factor is the
+// 0.1 (ScaleWithGravity(0.1, 0.1), as the paraglider's). TOTK_EVENT_GLIDE_EASE=0: the original alone.
+static void event_glide(Ctx *__restrict c) {
+    static const bool on = [] {
+        const char *e = getenv("TOTK_EVENT_GLIDE_EASE");
+        const bool v = !e || strcmp(e, "0");
+        printf("[glide-ease] scripted paraglide decay %s\n",
+               v ? "in game time" : "per frame, as the game (TOTK_EVENT_GLIDE_EASE=0)");
+        return v;
+    }();
+    const u64 node = c->x[21], fd = totk_frame_delta();   // (the caller's x21 = its node: mov x21, x0 in its prologue)
+    if (!on || !totk_main_known(0x1076be0) || !totk_ptr_ok(fd) || !totk_ptr_ok(node)) return;
+    const V128 s0 = c->v[0], s1 = c->v[1];
+    c->v[0] = vS(kEase), c->v[1] = vS(kEase);
+    f_1076be0(c);
+    const float k = c->v[0].f[0];
+    c->v[0] = s0, c->v[1] = s1;
+    if (k != kEase) return;
+    const float keep = totk_glide_decay_keep(k, totk_frame_ratio(fd));
+    if (keep == 1.0f) return;
+    for (int i = 0; i < 3; i++) stf(node + kVel + 4 * i, ldf32(node + kVel + 4 * i) * keep);
+}
+
 void hook_f_16e4b80(Ctx *__restrict c) {   // GameActor::approachTargetSpeed(this, s0 = T, s1 = a, s2 = d) -> s0
 #ifndef _WIN32
     if (!f_16e4b80_orig) return;
@@ -124,6 +159,7 @@ void hook_f_16e4b80(Ctx *__restrict c) {   // GameActor::approachTargetSpeed(thi
     const float T = c->v[0].f[0], a = c->v[1].f[0], d = c->v[2].f[0];
     f_16e4b80_orig(c);
     if (lr == kParaCall) return paraglide(c, T, a, d);
+    if (lr == kEventCall) return event_glide(c);
     if (lr != kGlideCall) return;
     static const bool on = [] {
         const char *e = getenv("TOTK_GLIDE_EASE");

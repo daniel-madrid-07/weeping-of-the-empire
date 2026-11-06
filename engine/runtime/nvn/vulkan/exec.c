@@ -951,6 +951,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     vk_end_pass();
     gdev_check_prev();
     Sub *s = sub();
+    if (s->main_begun) { extern void vk_tex_presubmit(void); vk_tex_presubmit(); }   // (LARECOMP_TEX_SUBMIT_RECHECK)
     if (!s->main_begun && !s->upload_begun && !wait && !signal) return;
     VkCommandBufferSubmitInfo cbs[2];
     int n = 0;
@@ -1048,6 +1049,7 @@ void renderer_sync(void) {
     uint64_t s = submit_seq;
     pthread_mutex_unlock(&seq_lock);
     vk_wait_seq(s);
+    vk_writeback_complete(vk_completed_seq(), false);   // (LARECOMP_WB_DEFER)
 }
 
 uint64_t renderer_fence_seq(void) {
@@ -1161,6 +1163,7 @@ void renderer_wait_seq(uint64_t seq) {
             (unsigned long long)renderer_present_count(), (unsigned long long)w, (unsigned long long)seq, (unsigned long long)s,
             (unsigned long long)done0, s - w < 64 ? (t0 - sub_t[w & 63]) / 1e6 : -1.0, (SDL_GetTicksNS() - t0) / 1e6);
     }
+    vk_writeback_complete(vk_completed_seq(), false);   // (LARECOMP_WB_DEFER: texels the game may read past this wait)
     rc_check(w);
 }
 
@@ -1522,6 +1525,48 @@ void sync_guard_note(uint64_t addr, uint64_t len);
 void sync_guard_note_write(uint64_t addr, uint64_t len);
 void sync_guard_fence(const void *key, uint64_t ticket);
 void sync_guard_hold(int on);
+// Frame snapshot (LEAD 2026-11-03 P0, the v0.1.9 gate's one-frame rain streaks / missing roof): the replay read uniform data
+// and CPU-written vertex / instance streams from guest memory when it got to them, and with objects.c's SyncWait ticket lag
+// a slow replay (a GPU wait: the bytes of [addr, addr + size) as the frame of the op being replayed left them, or NULL (not
+// captured: read live, as before). guest_copy takes them from there, and a vertex stream it covers is copied instead of
+// bound in place (guest_direct: the GPU would read guest memory even later). LARECOMP_FRAME_SNAP=0: always live (old).
+const void *(*vk_snap_src)(uint64_t addr, uint64_t size);
+void *frame_snap_take(uint64_t handle);   // frame_snap.c (the capture half): at the submit, on the game's thread
+void frame_snap_apply(void *snap);        // the render thread: the list's snapshot current while it is replayed
+void frame_snap_write(uint64_t addr, const void *src, uint64_t len);   // the replay's own guest writes, into it too
+void frame_snap_note(uint64_t addr, uint64_t len);   // a guest write the snapshot cannot hold (GPU timeline): live from then on
+static uint64_t stat_snap_reads, stat_snap_bytes;
+// The frame's buffer-path events for the glitch detector (bxe_note, printed per hit by vk_cov_dump after the texture
+// events; hdr 11-05, so the vertex / uniform paths that read guest memory late or live)
+enum { BXE_VX_STRADDLE, BXE_VX_INFLIGHT, BXE_PG_LIVE, BXE_PG_INFLIGHT, BXE_UBO_V7, BXE_SNAP_NEWER, BXE_LATE_TIC, BXE_REPLAY_LATE, BXE_HOST_FALL, BXE_N };
+static uint64_t g_replay_seq;   // (async) the replayed list's g_nvn_submit_seq, 0 outside a list / synchronous
+static bool g_tic_snapped;      // (LARECOMP_POOL_SNAP) texture_info_ took an entry's value at its list's submit: not memoized
+static uint64_t stat_pool_snap, stat_pool_snap_miss;
+// LARECOMP_POOL_SNAP (objects.c nvn_pool_entry_at): the entry as the replayed list's submit left it, else e itself
+static const NvnTexEntry *pool_entry_at_submit(const NvnTexEntry *e, NvnTexEntry *tmp) {
+    if (!g_replay_seq || e->wseq < g_replay_seq || !nvn_pool_snap_on()) return e;
+    if (!nvn_pool_entry_at(e, g_replay_seq, tmp)) { stat_pool_snap_miss++; return e; }
+    stat_pool_snap++;
+    static uint64_t next_ns, l_snap, l_miss;
+    const uint64_t now = SDL_GetTicksNS();
+    if (now >= next_ns) {
+        if (next_ns) LOG("[pool-snap] last 2 s: %llu texture pool reads as their list's submit left them, %llu changed too often since (read now)\n",
+                         (unsigned long long)(stat_pool_snap - l_snap), (unsigned long long)(stat_pool_snap_miss - l_miss));
+        l_snap = stat_pool_snap, l_miss = stat_pool_snap_miss, next_ns = now + 2000000000ull;
+    }
+    return tmp;
+}
+static void bxe_note(int kind);
+bool vk_glitch_on(void);   // glitch.c
+static const void *frame_snap(uint64_t addr, uint64_t size, bool count) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_FRAME_SNAP"); on = !(e && *e == '0'); }
+    const void *(*f)(uint64_t, uint64_t) = __atomic_load_n(&vk_snap_src, __ATOMIC_ACQUIRE);
+    if (!on || !f || !addr || !size) return NULL;
+    const void *p = f(addr, size);
+    if (p && count) stat_snap_reads++, stat_snap_bytes += size;
+    return p;
+}
 // With chunked submission the copies are shared by every chunk of one guest list (nothing writes guest memory within a
 // list, gcopy_gen otherwise): the key is the list, and a reuse in a later chunk keeps the ring chunk alive until then.
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
@@ -1553,8 +1598,12 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     if (prof) {   // (a slot already holding this list's copy of another range = a hash collision evicting it)
         if (gcopy[slot].seq == seq) prof_gc_evict++, prof_gc_evict_b += size; else prof_gc_new++, prof_gc_new_b += size;
     }
-    VkSpan s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
-    sync_guard_note(addr, size);   // (read now, for the frame being replayed: LARECOMP_SYNC_GUARD)
+    const void *snap = frame_snap(addr, size, true);   // (the frame's own bytes when captured at its release)
+    // (the detector: memory already holds other bytes than the frame left = what a live read would have taken: the race
+    // the snapshot closes, seen happening; captured ranges are committed heap, readable)
+    if (snap && vk_glitch_on() && memcmp(snap, (const void *)(uintptr_t)addr, size)) bxe_note(BXE_SNAP_NEWER);
+    VkSpan s = vk_transient_copy(snap ? snap : (const void *)(uintptr_t)addr, size, 256);
+    if (!snap) sync_guard_note(addr, size);   // (read now, for the frame being replayed: LARECOMP_SYNC_GUARD)
     gcopy[slot].addr = addr; gcopy[slot].size = size; gcopy[slot].seq = seq; gcopy[slot].span = s; gcopy[slot].used = pend;
     if (prof && vk_up_kind == 2) vx_page_stats(addr, size, pend);
     return s;
@@ -1856,12 +1905,34 @@ static bool gate_low(void) {
     }
     return low;
 }
+// Intel GPUs: background builds (the precompile / archive warm-up / Setup's prepare) one at a time, never beside another
+// build that started first. Intel's shader compiler crashed or hung in those passes when several builds ran at once:
+// public #55 (Core 3 100U, 101.7092: two compute builds stuck in igvk64.dll at the same moment, 30 s, then a crash in it),
+// #34 / #39 (Arc B580, 101.9150: igc-default64.dll in the warm-up). The quarantine only learns after a crash, so each
+// player's first starts crashed. The game's own builds keep their parallelism (no new hitches in play: #55's two stuck
+// builds were both the precompile's); the first start's shader pass is slower on Intel. Windows only by default (the
+// crashes are Intel's Windows DLLs). LARECOMP_INTEL_SERIAL=0: off, =1: on any GPU / OS.
+static bool gate_serial_bg(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("LARECOMP_INTEL_SERIAL");
+#ifdef _WIN32
+        v = e && *e ? *e == '1' : g_vk.props.vendorID == 0x8086;
+#else   // (Mesa's ANV on Linux: no such crash seen; there it would only cost warm-up time. =1 still forces it)
+        v = e && *e == '1';
+#endif
+        if (v) LOG("[vk] compile gate: background shader builds one at a time (%s; LARECOMP_INTEL_SERIAL=0: off)\n",
+                   e && *e ? "LARECOMP_INTEL_SERIAL=1" : "Intel GPU: its compiler crashed under parallel builds, #55 / #34");
+    }
+    return v;
+}
 static void gate_enter(void) {
     if (tl_gate == GATE_NONE || tl_in_gate) return;
     uint64_t wait0 = 0;
     for (;;) {
         int cur = atomic_load(&g_gate_inflight);
-        if (!gate_low() && !vk_gpu_safe()) {   // (safe GPU mode, device.c: one build at a time, as when memory is short)
+        // (safe GPU mode, device.c: one build at a time, as when memory is short; on Intel the background ones always)
+        if (!gate_low() && !vk_gpu_safe() && !(tl_gate != GATE_GAME && gate_serial_bg())) {
             if (atomic_compare_exchange_weak(&g_gate_inflight, &cur, cur + 1)) break;
             continue;
         }
@@ -2001,7 +2072,7 @@ static const char *const tc_env_vars[] = {
     "LARECOMP_NO_DAG_GUARD", "LARECOMP_NO_DISCARD", "LARECOMP_NO_FLAT", "LARECOMP_NO_FS_STG", "LARECOMP_NO_IMAP", "LARECOMP_NO_MINPC",
     "LARECOMP_NO_RED", "LARECOMP_RSC_OWN", "LARECOMP_SAVE_MSL", "LARECOMP_TXD_HWGRAD", "LARECOMP_VP_EXACT", "LARECOMP_YDIR_POS",
     "LARECOMP_BRX_C1_ALL", "TOTK_SOFT_SHADOWS", "TOTK_SOFT_SHADOWS_MAX", "LARECOMP_FLAT_NPC", "LARECOMP_QUAD_SWAP",
-    "LARECOMP_F2I_NAN",
+    "LARECOMP_F2I_NAN", "LARECOMP_AOFFI_GUEST",
     "LARECOMP_GATHER_SCALE",
 };   // (LARECOMP_TEX_PRED_HOIST is read by device.c: its result, maxwell_tex_hoist, is in the device part below)
 static uint64_t tc_env;   // (hash of the translator's configuration; 0 = cache off)
@@ -2419,6 +2490,17 @@ static bool hitch_log_ok(uint64_t now, uint64_t dt, uint64_t hitch_ns) {
     if (dt > worst) worst = dt;
     return false;
 }
+// The last logged hitch for the F9 overlay's line: its length and its largest part, from the sums the [hitch] lines
+// print. Parts: 0 GPU wait (backend waits + the present's frame slot), 1 shader builds on the drawing thread, 2 texture
+// uploads, 3 new images and their memory, 4 file reads on the presenting thread, 5 the present (driver / window), 6 the
+// game's own CPU, 7 the rest of the drawing thread. Written and read on the presenting thread (device.c
+// backend_present: vk_frame_end draws the overlay, vk_prof_frame follows), so plain fields.
+static struct { uint64_t when_ns; float ms, part_ms; int part; } g_last_hitch;
+int vk_last_hitch(float *ms, float *part_ms, float *age_s) {   // (-1: none yet)
+    if (!g_last_hitch.when_ns) return -1;
+    *ms = g_last_hitch.ms, *part_ms = g_last_hitch.part_ms, *age_s = (float)((SDL_GetTicksNS() - g_last_hitch.when_ns) / 1e9);
+    return g_last_hitch.part;
+}
 void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
     static uint64_t last_t, l_exec, l_wait, l_draws, l_subs, l_tex, l_fs, l_img, l_img_ns, l_op[CMD_COUNT], l_opc[CMD_COUNT], l_cpu, l_ivcsw;
     static int l_progs;
@@ -2467,6 +2549,21 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
             ((double)dt - ex - present_ns) / 1e6, (unsigned long long)(cum_draws - l_draws), (unsigned long long)(cum_submits - l_subs),
             atomic_load(&stat_compiles), progs - l_progs, (cum_tex_up - l_tex) / 1048576.0, (fs - l_fs) / 1048576.0,
             (unsigned long long)(cum_img_n - l_img), (cum_img_ns - l_img_ns) / 1e6);
+        {   // (the F9 line: the largest part, g_last_hitch above)
+            const double tick = up_ns_per_tick();
+            const uint64_t slot = g_pr_ns[PR_SLOT], shader = (cum_dt_prog_ns - l_dtp) + (cum_dt_link_ns - l_dtl),
+                           up = (uint64_t)(((cum_up_ww_tk - l_up[0]) + (cum_up_hash_tk - l_up[1]) + (cum_up_copy_tk - l_up[2])) * tick),
+                           img = (cum_img_ns - l_img_ns) + (al[1] - l_al[1]), rd = gr[1] - l_gr[1];
+            const int64_t other = (int64_t)dt - (int64_t)ex - (int64_t)present_ns,
+                          rest = (int64_t)ex - (int64_t)(wt + shader + up + img);
+            const double part[8] = {(double)(wt + slot), (double)shader, (double)up, (double)img, (double)rd,
+                                    (double)(g_pr_ns[PR_PRESENT] + g_pr_ns[PR_ACQ] + g_pr_ns[PR_RECREATE] + g_pr_ns[PR_FG]),
+                                    other > (int64_t)rd ? (double)(other - (int64_t)rd) : 0.0, rest > 0 ? (double)rest : 0.0};
+            int best = 0;
+            for (int i = 1; i < 8; i++) if (part[i] > part[best]) best = i;
+            g_last_hitch.ms = (float)(dt / 1e6), g_last_hitch.part_ms = (float)(part[best] / 1e6), g_last_hitch.part = best;
+            g_last_hitch.when_ns = now;
+        }
         extern void rt_hitch_dump(uint64_t frame, double ms, double other_ms);   // (rt_main.cpp, TOTK_HITCH_STACKS: its stacks)
         rt_hitch_dump(frame, dt / 1e6, ((double)dt - ex - present_ns) / 1e6);
         LOG("[hitch] frame %llu uploads (render thread): write watch %.1f ms, identify + hash %.1f ms (%llu full), deswizzle / "
@@ -2862,6 +2959,11 @@ const char *renderer_stats(void) {
                  (unsigned long long)g_cond_flips);
         g_cond_evals = g_cond_off = g_cond_skipped = g_cond_flips = 0;
         n = strlen(stats_text);
+        if (stat_snap_reads)   // (frame_snap: uniform / stream bytes taken from the frame's release-time copy)
+            snprintf(stats_text + n, sizeof stats_text - n, " | frame snapshot reads %llu, %.1f MB", (unsigned long long)stat_snap_reads,
+                     stat_snap_bytes / 1048576.0);
+        stat_snap_reads = stat_snap_bytes = 0;
+        n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, " | chunks %llu | syncwait %llu blocking, age %.1f ms, wait %.1f ms avg | waits",
                  (unsigned long long)prof_chunks, (unsigned long long)sw_n, sw_n ? sw_age_ns / 1e6 / sw_n : 0.0,
                  sw_n ? sw_wait_ns / 1e6 / sw_n : 0.0);
@@ -2997,19 +3099,30 @@ void renderer_texture_promote_kind(NvnTexture *t, int kind);
 bool renderer_texture_presented(NvnTexture *t);
 bool renderer_texture_first_write(NvnTexture *t);
 bool renderer_texture_level_fresh(NvnTexture *t);
+bool renderer_texture_unwritten(NvnTexture *t);
 bool renderer_texture_frame_fresh(NvnTexture *t);
 void renderer_texture_mark_presented(NvnTexture *t);
 uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 static float pass_sx = 1, pass_sy = 1;
 static float vp_sx = 1, vp_sy = 1, vp_ox = 0, vp_oy = 0;
-static float tex_sc[2][64][3];   // [2]: 1 = a D16 image sampled with depth compare (translate.c d16q)
+static float tex_sc[2][64][3];   // [2]: bit 1 = a D16 image sampled with depth compare (translate.c d16q), bit 2 = output canvas kind (AOFFI)
 static uint32_t tex_wh[2][64][2];
 
 // ================================================================== render passes
 static VkFormat pass_color[8], pass_depth, pass_stencil;
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
 static int debug_pass_no;
+// Colour attachments this pass is the first writer of (textures.c renderer_texture_unwritten: a new image, or one recycled
+// from other storage), cleared at its start: their extents, for draw_'s partial-first-writer line (fresh_cover_check).
+// LARECOMP_FRESH_CLEAR=0: loaded as before (the memory's old contents: 9.1 see2 hit 40195, a band of an earlier place).
+static uint32_t pass_fresh, pass_fresh_w[8], pass_fresh_h[8];
+static uint64_t pass_fresh_addr[8];
+static bool fresh_clear_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_FRESH_CLEAR"); on = !(e && *e == '0'); }
+    return on;
+}
 
 // Passes into block shadows (textures.c block_shadow): after the pass, the rendered level / slice is copied into the BC
 // image (size-compatible copy: extent in the shadow's texels = blocks of the BC image).
@@ -4007,9 +4120,16 @@ static void contact_pass_hook(VkCommandBuffer cb) {
 // of its size). begin_pass decides it BEFORE its promotion loop, so the pass that first meets the pair is already whole
 // (P1.4: decided after the attachments, that pass rendered the smallest attachment's area and the scaled targets' right /
 // bottom 1 - 1 / scale kept older pixels for a frame), and again after the attachments for a partner whose backend the
-// attachment loop made. LARECOMP_PROMO_FIRST=0: only after the attachments (old).
+// attachment loop made. LARECOMP_PROMO_FIRST=0: only after the attachments (old). An attachment without a backend yet
+// counts at the scale the attachment loop will make it at: a first meeting where the scaled target's image is new this
+// pass (the scene-scale RGBA16F 640x360 next to its unscaled R8 twin, #70's logs) mixed there once, its render area the
+// unscaled one's, and the scaled image's uncovered right / bottom kept whatever it held: a recycled image's older picture
+// of the run. LARECOMP_PROMO_NEW=0: backends only.
 static void promote_partners(void) {
     extern void renderer_get_scale(float *sx, float *sy);
+    extern void renderer_texture_planned_scale(const NvnTexture *t, float *sx, float *sy);
+    static int promo_new = -1;
+    if (promo_new < 0) { const char *e = getenv("LARECOMP_PROMO_NEW"); promo_new = !(e && *e == '0'); }
     float rsx, rsy;
     renderer_get_scale(&rsx, &rsy);
     const int n = st.rt.ncolor;
@@ -4017,15 +4137,17 @@ static void promote_partners(void) {
     for (int i = 0; i <= n && (rsx != 1 || rsy != 1); i++) {
         NvnTexture *t = i < n ? st.rt.color[i] : st.rt.depth;
         float sx = 1, sy = 1;
-        if (!t || !t->backend) continue;
-        renderer_texture_scale(t, &sx, &sy);
+        if (!t || (!t->backend && !promo_new)) continue;
+        if (t->backend) renderer_texture_scale(t, &sx, &sy);
+        else renderer_texture_planned_scale(t, &sx, &sy);
         if (sx == rsx && sy == rsy && t->target == 1) { big = t; break; }
     }
     for (int i = 0; big && i <= n; i++) {
         NvnTexture *t = i < n ? st.rt.color[i] : st.rt.depth;
         float sx = 1, sy = 1;
-        if (!t || !t->backend || t == big) continue;
-        renderer_texture_scale(t, &sx, &sy);
+        if (!t || (!t->backend && !promo_new) || t == big) continue;
+        if (t->backend) renderer_texture_scale(t, &sx, &sy);
+        else renderer_texture_planned_scale(t, &sx, &sy);
         if (sx == 1 && sy == 1 && t->width == big->width && t->height == big->height) renderer_texture_promote(t);
     }
     static int promo_shadow = -1;
@@ -4074,6 +4196,50 @@ static void gmem_flush_now(void) {
     if ((++g_gmem_flushes & 4095) == 1) LOG("[vk] gmem flush: %llu so far\n", (unsigned long long)g_gmem_flushes);
 }
 
+// Named once per target (32 at most): a colour render target shaped like a fraction of the scene (16:9, from 1/2 down to
+// 1/8 of 1920x1080, guest size) left unscaled while the render scale is not 1, with its format, flags and the first fs
+// drawing into it; and the first fs that samples it (texture_info_). Log only. LARECOMP_UNSCALED_LOG=0: off.
+static struct { uint64_t addr; uint32_t w, h, fmt; bool sampled; } ufr[32];
+static int ufr_n, ufr_unsampled;
+static bool ufr_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_UNSCALED_LOG"); on = !(e && *e == '0'); }
+    return on;
+}
+static void ufr_target(const NvnTexture *t, const TexBackend *b) {
+    if (ufr_n >= 32 || !t || !b || b->scalable || t->target != 1 || t->samples > 1 || t->width < 160 || t->width > 960 ||
+        t->height < 90 || !ufr_on())
+        return;
+    const float a = (float)t->width / (float)t->height;
+    if (a < 1.76f || a > 1.80f) return;
+    extern void renderer_get_scale(float *sx, float *sy);
+    float rx, ry;
+    renderer_get_scale(&rx, &ry);
+    if (rx == 1 && ry == 1) return;
+    for (int i = 0; i < ufr_n; i++)
+        if (ufr[i].addr == t->addr && ufr[i].w == t->width && ufr[i].h == t->height && ufr[i].fmt == t->format) return;
+    ufr[ufr_n++] = (typeof(ufr[0])){t->addr, t->width, t->height, t->format, false};
+    ufr_unsampled++;
+    LOG("[tex] unscaled scene-fraction target %ux%u f%#x flags %#x at render scale x%.2f: addr %llx, drawn by fs %016llx "
+        "(LARECOMP_UNSCALED_LOG)\n", t->width, t->height, t->format, t->flags, (double)rx, (unsigned long long)t->addr,
+        (unsigned long long)g_cur_fs_hash);
+}
+static void ufr_sampled(const NvnTexture *t, int stage) {
+    if (t->width < 160 || t->width > 960 || t->height < 90) return;   // (the size filter first: ~2400 lookups a frame)
+    for (int i = 0; i < ufr_n; i++)
+        if (!ufr[i].sampled && ufr[i].addr == t->addr && ufr[i].w == t->width && ufr[i].h == t->height) {
+            ufr[i].sampled = true;
+            ufr_unsampled--;
+            LOG("[tex] unscaled scene-fraction target %ux%u f%#x (addr %llx) first sampled by %s %016llx\n", t->width, t->height,
+                t->format, (unsigned long long)t->addr, stage == 5 ? "the compute program at" : "fs",
+                (unsigned long long)(stage == 5 && st.program ? st.program->stages[5].code_addr : g_cur_fs_hash));
+            return;
+        }
+}
+
+bool vk_glitch_on(void);   // glitch.c
+static bool cov_any;
+static void cov_pass(int i, const NvnTexture *t, uint32_t w, uint32_t h, bool cleared);
 static void begin_pass(void) {
     // (a draw that wrote global memory: the pass ends and is begun again after the flush, LARECOMP_GMEM_FLUSH)
     if (g_gmem_flush_pend) { vk_end_pass_at(-1); gmem_flush_now(); }
@@ -4145,18 +4311,21 @@ static void begin_pass(void) {
         }
     }
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
+    uint32_t cov_w[8] = {0}, cov_h[8] = {0};   // (TOTK_GLITCH_DETECT's pass ring: the colour targets' own extents)
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
     pass_ncolor = (uint32_t)st.rt.ncolor;
     pass_samples = 1;
     pass_nblk = 0;
     pass_ntwin = 0;
     n_pass_img = 0;
+    pass_fresh = 0;
     vk_cpu_read_begin();
     for (int i = 0; i < st.rt.ncolor; i++) {
         NvnTexture *t = st.rt.color[i];
         ca[i] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         pass_color[i] = VK_FORMAT_UNDEFINED;
         if (!t) continue;
+        const bool unwritten = renderer_texture_unwritten(t);   // (before the mark below: its first writer is this pass)
         renderer_mark_gpu_owned(t);
         uint64_t tv0 = prof ? prof_now() : 0;
         VkImageView v = vk_view(t, &st.rt.cview[i], st.rt.has_cview[i], true, TEXTYPE_2D);
@@ -4188,6 +4357,20 @@ static void begin_pass(void) {
                       ? vk_format(st.rt.cview[i].format) : b->format;
         uint32_t lv = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 1) ? st.rt.cview[i].base_level : 0;
         uint32_t ew = level_extent(b->width, lv), eh = level_extent(b->height, lv);
+        if (b == t->backend) cov_w[i] = ew, cov_h[i] = eh;
+        ufr_target(t, t->backend);   // (#70: an unscaled scene-fraction target, named once)
+        if (unwritten && b == t->backend && ca[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && fresh_clear_on()) {
+            ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            pass_fresh |= 1u << i;
+            pass_fresh_w[i] = ew; pass_fresh_h[i] = eh; pass_fresh_addr[i] = t->addr;
+            static bool said;
+            if (!said) {
+                said = true;
+                LOG("[pass] colour targets whose first writer is a pass start cleared, not with what their image held (a new "
+                    "image, or one recycled from other storage; first: addr %llx %ux%u f%#x; LARECOMP_FRESH_CLEAR=0: loaded)\n",
+                    (unsigned long long)t->addr, ew, eh, t->format);
+            }
+        }
         if (!w) { attachment_scale(t, b, lv, &pass_sx, &pass_sy); w = ew; }
         if (ew < minw) minw = ew;
         if (eh < minh) minh = eh;
@@ -4253,6 +4436,11 @@ static void begin_pass(void) {
         promote_partners();   // (a partner the attachment loop made: from its next backend)
     }
     pass_w = minw; pass_h = minh;
+    cov_any = false;
+    if (vk_glitch_on())
+        for (int i = 0; i < 8; i++)
+            cov_pass(i, i < st.rt.ncolor && cov_w[i] ? st.rt.color[i] : NULL, cov_w[i], cov_h[i],
+                     i < st.rt.ncolor && ca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR);
     smark_frame_start(cb);   // (LARECOMP_SNAP_MARK)
     pd_n = 0;   // (LARECOMP_SNAP_DELTA: draw_ adds its scissor to these images' boxes)
     for (int i = 0; i <= st.rt.ncolor; i++) {
@@ -4378,6 +4566,283 @@ static void apply_scissor(void) {
     if (vsc.sc_ok && !memcmp(&vsc.sc, &r, sizeof r)) return;
     vkCmdSetScissor(cb, 0, 1, &r);
     vsc.sc = r; vsc.sc_ok = true;
+}
+// draw_, in a pass that is the first writer of a colour image (pass_fresh): a draw whose viewport and scissor do not cover
+// the image is a partial first writer; the rest keeps the pass's clear (before: the image's old contents). Logged once per
+// (fs, image), 64 at most: the rect names it (a stale band on the left = x0 > 0).
+// (the draw's pixels: its scissor sc within the viewport set last, as x0 y0 x1 y1)
+static void draw_rect(VkRect2D sc, int r[4]) {
+    int x0 = sc.offset.x, y0 = sc.offset.y, x1 = x0 + (int)sc.extent.width, y1 = y0 + (int)sc.extent.height;
+    if (vsc.vp_ok) {   // (set_viewport's form: y at the bottom, a negative height)
+        const VkViewport *v = &vsc.vp;
+        const float vy0 = v->height < 0 ? v->y + v->height : v->y;
+        // (outward rounding: a float viewport ending at 2559.99 still covers a 2560-wide image)
+        if ((int)floorf(v->x) > x0) x0 = (int)floorf(v->x);
+        if ((int)floorf(vy0) > y0) y0 = (int)floorf(vy0);
+        if ((int)ceilf(v->x + v->width) < x1) x1 = (int)ceilf(v->x + v->width);
+        if ((int)ceilf(vy0 + fabsf(v->height)) < y1) y1 = (int)ceilf(vy0 + fabsf(v->height));
+    }
+    r[0] = x0, r[1] = y0, r[2] = x1, r[3] = y1;
+}
+static void fresh_cover_check(VkRect2D sc) {
+    int r[4];
+    draw_rect(sc, r);
+    const int x0 = r[0], y0 = r[1], x1 = r[2], y1 = r[3];
+    static struct { uint64_t fs, addr; } seen[64];
+    static int nseen;
+    for (int i = 0; i < 8 && nseen < 64; i++) {
+        if (!(pass_fresh >> i & 1) || (x0 <= 0 && y0 <= 0 && x1 >= (int)pass_fresh_w[i] && y1 >= (int)pass_fresh_h[i])) continue;
+        int k = 0;
+        while (k < nseen && (seen[k].fs != g_cur_fs_hash || seen[k].addr != pass_fresh_addr[i])) k++;
+        if (k < nseen) continue;
+        seen[nseen].fs = g_cur_fs_hash; seen[nseen++].addr = pass_fresh_addr[i];
+        LOG("[pass] first writer of a cleared target draws only x %d..%d y %d..%d of its %ux%u: rt%d addr %llx, fs %016llx\n",
+            x0, x1, y0, y1, pass_fresh_w[i], pass_fresh_h[i], i, (unsigned long long)pass_fresh_addr[i],
+            (unsigned long long)g_cur_fs_hash);
+    }
+}
+
+// TOTK_GLITCH_DETECT's pass coverage ring (diag4 bands, hdr 11-04 (1)): per presented frame, each colour target of 256 px
+// or more that a pass rendered (addr, extent, the first fs that drew into it, how many passes) and what those passes
+// covered: the union of the draws' viewport within scissor, the whole render area for a CLEAR load. glitch.c dumps a
+// judged frame's partly covered targets at a hit (vk_cov_dump), so a stale band names the target, its pass's fs and the
+// rect. Also the image-storing dispatches' grids (threads = groups x local size), named when a program's grid differs
+// from the frame before (a grid short in x leaves columns of an older picture; hdr's (a)). Render thread only; nothing
+// kept with the detector off. Coverage is a 32 x 18 cell grid per target (a cell counts once a rect covers it whole), not
+// one bounding box: a small draw at the left edge must not hide a missing left band (hdr's second read). Also the frame's
+// texture-path events (vk_txe_note, hdr 11-05, a terrain tile's heights / normals / grass wrong for one frame): counts
+// per kind, the objects behind them (one per object and kind), the textures sent.
+enum { COV_N = 384, COV_F = 12, COV_D = 128, COV_GX = 32, COV_GY = 18, COV_T = 24 };
+typedef struct { uint64_t addr, fs; uint32_t w, h, passes; int x0, y0, x1, y1; uint32_t occ[COV_GY]; } CovEnt;
+typedef struct { uint64_t prog; uint32_t tx, ty, n; } CovDisp;
+typedef struct { const NvnTexture *t; uint64_t addr; uint32_t w, h, fmt, kind; } CovTex;
+typedef struct { uint64_t frame; int n, dropped, nd, nt, tdropped; uint32_t txe[TXE_N], bxe[BXE_N]; uint64_t sent, awc; CovEnt e[COV_N];
+                 CovDisp d[COV_D]; CovTex t[COV_T]; } CovFrame;
+static CovFrame g_cov[COV_F];
+static int g_cov_cur, cov_att[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+// (cov_any, declared above begin_pass: the open pass has a ring entry, draw_ adds its rects)
+static void cov_union(CovEnt *c, int x0, int y0, int x1, int y1) {
+    if (x0 >= x1 || y0 >= y1) return;
+    if (x0 < c->x0) c->x0 = x0;   // (the drawn bounding box, for the line)
+    if (y0 < c->y0) c->y0 = y0;
+    if (x1 > c->x1) c->x1 = x1;
+    if (y1 > c->y1) c->y1 = y1;
+    const int64_t w = c->w, h = c->h;   // (cells i covered whole: x0 <= i*w/GX and (i+1)*w/GX <= x1)
+    const int cx0 = x0 <= 0 ? 0 : (int)(((int64_t)x0 * COV_GX + w - 1) / w), cx1 = x1 >= w ? COV_GX : (int)((int64_t)x1 * COV_GX / w);
+    const int cy0 = y0 <= 0 ? 0 : (int)(((int64_t)y0 * COV_GY + h - 1) / h), cy1 = y1 >= h ? COV_GY : (int)((int64_t)y1 * COV_GY / h);
+    if (cx0 >= cx1 || cy0 >= cy1) return;
+    const uint32_t m = (cx1 - cx0 >= 32 ? 0xFFFFFFFFu : ((1u << (cx1 - cx0)) - 1u)) << cx0;
+    for (int y = cy0; y < cy1; y++) c->occ[y] |= m;
+}
+// begin_pass, after the attachments: attachment i of the pass (NULL / small: none)
+static void cov_pass(int i, const NvnTexture *t, uint32_t w, uint32_t h, bool cleared) {
+    cov_att[i] = -1;
+    if (!t || (w < 256 && h < 256)) return;
+    CovFrame *s = &g_cov[g_cov_cur];
+    int k = 0;
+    while (k < s->n && (s->e[k].addr != t->addr || s->e[k].w != w || s->e[k].h != h)) k++;
+    if (k == s->n) {
+        if (s->n == COV_N) { s->dropped++; return; }
+        s->e[s->n++] = (CovEnt){t->addr, 0, w, h, 0, INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN, {0}};
+    }
+    s->e[k].passes++;
+    if (cleared) cov_union(&s->e[k], 0, 0, (int)pass_w, (int)pass_h);
+    cov_att[i] = k;
+    cov_any = true;
+}
+// draw_: the draw's rect into the open pass's entries
+static void cov_draw(VkRect2D sc) {
+    int r[4];
+    draw_rect(sc, r);
+    CovFrame *s = &g_cov[g_cov_cur];
+    for (int i = 0; i < 8; i++) {
+        if (cov_att[i] < 0) continue;
+        CovEnt *c = &s->e[cov_att[i]];
+        if (!c->fs) c->fs = g_cur_fs_hash;
+        cov_union(c, r[0], r[1], r[2], r[3]);
+    }
+}
+// The image-store targets texture_info_ resolved for the coming dispatch (dispatch_compute clears them before stage_set):
+// each counts as drawn WHOLE, so 'last drawn whole' holds across compute and pass writers of one target. The pixels per
+// thread are not known here (2x2 / 8x8 per thread is common), so a short grid is left to the per-program grid-change
+// line (cov_dispatch), not to this coverage (hdr's second read). Known limit: every storage-image binding counts, read-only
+// ones too (ShaderTexture has no store flag), and a cached descriptor set's targets are not seen.
+static NvnTexture *cov_img[8];
+static int cov_img_n;
+static void cov_image_store(const NvnTexture *t, uint64_t prog) {
+    const TexBackend *b = t ? t->backend : NULL;
+    if (!b || (b->width < 256 && b->height < 256)) return;
+    CovFrame *s = &g_cov[g_cov_cur];
+    int k = 0;
+    while (k < s->n && (s->e[k].addr != t->addr || s->e[k].w != b->width || s->e[k].h != b->height)) k++;
+    if (k == s->n) {
+        if (s->n == COV_N) { s->dropped++; return; }
+        s->e[s->n++] = (CovEnt){t->addr, 0, b->width, b->height, 0, INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN, {0}};
+    }
+    CovEnt *c = &s->e[k];
+    c->passes++;
+    if (!c->fs) c->fs = prog;
+    cov_union(c, 0, 0, (int)c->w, (int)c->h);
+}
+// dispatch_compute: a program that stores to images, its grid in threads (the largest of the frame per program)
+static void cov_dispatch(uint64_t prog, uint32_t tx, uint32_t ty) {
+    CovFrame *s = &g_cov[g_cov_cur];
+    int k = 0;
+    while (k < s->nd && s->d[k].prog != prog) k++;
+    if (k == s->nd) {
+        if (s->nd == COV_D) return;
+        s->d[s->nd++] = (CovDisp){prog, 0, 0, 0};
+    }
+    CovDisp *d = &s->d[k];
+    if (tx > d->tx) d->tx = tx;
+    if (ty > d->ty) d->ty = ty;
+    d->n++;
+}
+void vk_txe_note(int kind, const NvnTexture *t) {
+    if (!vk_glitch_on() || kind < 0 || kind >= TXE_N) return;
+    CovFrame *s = &g_cov[g_cov_cur];
+    s->txe[kind]++;
+    if (!t) return;
+    for (int k = 0; k < s->nt; k++)
+        if (s->t[k].t == t && s->t[k].kind == (uint32_t)kind) return;
+    if (s->nt >= COV_T) { s->tdropped++; return; }
+    s->t[s->nt++] = (CovTex){t, t->addr, t->width, t->height, t->format, (uint32_t)kind};
+}
+static void bxe_note(int kind) {   // (relaxed: the mirror sync may run off the render thread; a count, nothing more)
+    if (vk_glitch_on()) __atomic_fetch_add(&g_cov[__atomic_load_n(&g_cov_cur, __ATOMIC_RELAXED)].bxe[kind], 1, __ATOMIC_RELAXED);
+}
+// glitch.c vk_glitch_frame: the passes since the last call were this presented frame's
+void vk_cov_frame(uint64_t frame) {
+    extern uint64_t cum_up_sent, prof_alias_writer_changes;   // (textures.c: cumulative)
+    static uint64_t l_sent, l_awc;
+    g_cov[g_cov_cur].sent = cum_up_sent - l_sent, l_sent = cum_up_sent;
+    g_cov[g_cov_cur].awc = prof_alias_writer_changes - l_awc, l_awc = prof_alias_writer_changes;
+    g_cov[g_cov_cur].frame = frame;
+    g_cov_cur = (g_cov_cur + 1) % COV_F;
+    g_cov[g_cov_cur].n = g_cov[g_cov_cur].dropped = g_cov[g_cov_cur].nd = 0;
+    g_cov[g_cov_cur].nt = g_cov[g_cov_cur].tdropped = 0;
+    memset(g_cov[g_cov_cur].txe, 0, sizeof g_cov[g_cov_cur].txe);
+    memset(g_cov[g_cov_cur].bxe, 0, sizeof g_cov[g_cov_cur].bxe);
+    g_cov[g_cov_cur].frame = 0;
+    for (int i = 0; i < 8; i++) cov_att[i] = -1;
+    cov_any = false;
+}
+// glitch.c gl_eval, at a hit: that frame's targets its passes drew only in part. Many are partial every frame (atlases,
+// tile-redrawn lighting), so a target is named only if the frame before drew it whole: the change is the suspect.
+// 'Before' is the ring's previous slot (the previous game present), not frame - 1: frame ids count every vk_frame_end,
+// generated (FG) and held ones too, which never close a slot. N-k below is in ring steps.
+static int cov_find(uint64_t frame) {
+    for (int f = 0; f < COV_F; f++)
+        if (g_cov[f].frame == frame && f != g_cov_cur) return f;
+    return -1;
+}
+static const CovFrame *cov_back(int at, int steps) {   // (the slot `steps` game presents before slot `at`, if kept and older)
+    const CovFrame *s = &g_cov[at], *o = &g_cov[(at - steps % COV_F + COV_F) % COV_F];
+    return steps > 0 && steps < COV_F - 1 && o != &g_cov[g_cov_cur] && o->frame && o->frame < s->frame ? o : NULL;
+}
+static bool cov_whole(const CovEnt *c) {
+    for (int y = 0; y < COV_GY; y++) if (c->occ[y] != 0xFFFFFFFFu) return false;
+    return true;
+}
+void vk_cov_dump(uint64_t frame) {
+    const int at = cov_find(frame);
+    const CovFrame *s = at < 0 ? NULL : &g_cov[at], *p = at < 0 ? NULL : cov_back(at, 1);
+    if (!s) {
+        LOG("[glitch]     frame %llu: no pass record kept (older than %d frames)\n", (unsigned long long)frame, COV_F - 1);
+        return;
+    }
+    int part = 0, usual = 0, logged = 0;
+    for (int k = 0; k < s->n; k++) {
+        const CovEnt *c = &s->e[k];
+        if (cov_whole(c)) continue;
+        part++;
+        const CovEnt *q = NULL;
+        for (int j = 0; p && j < p->n && !q; j++)
+            if (p->e[j].addr == c->addr && p->e[j].w == c->w && p->e[j].h == c->h) q = &p->e[j];
+        if (q && !cov_whole(q)) { usual++; continue; }   // (in part the frame before too)
+        if (logged++ >= 24) continue;
+        int last = 0;   // (the newest older present that drew it whole: N-last in game presents; 0 = none kept)
+        for (int a = 1; a < COV_F - 1 && !last; a++) {
+            const CovFrame *o = cov_back(at, a);
+            if (!o) break;
+            for (int j = 0; j < o->n; j++)
+                if (o->e[j].addr == c->addr && o->e[j].w == c->w && o->e[j].h == c->h) { if (cov_whole(&o->e[j])) last = a; break; }
+        }
+        char lw[24] = "none kept";
+        if (last) snprintf(lw, sizeof lw, "N-%d", last);
+        if (c->x0 > c->x1) LOG("[glitch]     frame %llu: target %llx %ux%u: %u pass(es), nothing drawn; last drawn whole %s\n",
+                               (unsigned long long)frame, (unsigned long long)c->addr, c->w, c->h, c->passes, lw);
+        else {   // (the uncovered cells' box, in pixels: a left band reads 'not covered x 0..N')
+            int ux0 = COV_GX, ux1 = -1, uy0 = COV_GY, uy1 = -1;
+            for (int y = 0; y < COV_GY; y++)
+                for (int x = 0; x < COV_GX; x++)
+                    if (!(c->occ[y] >> x & 1)) {
+                        if (x < ux0) ux0 = x;
+                        if (x > ux1) ux1 = x;
+                        if (y < uy0) uy0 = y;
+                        if (y > uy1) uy1 = y;
+                    }
+            LOG("[glitch]     frame %llu: target %llx %ux%u: not covered x %u..%u y %u..%u (drawn box x %d..%d y %d..%d, %u passes, "
+                "first fs %016llx); last drawn whole %s\n", (unsigned long long)frame, (unsigned long long)c->addr, c->w, c->h,
+                ux0 * c->w / COV_GX, (ux1 + 1) * c->w / COV_GX, uy0 * c->h / COV_GY, (uy1 + 1) * c->h / COV_GY, c->x0, c->x1,
+                c->y0, c->y1, c->passes, (unsigned long long)c->fs, lw);
+        }
+    }
+    LOG("[glitch]     frame %llu: %d of %d targets of 256 px or more drawn only in part (%d of them in part the frame before "
+        "too)%s\n", (unsigned long long)frame, part, s->n, usual, s->dropped || (p && p->dropped) ? "; ring full: some not kept" : "");
+    for (int k = 0; p && k < s->nd; k++) {   // (image-storing dispatches whose grid changed from the frame before)
+        const CovDisp *d = &s->d[k];
+        for (int j = 0; j < p->nd; j++)
+            if (p->d[j].prog == d->prog && (p->d[j].tx != d->tx || p->d[j].ty != d->ty))
+                LOG("[glitch]     frame %llu: image-storing program %llx ran %ux%u threads (the frame before %ux%u), %u dispatches\n",
+                    (unsigned long long)frame, (unsigned long long)d->prog, d->tx, d->ty, p->d[j].tx, p->d[j].ty, d->n);
+    }
+    // texture-path events, N-2 / N-1 / N / N+1 in game presents ('-': not kept): a kind that only frame N has is the suspect
+    const CovFrame *row[4] = {cov_back(at, 2), p, s, NULL};
+    const CovFrame *nx = &g_cov[(at + 1) % COV_F];
+    if (nx != &g_cov[g_cov_cur] && nx->frame > s->frame) row[3] = nx;
+    static const char *const kname[TXE_N] = {"alias miss gone->guest bytes", "gone->own image", "other shape->guest bytes",
+                                             "other shape->own image", "finalized sampled: unbound", "finalized: uploaded again",
+                                             "empty slot", "written back", "uploaded again (new bytes)",
+                                             "uploaded while written", "late fill (new bytes <= 8 frames after its first upload)"};
+    char line[2048];   // (a kind's text is under 130 chars: the loop stops 256 short of the end, so o never passes it)
+    int o = 0;
+    for (int k = 0; k <= TXE_N + 1 && o < (int)sizeof line - 256; k++) {
+        o += snprintf(line + o, sizeof line - o, "%s%s ", k ? "; " : "", k < TXE_N ? kname[k] : k == TXE_N ? "textures sent" : "alias writer changes");
+        for (int r = 0; r < 4; r++) {
+            const CovFrame *f = row[r];
+            if (!f) o += snprintf(line + o, sizeof line - o, "%s-", r ? "/" : "");
+            else o += snprintf(line + o, sizeof line - o, "%s%llu", r ? "/" : "",
+                               (unsigned long long)(k < TXE_N ? f->txe[k] : k == TXE_N ? f->sent : f->awc));
+        }
+    }
+    LOG("[glitch]     frame %llu texture events (N-2/N-1/N/N+1): %s\n", (unsigned long long)frame, line);
+    static const char *const bname[BXE_N] = {"vertex range copied stale (window straddle)", "vertex range bound live (writer in flight)",
+                                             "mirror page read live (write ring lost)", "mirror page partly from an in-flight writer",
+                                             "uniform range a shader of the open submission writes (V7)",
+                                             "uniform range newer in memory than the frame snapshot (FRAME_SNAP=1)",
+                                             "texture pool entry changed after its list's submit (late tic)",
+                                             "list replayed after the game's wait for its fence returned (replay lag)",
+                                             "storage buffer read in place on the GPU timeline (host fallback)"};
+    o = 0;
+    for (int k = 0; k < BXE_N && o < (int)sizeof line - 256; k++) {   // (counts at a frame's edge are approximate: off-thread notes)
+        o += snprintf(line + o, sizeof line - o, "%s%s ", k ? "; " : "", bname[k]);
+        for (int r = 0; r < 4; r++)
+            o += row[r] ? snprintf(line + o, sizeof line - o, "%s%u", r ? "/" : "", row[r]->bxe[k]) : snprintf(line + o, sizeof line - o, "%s-", r ? "/" : "");
+    }
+    LOG("[glitch]     frame %llu buffer events (N-2/N-1/N/N+1): %s\n", (unsigned long long)frame, line);
+    int nnew = 0;   // (frame N's objects with an event the frame before did not have for them)
+    for (int k = 0; k < s->nt; k++) {
+        const CovTex *c = &s->t[k];
+        bool before = false;
+        for (int j = 0; p && j < p->nt && !before; j++) before = p->t[j].t == c->t && p->t[j].kind == c->kind;
+        if (before || nnew++ >= 16) continue;
+        LOG("[glitch]     frame %llu: %s: %p addr %llx %ux%u f%#x (not the frame before)\n", (unsigned long long)frame,
+            kname[c->kind], (const void *)c->t, (unsigned long long)c->addr, c->w, c->h, c->fmt);
+    }
+    if (nnew || s->tdropped)
+        LOG("[glitch]     frame %llu: %d object(s) with a texture event the frame before did not have%s\n", (unsigned long long)frame,
+            nnew, s->tdropped || (p && p->tdropped) ? " (list full: some not kept)" : "");
 }
 
 // Metal convention (y up in NDC, origin top-left) through a negative-height viewport.
@@ -7764,6 +8229,18 @@ static void pc_start(void) {
             LOG("[precompile] own and seed records merged by position (the seed's boot programs early; "
                 "TOTK_PRECOMPILE_ORDER=files: own first)\n");
         }
+        // <seed>/precompile_extra.bin: the programs and pipelines the soak routes built in play that the seed lacks. Loaded
+        // after the seed, so they are built last, in this same background pass at the start (the compile indicator shows it);
+        // vk_prepare (Setup's step 9) loads the seed alone, so the install does not grow. Absent: nothing changes.
+        // TOTK_PRECOMPILE_EXTRA=0: not loaded (its A/B).
+        const char *x = getenv("TOTK_PRECOMPILE_EXTRA");
+        if (!(x && *x == '0')) {
+            snprintf(path, sizeof path, "%s/precompile_extra.bin", pc_seed_dir());
+            const int xp = pc_nprogs, xl = pc_npipes, xc = pc_ncomps, rx = pc_load_file(path);
+            if (rx >= 0)
+                LOG("[precompile] extra %s: %s, +%d programs, +%d pipelines, +%d compute programs\n", path,
+                    rx ? "loaded" : "another heap base / layout, ignored", pc_nprogs - xp, pc_npipes - xl, pc_ncomps - xc);
+        }
     }
     pc_derive_a2c();
     pc_start_workers();
@@ -7887,6 +8364,15 @@ int vk_precompile_recorded_progress(int *done, int *total) {
 }
 // 1 while the first-start pass builds (hle_osd.cpp: its own text over the recorded progress)
 int vk_precompile_cold_active(void) { return atomic_load(&pc_cold_running); }
+// The compile indicator: 1 while compile work runs that a frame may wait for or skip draws for. *done / *total: the
+// recorded / seed phase (a known total; 0 / 0 when it is not running), *pending: the game's own translations and builds
+// queued or running (g_jobs_pending: first-seen programs, pipelines and compute in play; no total exists for those). The
+// archive warm-up stays out, as in the banner: idle-priority work no frame waits for.
+int vk_compile_activity(int *done, int *total, int *pending) {
+    if (!vk_precompile_recorded_progress(done, total)) *done = *total = 0;
+    *pending = atomic_load(&g_jobs_pending);
+    return *total > 0 || *pending > 0;
+}
 // TOTK_WARMUP (tools/linux/warmup.sh): the archive warm-up's progress for its own banner (hle_osd.cpp)
 int vk_precompile_warmup_progress(int *done, int *total) {
     if (!pa_warmup_mode() || !pa_nprogs) return 0;
@@ -7961,12 +8447,17 @@ static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
     uint32_t tic = h & 0xFFFFF;
     if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
-    NvnTexture *t = ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+    NvnTexEntry snap_e;
+    NvnTexture *t = pool_entry_at_submit(&((NvnTexEntry *)st.tpool->entries)[tic], &snap_e)->tex;
+    if (!t) vk_txe_note(TXE_NONE, NULL);
     if (t && t->zombie && !t->backend) {
         // finalized while registered (objects.c nvnTextureFinalize): usable only through another object's live
         // rendering at its storage, or (CPU-written texture) by uploading its storage again if that is still readable
         extern bool renderer_texture_has_writer(NvnTexture *t);
-        if (!renderer_texture_has_writer(t) && (t->zombie_gpu || !pc_readable(t->addr, tegra_total_size(&t->layout)))) return NULL;
+        if (!renderer_texture_has_writer(t)) {
+            if (t->zombie_gpu || !pc_readable(t->addr, tegra_total_size(&t->layout))) { vk_txe_note(TXE_ZOMBIE_NULL, t); return NULL; }
+            vk_txe_note(TXE_ZOMBIE_REUP, t);
+        }
     }
     return t;
 }
@@ -8197,6 +8688,7 @@ static HdrDraw hdr_ring[32];
 static uint32_t hdr_n;
 static struct { uint64_t hash; int k; } hdr_tm[4];   // the tonemap draws learned (several shaders may alternate), newest first
 static uint32_t hdr_cw, hdr_ch;                      // the canvas the upscale pass last drew into (backend size)
+static bool hdr_wanted(void) { return vk_ngx_sr_hdr_on() || vk_present_hue_on(); }   // (the learning and the ring)
 
 static void hdr_learn(NvnTexture *fxaa_rt, uint64_t now) {   // the FXAA draw (1:1, fs 6dc5) into fxaa_rt
     TexBackend *tb = vk_render_backend(fxaa_rt);
@@ -8227,9 +8719,43 @@ static void hdr_learn(NvnTexture *fxaa_rt, uint64_t now) {   // the FXAA draw (1
     }
 }
 
+// display.hdr_hue (present.c vk_present_hue_capture): a learned tonemap's scene and the SDR picture it drew, kept at the
+// frame's next full-screen draw or upscale pass, before either can overwrite the scene (the FXAA's copy into a scratch
+// target: the game may reuse the scene's for it)
+static TexBackend *hue_scene, *hue_sdr;
+static uint64_t hue_frame = ~0ull;
+// textures.c, as contact_forget: b's image destroyed or replaced, or b pooled / freed (a finalize between the tonemap
+// and the flush: the FXAA's copy may take the scene's storage). The pending capture is dropped, counted
+void vk_hue_forget(TexBackend *b) {
+    if (!b || hue_frame == ~0ull || (b != hue_scene && b != hue_sdr)) return;
+    hue_scene = hue_sdr = NULL, hue_frame = ~0ull;
+    static uint64_t ndrop;
+    const uint64_t n = ++ndrop;
+    if (!(n & (n - 1)))
+        LOG("[present] HDR hue: a capture dropped, the tonemap's scene or picture went before it (%llu so far)\n",
+            (unsigned long long)n);
+}
+static void hue_flush(uint64_t now) {
+    if (hue_frame == ~0ull) return;
+    const bool due = hue_frame == now && hue_scene && hue_sdr;
+    hue_frame = ~0ull;
+    if (!due) return;
+    vk_end_pass();
+    vk_present_hue_capture(vk_cmd(), hue_scene, hue_sdr);
+    dyn_invalidate();
+}
+
 // A full-screen draw into one colour target without depth: SR first when it is a learned tonemap (once a frame), then kept.
+// (The HDR hue notes the tonemap first; SR leaves the scene where it was, DLAA in place.)
 static void hdr_fs_draw(ShaderTexture *tex, int ntex, uint64_t hash, uint64_t now) {
-    for (int i = 0; i < 4 && hdr_tm[i].hash && vk_ngx_sr_hdr_frame() != now; i++) {
+    hue_flush(now);
+    for (int i = 0; i < 4 && hdr_tm[i].hash && vk_present_hue_on(); i++)
+        if (hdr_tm[i].hash == hash && hdr_tm[i].k < ntex) {
+            NvnTexture *x = shader_texture_object(1, &tex[hdr_tm[i].k]);
+            hue_scene = x ? vk_render_backend(x) : NULL, hue_sdr = vk_render_backend(st.rt.color[0]), hue_frame = now;
+            break;
+        }
+    for (int i = 0; i < 4 && hdr_tm[i].hash && vk_ngx_sr_hdr_on() && vk_ngx_sr_hdr_frame() != now; i++) {
         if (hdr_tm[i].hash != hash || hdr_tm[i].k >= ntex) continue;
         NvnTexture *x = shader_texture_object(1, &tex[hdr_tm[i].k]);
         TexBackend *xb = x ? vk_render_backend(x) : NULL;
@@ -8384,6 +8910,33 @@ static void twins_refresh(ShaderInfo *const *infos, const int *stages, int n, bo
             vk_depth_twin_copy(vk_cmd(), b);
             st.rt_dirty = true;
         }
+}
+
+// Uploads in submission order (LARECOMP_UPLOAD_INLINE=1, textures.c vk_tex_inline_use): before a draw's / dispatch's
+// pass begins, the textures it samples are stamped as used in this submission, and those earlier draws of it sampled
+// too are asked for new bytes here, where a copy may still go between those draws and this one (at the draw,
+// texture_info runs inside the open pass). Asked only while something may be due (a WriteTexels / video frame since
+// the last submission, a frame boundary inside this one). A texture this scan does not resolve (bindless) keeps the
+// upload buffer ("[tex] in-use uploads").
+static void ups_refresh(ShaderInfo *const *infos, const int *stages, int n) {
+    extern bool vk_tex_inline_on(void), vk_tex_inline_due(void);
+    extern void vk_tex_inline_use(NvnTexture *t, bool due);
+    if (!vk_tex_inline_on()) return;
+    const bool due = vk_tex_inline_due();
+    for (int sg = 0; sg < n; sg++)
+        for (int i = 0; i < infos[sg]->ntex; i++) {
+            NvnTexture *t0 = shader_texture_object(stages[sg], &infos[sg]->tex[i]);
+            if (t0) vk_tex_inline_use(t0, due);
+        }
+}
+// textures.c up_cmd: the copy of a texture draws of this submission already sampled, after those draws (the pass ends;
+// the next draw begins it again) and before the next one (textures.c's barrier after its copies)
+VkCommandBuffer vk_upload_inline_cmd(void) {
+    vk_end_pass();
+    st.rt_dirty = true;
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);   // (the earlier draws' reads are done before the copy writes)
+    return cb;
 }
 
 // LARECOMP_SELFW_STATS=1: the draws that sample a colour target they also write, per fragment program: count, the
@@ -9021,6 +9574,7 @@ static VkDescriptorBufferInfo cbuf_info_(int stage, ShaderInfo *si, int k, uint3
                            (si->cbuf_dynamic & (1u << k)) ? " dynamic" : "");
     // Logged with the fragment shader's hash; if it ever fires, such ranges want binding in place instead of copying.
     if (gw_overlap(r.addr, size, submit_seq, ~0ull) == 1) {
+        bxe_note(BXE_UBO_V7);
         static uint64_t nv7;
         if (nv7++ < 20 || nv7 % 10000 == 0)
             LOG("[v7] constant range %llx +%llu (cb%d stage %d, fs %016llx) is written by a shader of the open submission: copied before it runs (%llu so far)\n",
@@ -9837,8 +10391,9 @@ static int gsf_on(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("LARECOMP_GDEV_SNAPFALL");
-        on = e && *e == '1';
-        if (on) LOG("[vk] device window: read-only storage buffers it has no room for are snapshotted into an %d MB area at its top (LARECOMP_GDEV_SNAPFALL)\n", GSF_BYTES >> 20);
+        on = e && *e ? *e == '1' : backend_replay_bound();   // (LARECOMP_REPLAY_BOUND: the GPU still reads after the game's wait)
+        if (on) LOG("[vk] device window: read-only storage buffers it has no room for are snapshotted into an %d MB area at its top (%s)\n", GSF_BYTES >> 20,
+                    e && *e ? "LARECOMP_GDEV_SNAPFALL" : "LARECOMP_REPLAY_BOUND");
     }
     return on;
 }
@@ -9956,7 +10511,7 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
         // their host words alone.
         static int reads = -1;
         if (reads < 0) { const char *e = getenv("LARECOMP_GDEV_READS"); reads = !(e && *e == '0') && wb_init(); }   // (needs the diff copy-back)
-        if ((!write && !reads) || size > GDEV_REGION_MAX) return addr;
+        if ((!write && !reads) || size > GDEV_REGION_MAX) { bxe_note(BXE_HOST_FALL); return addr; }   // (in place, on the GPU timeline)
         for (int i = 0; i < gdev_n; i++)   // (the reserve stops short of any region starting in it)
             if (gdev_reg[i].addr >= addr + size && gdev_reg[i].addr < addr + rsize) rsize = gdev_reg[i].addr - addr;
         for (int i = 0; i < gdev_n; i++)
@@ -9974,7 +10529,7 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
                     if (nlog++ < 8 || g_debug_frame)
                         LOG("[vk] device window: %llx +%llx overlaps live region %llx +%llx, left in host memory\n", (unsigned long long)addr,
                             (unsigned long long)size, (unsigned long long)gdev_reg[i].addr, (unsigned long long)gdev_reg[i].size);
-                    gdev_stat_host++;
+                    gdev_stat_host++; bxe_note(BXE_HOST_FALL);
                     return addr;
                 }
                 gdev_reg[i--] = gdev_reg[--gdev_n];  // stale (copied back already): drop it
@@ -9989,7 +10544,7 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
         }
         uint64_t off = (gdev_top + 255) & ~255ull;
         if (oldfull && (off + rsize > GDEV_SIZE || gdev_n >= gdev_lim())) {
-            for (int i = 0; i < gdev_n; i++) if (gdev_reg[i].seq == cur) { gdev_stat_host++; return addr; }
+            for (int i = 0; i < gdev_n; i++) if (gdev_reg[i].seq == cur) { gdev_stat_host++; bxe_note(BXE_HOST_FALL); return addr; }
             vk_wait_seq(submit_seq);
             gdev_n = 0;
             gdev_gen++;
@@ -10013,7 +10568,7 @@ static uint64_t gdev_map(uint64_t addr, uint64_t size, bool write) {
             }
             if (nlog++ < 8) LOG("[vk] device window: %llx +%llx left in host memory (%d regions, half %d)\n", (unsigned long long)addr,
                                 (unsigned long long)size, gdev_n, gdev_half);
-            gdev_stat_host++;
+            gdev_stat_host++; bxe_note(BXE_HOST_FALL);
             return addr;
         }
         r = &gdev_reg[gdev_n++];
@@ -10103,6 +10658,7 @@ static void gdev_writeback(VkCommandBuffer cb) {
     for (int i = 0; i < gdev_n; i++)
         if (gdev_reg[i].seq == cur) bc[n++] = (VkBufferCopy){gdev_reg[i].off, gdev_reg[i].addr - HEAP_BASE, gdev_reg[i].size};
     if (!n) return;
+    for (uint32_t i = 0; i < n; i++) frame_snap_note(HEAP_BASE + bc[i].dstOffset, bc[i].size);   // (frameguard: read live after this)
     vk_full_barrier(cb);
     if (gdev_chk_on() && !g_wb_mid) {  // host as it is right before the copy-back (the submission's own, not raw_wb's)
         static VkBufferCopy hc[GDEV_REGS];
@@ -10845,6 +11401,7 @@ static bool heap_mirror(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSiz
                 // game's dynamic vertex data on it late (LARECOMP_LIVE_PAGES=1, or the ring lost an entry).
                 int gw = live_pages() ? -1 : gw_overlap(HEAP_BASE + (bk << GDEV_SH), 1u << GDEV_SH, done, cur - 1);
                 pg[i] = gw < 0 ? 2 : gw ? 3 : 1;
+                if (pg[i] != 1) bxe_note(pg[i] == 2 ? BXE_PG_LIVE : BXE_PG_INFLIGHT);
                 bytes += 1u << GDEV_SH;
             }
             hm_blk_seq[bk] = cur;
@@ -11138,6 +11695,7 @@ static bool guest_direct_(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         if (addr < r->addr || addr + size > r->addr + r->size) {  // straddles it: (stale) copy
             static int nlog;
             prof_vx_straddle++;
+            bxe_note(BXE_VX_STRADDLE);
             if (nlog++ < 20 || g_debug_frame)
                 LOG("[vk] vertex/index range %llx +%llx straddles live window region %llx +%llx: copied from host (stale)\n",
                     (unsigned long long)addr, (unsigned long long)size, (unsigned long long)r->addr, (unsigned long long)r->size);
@@ -11157,6 +11715,7 @@ static bool guest_direct_(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         if (live && !live_pages() && !gw_overlap(addr, size, done, ~0ull)) live = false;   // CPU bytes on a shader-written page
         if (!live) return false;
         prof_vx_inflight++;
+        bxe_note(BXE_VX_INFLIGHT);
         g_gd_nocache = true;   // (in place while a writer is in flight: a copy once it completes)
     }
     *buf = gmem_buf;
@@ -11323,7 +11882,9 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
         prof_tic_hit++;
         return;
     }
+    g_tic_snapped = false;   // (a direct texture_info_ call elsewhere may have left it set)
     texture_info_(stage, si, i, out, sc, wh);
+    if (g_tic_snapped) { g_tic_snapped = false; e->valid = 0; return; }   // (a submit-time value: for this list only)
     if (hit) {   // (check mode)
         static uint64_t n, bad;
         n++;
@@ -11358,6 +11919,22 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
     if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
         NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
         NvnTexture *tex = e->tex;  // read once (finalize clears entries; nvn.h backend_exec_lock)
+        // Detector only, a count + 4 lines a frame.
+        if (g_replay_seq && e->wseq >= g_replay_seq && vk_glitch_on()) {
+            bxe_note(BXE_LATE_TIC);
+            static uint64_t lf; static int ln;
+            const uint64_t fr = renderer_present_count();
+            if (lf != fr) lf = fr, ln = 0;
+            if (ln++ < 4)
+                LOG("[late] tic frame=%llu id=%u stage=%d list_seq=%llu wseq=%llu new=%ux%u fmt=%#x addr=%llx\n", (unsigned long long)fr, tic,
+                    stage, (unsigned long long)g_replay_seq, (unsigned long long)e->wseq, tex ? tex->width : 0, tex ? tex->height : 0,
+                    tex ? tex->format : 0, tex ? (unsigned long long)tex->addr : 0ull);
+        }
+        NvnTexEntry snap_e;   // (LARECOMP_POOL_SNAP: the value its list was submitted with, FIX item a)
+        const NvnTexEntry *se = pool_entry_at_submit(e, &snap_e);
+        if (se != e) e = &snap_e, tex = e->tex, g_tic_snapped = true;
+        if (tex && stage == 5 && st_->is_image && cov_img_n < 8) cov_img[cov_img_n++] = tex;   // (pass ring: this dispatch's store targets)
+        if (tex && ufr_unsampled) ufr_sampled(tex, stage);   // (#70: who reads an unscaled scene-fraction target)
         if (tex) {
             // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
             // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
@@ -11421,6 +11998,9 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
             }
             wh[0] = tex->width; wh[1] = tex->height;
             vb = (w ? w : tex)->backend;   // (vk_view shows the alias writer's image)
+            // (sc[2] bit 2: the image shown is the output canvas's kind, for translate.c's AOFFI in guest texels; stage_set
+            // splits it from the D16 bit into rscale's .w)
+            if (vb && vb->scalable && vb->scale_kind == 3) sc[2] += 2;
             for (int k = 0; k < nfeedback; k++)
                 if (tex == feedback_tex[k] && feedback_view[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
                     view = feedback_view[k];
@@ -11439,7 +12019,7 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
                 TexBackend *sb = (w ? w : tex)->backend;
                 VkImageView tv = sb && !subst ? vk_depth_twin_view(sb, &e->view, e->has_view, st_->type) : VK_NULL_HANDLE;
                 if (tv) view = tv, vb = NULL;
-                if (sb && (sb->format == VK_FORMAT_D16_UNORM || (tv && sb->format == VK_FORMAT_R16_UNORM))) sc[2] = 1;   // (a D16 image / twin)
+                if (sb && (sb->format == VK_FORMAT_D16_UNORM || (tv && sb->format == VK_FORMAT_R16_UNORM))) sc[2] += 1;   // (a D16 image / twin; bit 1)
                 // (a colour format no compare can read: the depth dummy. R32F / R16 keep their colour view, which NVIDIA
                 // compares, until their twin is filled.)
                 if (!tv && !subst && sb && !(sb->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !vk_depth_twin_format(sb->format) && dref_dummy_on()) {
@@ -11456,6 +12036,14 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
         static int plain = -1;
         if (plain < 0) { const char *ev = getenv("LARECOMP_PLAIN_SAMPLER"); plain = !ev || *ev != '0'; }
         NvnSamplerDesc *sd = &((NvnSamplerDesc *)st.spool->entries)[tsc];
+        static NvnSamplerDesc sd_at;   // (LARECOMP_POOL_SNAP: the entry as this list's submit left it; render thread)
+        if (g_replay_seq && sd->wseq >= g_replay_seq && nvn_pool_snap_on()) {
+            // (g_tic_snapped: texture_info's memo keeps no list epoch, so a snapped result must not be stored for the next
+            // list; backend cleared: vk_sampler's seen set keys on the address, the same &sd_at for every snapped entry, so
+            // the kept VkSampler goes back through the content table, the same sampler)
+            if (nvn_sampler_entry_at(sd, g_replay_seq, &sd_at)) sd_at.backend = NULL, sd = &sd_at, stat_pool_snap++, g_tic_snapped = true;
+            else stat_pool_snap_miss++;
+        }
         extern bool vk_pc_lod_bias_on(void);
         extern VkSampler vk_sampler_nobias(NvnSamplerDesc *d, bool plain);
         // (and the PC anisotropy floor: both are for the game's own material textures only, textures.c.
@@ -11799,7 +12387,15 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->binding == 18) {
             int nt = si->ntex < 64 ? si->ntex : 64;
-            for (int t = 0; t < nt; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; rs[1 + t][2] = tex_sc[sg][t][2]; rs[1 + t][3] = 0; }
+            // (.z: D16, bit 1 of tex_sc's [2];.w: AOFFI in guest texels for this texture (translate.c), bit 2: the output
+            // canvas's kind LARECOMP_AOFFI_GUEST=all: every texture)
+            static int aoffi_all = -1;
+            if (aoffi_all < 0) { const char *e = getenv("LARECOMP_AOFFI_GUEST"); aoffi_all = e && !strcmp(e, "all"); }
+            for (int t = 0; t < nt; t++) {
+                const int fl = (int)tex_sc[sg][t][2];
+                rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1];
+                rs[1 + t][2] = (float)(fl & 1); rs[1 + t][3] = aoffi_all || (fl & 2) ? 1.0f : 0.0f;
+            }
             uint64_t rsz = (uint64_t)(1 + nt) * 16;
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, rsz, 256), rsz);
         } else {
@@ -12194,14 +12790,24 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     uint32_t cdyn[MAX_BIND], ncdyn = 0;
     {
         static const int cstage = 5;
+        ups_refresh(&cp->si, &cstage, 1);
         twins_refresh(&cp->si, &cstage, 1, false);
     }
+    cov_img_n = 0;   // (pass ring: texture_info_ lists this dispatch's image-store targets)
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL, cdyn, &ncdyn);
     if (cp->si->ldg_raw) raw_wb(cb);   // (LARECOMP_RAW_WRITEBACK: an earlier writer's window bytes into host memory first)
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, ncdyn, cdyn);
     for (int k = 0; k < cp->si->ntex; k++)   // (LARECOMP_SNAP_DELTA: only image stores write images; storage buffers are guest memory)
-        if (cp->si->tex[k].is_image) { snap_ndgen++; snap_nd_why = "image-store dispatch"; break; }
+        if (cp->si->tex[k].is_image) {
+            snap_ndgen++; snap_nd_why = "image-store dispatch";
+            if (vk_glitch_on()) {   // (pass ring: the grid per program, and over each store target)
+                const uint64_t pg = st.program->stages[5].code_addr;
+                cov_dispatch(pg, gx * cp->local[0], gy * cp->local[1]);
+                for (int m = 0; m < cov_img_n; m++) cov_image_store(cov_img[m], pg);
+            }
+            break;
+        }
     vkCmdDispatch(cb, gx, gy, gz);
     stat_dispatches++; chunk_draws++;
     if (cp->si->ldg_raw) rawd_note(cp->p.ckey ? cp->p.ckey : st.program->stages[5].code_addr, cp->si);   // (before its own writes count)
@@ -12477,10 +13083,18 @@ static void draw_(CmdRec *r, bool indexed) {
             dyn_invalidate();
             hl_canvas = NULL;
         }
-        // TOTK_DLSS_HDR=1: SR on the HDR scene before the game's tonemap draw (hdr_fs_draw; learned at the FXAA below)
+        // TOTK_DLSS_HDR=1: SR on the HDR scene before the game's tonemap draw (hdr_fs_draw; learned at the FXAA below).
+        // display.hdr_hue: the same learning, with SR or without
         if (!upscale_pass && st.rt.color[0] && st.rt.ncolor == 1 && !st.rt.depth && r->x[2] <= 6 && pr->fi->ntex >= 1 &&
-            vk_ngx_sr_hdr_on())
+            hdr_wanted())
             hdr_fs_draw(pr->fi->tex, pr->fi->ntex, last_hash, renderer_present_count());
+        if (upscale_pass && st.rt.color[0] && pr->fi->ntex >= 1 && hdr_wanted()) {
+            const uint64_t now = renderer_present_count();
+            hue_flush(now);   // (the 1280x720 tier: 6dc5 scales the tonemap's output into the canvas, no FXAA between)
+            // the game's FXAA (6dc5 1:1, at the 1600x900 tier): the tonemap is learned there
+            NvnTexture *src = shader_texture_object(1, &pr->fi->tex[0]);
+            if (src && last_hash == 0x6dc5011326ac42a2ull && st.rt.color[0]->width <= src->width) hdr_learn(st.rt.color[0], now);
+        }
         // (Any other draw that samples a texture of the latest G-buffer depth's size into a larger target is named once
         // per shader, 40 at most, to find the pass the game uses there. TOTK_DLSS_HUNT=1 only.)
         static int dlss_hunt = -1;
@@ -12511,8 +13125,8 @@ static void draw_(CmdRec *r, bool indexed) {
             // (fs 6dc5011326ac42a2 is the scene -> canvas pass only at the 1280x720 tier; at 1600x900 the game runs it
             // 1:1 into a 1600x900 target before EASU: SR took that one, as DLAA, and refused EASU after it)
             if (src && last_hash == 0x6dc5011326ac42a2ull && st.rt.color[0]->width <= src->width) {
-                // (that 1:1 draw is the game's FXAA: while SR runs it becomes a copy of its input, ngx.c)
-                if (vk_ngx_sr_hdr_on()) hdr_learn(st.rt.color[0], renderer_present_count());
+                // (that 1:1 draw is the game's FXAA: while SR runs it becomes a copy of its input, ngx.c; the HDR
+                // scene's tonemap was learned above)
                 vk_end_pass();
                 vk_feedback_epoch_bump();
                 bool copied = vk_ngx_sr_fxaa_bypass(vk_cmd(), vk_render_backend(src), vk_render_backend(st.rt.color[0]));
@@ -12758,6 +13372,11 @@ static void draw_(CmdRec *r, bool indexed) {
         pass_barrier_fresh = true;
         st.rt_dirty = true;
         stat_depth_war++;
+    }
+    {   // (before resolve_feedback: a pass this ends does not move its feedback-loop images back)
+        ShaderInfo *const uinfos[2] = {pr->vi, pr->fi};
+        static const int ustages[2] = {0, 1};
+        ups_refresh(uinfos, ustages, 2);
     }
     resolve_feedback(pr);
     {
@@ -13364,6 +13983,8 @@ pipe_known:;
     }
     apply_scissor();
     VkRect2D pe_sc = scissor_rect();   // (vp_exact split: the game's scissor, which every part is clipped to)
+    if (pass_fresh) fresh_cover_check(pe_sc);   // (LARECOMP_FRESH_CLEAR: a partial first writer of a cleared target)
+    if (cov_any) cov_draw(pe_sc);   // (TOTK_GLITCH_DETECT's pass ring)
     for (int k = 0; k < pd_n; k++) if (pd_b[k]->snap_tag) snap_box_add(pd_b[k], pe_sc);   // (LARECOMP_SNAP_DELTA)
     if (!pr->fi->uses_smark && pd_n) {   // (LARECOMP_SNAP_MARK: a write it did not mark; its variant from the next sight on)
         for (int k = 0; k < pd_n; k++) pd_b[k]->smark_ok = false;
@@ -13478,7 +14099,8 @@ pipe_known:;
             Range v = st.vbuf[s];
             VkBuffer dbuf;
             VkDeviceSize doff;
-            if (v.addr && v.size && guest_direct(v.addr, v.size, &dbuf, &doff)) {
+            // (a stream the frame snapshot holds is copied from it: bound in place, the GPU would read it later still)
+            if (v.addr && v.size && !frame_snap(v.addr, v.size, false) && guest_direct(v.addr, v.size, &dbuf, &doff)) {
                 bind_vertex(cb, (uint32_t)s, dbuf, doff);
                 continue;
             }
@@ -14137,6 +14759,10 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     TexBackend *b = vk_tex(t, false);  // prior CPU contents uploaded first
     extern void rt_first_note(NvnTexture *t, const char *how);
     rt_first_note(t, "buf2tex");
+    // (#62, ram-diet's CPU-filled rule: a never-rendered canvas-scale texture whose first contents come from a buffer copy
+    // is made at the game's size, as one filled from the CPU, so the copy is exact instead of a filtered upscale)
+    extern void renderer_texture_buf_first(NvnTexture *t);
+    if (!b->gpu_owned) renderer_texture_buf_first(t);
     renderer_mark_gpu_owned(t);
     if (level >= 0 && level < 31) b->b2t_levels |= 1u << level;   // (texture_info_'s count of buffer-filled materials)
     if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) return;
@@ -14408,6 +15034,20 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
                       .dstSubresource = {depth ? (da & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : da) : da, dlv, dly, 1},
                       .dstOffsets = {{dx0, dy0, 0}, {dx0 + dw, dy0 + dh, 1}}};
     bool linear = (flags & 1) && !depth && !rt_kind(st_->format);
+    // A downsample of the game's 1920x1080 canvas (at the output canvas's scale with native UI On, or promoted to the
+    // scene's) into an unscaled texture: the game copies 1:1 and asks no filter, but at x1.333 nearest dropped every 4th
+    // row and column of the text in it (the pause screen's 170x57 / 240x36 / 510x75 captures, ram-diet #62). Filtered
+    // then (the check below still makes it nearest where the source can't be). LARECOMP_CANVAS_COPY_FILTER=0: as asked.
+    static int canvas_filter = -1;
+    if (canvas_filter < 0) { const char *e = getenv("LARECOMP_CANVAS_COPY_FILTER"); canvas_filter = !(e && *e == '0'); }
+    if (!linear && canvas_filter && !depth && !rt_kind(st_->format) && s->scalable && st_->width == 1920 && st_->height == 1080 &&
+        (ssx > dsx * 1.01f || ssy > dsy * 1.01f)) {
+        linear = true;
+        static int nlog;
+        if (nlog++ < 4)
+            LOG("[tex] canvas copy into %ux%u f%#x at x%.3f -> x%.3f: filtered, not nearest (LARECOMP_CANVAS_COPY_FILTER)\n",
+                dt->width, dt->height, dt->format, (double)ssx, (double)dsx);
+    }
     {   // A blit is valid only where the device lists BLIT_SRC / BLIT_DST for the two formats, and a linear one only where
         // it can filter the source (public #39, Arc B580: white patches on water and in caves that move with the view;
         // NVIDIA lists every format the game copies, other GPUs not all): a linear blit the source cannot filter is made
@@ -14658,6 +15298,17 @@ void renderer_apply_post(const char *aa, const char *upscale, const char *sharpe
 }
 // The view the present samples: the game image, or its anti-aliased / upscaled version. ow x oh: the whole image's
 // size in the window (its crop is drawn into the viewport).
+// The F9 overlay's upscaler line (pc_overlay.cpp): the last present's game image size, the window's, and whether FSR 1
+// upscaled it (post_process below; read on the presenting thread, so atomics)
+static _Atomic uint32_t g_postl_in, g_postl_out;   // (w << 16 | h)
+static _Atomic int g_postl_fsr;
+static _Atomic uint64_t g_postl_ns;
+int vk_post_last(unsigned *iw, unsigned *ih, unsigned *ow, unsigned *oh, int *fsr1) {
+    if (!atomic_load(&g_postl_ns)) return 0;
+    const uint32_t i = atomic_load(&g_postl_in), o = atomic_load(&g_postl_out);
+    *iw = i >> 16, *ih = i & 0xffff, *ow = o >> 16, *oh = o & 0xffff, *fsr1 = atomic_load(&g_postl_fsr);
+    return 1;
+}
 static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, double oh_d, const float crop[4]) {
     VkImageView v = raw_view(b);
     bool smaa = __atomic_load_n(&g_settings.antialias, __ATOMIC_RELAXED) == AA_SMAA;   // (renderer_apply_post: any thread)
@@ -14672,6 +15323,10 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     float sharpen;   // (renderer_apply_post changes it live, from any thread)
     __atomic_load(&g_sharpen, &sharpen, __ATOMIC_RELAXED);
     bool rcas = sharpen >= 0 && !fsr;
+    atomic_store(&g_postl_in, (b->width & 0xffff) << 16 | (b->height & 0xffff));   // (the F9 line: vk_post_last)
+    atomic_store(&g_postl_out, (ow & 0xffff) << 16 | (oh & 0xffff));
+    atomic_store(&g_postl_fsr, fsr);
+    atomic_store(&g_postl_ns, SDL_GetTicksNS());
     if (!smaa && !fsr && !rcas) return v;
     extern void vk_frame_suspend(void);
     extern void vk_frame_resume(void);
@@ -14750,6 +15405,7 @@ static bool present_color(float k[4]) {   // (the factors of the current setting
     for (int i = 0; i < 4; i++) __atomic_load(&g_color_k[i], &k[i], __ATOMIC_RELAXED);
     return true;
 }
+bool vk_present_color_factors(float k[4]) { return present_color(k); }   // (present.c's HDR hue: what the present drew)
 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
 void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]) {
@@ -15340,6 +15996,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_DRAW_ELEMENTS: draw(r, true); break;
         case CMD_UPDATE_UNIFORM_BUFFER:
             memcpy((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3]);
+            frame_snap_write(r->x[0] + r->x[2], x, r->x[3]);   // (the snapshot of this list sees the update too)
             sync_guard_note_write(r->x[0] + r->x[2], r->x[3]);   // (LARECOMP_SYNC_GUARD: not guarded, the replay writes it)
             // (uniform buffers reach the heap mirror only with LARECOMP_UBO_ZEROCOPY=2; otherwise they are the snapshots
             // flushed below, and ~280 inline updates a frame (d55) would each re-sync a mirror chunk for nothing)
@@ -15497,7 +16154,7 @@ static void exec_list(uint64_t handle, int depth) {
             }
             if (type == 0 || type == 16) dsub_live = !hold;
             const bool owned = (type == 0 || type == 16) && !hold && dts_claim(type, out, host_v, k);
-            if (out) { out[0] = v; if (!owned) out[1] = host_v; sync_guard_note_write(r->x[1], 16); }
+            if (out) { out[0] = v; if (!owned) out[1] = host_v; sync_guard_note_write(r->x[1], 16); frame_snap_write(r->x[1], out, 16); }
             if (type == 1 && oq_mode == 2) oq_report(out);
             if (type == 1) oqa_note(r->x[1]);
             if (g_debug_frame) LOG("[counter] type %u -> %llx value %llu\n", type, (unsigned long long)r->x[1], (unsigned long long)v);
@@ -15522,6 +16179,7 @@ static void exec_list(uint64_t handle, int depth) {
             }
             renderer_flush();
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
+            frame_snap_write(r->x[1], (const void *)(uintptr_t)r->x[1], r->x[2]);   // (a later bind of this list reads the copy)
             mirror_guest_written(r->x[1], r->x[2]);
             sync_guard_note_write(r->x[1], r->x[2]);
             break;
@@ -15558,6 +16216,7 @@ static void backend_execute_now(uint64_t handle) {
     if (prof) QueryThreadCycleTime(GetCurrentThread(), &cy0);
 #endif
     backend_exec_lock();
+    vk_writeback_complete(vk_completed_seq(), true);   // (LARECOMP_WB_DEFER: batches the GPU has done since)
     alias_import_kick();
     deferred_frees();   // (LARECOMP_DEFER_FREE)
     if (capture_on()) capture_exec(handle);
@@ -15599,7 +16258,7 @@ static void backend_execute_now(uint64_t handle) {
 enum { AOP_EXEC = 1, AOP_FENCE, AOP_PRESENT, AOP_CALL };
 void vk_present_set_frame(uint64_t frame);   // present.c (low latency markers)
 uint64_t vk_present_latency_frame(void);
-typedef struct { int kind; uint64_t a; void *p; void (*fn)(void *); uint64_t t; } AsyncOp;   // (t: push time, ns)
+typedef struct { int kind; uint64_t a; void *p; void (*fn)(void *); uint64_t t, seq; } AsyncOp;   // (t: push time, ns; seq: AOP_EXEC's g_nvn_submit_seq)
 uint64_t g_op_push_ns;   // (render thread: push time of the op it is running)
 static AsyncOp *aq;
 static uint64_t aq_cap, aq_head, aq_tail, aq_done, aq_pres_pushed, aq_pres_done;   // head/tail: monotonic op indices
@@ -15615,6 +16274,28 @@ bool backend_async_on(void) {
     // the game's presents.
     if (on < 0) { const char *e = getenv("LARECOMP_ASYNC_EXEC"); on = e ? *e != '0' : !getenv("LARECOMP_CAPTURE"); LOG("[async] render thread %s\n", on ? "on" : e ? "off (LARECOMP_ASYNC_EXEC=0)" : "off (capture)"); }
     return on;
+}
+// LARECOMP_REPLAY_BOUND=1 (replaylag): the game's wait for fence N returns only once the render thread replayed frame N
+// (its UBO / pool entry / vertex / storage reads of guest memory are done), as with LARECOMP_SYNC_TICKET_LAG=0; the GPU
+// wait stays one fence behind (LARECOMP_SYNC_LAG), so the read-only storage buffers the GPU would read in place after
+// that are snapshotted (LARECOMP_GDEV_SNAPFALL's default). With the ticket lag the game builds N+1 while N is still
+// replayed: TotK's frame loop rewrites per-object data and streams tiles in that time (ONEFRAME_REPORT #1 / #2).
+int backend_replay_bound(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_REPLAY_BOUND"); on = e && *e == '1'; if (on) LOG("[async] replay bound: a fence's wait returns after its frame's replay (LARECOMP_REPLAY_BOUND)\n"); }
+    return on;
+}
+// The replay lag, counted (the '[async] 5 s' line, the detector's 'replay lag' buffer event): the newest fence a guest
+// wait returned for before the render thread passed it (the game takes every op before it as done) and since when; a
+// list the render thread starts below it is replayed after the game was told it is.
+static uint64_t aq_rel_ticket, aq_rel_ns, aq_stat_late, aq_stat_late_max_ns;   // (aq_mu)
+void backend_async_released(uint64_t ticket) {
+    pthread_mutex_lock(&aq_mu);
+    if (ticket > aq_rel_ticket && aq_done < ticket) {
+        if (aq_rel_ticket <= aq_done) aq_rel_ns = SDL_GetTicksNS();   // (the oldest release still ahead of the replay: the lag's start)
+        aq_rel_ticket = ticket;
+    }
+    pthread_mutex_unlock(&aq_mu);
 }
 #ifdef _WIN32
 // The render thread alone on one physical core: cx5 saw its CPU per frame vary up to 70 % between boots with the same
@@ -15644,10 +16325,16 @@ static void *async_main(void *arg) {
         pthread_mutex_lock(&aq_mu);
         while (aq_head == aq_tail) pthread_cond_wait(&aq_cv, &aq_mu);
         AsyncOp op = aq[aq_head & (aq_cap - 1)];
+        if (op.kind == AOP_EXEC && aq_head + 1 < aq_rel_ticket) {   // (this op's ticket is aq_head + 1)
+            const uint64_t lag = SDL_GetTicksNS() - aq_rel_ns;
+            aq_stat_late++;
+            if (lag > aq_stat_late_max_ns) aq_stat_late_max_ns = lag;
+            bxe_note(BXE_REPLAY_LATE);
+        }
         pthread_mutex_unlock(&aq_mu);
         g_op_push_ns = op.t;
         switch (op.kind) {
-        case AOP_EXEC: backend_execute_now(op.a); break;
+        case AOP_EXEC: frame_snap_apply(op.p); g_replay_seq = op.seq; backend_execute_now(op.a); g_replay_seq = 0; frame_snap_apply(NULL); break;   // (op.p: frame_snap_take's)
         case AOP_FENCE: {
             NvnSync *s = (NvnSync *)op.p;
             renderer_fence_submit();
@@ -15710,7 +16397,8 @@ void backend_async_wait(uint64_t ticket) {
     pthread_mutex_unlock(&aq_mu);
 }
 void backend_execute(uint64_t handle) {
-    if (backend_async_on()) aq_push((AsyncOp){AOP_EXEC, handle, NULL, NULL});
+    const uint64_t seq = __atomic_add_fetch(&g_nvn_submit_seq, 1, __ATOMIC_RELAXED);   // (objects.c stamps pool entries with it)
+    if (backend_async_on()) aq_push((AsyncOp){AOP_EXEC, handle, frame_snap_take(handle), NULL, .seq = seq});   // (the list's bound ranges now)
     else backend_execute_now(handle);
 }
 // LARECOMP_DEFER_FREE=1: in synchronous execute a finalizer's plain free() is queued and done by the next execute under
@@ -15764,11 +16452,12 @@ void backend_async_present(NvnTexture *t) {
     static uint64_t last_log;
     if (t0 - last_log > 5000000000ull) {   // every 5 s: game-side waits on the render thread
         if (last_log)
-            LOG("[async] 5 s: %llu ops (max queue %llu), present throttle %.0f ms, sync/finish waits %llu = %.0f ms\n",
+            LOG("[async] 5 s: %llu ops (max queue %llu), present throttle %.0f ms, sync/finish waits %llu = %.0f ms, "
+                "lists replayed after their fence's wait returned %llu (up to %.1f ms after)\n",
                 (unsigned long long)aq_stat_ops, (unsigned long long)aq_stat_maxdepth, aq_stat_pres_wait_ns / 1e6,
-                (unsigned long long)aq_stat_waits, aq_stat_wait_ns / 1e6);
+                (unsigned long long)aq_stat_waits, aq_stat_wait_ns / 1e6, (unsigned long long)aq_stat_late, aq_stat_late_max_ns / 1e6);
         last_log = t0;
-        aq_stat_ops = aq_stat_maxdepth = aq_stat_pres_wait_ns = aq_stat_waits = aq_stat_wait_ns = 0;
+        aq_stat_ops = aq_stat_maxdepth = aq_stat_pres_wait_ns = aq_stat_waits = aq_stat_wait_ns = aq_stat_late = aq_stat_late_max_ns = 0;
     }
     pthread_mutex_unlock(&aq_mu);
 }

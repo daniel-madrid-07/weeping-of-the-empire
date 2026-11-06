@@ -27,7 +27,9 @@ def shape(fn):
     return hashlib.sha256(ast.dump(tree).encode()).hexdigest()[:16]
 
 
-UPSTREAM = {'function': 'b97cdeca74c6b20e', 'tail': 'b06f536b1ecf4910'}   # shape() of the gen.py methods this copies
+# shape() of the gen.py methods this copies (c09b9332: function's split test also takes --split-loops; the copy below
+# never splits, so nothing to port)
+UPSTREAM = {'function': 'c09b9332eb55db1d', 'tail': 'b06f536b1ecf4910'}
 for name, want in UPSTREAM.items():
     have = shape(getattr(G.Emitter, name))
     if have != want:

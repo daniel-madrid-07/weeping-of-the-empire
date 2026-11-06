@@ -291,6 +291,78 @@ class FieldEvidenceTest(unittest.TestCase):
         p = self.P(new_ldr=0xb9404c09)                                          # renamed, another offset
         self.assertIn('offset 0x4c, not 0x48', em.gated_fields(self.F, p, {})[1][0])
 
+    def test_pre_index(self):
+        """a pre-indexed access is at base + imm, a post-indexed one at base + 0; after any writeback of its base (pre
+        or post), [rn, #k] is no longer +k of that base"""
+        pre, post, ldr4, nop, ret = 0xb8428d09, 0xb8428509, 0xb940050a, 0xd503201f, 0xd65f03c0   # [x8, #0x28]! / ], #0x28
+        self.assertEqual(em.mem_imm(pre)[1], 0x28)
+        self.assertEqual(em.mem_imm(post)[1], 0)
+        p = self.P()
+        for img, base in ((p.old, 0x100), (p.new, 0x1100)):
+            img.words[base // 4: base // 4 + 4] = [pre, ldr4, nop, ret]
+        rep = {}
+        f = {'QueryRequest': {'0x28': {'new': '0x28', 'for': ['0x100']}}}
+        self.assertEqual(em.gated_fields(f, p, {}, rep)[1], [])
+        self.assertEqual(rep['QueryRequest+0x28'], [['0x100', 'aligned']])
+        moved = {'QueryRequest': {'0x4': {'new': '0x4', 'for': ['0x104']}}}   # the near miss: base moved by the pre
+        self.assertIn('moved by a writeback at 0x100', em.gated_fields(moved, p, {})[1][0])
+        for img, base in ((p.old, 0x100), (p.new, 0x1100)):                    # post-index: the same refusal after it
+            img.words[base // 4: base // 4 + 4] = [post, ldr4, nop, ret]
+        self.assertIn('moved by a writeback at 0x100', em.gated_fields(moved, p, {})[1][0])
+        at0 = {'QueryRequest': {'0x0': {'new': '0x0', 'for': ['0x100']}}}      # ... and itself reads base + 0
+        self.assertEqual(em.gated_fields(at0, p, {})[1], [])
+
+    def test_writeback_then_write(self):
+        """a full write of rn after the writeback starts a new base (QuerySlot+0x140: the madd right before the add),
+        but only when no branch lands between that write and the access: a path skipping the write brings the moved
+        base in"""
+        pre, setx8, ldr4, nop, ret = 0xb8428d09, 0xaa0203e8, 0xb940050a, 0xd503201f, 0xd65f03c0   # mov x8, x2
+        cbz = 0x34000049                                                        # cbz w9, 0x10c (onto the access)
+        f = {'QueryRequest': {'0x4': {'new': '0x4', 'for': ['0x10c']}}}
+
+        def porter(words):
+            p = self.P()
+            for img, base in ((p.old, 0x100), (p.new, 0x1100)):
+                img.words[base // 4: base // 4 + 5] = words
+            p.size_o, p.size_n = {0x100: 20, 0x200: 16}, {0x1100: 20}
+            p._norm = lambda side, s: (p.old if side == 0 else p.new).words[s // 4: s // 4 + 5]
+            p.func_of = lambda side, off: next((s for s in ((0x100,) if side == 0 else (0x1100,)) if s <= off < s + 20),
+                                               None)
+            return p
+        self.assertEqual(em.gated_fields(f, porter([pre, nop, setx8, ldr4, ret]), {})[1], [])   # a new base
+        self.assertIn('moved by a writeback at 0x100', em.gated_fields(f, porter([pre, cbz, setx8, ldr4, ret]), {})[1][0])
+        br = 0xd61f0120                                                         # br x9: its targets are not counted
+        self.assertEqual(em.gated_fields(f, porter([pre, nop, setx8, ldr4, br]), {})[1], [])   # (UltraHand+0x18's case)
+
+    def test_exact(self):
+        """the exact form: an identical word moved in the 1.4.3 body (not aligned) holds when it occurs once in each
+        function and its base is not written before it in either; near misses: two copies, the base written, a call
+        before it (x1 caller-saved), the word absent; and alone it places only a read-only ('ro') field"""
+        strb, mov0, mov3, mov11, nop, ret = 0x3900d022, 0x52800020, 0x52800043, 0x5280002b, 0xd503201f, 0xd65f03c0
+        setx1 = 0xaa0203e1                                                      # mov x1, x2
+
+        def porter(new_words):   # 1.0.0: the store after the mov (0x108); 1.4.3: before it, as 0x7cbb10 / 0x2a0dbc
+            p = self.P()
+            p.old.words[0x100 // 4: 0x100 // 4 + 5] = [mov0, mov3, strb, nop, ret]
+            p.new.words[0x1100 // 4: 0x1100 // 4 + len(new_words)] = new_words
+            p.size_o, p.size_n = {0x100: 20, 0x200: 16}, {0x1100: 4 * len(new_words)}
+            p._norm = lambda side, s: (p.old.words[s // 4: s // 4 + 5] if side == 0
+                                       else p.new.words[s // 4: s // 4 + len(new_words)])
+            return p
+        f = {'QueryRequest': {'0x34': {'new': '0x34', 'for': ['0x108'], 'ro': True}}}
+        rep = {}
+        self.assertEqual(em.gated_fields(f, porter([mov0, strb, mov3, nop, ret]), {}, rep)[1], [])
+        self.assertEqual(rep['QueryRequest+0x34'], [['0x108', 'exact']])
+        twice = porter([mov0, strb, mov3, nop, ret, strb])
+        self.assertTrue(em.gated_fields(f, twice, {})[1])
+        self.assertTrue(em.gated_fields(f, porter([setx1, mov0, strb, mov3, nop, ret]), {})[1])   # x1 set
+        self.assertTrue(em.gated_fields(f, porter([mov0, mov11, mov3, nop, ret]), {})[1])   # absent
+        call = 0x94000010                                                       # bl +0x40
+        self.assertTrue(em.gated_fields(f, porter([call, mov0, strb, mov3, nop, ret]), {})[1])
+        written = {'QueryRequest': {'0x34': {'new': '0x34', 'for': ['0x108']}}}   # not 'ro': one exact piece is short
+        self.assertIn('second piece', em.gated_fields(written, porter([mov0, strb, mov3, nop, ret]), {})[1][0])
+        self.assertFalse(em._writes_gpr(0xf9000101, 1))                         # str x1, [x8]: a store reads x1
+
     def test_rewritten_stretch(self):
         """the access inside a stretch the update rewrote to another length: the one same access in it counts"""
         p = self.P()
@@ -386,6 +458,9 @@ class RenamedFormTest(unittest.TestCase):
         self.assertIsNotNone(em.field_evidence(porter, 0x2230154, 0x58, 0x60, pinned, renamed_ok=True))   # near miss
 
 
+EXACT_ONLY = ['QueryRequest+0x34']   # (the ticket hook's slot index: read only, 'ro')
+
+
 @unittest.skipUnless(_mains(), 'no 1.0.0 / 1.4.3 mains in the work folder')
 class CommittedTablesOnMainsTest(unittest.TestCase):
     """the committed pins_v143.json / fields_v143.json on the real mains: every pin passes, every field's evidence
@@ -408,9 +483,15 @@ class CommittedTablesOnMainsTest(unittest.TestCase):
         if not full:   # (only the fields every piece of which sits in a pinned function)
             fields = {st: {k: v for k, v in offs.items()
                            if all(porter.func_of(0, int(x, 16)) in pinned for x in v['for'])} for st, offs in fields.items()}
-        fmap, refused = em.gated_fields(fields, porter, pinned)
+        rep = {}
+        fmap, refused = em.gated_fields(fields, porter, pinned, rep)
         self.assertEqual(refused, [])
         self.assertEqual(sum(len(v) for v in fmap.values()), sum(len(v) for v in fields.values()))
+        # the fields that stand on the exact form alone: they pass, but each is named here, so a new one is a visible
+        # change of this list
+        exact = sorted(k for k, pieces in rep.items() if all(kd == 'exact' for _, kd in pieces))
+        print('exact-only fields:', ', '.join(exact) or 'none')
+        self.assertEqual(exact, EXACT_ONLY)
         # the vk hook's flag-set table: 1.0.0 reads [set, #0x10] (x8 = base + 0x30), 1.4.3 the same word as
         # [base, #0x40] (x9): equal offsets would say 'moved to 0x40', which is false; another base register refuses
         self.assertIn('not 0x30 + 0x40', em.field_evidence(porter, 0x1ccf8c8, 0x10, 0x40, pinned))

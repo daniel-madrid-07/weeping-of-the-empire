@@ -9,6 +9,7 @@
 #ifdef _WIN32   // (NGX is Windows-only here: the Linux / Deck build gets the stubs at the end, DLSS unavailable)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +51,7 @@ static bool dlss_mode(const char *m) {
 // values (pc_dlss.cpp). Each path picks its backend; NGX starts only for a DLSS one.
 static int g_ngx_env = -1;        // NGX wanted at the start: its extensions and Init with the device
 static bool g_sr_ffx, g_fg_ffx;   // SR / FG through FidelityFX instead of NGX
+static bool g_sr_xess;            // SR through Intel XeSS instead of NGX (xess.c; never with g_sr_ffx)
 static bool g_sr_dlaa;            // DLSS SR with the scene at the output's size (vk_ngx_scene_scale): DLAA
 static bool g_fg_ffx_hl;          // FidelityFX's FG context takes the HUD-less image (as g_fg_hl for NGX's)
 extern int rt_fleet(void);  // (rt_main.cpp, TOTK_FLEET=1)
@@ -87,8 +89,8 @@ static void discovery(NVSDK_NGX_FeatureDiscoveryInfo *d, NVSDK_NGX_Feature featu
         wcscpy(g_dirs[0], g_data);
         // TOTK_DLSS_DIR: where the feature DLLs are (boot.py and a release's player.txt: <work>\engine\dlss, which
         // tools/engine/build.py fills); unset, the exe's folder only
-        const char *dir = getenv("TOTK_DLSS_DIR");
-        if (dir && *dir) MultiByteToWideChar(CP_UTF8, 0, dir, -1, g_dirs[1], MAX_PATH);
+        const wchar_t *dir = _wgetenv(L"TOTK_DLSS_DIR");   /* (wide, not getenv's ANSI read as UTF-8: #94) */
+        if (dir && *dir && wcslen(dir) < MAX_PATH) wcscpy(g_dirs[1], dir);
         else wcscpy(g_dirs[1], g_data);
         g_dir_list[0] = g_dirs[0];
         g_dir_list[1] = g_dirs[1];
@@ -628,8 +630,10 @@ static float g_cam_eval[CAM_FLOATS];   // the camera of the last evaluate (motio
 static uint64_t g_cam_eval_n;          // and its latch number
 static uint64_t g_sr_rej[6];           // evaluates refused: size, no new camera, pipeline, singular, NGX, repeat
 static const char *const k_rej[6] = {"colour / depth sizes differ", "no new G-buffer camera", "motion-vector pipeline", "singular camera", "NGX evaluate failed", "second upscale in a frame"};
+static void sr_idle_note(int reason, uint32_t iw, uint32_t ih, uint32_t ow, uint32_t oh);   // (the F9 line: vk_sr_idle)
 static void sr_reject(int why, const char *detail) {
     g_sr_last = g_in_last = false;
+    if (why != 5) sr_idle_note(why == 4 ? 2 : 4, 0, 0, 0, 0);   // (5: a second call in a frame, not idle)
     uint64_t n = ++g_sr_rej[why];
     if (n <= 3 || (n & (n - 1)) == 0) LOG("[dlss] SR not run (%s%s%s): %llu times\n", k_rej[why], detail ? ": " : "", detail ? detail : "", (unsigned long long)n);
 }
@@ -642,17 +646,19 @@ static float g_fg_jx, g_fg_jy;
 static bool g_fg_reset, g_fg_inv, g_fg_flip, g_fg_zminus;
 static float g_cam_eval_prev[CAM_FLOATS];
 static VkFormat fg_storage_format(VkFormat f);   // (DLSS-G section)
-static bool sr_ready(void) { return g_sr_ffx ? vk_ffx_sr_ready() : g_ready; }   // (the chosen backend is up)
+static bool sr_ready(void) { return g_sr_ffx ? vk_ffx_sr_ready() : g_sr_xess ? vk_xess_sr_ready() : g_ready; }   // (the chosen backend is up)
 
 bool vk_ngx_sr_on(void) {
     if (g_sr_mode < 0) {
         int sr = dlss_env("TOTK_DLSS_SR");
         bool fg = dlss_mode("fg") || dlss_mode("fgtest") || dlss_env("TOTK_DLSS_FG") == 1 || dlss_env("TOTK_FSR_FG") == 1;
         g_sr_ffx = !rt_fleet() && dlss_env("TOTK_FSR_SR") == 1;
-        g_sr_dlaa = !g_sr_ffx && dlss_env("TOTK_DLSS_DLAA") == 1;
-        g_sr_want = g_sr_ffx || (sr != 0 && (dlss_mode("sr") || dlss_mode("fg") || dlss_mode("fgtest") || sr == 1));
+        g_sr_xess = !rt_fleet() && !g_sr_ffx && dlss_env("TOTK_XESS_SR") == 1;
+        g_sr_dlaa = !g_sr_ffx && !g_sr_xess && dlss_env("TOTK_DLSS_DLAA") == 1;
+        g_sr_want = g_sr_ffx || g_sr_xess || (sr != 0 && (dlss_mode("sr") || dlss_mode("fg") || dlss_mode("fgtest") || sr == 1));
         g_sr_mode = g_sr_want || fg;
         if (g_sr_ffx) LOG("[dlss] SR through AMD FSR 3.1 (TOTK_FSR_SR, ffx.c)\n");
+        if (g_sr_xess) LOG("[dlss] SR through Intel XeSS (TOTK_XESS_SR, xess.c)\n");
         const char *js = getenv("TOTK_DLSS_JSIGN");
         if (js) sscanf(js, "%f,%f", &g_jsx, &g_jsy);
         if (g_sr_want) LOG("[dlss] SR on: the game's upscale pass becomes DLSS Super Resolution (DLAA at 1:1); jitter sign %+g %+g\n", g_jsx, g_jsy);
@@ -667,7 +673,58 @@ bool vk_ngx_sr_on(void) {
 // row's (its saved choice is untouched and comes back with DLAA off). Plain reads: the render thread, every present.
 float vk_ngx_scene_scale(float out_scale) {
     if (g_sr_mode < 0) (void)vk_ngx_sr_on();
-    return g_sr_dlaa && g_sr_want && !g_sr_ffx && g_ready ? 1.2f * out_scale : 0.f;
+    return g_sr_dlaa && g_sr_want && !g_sr_ffx && !g_sr_xess && g_ready ? 1.2f * out_scale : 0.f;
+}
+// totk_hooks.c (the Render resolution row's "auto", the window's resolution since 11-05): what the window's picture is
+// divided by. 1.5 while an upscaler runs (DLSS, FSR or XeSS, not DLAA): the Quality ratio (1707x960 into 2560x1440,
+// sr_quality's MaxQuality), or Auto would hand it a scene as large as its output, DLAA's cost for no speed-up. 1: no
+// upscaler, DLAA, or its backend not up / failed. Plain reads, every present.
+float vk_ngx_auto_ratio(void) {
+    if (g_sr_mode < 0) (void)vk_ngx_sr_on();
+    return g_sr_want && !g_sr_dlaa && sr_ready() && g_sr_fails <= 3 ? 1.5f : 1.f;
+}
+
+// The F9 overlay's upscaler line (pc_overlay.cpp: "so he can tell DLSS is really running"): what the last successful
+// evaluate was, not the setting: 1 DLSS, 2 FSR 3.1, 3 XeSS, its render size and its output (g_out), and when (sr_run,
+// the drawing thread; read on the presenting thread, so atomics). 1 while one ran in the last half second.
+static _Atomic uint64_t g_srl_ns;
+static _Atomic uint32_t g_srl_in, g_srl_out;   // (w << 16 | h)
+static _Atomic int g_srl_be;
+// and why it is idle while it is wanted (sr_run / sr_reject): 1 its output (the canvas) is not larger than the scene,
+// 2 NGX / the backend failed, 3 not ready yet, 4 no 3D view this frame (no G-buffer camera, sizes, a menu); the scene
+// and output sizes when known. 1 while that was so in the last half second (a success since wins: vk_sr_last first).
+static _Atomic uint64_t g_sri_ns;
+static _Atomic uint32_t g_sri_in, g_sri_out;
+static _Atomic int g_sri_reason;
+static void sr_idle_note(int reason, uint32_t iw, uint32_t ih, uint32_t ow, uint32_t oh) {
+    if (!g_sr_want) return;   // (frame generation alone: SR is not asked for)
+    atomic_store(&g_sri_reason, reason);
+    if (ow) {
+        atomic_store(&g_sri_in, (iw & 0xffff) << 16 | (ih & 0xffff));
+        atomic_store(&g_sri_out, (ow & 0xffff) << 16 | (oh & 0xffff));
+    }
+    atomic_store(&g_sri_ns, SDL_GetTicksNS());
+}
+int vk_sr_idle(int *backend, int *reason, unsigned *iw, unsigned *ih, unsigned *ow, unsigned *oh) {
+    const uint64_t t = atomic_load(&g_sri_ns);
+    if (!t || SDL_GetTicksNS() - t > 500000000ull) return 0;
+    const uint32_t i = atomic_load(&g_sri_in), o = atomic_load(&g_sri_out);
+    *backend = g_sr_xess ? 3 : g_sr_ffx ? 2 : 1, *reason = atomic_load(&g_sri_reason);
+    *iw = i >> 16, *ih = i & 0xffff, *ow = o >> 16, *oh = o & 0xffff;
+    return 1;
+}
+// SR is asked for (the setting, NGX / the backend chosen): the F9 line's 'idle: no scene seen' when neither stamp is
+// fresh (no upscale pass reached sr_run: a menu, a load)
+int vk_sr_wanted(int *backend) {
+    *backend = g_sr_xess ? 3 : g_sr_ffx ? 2 : 1;
+    return vk_ngx_sr_on() && g_sr_want;
+}
+int vk_sr_last(int *backend, unsigned *iw, unsigned *ih, unsigned *ow, unsigned *oh) {
+    const uint64_t t = atomic_load(&g_srl_ns);
+    if (!t || SDL_GetTicksNS() - t > 500000000ull) return 0;
+    const uint32_t i = atomic_load(&g_srl_in), o = atomic_load(&g_srl_out);
+    *backend = atomic_load(&g_srl_be), *iw = i >> 16, *ih = i & 0xffff, *ow = o >> 16, *oh = o & 0xffff;
+    return 1;
 }
 
 // The sub-pixel offset this frame's scene geometry is drawn with (render pixels, +x right, +y down the image); zero when
@@ -817,6 +874,8 @@ static bool sr_run(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, Tex
     bool reset = g_cam_cut || !g_in_last || g_cam_n != g_cam_eval_n + 1;
     bool sr_can = g_sr_want && sr_ready() && color->width <= out->width && color->height <= out->height && g_sr_fails <= 3;
     static int told_off;
+    if (!sr_can)   // (the F9 line says why: vk_sr_idle; hdr CANVAS1080_1105 (b))
+        sr_idle_note(g_sr_fails > 3 ? 2 : !sr_ready() ? 3 : 1, color->width, color->height, out->width, out->height);
     if (!sr_can && g_sr_want && !told_off++)
         LOG("[dlss] SR off (scene %ux%u, output %ux%u%s): the game's pass draws; FG still gets motion vectors and depth\n",
             color->width, color->height, out->width, out->height, g_sr_fails > 3 ? ", NGX failed" : "");
@@ -885,15 +944,16 @@ static bool sr_run(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, Tex
     VkNgxImage im = {g_mv.img, g_mv.view, g_mv.fmt, w, h}, io = {g_out.img, g_out.view, g_out.fmt, g_out.w, g_out.h};
     VkNgxImage ib = {g_bias.img, g_bias.view, g_bias.fmt, w, h};
     bool ok;
-    if (g_sr_ffx) {   // (AMD FSR 3.1, ffx.c: the same inputs)
+    if (g_sr_ffx || g_sr_xess) {   // (AMD FSR 3.1, ffx.c, or Intel XeSS, xess.c: the same inputs)
         VkTemporalInputs ti;
         memset(&ti, 0, sizeof ti);
         ti.color = ic, ti.depth = idp, ti.mv = im, ti.out = io;
         if (g_bias_mode) ti.bias = ib;
-        ti.jx = g_jsx * jx, ti.jy = g_jsy * jy, ti.mv_sx = ti.mv_sy = 1.f;
+        // (XeSS: the raw jitter; xess.c applies its own TOTK_XESS_JSIGN A/B, not DLSS's TOTK_DLSS_JSIGN)
+        ti.jx = g_sr_xess ? jx : g_jsx * jx, ti.jy = g_sr_xess ? jy : g_jsy * jy, ti.mv_sx = ti.mv_sy = 1.f;
         ti.reset = reset, ti.depth_inverted = inv, ti.frame = frame, ti.hdr = hdr;
         cam_lens(c, flip_y, zminus, &ti);
-        ok = vk_ffx_sr_evaluate(cb, &ti);
+        ok = g_sr_xess ? vk_xess_sr_evaluate(cb, &ti) : vk_ffx_sr_evaluate(cb, &ti);
         if (!ok) g_sr_fails++;
     } else ok = vk_ngx_sr_evaluate(cb, &ic, &idp, &im, &io, g_jsx * jx, g_jsy * jy, 1.f, 1.f, reset, inv, hdr, g_bias_mode ? &ib : NULL);
     if (!ok) {
@@ -915,6 +975,10 @@ static bool sr_run(VkCommandBuffer cb, TexBackend *color, TexBackend *depth, Tex
     g_sr_frame = frame;
     g_sr_last = g_in_last = true;
     g_sr_evals++;
+    atomic_store(&g_srl_be, g_sr_xess ? 3 : g_sr_ffx ? 2 : 1);   // (the F9 line: vk_sr_last)
+    atomic_store(&g_srl_in, (w & 0xffff) << 16 | (h & 0xffff));
+    atomic_store(&g_srl_out, (g_out.w & 0xffff) << 16 | (g_out.h & 0xffff));
+    atomic_store(&g_srl_ns, SDL_GetTicksNS());
     g_in_n++;
     memcpy(g_cam_eval_prev, g_cam_eval, sizeof g_cam_eval);
     memcpy(g_cam_eval, c, sizeof g_cam_eval);
@@ -1255,9 +1319,9 @@ static uint32_t scaled_up(uint32_t n, float s) {   // (textures.c create_image_'
 // (below), the texture bias and the samplers following SR. A render scale change (live-settings: vk_render_epoch) makes
 // them again at the new sizes here too, not on the scene's frame. TOTK_DLSS=fgtest is not live.
 static volatile LONG g_req_sr = -1, g_req_fg = -1;   // (-1: nothing asked; vk_ngx_request's values)
-// sr: 0 off, 1 DLSS, 2 FSR; fg: 0 off, 1..3 DLSS generated frames, VK_NGX_FG_FSR FSR x2 (-1: unchanged)
+// sr: 0 off, 1 DLSS, 2 FSR, 3 DLAA, 4 XeSS; fg: 0 off, 1..3 DLSS generated frames, VK_NGX_FG_FSR FSR x2 (-1: unchanged)
 void vk_ngx_request(int sr, int fg) {
-    if (sr >= 0) InterlockedExchange(&g_req_sr, sr > 3 ? 1 : sr);
+    if (sr >= 0) InterlockedExchange(&g_req_sr, sr > 4 ? 1 : sr);
     if (fg >= 0) InterlockedExchange(&g_req_fg, fg == VK_NGX_FG_FSR ? fg : fg > FG_MAX ? FG_MAX : fg);
 }
 
@@ -1296,13 +1360,15 @@ static bool apply_request(void) {   // true: a feature was turned on or off, its
     (void)vk_ngx_on(), (void)vk_ngx_sr_on(), (void)vk_ngx_fg_on();   // (the start's state first)
     if (g_fg_mode == 2) fg = -1;
     bool want_sr = sr >= 0 ? sr != 0 : g_sr_want, sr_ffx = sr >= 0 ? sr == 2 : g_sr_ffx, dlaa = sr >= 0 ? sr == 3 : g_sr_dlaa;
+    bool sr_xess = sr >= 0 ? sr == 4 : g_sr_xess;
     bool fg_ffx = fg >= 0 ? fg == VK_NGX_FG_FSR : g_fg_ffx;
     int want_fg = fg >= 0 ? (fg == VK_NGX_FG_FSR ? 1 : fg) : g_fg_mode ? fg_frames() : 0;
-    if (want_sr && !(sr_ffx ? vk_ffx_sr_ready() : ngx_can())) want_sr = false;
+    if (want_sr && !(sr_ffx ? vk_ffx_sr_ready() : sr_xess ? vk_xess_sr_ready() : ngx_can())) want_sr = false;
     if (want_fg && !(fg_ffx ? vk_ffx_fg_ready() : ngx_can())) want_fg = 0;
     bool changed = false, ffx_off = false;
-    if (want_sr != g_sr_want || (want_sr && sr_ffx != g_sr_ffx)) {   // (the old backend's SR goes)
-        if (g_sr_want && !g_sr_ffx) {
+    if (want_sr != g_sr_want || (want_sr && (sr_ffx != g_sr_ffx || sr_xess != g_sr_xess))) {   // (the old backend's SR goes)
+        if (g_sr_want && g_sr_xess) { renderer_submit(); vk_xess_release(); }   // (its last execute is in the open frame: out first)
+        if (g_sr_want && !g_sr_ffx && !g_sr_xess) {
             sr_release_live(g_sr);
             for (int i = 0; i < SR_SPARES; i++) sr_release_live(g_sr_spare[i].h);
             g_sr = NULL, g_sr_flags = -1, g_sr_exact = false, g_sr_seen_w = g_sr_seen_h = 0;
@@ -1310,13 +1376,13 @@ static bool apply_request(void) {   // true: a feature was turned on or off, its
         }
         ffx_off |= g_sr_want && g_sr_ffx;
         if (!want_sr) own_free(&g_out);
-        g_sr_want = want_sr, g_sr_ffx = want_sr && sr_ffx, g_sr_fails = 0, changed = true;
+        g_sr_want = want_sr, g_sr_ffx = want_sr && sr_ffx, g_sr_xess = want_sr && sr_xess && !sr_ffx, g_sr_fails = 0, changed = true;
         g_sr_last = false;   // (no jitter until the upscaler has run again)
-        LOG("[dlss] SR turned %s in game\n", !want_sr ? "off" : sr_ffx ? "on (FSR)" : dlaa ? "on (DLAA)" : "on (DLSS)");
+        LOG("[dlss] SR turned %s in game\n", !want_sr ? "off" : sr_ffx ? "on (FSR)" : sr_xess ? "on (XeSS)" : dlaa ? "on (DLAA)" : "on (DLSS)");
     }
     if (preset_new) {   // (DLSS's features were made with the old model: all go, the next evaluate makes one again)
         g_preset = preset;
-        if (g_sr_want && !g_sr_ffx) {
+        if (g_sr_want && !g_sr_ffx && !g_sr_xess) {   // (NGX's features only)
             sr_release_live(g_sr);
             for (int i = 0; i < SR_SPARES; i++) sr_release_live(g_sr_spare[i].h);
             g_sr = NULL, g_sr_flags = -1;
@@ -1325,7 +1391,7 @@ static bool apply_request(void) {   // true: a feature was turned on or off, its
         changed = true;
         LOG("[dlss] DLSS model %s in game\n", preset_name(preset));
     }
-    dlaa = dlaa && g_sr_want && !g_sr_ffx;
+    dlaa = dlaa && g_sr_want && !g_sr_ffx && !g_sr_xess;
     if (dlaa != g_sr_dlaa) {   // (the render scale follows at the next present: totk_hooks.c output_scale, vk_render_epoch)
         g_sr_dlaa = dlaa, changed = true;
         LOG("[dlss] DLAA %s in game: the scene %s\n", dlaa ? "on" : "off", dlaa ? "at the output's size" : "back at Render resolution");
@@ -1382,7 +1448,12 @@ void vk_ngx_prepare(VkCommandBuffer cb, const TexBackend *b) {
         cb = vk_cmd();
         sr_ok = vk_ffx_sr_prepare(cb, rw, rh, ow, oh), made = true;
     }
-    else if (!off && sr && rw <= ow && rh <= oh && !(g_sr && g_sr_rw == rw && g_sr_rh == rh && g_sr_ow == ow && g_sr_oh == oh)) {
+    else if (!off && sr && g_sr_xess && rw <= ow && rh <= oh) {   // (XeSS: its context and pipelines, as FSR's)
+        renderer_submit();
+        cb = vk_cmd();
+        sr_ok = vk_xess_sr_prepare(cb, rw, rh, ow, oh), made = true;
+    }
+    else if (!off && sr && !g_sr_xess && rw <= ow && rh <= oh && !(g_sr && g_sr_rw == rw && g_sr_rh == rh && g_sr_ow == ow && g_sr_oh == oh)) {
         g_sr_seen_w = rw, g_sr_seen_h = rh;   // (a scene larger than the output is not upscaled: vk_ngx_sr_upscale)
         if (g_sr) {   // (sr_create releases the live feature or the spare: the open submission evaluated it, out first)
             renderer_submit();
@@ -1404,7 +1475,7 @@ void vk_ngx_prepare(VkCommandBuffer cb, const TexBackend *b) {
     if (made)
         LOG("[dlss] features made between frames (present %llu): output %ux%u (x%.3f), scene %ux%u (x%.3f)%s%s (FG format %d) in "
             "%.0f ms\n", (unsigned long long)renderer_present_count(), ow, oh, os, rw, rh, rx,
-            sr ? sr_ok ? g_sr_ffx ? ", SR (FSR)" : ", SR" : ", SR failed" : "",
+            sr ? sr_ok ? g_sr_ffx ? ", SR (FSR)" : g_sr_xess ? ", SR (XeSS)" : ", SR" : ", SR failed" : "",
             fg ? fg_ok ? g_fg_ffx ? ", FG (FSR)" : ", FG" : ", FG failed" : "", (int)fmt, (SDL_GetTicksNS() - t0) / 1e6);
     sr_bias_update();
 }
@@ -1637,6 +1708,15 @@ bool vk_ngx_sr_evaluate(VkCommandBuffer cb, const VkNgxImage *color, const VkNgx
     return false;
 }
 bool vk_ngx_sr_on(void) { return false; }
+int vk_sr_last(int *backend, unsigned *iw, unsigned *ih, unsigned *ow, unsigned *oh) {
+    (void)backend; (void)iw; (void)ih; (void)ow; (void)oh;
+    return 0;
+}
+int vk_sr_idle(int *backend, int *reason, unsigned *iw, unsigned *ih, unsigned *ow, unsigned *oh) {
+    (void)backend; (void)reason; (void)iw; (void)ih; (void)ow; (void)oh;
+    return 0;
+}
+int vk_sr_wanted(int *backend) { (void)backend; return 0; }
 bool vk_ngx_sr_frame_jitter(uint64_t frame, uint32_t render_w, uint32_t out_w, float *jx, float *jy) {
     (void)frame; (void)render_w; (void)out_w; *jx = *jy = 0;
     return false;
@@ -1660,6 +1740,7 @@ void vk_ngx_request(int sr, int fg) { (void)sr; (void)fg; }
 void vk_ngx_set_preset(const char *name) { (void)name; }
 void vk_ngx_set_trails(int pct) { (void)pct; }
 float vk_ngx_scene_scale(float out_scale) { (void)out_scale; return 0.f; }
+float vk_ngx_auto_ratio(void) { return 1.f; }
 int vk_ngx_fg_frame(VkCommandBuffer cb, TexBackend *b) { (void)cb; (void)b; return 0; }
 void vk_ngx_fg_show(VkCommandBuffer cb, TexBackend *b, int generated) { (void)cb; (void)b; (void)generated; }
 void vk_ngx_fg_keep_hudless(VkCommandBuffer cb, TexBackend *out, uint64_t frame) { (void)cb; (void)out; (void)frame; }

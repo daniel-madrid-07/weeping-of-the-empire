@@ -342,6 +342,7 @@ volatile int g_cutscene_16x9;   /* graphics.cutscene_aspect = 16:9 (below; the V
 
 #ifndef TOTK_NO_PC_SETTINGS
 #include "../../../engine/runtime/pc_settings.h"
+#include "../../../engine/runtime/pc_overlay.h"
 
 static const struct { const char *key, *env; } k_row_env[] = {
     {"graphics.min_resolution", "TOTK_DYNAMIC_RES"}, {"graphics.fov", "TOTK_FOV"},
@@ -498,6 +499,12 @@ static void add_restart_rows(void) {
                 k_restart_rows[1].key);
     }
     pc_settings_add(k_restart_rows, g_restart_rows);
+    /* pc_settings puts a row into the environment only when the settings file or NX_SET_ names it, and wide_canvas reads
+       TOTK_WIDE: a first start (no file yet) or a file without the line kept the game's 16:9 with no line said, whatever
+       the window's shape (gate v0.1.9.1, the 3:2 boot). The row's own value then, its default "window" (with the overlay
+       off the file is never read: left as it was) */
+    const char *wide = getenv("TOTK_WIDE"), *row = pc_settings_get("graphics.aspect_ratio");
+    if ((!wide || !*wide) && row && *row && !aspect_row_off() && pc_overlay_enabled()) setenv_("TOTK_WIDE", row);
     if (!aspect_row_off()) {   /* (live: the saved value at once; present reads it every frame) */
         pc_settings_add(k_cutscene_row, 1);
         cutscene_apply(pc_settings_get(k_cutscene_row[0].key));
@@ -550,9 +557,6 @@ static void add_live_rows(void) {}
    or the monitor (TOTK_MONITOR's, else the primary); windowed -> LARECOMP_WINDOW (else ui_window_init's 1280x720). A
    TOTK_OUTPUT_RES given for the run wins. Taken only when the layout overlay for that shape is there (layout_overlay),
    else a 21:9 canvas would get the 16:9 HUD stretched over it. */
-#ifndef TOTK_NO_PC_SETTINGS
-#include "../../../engine/runtime/pc_overlay.h"
-#endif
 
 #ifdef _WIN32
 typedef struct { int want, n; HMONITOR found; } MonPick;
@@ -634,6 +638,25 @@ static int shape_marks(const char *ov, const char *const *sets, int n, int on) {
     return 1;
 }
 
+/* Why a shape's layouts were not built at this start, said on screen once the picture is up (totk_window_shape_hint):
+   1 = the build cannot leave the job the game runs in, which would end it with the game; 2 = an earlier build failed or
+   was stopped (its mark is there) */
+static int g_shape_note;
+
+#ifdef _WIN32
+/* The game runs in a job that ends every process in it when the job closes (a launcher that wraps the games it starts:
+   Steam, Playnite, a test harness): a build started from here dies with the game, leaving its mark (gate v0.1.9.1).
+   Only the innermost job is read: an outer kill-on-close job around a plain inner one (nested jobs) is missed, and the
+   build then starts in the jobs and dies with the game as before*/
+static int job_ends_children(void) {
+    BOOL in = FALSE;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+    if (!IsProcessInJob(GetCurrentProcess(), NULL, &in) || !in) return 0;
+    if (!QueryInformationJobObject(NULL, JobObjectExtendedLimitInformation, &li, sizeof li, NULL)) return 0;
+    return (li.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) != 0;
+}
+#endif
+
 static void build_shape(const char *const *sets, int n) {
     const char *cmd = getenv("TOTK_ASPECT_BUILD"), *ov = getenv("TOTK_OVERLAY");
     if (!cmd || !*cmd || !ov || !*ov) return;
@@ -642,8 +665,17 @@ static void build_shape(const char *const *sets, int n) {
     for (int i = 0; i < n; i++) {
         snprintf(mark, sizeof mark, "%s-%s.failed", ov, sets[i]);
         if (stat(mark, &st) == 0) {
-            fprintf(stderr, "[totk] aspect ratio: building %s did not succeed before (%s; Setup tries again): not asked "
-                            "again\n", sets[i], mark);
+            char why[200] = "";
+            FILE *f = fopen(mark, "r");
+            if (f) {
+                if (!fgets(why, sizeof why, f)) why[0] = 0;
+                fclose(f);
+            }
+            why[strcspn(why, "\r\n")] = 0;
+            fprintf(stderr, "[totk] aspect ratio: building %s did not succeed before (%s: %s; Setup tries again): not "
+                            "asked again\n", sets[i], mark, !strncmp(why, "building", 8) ? "it was stopped before it ended"
+                                                                                      : why);
+            g_shape_note = 2;
             return;
         }
     }
@@ -661,7 +693,23 @@ static void build_shape(const char *const *sets, int n) {
     STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi = {0};
     if (!shape_marks(ov, sets, n, 1)) return;
-    if (!CreateProcessW(NULL, line, NULL, NULL, FALSE, CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi)) {
+    /* out of the game's job (CREATE_BREAKAWAY_FROM_JOB; no effect outside one). A job that does not let it leave refuses
+       the start (ERROR_ACCESS_DENIED): then in the job, unless the job would end it with the game: no build then, this
+       run goes on at 16:9 and says how to get the layouts (LEAD 15:22) */
+    const DWORD flags = CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP;
+    BOOL ok = CreateProcessW(NULL, line, NULL, NULL, FALSE, flags | CREATE_BREAKAWAY_FROM_JOB, NULL, NULL, &si, &pi);
+    if (!ok && GetLastError() == ERROR_ACCESS_DENIED) {
+        if (job_ends_children()) {
+            fprintf(stderr, "[totk] aspect ratio: %s not built here, and the game runs in a job that ends what it starts "
+                            "when it closes (another launcher started it): the build would end with it. Start the game "
+                            "once from TotK Launcher.exe to build it (the game's 16:9 now)\n", sets[0]);
+            shape_marks(ov, sets, n, 0);
+            g_shape_note = 1;
+            return;
+        }
+        ok = CreateProcessW(NULL, line, NULL, NULL, FALSE, flags, NULL, NULL, &si, &pi);
+    }
+    if (!ok) {
         fprintf(stderr, "[totk] aspect ratio: the layouts' build did not start (error %lu): the game's 16:9\n", GetLastError());
         shape_marks(ov, sets, n, 0);   /* (this run goes on: the next start may try again) */
         return;
@@ -771,13 +819,19 @@ static void wide_canvas(void) {
    (wide_canvas above; its heap and layout sets are read once, so it cannot follow live). A window that takes another
    shape later (a borderless window moved to another monitor, a windowed one resized) keeps the start's picture, shown
    whole with bars, and one line says that a restart gives the new shape. Once per shape, after it has held for about a
-   second (a drag passes through many). totk_hooks.c calls it from the present; every 15th frame looks. */
+   second (a drag passes through many). totk_hooks.c calls it from the present; every 15th frame looks. A shape whose
+   layouts were not built at this start (build_shape, g_shape_note) is said here too, once, when the picture is up. */
 #if defined(_WIN32) && !defined(TOTK_NO_PC_SETTINGS)
 extern void *shim_window_hwnd(void);               /* nvn/vulkan/shim_win.c */
 extern void osd_toast(const char *text, int ms);   /* hle_osd.cpp */
 void totk_window_shape_hint(uint64_t frame) {
     static int on = -1, start = -2, last = -2, told = -2;
     static uint64_t since;
+    if (g_shape_note && frame >= 120) {
+        osd_toast(g_shape_note == 1 ? pc_tr("Screen shape: start the game once from TotK Launcher.exe to prepare its layout (16:9 until then)")
+                                    : pc_tr("This screen shape's layout was not prepared: 16:9 until Setup runs again"), 12000);
+        g_shape_note = 0;
+    }
     if (on < 0) {
         const char *w = getenv("TOTK_WIDE");
         on = w && !strcmp(w, "window") && !aspect_row_off();

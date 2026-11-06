@@ -154,6 +154,12 @@ default = true
 needs = []
 original_sha256 = "0230f6e6c91e52b687b6ae374ed484455873449539e58b1bdacd18ac9b743db6"
 
+[[feature]]
+name = "reportguard"
+default = true
+needs = []
+original_sha256 = "6dbf544bd675e2b83376f0a18785dff7b328db0470da694b0da82ed1758d830d"
+
 [[patch]]
 feature = "fps60"
 module = "main"
@@ -4691,4 +4697,98 @@ offset = 0x46661e0
 new = "22d61317"
 new_asm = "b #0xb5ba68"
 reason = "altitude effect burst count veneer [6]"
+
+[[veneer]]
+feature = "reportguard"
+module = "main"
+start = 0x46661f0
+end = 0x4666214
+
+[[patch]]
+feature = "reportguard"
+module = "main"
+offset = 0x844648
+new = "ea86f814"
+new_asm = "b #0x46661f0"
+reason = "reportguard: lsl w10, w9, #1 (2h) -> b <handle veneer>"
+
+[[patch]]
+feature = "reportguard"
+module = "main"
+offset = 0x46661f0
+new = "6900f837"
+new_asm = "tbnz w9, #0x1f, #0x46661fc"
+reason = "report handle veneer [0]"
+
+[[patch]]
+feature = "reportguard"
+module = "main"
+offset = 0x46661f4
+copy_of = 0x844648
+new_asm = "(the word at main+0x844648)"
+reason = "report handle veneer [1]"
+
+[[patch]]
+feature = "reportguard"
+module = "main"
+offset = 0x46661f8
+new = "15790717"
+new_asm = "b #0x84464c"
+reason = "report handle veneer [2]"
+
+[[patch]]
+feature = "reportguard"
+module = "main"
+offset = 0x46661fc
+new = "34790717"
+new_asm = "b #0x8446cc"
+reason = "report handle veneer [3]"
+
+[[patch]]
+feature = "reportguard"
+module = "main"
+offset = 0x844658
+new = "ea86f814"
+new_asm = "b #0x4666200"
+reason = "reportguard: lsl w9, w9, #1 (n) -> b <row index veneer>"
+
+[[patch]]
+feature = "reportguard"
+module = "main"
+offset = 0x4666200
+new = "3f214071"
+new_asm = "cmp w9, #8, lsl #12"
+reason = "report row index veneer [0]"
+
+[[patch]]
+feature = "reportguard"
+module = "main"
+offset = 0x4666204
+new = "62000054"
+new_asm = "b.hs #0x4666210"
+reason = "report row index veneer [1]"
+
+[[patch]]
+feature = "reportguard"
+module = "main"
+offset = 0x4666208
+copy_of = 0x844658
+new_asm = "(the word at main+0x844658)"
+reason = "report row index veneer [2]"
+
+[[patch]]
+feature = "reportguard"
+module = "main"
+offset = 0x466620c
+new = "14790717"
+new_asm = "b #0x84465c"
+reason = "report row index veneer [3]"
+
+[[patch]]
+feature = "reportguard"
+module = "main"
+offset = 0x4666210
+new = "2f790717"
+new_asm = "b #0x8446cc"
+reason = "report row index veneer [4]"
 

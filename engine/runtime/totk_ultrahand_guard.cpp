@@ -17,8 +17,8 @@
 // one runs the original untouched. Skipping costs one status bit on a dead object. A slot reused by another live actor
 // passes (no crash: the bit lands on that actor for a frame). Each newly skipped target is logged once (up to 20
 // lines); the first call also logs the Ultrahand query manager's capacities ('[query] type0 slots N results M').
-// 1.0.0 only (another version: the original). 1.4.3 needs a pin for 0x15eca7c (pins_v143.json) and the Player /
-// BaseProc / BaseProcLinkData offsets above through totk_field (fields_v143.json) before it can run there.
+// Another version runs it where its table pins 0x15eca7c (1.4.3: main+0x1bd0138, pins_v143.json) and places every
+// offset above (totk_field, fields_v143.json; else the original runs). The query capacity line is 1.0.0's only.
 // gen.py --hook 15eca7c in GEN_MAIN; on by default, TOTK_ULTRAHAND_GUARD=0 turns it off.
 // tools/oracle/test_ultrahand_guard.py.
 #include "rt.h"
@@ -35,13 +35,19 @@ extern "C" u64 kernel_heap_size(void);   // hle_os_mem.cpp: committed bytes from
 
 namespace {
 #if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
-constexpr bool kHere = false;
+constexpr bool kV100 = false;
 #else
-constexpr bool kHere = true;
+constexpr bool kV100 = true;
 #endif
-constexpr u64 kState = 0x6a0, kResult = 0x6b0;                          // the Player component's handle
-constexpr u64 kProcId = 0x10, kProcState = 0x24, kLinkData = 0x1a8;      // a BaseProc
-constexpr u64 kDataProc = 0x40, kDataId = 0x48;                          // its BaseProcLinkData
+constexpr u64 kState = totk_field(Player, 0x6a0), kResult = totk_field(Player, 0x6b0);   // the Player component's handle
+constexpr u64 kProcId = totk_field(BaseProc, 0x10), kProcState = totk_field(BaseProc, 0x24),
+              kLinkData = totk_field(BaseProc, 0x1a8);                                   // a BaseProc
+constexpr u64 kDataProc = totk_field(BaseProcUnit, 0x40), kDataId = totk_field(BaseProcUnit, 0x48);   // its link data
+// (another version: the guard runs where its table placed every field it reads, else the game reads as before)
+constexpr bool kHere = totk_field_known(Player, 0x6a0) && totk_field_known(Player, 0x6b0) &&
+                       totk_field_known(BaseProc, 0x10) && totk_field_known(BaseProc, 0x24) &&
+                       totk_field_known(BaseProc, 0x1a8) && totk_field_known(BaseProcUnit, 0x40) &&
+                       totk_field_known(BaseProcUnit, 0x48);
 alignas(8) const u64 g_zero_entry = 0;   // the result the update is shown for a dead target: its first word, 0, is
                                          // 'no target' to the game (0x15ecb10)
 
@@ -79,7 +85,8 @@ bool enabled() {
     static const bool on = [] {
         const char *e = getenv("TOTK_ULTRAHAND_GUARD");
         const bool v = !e || strcmp(e, "0");
-        printf("[ultrahand-guard] Ultrahand's bound target %s\n", !kHere ? "read as the game (1.0.0 only)"
+        printf("[ultrahand-guard] Ultrahand's bound target %s\n",
+               !kHere ? "read as the game (its fields are not placed in this version)"
                : v ? "checked alive before its read (the default)" : "read as the game (TOTK_ULTRAHAND_GUARD=0)");
         return v && kHere;
     }();
@@ -94,7 +101,7 @@ void say_query_capacity() {
     static std::atomic<bool> done{false};
     static std::atomic<u32> calls{0};
     static std::atomic_flag said_wait = ATOMIC_FLAG_INIT;
-    if (!kHere || done.load(std::memory_order_relaxed) || (calls.fetch_add(1) & 63)) return;
+    if (!kV100 || done.load(std::memory_order_relaxed) || (calls.fetch_add(1) & 63)) return;   // (1.0.0's chain)
     u64 sys = 0, mgrs = 0, mgr = 0;
     const u64 owner = totk_global(0x4557a28);
     if (readable(owner + 0x128, 8)) sys = ld64(owner + 0x128);

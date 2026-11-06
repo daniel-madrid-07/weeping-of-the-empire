@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -17,8 +18,10 @@
 namespace {
 
 std::vector<uint32_t> g_hot, g_helper, g_all, g_render;
+uint32_t g_guest[3];   // TOTK_CORE_MODEL=switch: guest core k's CPU Set id (g_guest_on)
 int g_total = 0, g_smt = -1;
-bool g_on = false;
+bool g_on = false, g_guest_on = false;
+bool g_split = false;  // something is out of every other set (the render core, the guest cores)
 
 // distinct physical cores among the logical processors of class eff (and cache llc, or any: -1); core / llc are the
 // planner's dense ids (below ncore)
@@ -145,6 +148,43 @@ extern "C" int cpu_place_render_core(const cpu_lp *in, int n, const uint32_t *ho
     for (int i = 0; i < n && m < 4; i++)
         if (cand(in[i]) && ((uint32_t)in[i].group << 16 | in[i].core) == keys[last]) render[m++] = in[i].id;
     return m;
+}
+
+// The guest cores (cpu_place.h "guest"): three physical cores of hot (all where it is unrestricted), the fastest class
+// first, then the system's order, not the render core's; guest core k = the first logical processor of the k-th. Whole
+// cores (siblings idle) while 2 physical cores are left for everything else, else the 3 logical processors while 2 of
+// those are left (a 4c/8t with its render core), else none.
+extern "C" int cpu_place_guest_cores(const cpu_lp *in, int n, const uint32_t *hot, int n_hot, const uint32_t *render, int n_render,
+                                     uint32_t *guest, uint32_t *reserve, int *n_reserve) {
+    *n_reserve = 0;
+    auto has = [](const uint32_t *v, int m, uint32_t id) { for (int j = 0; j < m; j++) if (v[j] == id) return true; return false; };
+    int top = 0;
+    for (int i = 0; i < n; i++) top = in[i].eff > top ? in[i].eff : top;
+    std::vector<uint32_t> cores, cand;   // (group << 16 | core) of every physical core; of the chosen ones
+    for (int i = 0; i < n; i++) {
+        const uint32_t k = (uint32_t)in[i].group << 16 | in[i].core;
+        if (std::find(cores.begin(), cores.end(), k) == cores.end()) cores.push_back(k);
+    }
+    for (int eff = top; eff >= 0 && cand.size() < 3; eff--)
+        for (int i = 0; i < n && cand.size() < 3; i++) {
+            const uint32_t k = (uint32_t)in[i].group << 16 | in[i].core;
+            if (in[i].eff != eff || (n_hot && !has(hot, n_hot, in[i].id)) || std::find(cand.begin(), cand.end(), k) != cand.end())
+                continue;
+            bool on_render = false;   // (any logical processor of this core is the render core's)
+            for (int j = 0; j < n; j++)
+                on_render |= ((uint32_t)in[j].group << 16 | in[j].core) == k && has(render, n_render, in[j].id);
+            if (on_render) continue;
+            guest[cand.size()] = in[i].id;
+            cand.push_back(k);
+        }
+    const int left = (int)cores.size() - (n_render ? 1 : 0) - 3, lp_left = n - n_render - 3;
+    if (cand.size() < 3 || (left < 2 && lp_left < 2)) return 0;
+    const bool whole = left >= 2;
+    for (int i = 0; i < n; i++) {
+        const uint32_t k = (uint32_t)in[i].group << 16 | in[i].core;
+        if (whole ? std::find(cand.begin(), cand.end(), k) != cand.end() : has(guest, 3, in[i].id)) reserve[(*n_reserve)++] = in[i].id;
+    }
+    return whole ? 2 : 1;
 }
 
 #ifdef _WIN32
@@ -280,21 +320,43 @@ extern "C" void cpu_place_init(void) {
                                        min_smt, rids);
         }
     }
+    std::vector<uint32_t> out;   // (out of every other set)
     if (nr && nr < (int)lps.size()) {
         g_render.assign(rids, rids + nr);
-        auto drop = [](std::vector<uint32_t> &v) {
+        out = g_render;
+    }
+    // TOTK_CORE_MODEL=switch (cpu_place.h "guest"): the guest cores out of every other set, as the render core
+    const char *cm = getenv("TOTK_CORE_MODEL");
+    const char *cm_why = nullptr;
+    int cm_mode = 0;
+    if (cm && !strcmp(cm, "switch")) {
+        std::vector<uint32_t> res(lps.size());
+        int nres = 0;
+        cm_mode = cpu_place_guest_cores(lps.data(), (int)lps.size(), g_on ? g_hot.data() : nullptr, g_on ? (int)g_hot.size() : 0,
+                                        g_render.data(), (int)g_render.size(), g_guest, res.data(), &nres);
+        if (!spd) cm_why = wine ? "Wine: its CPU Sets are stubs" : "no CPU Sets";
+        else if (!cm_mode) cm_why = "too few cores: 3 physical ones beside the render core, and 2 left for the rest";
+        else {
+            out.insert(out.end(), res.begin(), res.begin() + nres);
+            g_guest_on = true;
+        }
+    }
+    if (!out.empty()) {
+        g_split = true;
+        auto drop = [&out](std::vector<uint32_t> &v) {
             std::vector<uint32_t> keep;
             for (uint32_t id : v) {
                 bool r = false;
-                for (uint32_t x : g_render) r |= x == id;
+                for (uint32_t x : out) r |= x == id;
                 if (!r) keep.push_back(id);
             }
             v.swap(keep);
         };
-        if (!g_on || g_hot.empty()) g_hot = g_all;   // (hot restricted now: everything but the render core)
+        if (!g_on || g_hot.empty()) g_hot = g_all;   // (hot restricted now: everything but those)
         drop(g_hot);
         drop(g_all);
         drop(g_helper);
+        if (g_hot.empty()) g_hot = g_all;   // (the guest cores took all of hot: the rest of the process instead)
     }
     printf("[cpu] render thread: %s\n",
            !g_render.empty() ? (manual ? "alone on the core of LARECOMP_RENDER_PIN's logical processor"
@@ -304,11 +366,17 @@ extern "C" void cpu_place_init(void) {
            : !spd            ? (wine ? "not placed (Wine: its CPU Sets are stubs)" : "not placed (no CPU Sets)")
            : manual          ? "not placed (LARECOMP_RENDER_PIN: no such logical processor)"
                              : "not placed (fewer than 4 SMT cores in hot)");
+    if (g_guest_on)
+        printf("[cpu] TOTK_CORE_MODEL=switch: guest cores 0 / 1 / 2 on CPU Sets %u / %u / %u alone (%s); guest threads held "
+               "to their core mask there at host priorities from the guest ones\n",
+               g_guest[0], g_guest[1], g_guest[2], cm_mode == 2 ? "their physical cores reserved" : "their SMT siblings run the rest");
+    else if (cm_why)
+        printf("[cpu] TOTK_CORE_MODEL=switch: not placed (%s): guest threads run as without it\n", cm_why);
     printf("[cpu] counts: hot %d, any %d, helper %d of %d logical processors in the process affinity (%d outside it)%s\n",
            cpu_place_count(CPU_HOT), cpu_place_count(CPU_ANY), cpu_place_count(CPU_HELPER), g_total, outside,
            cpu_place_active() ? "" : "; helpers not separated");
     printf("[cpu] SMT: %s\n", g_smt > 0 ? "yes (the fastest cores have siblings)" : g_smt == 0 ? "no (one logical processor a core)" : "unknown");
-    if ((g_on || !g_render.empty()) && !g_hot.empty()) {
+    if ((g_on || g_split) && !g_hot.empty()) {
         if (!spd(GetCurrentProcess(), (const ULONG *)g_hot.data(), (ULONG)g_hot.size()))
             printf("[cpu] SetProcessDefaultCpuSets failed (%lu)\n", GetLastError());
         // The process default is documented for threads created after it, so the thread calling this (the main /
@@ -317,6 +385,18 @@ extern "C" void cpu_place_init(void) {
         if (auto sts = (BOOL(WINAPI *)(HANDLE, const ULONG *, ULONG))GetProcAddress(k32, "SetThreadSelectedCpuSets"))
             sts(GetCurrentThread(), (const ULONG *)g_hot.data(), (ULONG)g_hot.size());
     }
+}
+
+extern "C" bool cpu_place_core_model(void) { return g_guest_on; }
+
+extern "C" bool cpu_place_guest_thread(void *h, uint64_t mask) {
+    if (!g_guest_on) return false;
+    static auto sts = (BOOL(WINAPI *)(HANDLE, const ULONG *, ULONG))GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                                                    "SetThreadSelectedCpuSets");
+    ULONG ids[3], n = 0;
+    for (int k = 0; k < 3; k++)
+        if (mask >> k & 1) ids[n++] = g_guest[k];
+    return sts && n && sts((HANDLE)h, ids, n);
 }
 
 extern "C" int cpu_place_smt(void) { return g_smt; }
@@ -356,12 +436,12 @@ extern "C" void cpu_place_thread(int cls) {
 extern "C" bool cpu_place_active(void) { return g_on && !g_helper.empty() && !g_hot.empty(); }
 
 extern "C" int cpu_place_count(int cls) {
-    const bool split = g_on || !g_render.empty();   // (any: all but the render core)
+    const bool split = g_on || g_split;   // (any: all but the render / guest cores)
     const size_t n = cls == CPU_HELPER ? (g_on ? g_helper.size() : 0)
                      : cls == CPU_HOT  ? (split ? g_hot.size() : 0)
-                     : cls == CPU_ANY && !g_render.empty() ? g_all.size() : 0;
+                     : cls == CPU_ANY && g_split ? g_all.size() : 0;
     if (n) return (int)n;
-    if (!g_render.empty()) return (int)g_all.size();   // (an unrestricted class: every logical processor but the render core's)
+    if (g_split) return (int)g_all.size();   // (an unrestricted class: every logical processor but the render / guest cores')
     if (g_total) return g_total;
     SYSTEM_INFO si;
     GetSystemInfo(&si);
@@ -373,5 +453,7 @@ extern "C" void cpu_place_thread(int) {}
 extern "C" bool cpu_place_active(void) { return false; }
 extern "C" int cpu_place_hot(uint32_t *, int) { return 0; }
 extern "C" int cpu_place_smt(void) { return -1; }
+extern "C" bool cpu_place_core_model(void) { return false; }
+extern "C" bool cpu_place_guest_thread(void *, uint64_t) { return false; }
 extern "C" int cpu_place_count(int) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }
 #endif

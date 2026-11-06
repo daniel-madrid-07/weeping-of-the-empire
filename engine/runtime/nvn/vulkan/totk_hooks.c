@@ -73,23 +73,40 @@ static bool scene_16x9(void) {
 }
 
 bool output_res_scaled(void) { res_scale_init(); return g_res_scaled > 0; }
-// "auto": the scene as tall as 900 / 1080 of the window (the game's 1600x900 at 1080 lines). A 16:9 scene keeps the
-// window height / 1080 of before (whatever TOTK_RENDER_RES gave it); another shape's scene, already the canvas's size,
-// is scaled only as far as that height needs (5120x1440 in a 1417-line window: 1).
-static double res_scale(double dh) {
+// "auto" (the row's default since 11-05: "if I set my game to 1440p it is at 1440p"): the scene as large as its picture
+// in the window, fitted by its shape (16:9 1600x900 in 2560x1440: x1.6, 2560x1440; in 3440x1440: the pillarboxed
+// 2560x1440 too; 5120x1440 in a 1417-line window: 0.98, so 1). An integrated GPU or one under 8 GB (textures.c
+// renderer_auto_scale_small; the row names it) keeps the pick of before: a 16:9 scene as tall as 900 / 1080 of the
+// window (whatever TOTK_RENDER_RES gave it), another shape's scaled only as far as that height needs. With an upscaler
+// on (DLSS, FSR, XeSS; ngx.c vk_ngx_auto_ratio) the window's picture / 1.5, its Quality input, on any GPU (the smaller
+// of the two on a small one), down to x0.5 (1080p: 1280x720).
+static double res_scale(double dw, double dh) {
     res_scale_init();
     const long m = g_res_milli;
     if (m == 0) {
-        double a = dh / 1080.0;
-        if (!scene_16x9()) { unsigned w, h; output_scene_size(&w, &h); a *= 900.0 / h; }
-        return a < 1.0 ? 1.0 : a > 4.0 ? 4.0 : a;
+        extern int renderer_auto_scale_small(void);
+        extern void pc_settings_auto_scale_small(void);   // (pc_settings.cpp: the row's choice says so)
+        extern float vk_ngx_auto_ratio(void);
+        unsigned w, h;
+        output_scene_size(&w, &h);
+        const double r = vk_ngx_auto_ratio();
+        double a = (dw / w < dh / h ? dw / w : dh / h) / r;
+        if (renderer_auto_scale_small()) {
+            static int told;
+            if (!told++) pc_settings_auto_scale_small();
+            double s = dh / 1080.0;
+            if (!scene_16x9()) s *= 900.0 / h;
+            if (r == 1.0 || s < a) a = s;
+        }
+        const double lo = r > 1.0 ? 0.5 : 1.0;
+        return a < lo ? lo : a > 4.0 ? 4.0 : a;
     }
     return m / 1000.0;
 }
 
 void output_scale(double dw, double dh, bool reshape_allowed, double now, double gpu_ms, OutScale *o) {
     (void)reshape_allowed; (void)now; (void)gpu_ms;
-    o->sx = o->sy = res_scale(dh); o->shape = 1.0;
+    o->sx = o->sy = res_scale(dw, dh); o->shape = 1.0;
     {   // DLAA (ngx.c, the Upscaler row's "dlaa"): the scene at the output's size while it runs; the row's choice otherwise
         extern float vk_ngx_scene_scale(float), renderer_out_scale(void);
         const float w = vk_ngx_scene_scale(renderer_out_scale());

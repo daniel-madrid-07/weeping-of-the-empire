@@ -11,6 +11,8 @@
 #pragma once
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <system_error>
@@ -30,7 +32,44 @@ struct Found {
 };
 
 inline std::string u8(const fs::path& p) { auto s = p.u8string(); return std::string(s.begin(), s.end()); }
-inline fs::path from_u8(const std::string& s) { return fs::path(std::u8string(s.begin(), s.end())); }
+// s is well-formed UTF-8 (no overlong form, no surrogate, nothing past U+10FFFF): what std::filesystem's UTF-8
+// conversion takes without throwing
+inline bool valid_u8(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) { i++; continue; }
+        const int n = (c & 0xe0) == 0xc0 ? 1 : (c & 0xf0) == 0xe0 ? 2 : (c & 0xf8) == 0xf0 ? 3 : -1;   // continuation bytes
+        if (n < 0 || i + n >= s.size()) return false;
+        unsigned cp = c & (0x3f >> n);
+        for (int k = 1; k <= n; k++) {
+            const unsigned char d = (unsigned char)s[i + k];
+            if ((d & 0xc0) != 0x80) return false;
+            cp = cp << 6 | (d & 0x3f);
+        }
+        if ((n == 1 && cp < 0x80) || (n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000) || cp > 0x10ffff ||
+            (cp >= 0xd800 && cp <= 0xdfff))
+            return false;
+        i += n + 1;
+    }
+    return true;
+}
+// A path from our UTF-8 string. Bytes that are not UTF-8 (a narrow API's ANSI code page, e.g. 'Moisés' from getenv)
+// are read in that code page instead: std::filesystem throws on them, and the runtime cannot catch (public #94).
+inline fs::path from_u8(const std::string& s) {
+    return valid_u8(s) ? fs::path(std::u8string(s.begin(), s.end())) : fs::path(s);
+}
+// An environment variable as UTF-8, "" when unset. The launcher sets the paths wide; on Windows getenv gives them in
+// the ANSI code page, which a UTF-8 reader takes wrong (#94: the mods folder under a profile 'Moisés').
+inline std::string env_u8(const char* var) {
+#ifdef _WIN32
+    const std::wstring w(var, var + strlen(var));
+    const wchar_t* v = _wgetenv(w.c_str());
+    return v && *v ? u8(fs::path(v)) : std::string();
+#else
+    const char* v = getenv(var);
+    return v ? std::string(v) : std::string();
+#endif
+}
 
 inline bool ieq(const std::string& a, const std::string& b) {
     return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {

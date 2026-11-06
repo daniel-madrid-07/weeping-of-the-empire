@@ -13,8 +13,11 @@
 // (the original exits only on -1 and sign-extends the rest). For a failing handle the hook does the original's own
 // 'no handle' path itself (0x84463c..0x844644: obj+0x94 = 0, the coverage of an object without a report) and returns,
 // so the handle is never written. A valid handle runs the original untouched. The original re-reads row 2h after the
-// check: a row rewritten in between can still hand it a bad n (a read-site guard can't close that; the writer would).
-// Each newly skipped (object, handle) is logged once (up to 20 lines). 1.0.0 only (another version: the original).
+// check: a row rewritten in between could still hand it a bad n (closed by the reportguard code patch, below).
+// Each newly skipped (object, handle) is logged once (up to 20 lines). 1.0.0 only (another version: the original;
+// 1.4.3 inlines this function, so the code patch games/totk/patches/sites_v143.py reportguard checks its rows instead).
+// 1.0.0 also has that patch (sites_v100.py reportguard): it re-checks h / n where the function reads them, so the
+// re-read above can no longer hand it a bad n.
 // gen.py --hook 844634 in GEN_MAIN; on by default, TOTK_REPORT_GUARD=0 turns it off.
 // tools/oracle/test_report_guard.py.
 #include "rt.h"

@@ -586,8 +586,8 @@ PC_ES("Rendering",
       "Renderizado")
 PC_ES("Upscaler",
       "Escalador")
-PC_ES("TOTK_DLSS_SR / TOTK_FSR_SR. DLSS (NVIDIA RTX) or FSR (any GPU) upscales the 3D scene to the output in place of the game's upscaler and its FXAA (DLAA / native AA when Render resolution matches the output).",
-      "TOTK_DLSS_SR / TOTK_FSR_SR. DLSS (NVIDIA RTX) o FSR (cualquier GPU) reescala la escena 3D a la salida en lugar del reescalador del juego y su FXAA (DLAA / AA nativo cuando la resolución de render coincide con la de salida).")
+PC_ES("TOTK_DLSS_SR / TOTK_FSR_SR / TOTK_XESS_SR. DLSS (NVIDIA RTX), FSR or XeSS (any GPU) upscales the 3D scene to the output in place of the game's upscaler and its FXAA (DLAA / native AA when Render resolution matches the output).",
+      "TOTK_DLSS_SR / TOTK_FSR_SR / TOTK_XESS_SR. DLSS (NVIDIA RTX), FSR o XeSS (cualquier GPU) escala la escena 3D a la salida en lugar del escalador del juego y su FXAA (DLAA / AA nativo cuando la resolución de renderizado coincide con la salida).")
 PC_ES("DLSS (NVIDIA RTX)",
       "DLSS (NVIDIA RTX)")
 PC_ES("DLAA (NVIDIA RTX)",
@@ -630,8 +630,8 @@ PC_ES("Console layout",
       "Como en consola")
 PC_ES("Language",
       "Idioma")
-PC_ES("TOTK_LANG: the game's texts and voices' subtitles, and the PC settings' own texts (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' display language if the game has it, else English.",
-      "TOTK_LANG: los textos del juego y los subtítulos de las voces, y los propios textos de los ajustes de PC (inglés, español, ruso, portugués de Brasil, chino simplificado). Português (Brasil): los textos de la 1.4.3; con la 1.0.0 necesitan la actualización 1.4.3 dada al Setup (si no, inglés); las voces siguen en inglés. Automático: el idioma de Windows si el juego lo tiene; si no, inglés.")
+PC_ES("TOTK_LANG: the game's texts and voices' subtitles, and the PC settings' own texts (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese, Traditional Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' display language if the game has it, else English.",
+      "TOTK_LANG: los textos del juego y los subtítulos de las voces, y los propios textos de los ajustes de PC (inglés, español, ruso, portugués de Brasil, chino simplificado, chino tradicional). Português (Brasil): los textos de la 1.4.3; con la 1.0.0 necesitan la actualización 1.4.3 dada al Setup (si no, inglés); las voces siguen en inglés. Automático: el idioma de Windows si el juego lo tiene; si no, inglés.")
 PC_ES("Automatic (Windows' language)",
       "Automático (idioma de Windows)")
 PC_ES("English (US)",
@@ -870,16 +870,18 @@ PC_ES("real",
       "reales")
 PC_ES("Render resolution",
       "Resolución de render")
-PC_ES("TOTK_RES_SCALE, of the game's 1600 x 900. Applies at once.",
-      "TOTK_RES_SCALE, sobre los 1600 x 900 del juego. Se aplica al momento.")
+PC_ES("TOTK_RES_SCALE, of the game's 1600 x 900. Window resolution: the 3D scene as large as the picture in the window (x0.83 of it on an integrated GPU or one under 8 GB; two thirds of it with DLSS, FSR or XeSS, their Quality). Applies at once.",
+      "TOTK_RES_SCALE, sobre los 1600 x 900 del juego. Resolución de la ventana: la escena 3D tan grande como la imagen en la ventana (x0,83 de ella con una GPU integrada o de menos de 8 GB; dos tercios con DLSS, FSR o XeSS, su modo Calidad). Se aplica al momento.")
 PC_ES("100 % (native)",
       "100 % (nativa)")
-PC_ES("Follow the window height",
-      "Según la altura de la ventana")
+PC_ES("Window resolution (default)",
+      "Resolución de la ventana (por defecto)")
+PC_ES("Window resolution x0.83 (default: integrated GPU or under 8 GB)",
+      "Resolución de la ventana x0,83 (por defecto: GPU integrada o de menos de 8 GB)")
 PC_ES("Native-resolution interface",
       "Interfaz a resolución nativa")
-PC_ES("TOTK_OUT_SCALE: above 1080p, menus, text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched. Off by default: at some resolutions it can show broken text (being fixed). Applies at once.",
-      "TOTK_OUT_SCALE: por encima de 1080p, menús, textos y HUD dibujados a la resolución de la ventana en vez de los 1920 x 1080 del juego estirados. Desactivado por defecto: con algunas resoluciones puede mostrar texto roto (en arreglo). Se aplica al momento.")
+PC_ES("TOTK_OUT_SCALE: above 1080p, menus, text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched; the 3D scene reaches it too. On by default. Applies at once.",
+      "TOTK_OUT_SCALE: por encima de 1080p, menús, textos y HUD dibujados a la resolución de la ventana en vez de los 1920 x 1080 del juego estirados; la escena 3D también llega a ella. Activado por defecto. Se aplica al momento.")
 PC_ES("Off (fixed size)",
       "No (tamaño fijo)")
 PC_ES("On, never below 90 %",
@@ -1279,6 +1281,10 @@ PC_ES("Paper white (nits)",
       "Blanco de papel (nits)")
 PC_ES("TOTK_HDR_PAPER: the brightness of SDR white.",
       "TOTK_HDR_PAPER: el brillo del blanco SDR.")
+PC_ES("Highlight colour",
+      "Color de las luces")
+PC_ES("TOTK_HDR_HUE: the hue of bright lights from the game's HDR scene, 0 to 100.",
+      "TOTK_HDR_HUE: el tono de las luces intensas, tomado de la escena HDR del juego, de 0 a 100.")
 PC_ES("Mouse cursor in menus",
       "Cursor del ratón en menús")
 PC_ES("TOTK_MENU_CURSOR: in a menu the pointer shows and selects what it points at; left click is A (back is Esc).",
@@ -1547,14 +1553,14 @@ PC_ES("The counter's corner. Top right keeps clear of the hearts and the map.",
       "La esquina del contador. Arriba a la derecha no tapa los corazones ni el mapa.")
 PC_ES("The counter's size. It also grows with the window's height.",
       "El tamaño del contador. También crece con la altura de la ventana.")
-PC_ES("The resolution the 3D scene is drawn at, against the game's own. Higher is sharper and costs much more GPU; lower is faster and blurrier. 100 % is native.",
-      "La resolución a la que se dibuja la escena 3D, respecto a la del juego. Más alta es más nítida y cuesta mucha más GPU; más baja es más rápida y más borrosa. 100 % es la nativa.")
+PC_ES("The resolution the 3D scene is drawn at, against the game's own. Higher is sharper and costs much more GPU; lower is faster and blurrier. The default: the window's resolution.",
+      "La resolución a la que se dibuja la escena 3D, respecto a la del juego. Más alta es más nítida y cuesta mucha más GPU; más baja es más rápida y más borrosa. Por defecto: la resolución de la ventana.")
 PC_ES("Lowers the 3D resolution only when the GPU falls behind, never below the floor chosen, to hold the frame rate. Off keeps the picture sharp all the time; On is smoother on a slower GPU.",
       "Baja la resolución 3D solo cuando la GPU se queda atrás, nunca por debajo del mínimo elegido, para mantener los FPS. Desactivada, la imagen siempre es nítida; activada, va más fluido en una GPU más lenta.")
-PC_ES("Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the game's 1080p stretched. Sharper text for a little GPU. Off by default for now: at some resolutions it can show broken text (being fixed).",
-      "Por encima de 1080p, los menús, los textos y el HUD se dibujan a la resolución de la ventana en vez de estirar los 1080p del juego. Texto más nítido a cambio de un poco de GPU. Desactivado por defecto de momento: con algunas resoluciones puede mostrar texto roto (en arreglo).")
-PC_ES("Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR: any GPU. All cost some GPU; Off is the game's own.",
-      "Escala la escena 3D con un escalador temporal que construye el detalle a lo largo de varios fotogramas. DLSS: solo NVIDIA RTX; DLAA: DLSS a resolución completa, la mejor imagen a cambio de más GPU. FSR: cualquier GPU. Todos cuestan algo de GPU; desactivado es lo del juego.")
+PC_ES("Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the game's 1080p stretched, and the 3D scene (render scale, DLSS / DLAA) reaches the window's resolution too. Sharper picture for a little GPU.",
+      "Por encima de 1080p, los menús, los textos y el HUD se dibujan a la resolución de la ventana en vez de estirar los 1080p del juego, y la escena 3D (resolución de render, DLSS / DLAA) también llega a la resolución de la ventana. Imagen más nítida a cambio de un poco de GPU.")
+PC_ES("Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR and XeSS: any GPU (XeSS runs fastest on Intel Arc). All cost some GPU; Off is the game's own.",
+      "Escala la escena 3D con un escalador temporal que construye el detalle a lo largo de varios fotogramas. DLSS: solo NVIDIA RTX; DLAA: DLSS a resolución completa, la mejor imagen a cambio de más GPU. FSR y XeSS: cualquier GPU (XeSS va más rápido en Intel Arc). Todos cuestan algo de GPU; Desactivado es el del juego.")
 PC_ES("Generated frames between the real ones make motion look smoother, but the game itself does not run faster and input latency rises a little. DLSS x2: RTX 40 and newer, x3 and x4: RTX 50; FSR x2: any GPU. Best when the game already runs well.",
       "Los fotogramas generados entre los reales hacen que el movimiento se vea más fluido, pero el juego no va más rápido y el retraso de entrada sube un poco. DLSS x2: RTX 40 o posterior, x3 y x4: RTX 50; FSR x2: cualquier GPU. Mejor cuando el juego ya va bien.")
 PC_ES("How the 3D scene is scaled up to the output: Bicubic (the port's) or FSR 1 (the game's own). Matters only below 100 % render resolution; either costs little.",
@@ -1571,8 +1577,8 @@ PC_ES("Keeps ground textures sharp when seen at a shallow angle. Higher is sharp
       "Mantiene nítidas las texturas del suelo vistas en ángulo. Más alto es más nítido a cambio de un poco de GPU; 16x va bien en casi todas las GPU. El del juego: su propio ajuste.")
 PC_ES("Which texture detail level is used; 0 is the game's. Below 0 is sharper but can shimmer; above 0 is blurrier and can break textures (red grass). Not a quality slider: leave it at 0.",
       "Qué nivel de detalle de textura se usa; 0 es el del juego. Por debajo de 0 es más nítido pero puede parpadear; por encima de 0 es más borroso y puede estropear texturas (hierba roja). No es un ajuste de calidad: déjalo en 0.")
-PC_ES("The resolution of the renderer's shadow maps: 1x is the Switch's, 2x (default) sharper, 3x and 4x sharper still for more GPU time and memory.",
-      "La resolución de los mapas de sombras del renderizador: 1x es la de la Switch, 2x (por defecto) más nítida, 3x y 4x más nítidas aún a cambio de más tiempo de GPU y memoria.")
+PC_ES("The resolution of the renderer's shadow maps: 1x is the Switch's, 2x (default) sharper, 3x and 4x sharper still for more GPU time and memory. With little video memory they are lowered to what fits (4 GB cards: 2x).",
+      "La resolución de los mapas de sombras del renderizador: 1x es la de la Switch, 2x (por defecto) más nítida, 3x y 4x más nítidas aún a cambio de más tiempo de GPU y memoria. Con poca memoria de vídeo se bajan a lo que cabe (tarjetas de 4 GB: 2x).")
 PC_ES("Sun shadows grow softer the farther they fall from what casts them, as in real light. Off is the game's look; on costs some GPU. A change rebuilds the shadow shaders in the background: the old shadows show until then.",
       "Las sombras del sol se suavizan cuanto más lejos caen de lo que las proyecta, como con luz real. Desactivadas es el aspecto del juego; activadas cuestan algo de GPU. Un cambio vuelve a crear los shaders de sombras en segundo plano: hasta entonces se ven las sombras anteriores.")
 PC_ES("Adds the small sun shadows the shadow maps miss: at feet, under stones, in grass. Off is the game's look; Subtle to Strong cost some GPU.",
@@ -1599,6 +1605,8 @@ PC_ES("Your monitor's peak brightness in nits, so highlights are neither clipped
       "El brillo máximo de tu monitor en nits, para que las luces no se recorten ni queden apagadas. Usa el valor que indica el monitor.")
 PC_ES("How bright ordinary white (menus, the sky) is in HDR. Raise it if the picture looks dim, lower it if it is too bright.",
       "Cuánto brilla el blanco normal (menús, el cielo) en HDR. Súbelo si la imagen se ve apagada, bájalo si brilla demasiado.")
+PC_ES("How much of their real colour bright lights keep in HDR: a torch flame or lava stays orange instead of turning yellow-white. 0 (the default) shows the picture as in SDR, only brighter; the HUD is left as it is.",
+      "Cuánto conservan su color real las luces intensas en HDR: la llama de una antorcha o la lava siguen naranjas en vez de volverse de un blanco amarillento. Con 0 (lo predeterminado) la imagen es como en SDR, solo que más brillante; el HUD se queda como está.")
 PC_ES("The window's (the default): on a 3:2, 16:10, 21:9, 32:9 or 48:9 window or monitor the picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9 / 3:2: that shape whatever the window. A new shape's layouts are made at its first start (about 30 s, once). A wider picture costs more GPU.",
       "La de la ventana (predeterminado): en una ventana o monitor 3:2, 16:10, 21:9, 32:9 o 48:9 la imagen toma esa forma, 21:9, 32:9 y 48:9 con más campo de visión; las demás formas, 16:9 entre ellas, mantienen la del juego. 16:9 / 16:10 / 21:9 / 32:9 / 48:9 / 3:2: esa forma sea cual sea la ventana. Las interfaces de una forma nueva se preparan en su primer arranque (unos 30 s, una vez). Una imagen más ancha exige más a la GPU.")
 PC_ES("On 21:9, 32:9 or 48:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a very wide screen). Nothing changes at 16:9. Automatic (the default): the middle on 48:9, the edges otherwise.",
@@ -1705,10 +1713,10 @@ PC_ES("How far the left stick must move before it counts. Raise it if Link moves
       "Cuánto tiene que moverse la palanca izquierda antes de contar. Súbelo si Link se mueve con la palanca en reposo; bájalo para pasos más finos. 0 = lo del mando.")
 PC_ES("How far the right stick must move before it counts. Raise it if the camera turns with the stick at rest; lower it for finer aiming. 0 = the pad's own.",
       "Cuánto tiene que moverse la palanca derecha antes de contar. Súbelo si la cámara gira con la palanca en reposo; bájalo para apuntar con más precisión. 0 = lo del mando.")
-PC_ES("The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' language if the game has it, else English.",
-      "Los textos y subtítulos del juego, y los de estos ajustes (inglés, español, ruso, portugués de Brasil, chino simplificado). Português (Brasil): los textos de la 1.4.3; con la 1.0.0 necesitan la actualización 1.4.3 dada al Setup (si no, inglés); las voces siguen en inglés. Automático: el idioma de Windows si el juego lo tiene; si no, inglés.")
-PC_ES("A new game skips the opening and starts on the Great Sky Island. F2 or Minus on the title screen also switch it.",
-      "Una partida nueva se salta la introducción y empieza en la Gran isla de los albores. F2 o Menos en la pantalla de título también lo cambian.")
+PC_ES("The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese, Traditional Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' language if the game has it, else English.",
+      "Los textos y subtítulos del juego, y los de estos ajustes (inglés, español, ruso, portugués de Brasil, chino simplificado, chino tradicional). Português (Brasil): los textos de la 1.4.3; con la 1.0.0 necesitan la actualización 1.4.3 dada al Setup (si no, inglés); las voces siguen en inglés. Automático: el idioma de Windows si el juego lo tiene; si no, inglés.")
+PC_ES("A new game skips the opening and starts on the Great Sky Island. F2 or Minus on the title screen also switch it. Game version 1.0.0 only (on 1.4.x the opening plays and the row is hidden).",
+      "Una partida nueva se salta la introducción y empieza en la Gran isla de los albores. F2 o Menos en la pantalla de título también lo cambian. Solo con la versión 1.0.0 del juego (en la 1.4.x la introducción se reproduce y la fila no aparece).")
 PC_ES("Docked (default) or handheld: handheld renders at the Switch's lower handheld resolution (faster, blurrier).",
       "Sobremesa (por defecto) o portátil: en portátil el juego dibuja a la resolución más baja del modo portátil de la Switch (más rápido, más borroso).")
 PC_ES("Pauses the game, picture and sound, while its window is not in front.",
@@ -1767,6 +1775,10 @@ PC_ES("Wide picture: F10 > Restart the game now to use %s",
       "Imagen panorámica: F10 > Reiniciar el juego ahora para usar %s")
 PC_ES("The window changed shape: F10 > Restart the game now to fit it",
       "La ventana cambió de forma: F10 > Reiniciar el juego ahora para ajustarla")
+PC_ES("Screen shape: start the game once from TotK Launcher.exe to prepare its layout (16:9 until then)",
+      "Forma de pantalla: inicia el juego una vez desde TotK Launcher.exe para preparar la interfaz (16:9 hasta entonces)")
+PC_ES("This screen shape's layout was not prepared: 16:9 until Setup runs again",
+      "La interfaz de esta forma de pantalla no se preparó: 16:9 hasta que vuelvas a ejecutar Setup")
 PC_ES("Safe mode is on: DLSS, FSR and frame generation stay off",
       "Modo seguro activado: DLSS, FSR y la generación de fotogramas siguen desactivados")
 PC_ES("Frame generation mode",
@@ -1811,3 +1823,65 @@ PC_ES("Safe GPU mode: the graphics driver crashed in the last runs, so shaders n
       "Modo GPU seguro: el controlador gráfico falló en las últimas sesiones, así que los shaders se compilan ahora de la forma lenta y segura")
 PC_ES("Safe GPU mode: the graphics driver kept crashing, so shaders are also built unoptimised; the game may run slower until it has run cleanly a few times",
       "Modo GPU seguro: el controlador gráfico siguió fallando, así que los shaders también se compilan sin optimizar; el juego puede ir más lento hasta que se haya cerrado bien unas cuantas veces")
+PC_ES("XeSS (any GPU)",
+      "XeSS (cualquier GPU)")
+PC_ES("Shader compile indicator",
+      "Indicador de compilación de shaders")
+PC_ES("Bottom right while shaders compile: the percentage on a first start, how many are left in play.",
+      "Abajo a la derecha mientras se compilan shaders: el porcentaje en el primer inicio y cuántos faltan durante el juego.")
+PC_ES("Shows when shaders are being compiled (bottom right): a short stutter while it is up is the compile, not your PC. Off hides it in play (a first start still shows its progress); the compiling still happens.",
+      "Muestra cuándo se están compilando shaders (abajo a la derecha): un tirón breve mientras aparece es la compilación, no tu PC. Desactivado lo oculta durante el juego (el primer inicio sigue mostrando su progreso); la compilación sigue ocurriendo.")
+PC_ES("Shaders left to compile:",
+      "Shaders por compilar:")
+PC_ES("Last hitch",
+      "Último tirón")
+PC_ES("No hitch yet",
+      "Ningún tirón todavía")
+PC_ES("GPU wait",
+      "espera de la GPU")
+PC_ES("shader builds",
+      "compilación de shaders")
+PC_ES("texture uploads",
+      "subida de texturas")
+PC_ES("new images",
+      "imágenes nuevas")
+PC_ES("file reads",
+      "lectura de archivos")
+PC_ES("present (driver / window)",
+      "presentación (controlador / ventana)")
+PC_ES("game CPU",
+      "CPU del juego")
+PC_ES("render CPU",
+      "CPU de renderizado")
+PC_ES("s ago",
+      "s atrás")
+PC_ES("Upscaler:",
+      "Escalador:")
+PC_ES("off",
+      "desactivado")
+PC_ES("plain scaling",
+      "escalado simple")
+PC_ES("native",
+      "nativo")
+PC_ES("Quality",
+      "Calidad")
+PC_ES("Balanced",
+      "Equilibrado")
+PC_ES("Performance",
+      "Rendimiento")
+PC_ES("Ultra Performance",
+      "Ultra rendimiento")
+PC_ES("idle",
+      "en reposo")
+PC_ES("3D output is",
+      "la salida 3D es")
+PC_ES("scene",
+      "escena")
+PC_ES("it failed to start",
+      "no pudo iniciarse")
+PC_ES("starting",
+      "iniciándose")
+PC_ES("no 3D view this frame",
+      "sin vista 3D en este fotograma")
+PC_ES("no scene seen",
+      "ninguna escena vista")

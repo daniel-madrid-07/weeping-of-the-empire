@@ -83,6 +83,7 @@ const char *const kVsync[] = {"", "off", nullptr};            // On (default), O
 const char *const kVrr[] = {"", "on", nullptr};               // Off (default), On
 const char *const kShaderWait[] = {"", "always", nullptr};   // Limit to 0.1 s (default), Always wait
 const char *const kOffYes[] = {"", "1", nullptr};             // Off (default), On
+const char *const kOnDef[] = {"", "0", nullptr};              // On (default), Off
 const char *const kFrameGen[] = {"", "1", "2", "3", "fsr", nullptr};   // Off (default), DLSS x2 / x3 / x4, FSR x2
 const char *const kUpscaler[] = {"", "1", "dlaa", "fsr", nullptr};    // Off (default), DLSS, DLAA, FSR
 const char *const kHdr[] = {"", "hdr10", "scrgb", nullptr};   // Off (default), HDR10, scRGB
@@ -133,7 +134,7 @@ const PcRow kRows[] = {
     {68, "graphics.aspect_ratio", kWide},  // restart (totk_engine.c, the ultrawide; patched main only)
     {128, "graphics.hud_layout", kHud},         // restart (totk_engine.c: the ultrawide HUD at the edges / middle 16:9)
     {130, "graphics.cutscene_aspect", kCut},    // live (totk_engine.c, totk_hooks.c: ultrawide cutscenes wide / 16:9)
-    {117, "graphics.native_ui", kOffYes},  // live
+    {117, "graphics.native_ui", kOnDef},  // live
     {53, "controls.mouse_sensitivity", kSens},  // live (hle_hid.cpp), a slider of 0.1 .. 20
     {116, "controls.mouse_aim_scale", kAimScale},  // live: the mouse while the bow is drawn
     {119, "controls.key_min_hold_ms", kKeyHold},  // live: the W / A / D tap slide

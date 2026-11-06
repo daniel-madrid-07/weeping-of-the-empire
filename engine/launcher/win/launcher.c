@@ -175,13 +175,14 @@ static int init_paths(void) {
 }
 
 /* The player's language, as the game decides it (pc_lang.cpp): game.language in <g_base>\settings.ini when set (Spanish
- * for "es" and "es-419", Brazilian Portuguese for "pt-BR", Russian for "ru", Simplified Chinese for "zh-Hans", English
- * for any other), else Windows' display language. The launcher speaks those five.
+ * for "es" and "es-419", Brazilian Portuguese for "pt-BR", Russian for "ru", Simplified Chinese for "zh-Hans",
+ * Traditional Chinese for "zh-Hant", English for any other), else Windows' display language. The launcher speaks those
+ * six.
  * Before the first start there is no settings.ini yet (run_package copies the build's defaults later), so Windows
  * decides, as it does for the game whose default is "automatic". */
 static const wchar_t *lang_name(void) {
     return g_es ? L"Spanish" : g_tr == TR_PT ? L"Portuguese (Brasil)" : g_tr == TR_RU ? L"Russian"
-         : g_tr == TR_ZH ? L"Simplified Chinese" : L"English";
+         : g_tr == TR_ZH ? L"Simplified Chinese" : g_tr == TR_ZHT ? L"Traditional Chinese" : L"English";
 }
 static void lang_init(void) {
     wchar_t p[MAX_PATH], line[512], value[64] = L"";
@@ -209,14 +210,17 @@ static void lang_init(void) {
     if (value[0]) {
         g_es = !wcscmp(value, L"es") || !wcscmp(value, L"es-419");
         g_tr = !wcscmp(value, L"pt-BR") ? TR_PT : !wcscmp(value, L"ru") ? TR_RU
-             : !wcscmp(value, L"zh-Hans") ? TR_ZH : TR_EN;
+             : !wcscmp(value, L"zh-Hans") ? TR_ZH : !wcscmp(value, L"zh-Hant") ? TR_ZHT : TR_EN;
         say(L"language: %ls (game.language = %ls)", lang_name(), value);
     } else {
         LANGID ui = GetUserDefaultUILanguage();
         g_es = PRIMARYLANGID(ui) == LANG_SPANISH;
-        int simplified = SUBLANGID(ui) == SUBLANG_CHINESE_SIMPLIFIED || SUBLANGID(ui) == SUBLANG_CHINESE_SINGAPORE;
+        /* (Chinese: Taiwan, Hong Kong and Macau traditional, as pc_lang.cpp's zh-TW / HK / MO, and the neutral zh-Hant
+           (LANG_CHINESE_TRADITIONAL 0x7c04: sublanguage 0x1f); the rest simplified) */
+        int traditional = SUBLANGID(ui) == SUBLANG_CHINESE_TRADITIONAL || SUBLANGID(ui) == SUBLANG_CHINESE_HONGKONG ||
+                          SUBLANGID(ui) == SUBLANG_CHINESE_MACAU || SUBLANGID(ui) == 0x1f;
         g_tr = PRIMARYLANGID(ui) == LANG_PORTUGUESE ? TR_PT : PRIMARYLANGID(ui) == LANG_RUSSIAN ? TR_RU
-             : PRIMARYLANGID(ui) == LANG_CHINESE && simplified ? TR_ZH : TR_EN;
+             : PRIMARYLANGID(ui) != LANG_CHINESE ? TR_EN : traditional ? TR_ZHT : TR_ZH;
         say(L"language: %ls (Windows' display language 0x%04x%ls)", lang_name(), (unsigned)ui,
             have_file ? L"; no game.language in settings.ini" : L"; no settings.ini");
     }

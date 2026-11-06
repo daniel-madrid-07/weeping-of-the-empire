@@ -104,6 +104,7 @@ static Tex tex[PC_TEX_SLOTS];
 static Dead dead[2 * PC_TEX_SLOTS];
 static int ndead;
 static bool broken;   // a setup step failed: the overlay stays off for the run (logged once)
+int pc_overlay_vk_ok(void) { return !broken; }   // (device.c: hle_osd.cpp's shader banner yields only to a working overlay)
 
 static void tex_free(Tex *t) {
     if (t->set) vkFreeDescriptorSets(g_vk.dev, pool, 1, &t->set);

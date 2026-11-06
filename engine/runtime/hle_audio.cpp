@@ -9,11 +9,13 @@
 // TOTK_AUX=planar (default)|interleaved|bypass, TOTK_AUX_FADE=0 (an aux return's gaps step instead of fading, kAuxFade), TOTK_AUX_HOLES=0
 // (no zeros for a dropped send stretch: the return short, a late block later), TOTK_AUX_PIECES=0 (a return write takes the game's count,
 // not what its buffer was read with), TOTK_AUDIO_LOG=1 (calls), TOTK_AUDIO_LOG=graph (the mix graph with per-mix peaks every 10 s, no
-// call log), TOTK_VOLUME=<0..2> master gain. PC output: TOTK_AUDIO_CHANNELS=auto|2|6|8 (default 2; the game is told 6 channels for 6 and
-// 8 and fills its 5.1 sink), TOTK_AUDIO_LATENCY_MS (queued ahead of the device, default 20), TOTK_AUDIO_FOLLOW (default 1: follow Windows
-// default-device changes; 0 = off; a lost device is reopened either way), TOTK_AUDIO_STALL_MS (default 1000: a device that takes no audio
-// that long is reopened; 0 = off), TOTK_AUDIO_MUSIC / _SFX / _VOICE bus gains over the sub mixes TOTK_AUDIO_BUSMAP names, TOTK_AUDIO_WAV
-// capture (before the master gain). History. Both handled below (event ticks per frame; empty loops produce silence).
+// call log), TOTK_VOLUME=<0..2> master gain. PC output: TOTK_AUDIO_CHANNELS=auto|2|6|8 (default 2; 6 and 8 at most the device's own
+// layout, TOTK_AUDIO_FORCE_CHANNELS=1 aside; the game is told 6 channels for 6 and 8 and fills its 5.1 sink), TOTK_AUDIO_LATENCY_MS
+// (queued ahead of the device, default 20), TOTK_AUDIO_FOLLOW (default 1: follow Windows default-device changes; 0 = off; a lost device
+// is reopened either way), TOTK_AUDIO_STALL_MS (default 1000: a device that takes no audio that long is reopened, one that has taken none
+// since it opened after 3 s, then 6, 12, 24: StallRule; 0 = off), TOTK_AUDIO_DEVICE=<part of a name> (Windows: that active output device
+// instead of the default, which stays as it is), TOTK_AUDIO_MUSIC / _SFX / _VOICE bus gains over the sub mixes TOTK_AUDIO_BUSMAP names,
+// TOTK_AUDIO_WAV capture (before the master gain). History. Both handled below (event ticks per frame; empty loops produce silence).
 #include "hle.h"
 #define NOMINMAX
 #include <windows.h>
@@ -44,6 +46,7 @@
 
 void hle_sysevent_init(u64 ev, bool autoclear);
 void hle_sysevent_signal(u64 ev);
+extern std::atomic<void (*)(u64, u64)> hle_sysevent_wait_hook;   // hle_os_thread.cpp: called as the guest starts a WaitSystemEvent
 
 extern "C" bool oe_window_focused(void);   // hle_oe.cpp
 extern "C" bool oe_host_paused(void);      // hle_oe.cpp: pause on focus loss
@@ -55,6 +58,15 @@ int g_rate = 48000, g_count = 240;
 std::atomic<u64> g_event{0}, g_frames{0}, g_appends{0}, g_releases{0};
 std::atomic<u64> g_updates{0};   // RequestUpdateAudioRenderer calls (the output thread paces its frames on them)
 std::atomic<void*> g_upd_ev{nullptr};   // (HANDLE) set by each RequestUpdateAudioRenderer; made by the output thread
+std::atomic<u64> g_waits{0};     // the game's waits on the renderer's event (on_guest_wait; the output thread paces on them)
+std::atomic<bool> g_pace_waits{true};   // (set by the output thread, read on the guest thread: TOTK_AUDIO_PACE=1 paces on the updates instead)
+// What the output thread's pace wait waits for. The game's AudioFrameworkThread loops: wait on the renderer's event,
+// RequestUpdateAudioRenderer, its voices, then each mix's effects, the aux pump (f_29de0e8) among them, and back to the
+// wait. Pacing on the update rendered the wake's next frame before that iteration's pump ran, so one pump found 2 frames
+// and the next ~0 (Swordman14's v0.1.9 log: 0.9 to 2.1 frames a call; public #18). So: the game back in its wait, its
+// frame's work done, as the console's DSP renders a frame per 5 ms wake; until the first such wait is seen (an event that
+// is not the renderer's: nothing to pace on), or with TOTK_AUDIO_PACE=1, the update
+u64 pace_count() { const u64 w = g_waits.load(); return g_pace_waits && w ? w : g_updates.load(); }
 std::atomic<bool> g_running{false};
 bool g_log = getenv("TOTK_AUDIO_LOG") && strcmp(getenv("TOTK_AUDIO_LOG"), "graph") != 0;
 bool g_graph = getenv("TOTK_AUDIO_LOG") && !strcmp(getenv("TOTK_AUDIO_LOG"), "graph");
@@ -959,7 +971,53 @@ OutCfg& out_cfg() {
 }
 std::atomic<bool> g_reopen{false};     // an overlay row changed the output: reopen the device with it
 void* g_out_wake = nullptr;            // (HANDLE) the output thread's event
-int channels_for(int mode, int dev_ch) { return mode ? mode : dev_ch >= 8 ? 8 : dev_ch >= 6 ? 6 : 2; }
+// The stream's channels: the Speakers row (TOTK_AUDIO_CHANNELS), at most the layout the system mixes the device in (its
+// Windows mix format, SDL's device format on Linux); auto is that layout. 5.1 / 7.1 on a device mixed in stereo is
+// folded back to 2 channels by Windows' matrixer, so it brings no surround, only the game's 6-channel path: told 6, it
+// pans into C / LFE / rears and runs its effects for 6 channels, one of which diverges (the aux guard mutes it, after it
+// has grown to +12 dB over its send). TOTK_AUDIO_FORCE_CHANNELS=1: 6 / 8 on any device (the 6-channel test boots).
+int channels_for(int mode, int dev_ch) {
+    static const bool force = env_int("TOTK_AUDIO_FORCE_CHANNELS", 0) != 0;   // (at first use: after the settings file)
+    const int fit = dev_ch >= 8 ? 8 : dev_ch >= 6 ? 6 : 2;
+    return mode && (mode <= fit || force) ? mode : fit;
+}
+void channels_told(int mode, int dev_ch, int ch) {   // (a Speakers choice the device's layout cut: once per pair)
+    static int told_mode = -1, told_dev = -1;
+    if (!mode || ch >= mode || (mode == told_mode && dev_ch == told_dev)) return;
+    told_mode = mode; told_dev = dev_ch;
+    printf("[audio] Speakers %s: the system mixes this device in %d channels, so the stream is %d (%s for the game); its "
+           "speaker setup in the system's sound settings gives it surround\n", mode == 8 ? "7.1" : "5.1", dev_ch, ch,
+           ch >= 6 ? "5.1" : "stereo");
+}
+// The stall rule (TOTK_AUDIO_STALL_MS, both output loops). A device that has taken audio since it opened and then takes
+// none for `stall` is lost: closed, a second of wall-clock pacing, reopened. One that has taken none yet is starting,
+// not stalled (a PipeWire node resuming a USB device, WirePlumber linking after login: D#83's first run reopened 229
+// times, two seconds apart, each stream closed before it started): it waits max(stall, 3 s), doubled after each reopen
+// in a row whose stream took nothing, up to 24 s.
+struct StallRule {
+    std::chrono::milliseconds stall;
+    bool took = false;    // the open stream has taken audio (its queue went down after a fill)
+    int idle_opens = 0;   // reopens in a row whose stream took nothing
+    u32 last_pad = 0;     // the queue after the last fill (0: none yet)
+    void opened() { took = false; last_pad = 0; }
+    void wake(u32 pad) { if (!took && last_pad && pad < last_pad) took = true, idle_opens = 0; }
+    void filled(u32 pad) { last_pad = pad; }
+    std::chrono::milliseconds limit() const {
+        if (took) return stall;
+        const auto first = std::max(stall, std::chrono::milliseconds(3000));
+        return std::min(first * (1 << std::min(idle_opens, 3)), std::max(first, std::chrono::milliseconds(24000)));
+    }
+    void closed() { if (!took) idle_opens++; }
+};
+void stall_told(const StallRule& sr, std::chrono::steady_clock::duration idle) {   // (before sr.closed())
+    static int told[2];   // (each kind its own 10 lines: a long start never uses up a later stall's)
+    if (told[sr.took]++ >= 10) return;
+    const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(idle).count();
+    if (sr.took) { printf("[audio] the device took no audio for %lld ms with no error: wall-clock pacing, reopening\n", ms); return; }
+    StallRule next = sr; next.closed();
+    printf("[audio] the device has taken no audio since it opened (%lld ms): wall-clock pacing, reopening (it gets %lld s next)\n",
+           ms, (long long)(next.limit().count() / 1000));
+}
 #ifndef _WIN32
 // Linux: the WASAPI loop below, on an SDL3 audio stream (PipeWire / PulseAudio / ALSA through one API; linux-port,
 // 2026-11-02). Upstream's SDL path let the device pull frames back to back from its callback; this one keeps the
@@ -968,10 +1026,12 @@ int channels_for(int mode, int dev_ch) { return mode ? mode : dev_ch >= 8 ? 8 : 
 //   device period: TOTK_AUDIO_FRAMES, default 480 = 10 ms, WASAPI's shared period), which fills the queue up to its target
 // - the queue: what the stream holds for the device (SDL_GetAudioStreamQueued), the same quantity WASAPI's padding
 //   is; its target, low wakes (+1 renderer frame, #18), stall cover, the 30 s ease and stall-as-lost are WASAPI's
-// - the pace wait: a frame with no game update since the last one waits for it up to 3 ms while the queue holds over 4 ms
-//   past the wait (TOTK_AUDIO_PACE=0: never), on the same event g_updates' writer sets
+// - the pace wait: a frame with the game not back in its wait since the last one (pace_count; its update with
+//   TOTK_AUDIO_PACE=1) waits for it up to 3 ms while the queue holds over 4 ms past the wait (TOTK_AUDIO_PACE=0: never),
+//   on the same event g_updates' and on_guest_wait's writers set
 // - the default device: SDL moves a stream opened on the default playback device by itself (TOTK_AUDIO_FOLLOW's job);
-//   the overlay's output rows reopen it; a device that takes nothing for TOTK_AUDIO_STALL_MS is treated as lost
+//   the overlay's output rows reopen it; a device that takes nothing for TOTK_AUDIO_STALL_MS is treated as lost (one
+//   that has taken nothing since it opened is starting: StallRule's longer wait, D#83)
 // - the thread: realtime through rtkit where the desktop has it (SDL's TIME_CRITICAL), the twin of MMCSS "Pro Audio"
 // Not here: Windows' Bluetooth 60 ms start (SDL names no device's bus; the low-wake rule finds that margin instead).
 int device_channels() {
@@ -992,7 +1052,9 @@ bool dev_open(HANDLE ev, Dev& d, bool quiet) {
     SDL_AudioSpec dev{};
     int dev_frames = 0;
     SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &dev, &dev_frames);
-    d.ch = channels_for(cfg.mode, dev.channels > 0 ? dev.channels : 2);   // (SDL's 5.1 / 7.1 order is out_frame's)
+    const int mode = cfg.mode, dev_ch = dev.channels > 0 ? dev.channels : 2;
+    d.ch = channels_for(mode, dev_ch);   // (SDL's 5.1 / 7.1 order is out_frame's)
+    channels_told(mode, dev_ch, d.ch);
     const SDL_AudioSpec spec = {SDL_AUDIO_F32, d.ch, g_rate};
     d.st = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
     if (!d.st) {
@@ -1029,7 +1091,7 @@ double pace_wait(HANDLE timer, u64 upd_prev, double budget_ms) {
     LARGE_INTEGER due; due.QuadPart = -(LONGLONG)(budget_ms * 10000);
     const HANDLE hs[2] = {(HANDLE)g_upd_ev.load(), timer};
     if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
-        while (g_updates.load() == upd_prev && WaitForMultipleObjects(2, hs, FALSE, INFINITE) == WAIT_OBJECT_0) {}
+        while (pace_count() == upd_prev && WaitForMultipleObjects(2, hs, FALSE, INFINITE) == WAIT_OBJECT_0) {}
     CancelWaitableTimer(timer);
     return (qpc_s() - t0) * 1000;
 }
@@ -1055,12 +1117,13 @@ void output_thread() {
     int last_ch = d.st ? d.ch : 2;
     bool primed = false; double t_wake = 0;
     static const auto stall = std::chrono::milliseconds(std::max(0, env_int("TOTK_AUDIO_STALL_MS", 1000)));
+    StallRule sr{stall};
     auto t_fed = std::chrono::steady_clock::now();
     SDL_AudioStream* fed_st = nullptr;
-    static const bool pace = env_int("TOTK_AUDIO_PACE", 1) != 0;
+    static const int pace = env_int("TOTK_AUDIO_PACE", 2); g_pace_waits = pace >= 2;
     g_upd_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     const HANDLE pace_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    u64 upd_prev = g_updates.load();
+    u64 upd_prev = pace_count();
     for (;;) {
         if (!d.st) {   // no device (lost, stalled or none yet): the wall clock, the device tried again each second
             next += period;
@@ -1122,20 +1185,21 @@ void output_thread() {
             }
         }
         const auto now = std::chrono::steady_clock::now();
-        if (fed_st != d.st) fed_st = d.st, t_fed = now;
+        if (fed_st != d.st) { fed_st = d.st; t_fed = now; sr.opened(); }
+        sr.wake(pad);
         double t_pad = t_now;
         while (pad + (u32)g_count <= d.target) {
             // the pace wait (WASAPI's, comments there)
-            if (pace && g_upd_ev.load() && pace_timer && g_running.load() && !oe_host_paused() && g_updates.load() == upd_prev) {
+            if (pace && g_upd_ev.load() && pace_timer && g_running.load() && !oe_host_paused() && pace_count() == upd_prev) {
                 const double t0 = qpc_s(), left_ms = pad * 1000.0 / g_rate - (t0 - t_pad) * 1000, budget = std::min(3.0, left_ms - 4);
                 if (budget > 0.2) {
                     const double waited = pace_wait(pace_timer, upd_prev, budget);
-                    g_paced++; g_pace_late += g_updates.load() == upd_prev; g_pace_max = std::max(g_pace_max, waited);
+                    g_paced++; g_pace_late += pace_count() == upd_prev; g_pace_max = std::max(g_pace_max, waited);
                     pad = queued_frames(d); t_pad = qpc_s();
                     if (pad + (u32)g_count > d.target) break;
                 }
             }
-            upd_prev = g_updates.load();
+            upd_prev = pace_count();
             out_frame(scratch.data(), d.ch);
             if (!SDL_PutAudioStreamData(d.st, scratch.data(), g_count * d.ch * (int)sizeof(float))) {
                 // (the frame is the mixer's already: a stream that refuses it is lost, so wall-clock pacing and a
@@ -1152,11 +1216,10 @@ void output_thread() {
         }
         if (!d.st) continue;   // (the stream refused a frame above: already closed)
         primed = pad > 0;
-        if (stall.count() && now - t_fed > stall) {
-            static int told;
-            if (told++ < 20)
-                printf("[audio] the device took no audio for %lld ms with no error: wall-clock pacing, reopening\n",
-                       (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - t_fed).count());
+        sr.filled(pad);
+        if (stall.count() && now - t_fed > sr.limit()) {
+            stall_told(sr, now - t_fed);
+            sr.closed();
             dev_close(d); primed = false; fed_st = nullptr;
             next = std::chrono::steady_clock::now();
             retry = next + std::chrono::seconds(1);
@@ -1186,18 +1249,6 @@ std::string mix_desc(IAudioClient* ac) {
     }
     return b;
 }
-// The game asks for the channel count before the output thread has a device; this opens the default endpoint once to see.
-int device_channels() {
-    HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    IMMDeviceEnumerator* en = nullptr; IMMDevice* dev = nullptr; IAudioClient* ac = nullptr; int n = 2; DWORD mask;
-    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en)) &&
-        SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev)) &&
-        SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac)))
-        n = mix_format(ac, &mask);
-    if (ac) ac->Release(); if (dev) dev->Release(); if (en) en->Release();
-    if (SUCCEEDED(ci)) CoUninitialize();
-    return n;
-}
 // a Bluetooth endpoint (A2DP or hands-free): its enumerator, BTHENUM / BTHHFENUM / BTHLEDevice...
 bool device_bluetooth(IMMDevice* dev) {
     static const PROPERTYKEY kEnum = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 24};   // PKEY_Device_EnumeratorName
@@ -1213,19 +1264,97 @@ bool device_bluetooth(IMMDevice* dev) {
 std::mutex g_dev_id_mtx;
 std::wstring g_dev_id;                  // the open endpoint's id (its format-change notices reopen it)
 std::atomic<bool> g_fmt_changed{false};
-std::string device_name(IMMDevice* dev) {
+std::wstring device_wname(IMMDevice* dev) {
     static const PROPERTYKEY kName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};   // PKEY_Device_FriendlyName
-    std::string out = "?";
+    std::wstring out;
     IPropertyStore* ps = nullptr;
     if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) {
         PROPVARIANT v; PropVariantInit(&v);
-        if (SUCCEEDED(ps->GetValue(kName, &v)) && v.vt == VT_LPWSTR) {
-            char buf[256]; int k = WideCharToMultiByte(CP_UTF8, 0, v.pwszVal, -1, buf, sizeof buf, nullptr, nullptr);
-            if (k > 0) out = buf;
-        }
+        if (SUCCEEDED(ps->GetValue(kName, &v)) && v.vt == VT_LPWSTR && v.pwszVal) out = v.pwszVal;
         PropVariantClear(&v); ps->Release();
     }
     return out;
+}
+std::string utf8(const std::wstring& w) {
+    const int k = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (k <= 0) return w.empty() ? "" : "?";
+    std::string out((size_t)k, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), out.data(), k, nullptr, nullptr);
+    return out;
+}
+std::string device_name(IMMDevice* dev) { const std::wstring w = device_wname(dev); return w.empty() ? "?" : utf8(w); }
+// TOTK_AUDIO_DEVICE: a device whose name holds this, case aside for ASCII (towlower in the C locale) ("LG TV" for "LG TV
+// SSCR2 (NVIDIA High Definition Audio)"); an empty one never matches
+bool device_name_matches(const std::wstring& name, const std::wstring& want) {
+    if (want.empty()) return false;
+    std::wstring a = name, b = want;
+    for (auto& c : a) c = towlower(c);
+    for (auto& c : b) c = towlower(c);
+    return a.find(b) != std::wstring::npos;
+}
+// The endpoint to open: the first active output device TOTK_AUDIO_DEVICE names, else the default one (with a line naming
+// the active devices, once). The soak boots name a connected one while the PC's default is a headset that is off;
+// Windows' default is never changed. A named device that is active but fails to open kNamedTries times in a row
+// (another app holding it exclusively, a format it refuses) is given up for the default, with a line: the game is never
+// left silent on it.
+std::atomic<bool> g_dev_named{false};   // the open device is TOTK_AUDIO_DEVICE's: default-device changes leave it
+std::atomic<int> g_named_fails{0};      // the named device's failed opens in a row (the output thread's; read by device_channels)
+constexpr int kNamedTries = 3;
+const std::wstring& device_wanted() {
+    static const std::wstring want = [] { const wchar_t* e = _wgetenv(L"TOTK_AUDIO_DEVICE"); return std::wstring(e ? e : L""); }();
+    return want;
+}
+// the first active output device whose name holds `want` (nullptr: none; names: the active ones, when asked)
+IMMDevice* named_endpoint(IMMDeviceEnumerator* en, const std::wstring& want, std::string* names) {
+    IMMDeviceCollection* all = nullptr; UINT n = 0; IMMDevice* found = nullptr;
+    if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &all)) && SUCCEEDED(all->GetCount(&n)))
+        for (UINT i = 0; i < n && !found; i++) {
+            IMMDevice* dev = nullptr;
+            if (FAILED(all->Item(i, &dev))) continue;
+            const std::wstring name = device_wname(dev);
+            if (device_name_matches(name, want)) { found = dev; break; }
+            if (names) *names += (names->empty() ? "" : ", ") + utf8(name);
+            dev->Release();
+        }
+    if (all) all->Release();
+    return found;
+}
+HRESULT pick_endpoint(IMMDeviceEnumerator* en, IMMDevice** out) {
+    const std::wstring& want = device_wanted();
+    g_dev_named = false;
+    if (!want.empty() && g_named_fails == kNamedTries) {
+        g_named_fails++;   // (once)
+        printf("[audio] TOTK_AUDIO_DEVICE '%s': %d opens of it failed in a row: the default device from now on\n",
+               utf8(want).c_str(), kNamedTries);
+    }
+    if (!want.empty() && g_named_fails < kNamedTries) {
+        std::string names;
+        if (IMMDevice* dev = named_endpoint(en, want, &names)) { *out = dev; g_dev_named = true; return S_OK; }
+        static bool told = false;
+        if (!told) {
+            told = true;
+            printf("[audio] TOTK_AUDIO_DEVICE '%s': no active output device has it in its name (active: %s): the default device\n",
+                   utf8(want).c_str(), names.empty() ? "none" : names.c_str());
+        }
+    }
+    return en->GetDefaultAudioEndpoint(eRender, eConsole, out);
+}
+// The game asks for the channel count before the output thread has a device; this opens the endpoint dev_open will
+// (TOTK_AUDIO_DEVICE's while it is active and not given up, else the default) once to see, with no lines or counts of
+// pick_endpoint's: a default 5.1 device with a named stereo one would tell the game 6 for a 2-channel stream.
+int device_channels() {
+    HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IMMDeviceEnumerator* en = nullptr; IMMDevice* dev = nullptr; IAudioClient* ac = nullptr; int n = 2; DWORD mask;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))) {
+        const std::wstring& want = device_wanted();
+        if (!want.empty() && g_named_fails < kNamedTries) dev = named_endpoint(en, want, nullptr);
+        if ((dev || SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev))) &&
+            SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac)))
+            n = mix_format(ac, &mask);
+    }
+    if (ac) ac->Release(); if (dev) dev->Release(); if (en) en->Release();
+    if (SUCCEEDED(ci)) CoUninitialize();
+    return n;
 }
 struct Dev { IMMDevice* dev = nullptr; IAudioClient* ac = nullptr; IAudioRenderClient* rc = nullptr; UINT32 bufn = 0, target = 0, target0 = 0, floor = 0, period_n = 0; double bad_t = 0, ease_t = 0; int ch = 2; };   // target0: the open-time queue; floor: what low wakes found (never eased); bad_t: the last stall
 void dev_close(Dev& d) {
@@ -1236,11 +1365,13 @@ void dev_close(Dev& d) {
 HRESULT dev_open(IMMDeviceEnumerator* en, HANDLE ev, Dev& d, bool quiet) {
     const OutCfg& cfg = out_cfg();
     const int latency_ms = cfg.latency_ms;
-    HRESULT hr = en->GetDefaultAudioEndpoint(eRender, eConsole, &d.dev);
+    HRESULT hr = pick_endpoint(en, &d.dev);
     if (SUCCEEDED(hr)) hr = d.dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&d.ac);
     DWORD dev_mask = 0; int dev_ch = 2;
     if (SUCCEEDED(hr)) dev_ch = mix_format(d.ac, &dev_mask);
-    d.ch = channels_for(cfg.mode, dev_ch);
+    const int mode = cfg.mode;
+    d.ch = channels_for(mode, dev_ch);
+    if (SUCCEEDED(hr)) channels_told(mode, dev_ch, d.ch);
     const DWORD front = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT, core = front | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY;
     const DWORD back = SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT, side = SPEAKER_SIDE_LEFT | SPEAKER_SIDE_RIGHT;
     // 5.1 goes out on the device's own surround pair (Windows' 5.1 is usually the side one), so the matrixer leaves it alone
@@ -1263,10 +1394,12 @@ HRESULT dev_open(IMMDeviceEnumerator* en, HANDLE ev, Dev& d, bool quiet) {
     if (SUCCEEDED(hr)) d.ac->GetDevicePeriod(&period, nullptr);
     if (SUCCEEDED(hr)) hr = d.ac->Start();
     if (FAILED(hr)) {
-        if (!quiet) printf("[audio] WASAPI open failed (hr %08lx)\n", (unsigned long)hr);
+        if (!quiet || g_dev_named) printf("[audio] WASAPI open failed (hr %08lx)%s\n", (unsigned long)hr, g_dev_named ? " on TOTK_AUDIO_DEVICE's device" : "");
+        if (g_dev_named) g_named_fails++;
         dev_close(d);
         return hr;
     }
+    if (g_dev_named) g_named_fails = 0;
     // queue: the latency setting, but at least one device period plus a renderer frame (the event comes once a period)
     const UINT32 floor_n = (UINT32)(period * g_rate / 10000000) + (UINT32)g_count;
     d.target = std::min<UINT32>(d.bufn, std::max<UINT32>(floor_n, (UINT32)((s64)g_rate * latency_ms / 1000)));
@@ -1283,8 +1416,9 @@ HRESULT dev_open(IMMDeviceEnumerator* en, HANDLE ev, Dev& d, bool quiet) {
     set_game_channels(d.ch);
     d.period_n = (UINT32)(period * g_rate / 10000000);
     d.target0 = d.floor = d.target;
-    printf("[audio] WASAPI: %s%s, %d Hz float %d ch (mask %lx; device mix %s, mask %lx), device buffer %u frames (%.1f ms), period %.1f ms, "
-           "queue %u frames (%.1f ms), renderer frame %d samples\n", device_name(d.dev).c_str(), bt ? " (Bluetooth)" : "", g_rate, d.ch, (unsigned long)mask, mix_desc(d.ac).c_str(),
+    printf("[audio] WASAPI: %s%s%s, %d Hz float %d ch (mask %lx; device mix %s, mask %lx), device buffer %u frames (%.1f ms), period %.1f ms, "
+           "queue %u frames (%.1f ms), renderer frame %d samples\n", device_name(d.dev).c_str(), bt ? " (Bluetooth)" : "",
+           g_dev_named ? " (TOTK_AUDIO_DEVICE)" : "", g_rate, d.ch, (unsigned long)mask, mix_desc(d.ac).c_str(),
            (unsigned long)dev_mask, d.bufn, d.bufn * 1000.0 / g_rate, period / 10000.0, d.target, d.target * 1000.0 / g_rate, g_count);
     return S_OK;
 }
@@ -1299,7 +1433,7 @@ double pace_wait(HANDLE timer, u64 upd_prev, double budget_ms) {
     LARGE_INTEGER due; due.QuadPart = -(LONGLONG)(budget_ms * 10000);
     const HANDLE hs[2] = {(HANDLE)g_upd_ev.load(), timer};
     if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
-        while (g_updates.load() == upd_prev && WaitForMultipleObjects(2, hs, FALSE, INFINITE) == WAIT_OBJECT_0) {}   // (a set left from an earlier update: wait again)
+        while (pace_count() == upd_prev && WaitForMultipleObjects(2, hs, FALSE, INFINITE) == WAIT_OBJECT_0) {}   // (a set left from an earlier update: wait again)
     CancelWaitableTimer(timer);
     return (qpc_s() - t0) * 1000;
 }
@@ -1341,6 +1475,7 @@ void output_thread() {
         printf("[audio] following the default device (TOTK_AUDIO_FOLLOW)\n");
     Dev d;
     if (SUCCEEDED(hr)) hr = dev_open(en, ev, d, false);
+    while (FAILED(hr) && en && g_named_fails > 0 && g_named_fails <= kNamedTries) hr = dev_open(en, ev, d, false);   // (then the default)
     if (FAILED(hr) && (!cfg.follow || !en)) { printf("[audio] WASAPI init failed (hr %08lx): no sound, null pacing\n", (unsigned long)hr); null_ticker(); return; }
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     // MMCSS ("Pro Audio"): Windows' scheduler for audio threads, which keeps them running when every core is busy (a
@@ -1356,12 +1491,13 @@ void output_thread() {
     // A device that takes no frame for TOTK_AUDIO_STALL_MS (default 1000, 0 = off) while reporting no error (a sleeping
     // Bluetooth or HDMI endpoint whose clock stopped) is treated as lost, so the game's audio thread is never starved
     static const auto stall = std::chrono::milliseconds(std::max(0, env_int("TOTK_AUDIO_STALL_MS", 1000)));
+    StallRule sr{stall};
     auto t_fed = std::chrono::steady_clock::now();
     IAudioClient* fed_ac = nullptr;   // (the device t_fed belongs to: a new one starts its own count)
-    static const bool pace = env_int("TOTK_AUDIO_PACE", 1) != 0;
+    static const int pace = env_int("TOTK_AUDIO_PACE", 2); g_pace_waits = pace >= 2;
     g_upd_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     const HANDLE pace_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    u64 upd_prev = g_updates.load();   // the game's update count when the last frame was rendered
+    u64 upd_prev = pace_count();   // the game's update count when the last frame was rendered
     for (;;) {
         if (!d.ac) {
             // no device (lost, stalled or none yet): the renderer runs on the wall clock (the game's audio thread keeps its
@@ -1382,7 +1518,9 @@ void output_thread() {
         const double gap_ms = primed ? (t_now - t_wake) * 1000 : 0;   // (since the last wake: the period, unless something stalled)
         if (primed) g_wake_max = std::max(g_wake_max, gap_ms);
         t_wake = t_now;
-        const bool changed = cfg.follow && g_dev_changed.exchange(false), asked = g_reopen.exchange(false), fmt = g_fmt_changed.exchange(false);
+        // (a device TOTK_AUDIO_DEVICE named stays through default-device changes: the default is not what was asked for)
+        const bool changed = g_dev_changed.exchange(false) && cfg.follow && !g_dev_named, asked = g_reopen.exchange(false),
+                   fmt = g_fmt_changed.exchange(false);
         if (changed || asked || fmt) {
             printf("[audio] %s: reopening\n", changed ? "default device changed" : fmt ? "the device's format changed" : "output settings changed");
             dev_close(d); primed = false; fed_ac = nullptr;
@@ -1395,7 +1533,8 @@ void output_thread() {
         if (FAILED(hr)) {
             // (also with following off: it only means not moving to a new default device; a lost one used to spin here
             // with no frame_done, and the game's audio thread waited for good)
-            printf("[audio] device lost (hr %08lx): wall-clock pacing, reopening the default device\n", (unsigned long)hr);
+            printf("[audio] device lost (hr %08lx): wall-clock pacing, reopening %s\n", (unsigned long)hr,
+                   g_dev_named ? "TOTK_AUDIO_DEVICE's device" : "the default device");
             dev_close(d); primed = false; fed_ac = nullptr;
             next = retry = std::chrono::steady_clock::now();
             continue;
@@ -1447,7 +1586,8 @@ void output_thread() {
             }
         }
         const auto now = std::chrono::steady_clock::now();
-        if (fed_ac != d.ac) fed_ac = d.ac, t_fed = now;
+        if (fed_ac != d.ac) { fed_ac = d.ac; t_fed = now; sr.opened(); }
+        sr.wake(pad);
         double t_pad = t_now;   // (when pad was read from the device)
         while (pad + (UINT32)g_count <= d.target) {
             // Pacing: the console's DSP renders one frame per update of the game's, and a wave buffer the game appends
@@ -1456,19 +1596,21 @@ void output_thread() {
             // committed buffers ran out inside the run starved although the next one was queued (a 2 ms fade, still a
             // click: public #18's 'starved' counts), and its aux pump fell behind. So, before a frame with no update
             // since the last one, wait for the game's update up to 3 ms, while the device still holds over 4 ms past
-            // the wait; a device near empty is filled at once, as before (TOTK_AUDIO_PACE=0: never wait)
-            if (pace && g_upd_ev.load() && pace_timer && g_running.load() && !oe_host_paused() && g_updates.load() == upd_prev) {
+            // the wait; a device near empty is filled at once, as before (TOTK_AUDIO_PACE=0: never wait). Since 2026-11-04
+            // the wait is for the game back in its wait on the renderer's event, past its update and its aux pump
+            // (pace_count; TOTK_AUDIO_PACE=1: the update, as before)
+            if (pace && g_upd_ev.load() && pace_timer && g_running.load() && !oe_host_paused() && pace_count() == upd_prev) {
                 const double t0 = qpc_s(), left_ms = pad * 1000.0 / g_rate - (t0 - t_pad) * 1000, budget = std::min(3.0, left_ms - 4);
                 if (budget > 0.2) {
                     const double waited = pace_wait(pace_timer, upd_prev, budget);
-                    g_paced++; g_pace_late += g_updates.load() == upd_prev; g_pace_max = std::max(g_pace_max, waited);
+                    g_paced++; g_pace_late += pace_count() == upd_prev; g_pace_max = std::max(g_pace_max, waited);
                     UINT32 now_pad = 0;   // (the device played on meanwhile: fill to the target from what it holds now)
                     if (FAILED(d.ac->GetCurrentPadding(&now_pad))) break;
                     pad = now_pad; t_pad = qpc_s();
                     if (pad + (UINT32)g_count > d.target) break;
                 }
             }
-            upd_prev = g_updates.load();
+            upd_prev = pace_count();
             BYTE* p = nullptr;
             if (FAILED(d.rc->GetBuffer((UINT32)g_count, &p))) break;
             out_frame((float*)p, d.ch);
@@ -1478,11 +1620,10 @@ void output_thread() {
             t_fed = now;
         }
         primed = pad > 0;
-        if (stall.count() && now - t_fed > stall) {
-            static int told;
-            if (told++ < 20)
-                printf("[audio] the device took no audio for %lld ms with no error: wall-clock pacing, reopening\n",
-                       (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - t_fed).count());
+        sr.filled(pad);
+        if (stall.count() && now - t_fed > sr.limit()) {
+            stall_told(sr, now - t_fed);
+            sr.closed();
             dev_close(d); primed = false; fed_ac = nullptr;
             next = std::chrono::steady_clock::now();
             retry = next + std::chrono::seconds(1);   // (a second of wall-clock pacing before trying the device again)
@@ -1516,6 +1657,14 @@ HLE_AS(audio_GetRequiredBufferSizeForReverb, "_ZN2nn5audio30GetRequiredBufferSiz
 HLE_AS(audio_GetRequiredBufferSizeForI3dl2Reverb, "_ZN2nn5audio35GetRequiredBufferSizeForI3dl2ReverbEii") { c->x[0] = 0x20000; }
 HLE_AS(audio_GetRequiredBufferSizeForLightLimiter, "_ZN2nn5audio36GetRequiredBufferSizeForLightLimiterENS_8TimeSpanEii") { c->x[0] = 0x1000; }
 HLE_AS(audio_InitializeAudioRendererConfig, "_ZN2nn5audio29InitializeAudioRendererConfigEPNS0_19AudioRendererConfigERKNS0_22AudioRendererParameterEPvm") { c->x[0] = 0; }
+// (hle_sysevent_wait_hook, on the guest thread as it starts a WaitSystemEvent: the renderer's event counts for pace_count)
+static void on_guest_wait(u64 ev, u64 lr) {
+    if (!ev || ev != g_event.load()) return;
+    if (g_waits++ == 0)
+        rt_log("[audio] pace: the game waits on the renderer's event (lr %llx): frames paced on its wait%s\n", (unsigned long long)lr,
+               g_pace_waits ? "" : " (not used: TOTK_AUDIO_PACE=1, the update)");
+    if (void* e = g_upd_ev.load()) SetEvent((HANDLE)e);
+}
 HLE_AS(audio_OpenAudioRenderer, "_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm") {
     const u32* p = (const u32*)c->x[2];
     if (p[0]) g_rate = (int)p[0];
@@ -1524,6 +1673,7 @@ HLE_AS(audio_OpenAudioRenderer, "_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRen
     for (int b = 0; b < BUS_N; b++) { static const char* const env[BUS_N] = {"TOTK_AUDIO_MUSIC", "TOTK_AUDIO_SFX", "TOTK_AUDIO_VOICE"}; g_bus[b] = std::clamp(env_float(env[b], 1.0f), 0.0f, 2.0f); }
     hle_sysevent_init(c->x[1], true);
     g_event = c->x[1];
+    hle_sysevent_wait_hook = on_guest_wait;
     static std::once_flag once;
     std::call_once(once, [] { std::thread(output_thread).detach(); });
     printf("[audio] OpenAudioRenderer: %d Hz, %d samples/frame, %u mix buffers, %u sub mixes, %u voices, %u effects, %u splitters, event %llx\n",
@@ -1739,12 +1889,14 @@ HLE_AS(audio_ListAudioOutputDeviceName, "_ZN2nn5audio25ListAudioOutputDeviceName
     memset((void*)c->x[0], 0, 256); strcpy((char*)c->x[0], "MainAudioOut"); c->x[0] = 1;
 }
 HLE_AS(audio_GetActiveAudioOutputDeviceName, "_ZN2nn5audio30GetActiveAudioOutputDeviceNameEPNS0_15AudioDeviceNameE") { memset((void*)c->x[0], 0, 256); strcpy((char*)c->x[0], "MainAudioOut"); c->x[0] = 0; }
-// 2 unless TOTK_AUDIO_CHANNELS asks for surround (6 for 5.1 and 7.1, auto: the device's layout); the game fills its 6-input
+// 2 unless TOTK_AUDIO_CHANNELS asks for surround the device's layout carries (6 for 5.1 and 7.1, auto: the device's
+// layout; channels_for); the game fills its 6-input
 // device sink either way (w2: AddDeviceSink MainAudioOut, 6 inputs) and pans for the count it is told
 HLE_AS(audio_GetActiveAudioDeviceChannelCountForOutput, "_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv") {
     int n = g_game_ch.load();
     if (!n) {
-        int want = channels_for(out_cfg().mode, out_cfg().mode ? 2 : device_channels()) >= 6 ? 6 : 2, zero = 0;
+        const int mode = out_cfg().mode;   // (surround and auto: what the device's layout allows, channels_for)
+        int want = channels_for(mode, mode == 2 ? 2 : device_channels()) >= 6 ? 6 : 2, zero = 0;
         g_game_ch.compare_exchange_strong(zero, want);
         n = g_game_ch.load();
         printf("[audio] GetActiveAudioDeviceChannelCountForOutput: %d\n", n);

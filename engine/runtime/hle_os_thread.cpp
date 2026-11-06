@@ -101,6 +101,7 @@ struct HThread {
     u64 name_ptr = 0;   // SetThreadNamePointer's (GetThreadNamePointer returns it; the SDK keeps the pointer, not a copy)
 #endif
     u32 fpcr = 0;   // the creator's FPCR at CreateThread (TOTK_FPCR=1: the new thread starts with it)
+    bool prio_ours = false;   // (MainThread's prio is our guess, not the game's: core_model_apply)
 };
 static Registry<HThread> g_threads;
 static thread_local HThread* t_self;
@@ -128,6 +129,7 @@ extern "C" void os_crash_thread_stack(u64* lo, u64* hi) {
     *lo = t && t->stack_size ? t->stack : 0;
     *hi = t && t->stack_size ? t->stack + t->stack_size : 0;
 }
+static void core_model_apply(HThread* t);   // (TOTK_CORE_MODEL=switch, below)
 void os_register_main_thread(Ctx* c, u64 stack_lo, u64 stack_size) {
     u64 tt = (u64)_aligned_malloc(0x200, 16); memset((void*)tt, 0, 0x200);   // guest-visible nn::os::ThreadType
     HThread* t = g_threads.get(tt);
@@ -135,16 +137,49 @@ void os_register_main_thread(Ctx* c, u64 stack_lo, u64 stack_size) {
     t->h = GetCurrentThread(); t->tid = GetCurrentThreadId();
     g_main_tid.store((unsigned long)GetCurrentThreadId());
     t_self = t;
+    t->prio_ours = true;
+    core_model_apply(t);   // (rt_main's boot thread, started after cpu_place_init)
     (void)c;
 }
 
 #ifndef _WIN32
 extern "C" void host_affinity(int kind, unsigned long long mask);   // (linux/plat_posix.cpp, TOTK_AFFINITY; no-op when off)
 #endif
+// TOTK_CORE_MODEL=switch (cpu_place.h "guest"; default off, a diagnostic): the thread held to its core mask's guest
+// cores at a host priority from its guest one (lower = higher; the game uses 2-28: 16 the job workers, 19-21 loading /
+// resource threads, 23 BaseProcCreateAndDelete, 24-28 background), without dynamic boosts, so on one guest core a 23
+// waits while a 16 is runnable, as on the Switch. Applied when the thread starts and at each SetThreadCoreMask /
+// ChangeThreadPriority, under one lock (a start racing a mask change cannot leave the older mask). MainThread's 28 is
+// ours (the console takes it from the NPDM): nn::os's default 16 until the game sets one.
+static void core_model_apply(HThread* t) {
+#ifdef _WIN32
+    if (!cpu_place_core_model()) return;
+    static std::mutex m;
+    std::lock_guard<std::mutex> l(m);
+    // (the id under the lock at the start: a call from another thread before StartThread's CreateThread has returned
+    // its handle opens it by id; StartThread stores the same value)
+    if (t == t_self) t->tid = GetCurrentThreadId();
+    HANDLE h = t == t_self ? GetCurrentThread() : t->h != GetCurrentThread() ? t->h : nullptr, opened = nullptr;
+    if (!h && t->tid)   // (the main thread from another one: its handle is the pseudo one)
+        h = opened = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION, FALSE, t->tid);
+    if (!h) return;   // (not started: thread_entry applies it)
+    if (cpu_place_guest_thread(h, t->core_mask)) {
+        const int p = t->prio_ours ? 16 : t->prio;
+        SetThreadPriority(h, p <= 10 ? THREAD_PRIORITY_HIGHEST : p <= 16 ? THREAD_PRIORITY_ABOVE_NORMAL
+                             : p <= 22 ? THREAD_PRIORITY_NORMAL : p <= 25 ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_LOWEST);
+        SetThreadPriorityBoost(h, TRUE);
+    }
+    if (opened) CloseHandle(opened);
+#else
+    (void)t;
+#endif
+}
 static DWORD WINAPI thread_entry(LPVOID p) {
     HThread* t = (HThread*)p; t_self = t;
 #ifndef _WIN32
     host_affinity(0, t->core_mask);
+#else
+    core_model_apply(t);
 #endif
     Ctx* c = rt_new_ctx(t->stack + t->stack_size, nullptr, nullptr);
     rt_bind_thread(c);
@@ -197,6 +232,11 @@ HLE_AS(os_GetThreadId, "_ZN2nn2os11GetThreadIdEPKNS0_10ThreadTypeE") {
 HLE_AS(os_GetThreadPriority, "_ZN2nn2os17GetThreadPriorityEPKNS0_10ThreadTypeE") { c->x[0] = (u64)g_threads.get(c->x[0])->prio; }
 HLE_AS(os_ChangeThreadPriority, "_ZN2nn2os20ChangeThreadPriorityEPNS0_10ThreadTypeEi") {
     HThread* t = g_threads.get(c->x[0]); int old = t->prio; t->prio = (int)c->x[1]; c->x[0] = (u64)old;
+    t->prio_ours = false;
+    if (cpu_place_core_model()) {   // (the gate reads which threads change and to what: the main thread's real one)
+        static int n; if (n++ < 32) printf("[os] ChangeThreadPriority %s %d -> %d\n", t->name.c_str(), old, t->prio);
+        core_model_apply(t);
+    }
 }
 // idealCore: >= 0 a core; -1 IdealCoreDontCare, -2 IdealCoreUseDefault (-> lowest core of the mask), -3 IdealCoreNoUpdate.
 HLE_AS(os_SetThreadCoreMask, "_ZN2nn2os17SetThreadCoreMaskEPNS0_10ThreadTypeEim") {
@@ -206,6 +246,8 @@ HLE_AS(os_SetThreadCoreMask, "_ZN2nn2os17SetThreadCoreMaskEPNS0_10ThreadTypeEim"
     static int n; if (n++ < 64) printf("[os] SetThreadCoreMask %s core %d mask %llx\n", t->name.c_str(), ideal, c->x[2]);
 #ifndef _WIN32
     if (t == t_self) host_affinity(0, t->core_mask);   // (other threads: applied when they start, thread_entry)
+#else
+    core_model_apply(t);
 #endif
 }
 HLE_AS(os_GetThreadAvailableCoreMask, "_ZN2nn2os26GetThreadAvailableCoreMaskEv") { c->x[0] = 7; }
@@ -255,13 +297,19 @@ static void hw_note(int k, bool blocked, s64 lat) {
 // player's report of more stutter, 2026-11-02) only holds off a ready thread for up to TOTK_YIELD_CAP_US; route-measured on
 // SMT only.
 enum { YIELD_SWITCH, YIELD_PAUSE, YIELD_SLEEP0, YIELD_HYBRID };
+static s64 yield_low_ns();   // (the hybrid-give block below: hybrid's give-way)
 static int yield_mode() {
     static const int m = [] {
         const char* e = getenv("TOTK_YIELD");
         if (!e || !*e) {
             const bool smt = cpu_place_smt() != 0;   // (-1 unknown: hybrid, as before)
-            printf("[os] YieldThread and spin waits: %s (TOTK_YIELD unset; %s)\n", smt ? "hybrid" : "switch",
+            printf("[os] YieldThread and spin waits: %s (TOTK_YIELD unset; %s", smt ? "hybrid" : "switch",
                    smt ? "SMT cores" : "no SMT: a pause would hold its core, as v0.1.6 they switch");
+            if (smt && yield_low_ns() > 0)
+                printf("; gives way with Sleep(0), SwitchToThread every %lld us: TOTK_YIELD_LOW_US", (long long)(yield_low_ns() / 1000));
+            else if (smt)
+                printf("; gives way with SwitchToThread: TOTK_YIELD_LOW_US=0, as v0.1.7");
+            printf(")\n");
             return smt ? (int)YIELD_HYBRID : (int)YIELD_SWITCH;
         }
         if (!strcmp(e, "hybrid")) return (int)YIELD_HYBRID;
@@ -285,21 +333,26 @@ static bool switch_due(s64 now) {
     static const s64 cap = getenv("TOTK_YIELD_CAP_US") ? (s64)atoll(getenv("TOTK_YIELD_CAP_US")) * 1000 : 1000000;
     return cap > 0 && now - t_switched > cap;
 }
-// hybrid's real give-way: SwitchToThread, as v0.1.7 (the default again for v0.1.8: the Havok cross-thread ordering crash, 2
-// of 2 B runs of the v0.1.8 gate and 0 of 2 v0.1.7, had 3611b8df / ced1e3af as its first suspect). TOTK_YIELD_LOW_US=<us>
-// (opt-in, 3611b8df's 4000 the measured value): Sleep(0) instead, and one SwitchToThread when this thread has not really
-// switched for that long. SwitchToThread hands the rest of the quantum to ANY ready thread on this CPU, the game's own
-// pipeline compile workers at below-normal / lowest / idle priority included, and a CPU-bound one keeps the core for its
-// whole quantum: a job worker's one YieldThread inside gsys ModelMgr::calcModel's phases took 165-390 ms (cA_route1 [sleep]
-// YieldThread max 390.24 ms, on a host at 100 % CPU). Sleep(0) gives way to equal or higher priority threads only: every
-// guest thread (all at normal priority) still gets this core; the 4 ms switch (whatever the loop's body: a run of yields
-// 20+ us apart never ages) lets a loop waiting on a lower-priority thread on this core with every core busy still let it
-// run within that, not at Windows' starvation boost seconds later. TOTK_YIELD=switch: SwitchToThread at every yield (as
-// v0.1.6).
+// hybrid's real give-way: Sleep(0), and one SwitchToThread when this thread has not really switched for TOTK_YIELD_LOW_US
+// (default 4000 = 3611b8df's measured value; 0 = SwitchToThread at every give-way, as v0.1.7). It was v0.1.7's again from
+// v0.1.8 to v0.1.9.3: the v0.1.8 Havok cross-thread ordering crash had 3611b8df / ced1e3af as its first suspect, but its
+// cause was dde084d4's gameplay steps under 1/240 s. The v0.1.9.3 soak still had the stall: each of its 6 game-side frames
+// of 54-220 ms (field + town arms) sat in a 5-s window whose longest YieldThread was 5-69 ms, against under 1 ms in a
+// normal one. SwitchToThread hands the rest of the quantum to ANY ready thread on this CPU, the game's own pipeline compile
+// workers at below-normal / lowest / idle priority included, and a CPU-bound one keeps the core for its whole quantum: a
+// job worker's one YieldThread inside gsys ModelMgr::calcModel's phases took 165-390 ms (cA_route1 [sleep] YieldThread max
+// 390.24 ms, on a host at 100 % CPU). Sleep(0) gives way to equal or higher priority threads only: every guest thread (all
+// at normal priority) still gets this core; the 4 ms switch (whatever the loop's body: a run of yields 20+ us apart never
+// ages) lets a loop waiting on a lower-priority thread on this core with every core busy still let it run within that, not
+// at Windows' starvation boost seconds later. TOTK_YIELD=switch: SwitchToThread at every yield (as v0.1.6).
 enum Give { GIVE_PAUSE, GIVE_SLEEP0, GIVE_SWITCH };
 static thread_local s64 t_give_last, t_give_run, t_low_switch;
+static s64 yield_low_ns() {
+    static const s64 low = getenv("TOTK_YIELD_LOW_US") ? (s64)atoll(getenv("TOTK_YIELD_LOW_US")) * 1000 : 4000000;
+    return low;
+}
 static Give give_way(s64 now) {
-    static const s64 low = getenv("TOTK_YIELD_LOW_US") ? (s64)atoll(getenv("TOTK_YIELD_LOW_US")) * 1000 : 0;
+    const s64 low = yield_low_ns();
     t_switched = now;
     if (low <= 0) return GIVE_SWITCH;
     if (now - t_low_switch >= low) { t_low_switch = now; return GIVE_SWITCH; }   // (this thread's last real switch)
@@ -442,11 +495,11 @@ HLE_AS(os_SleepThread, "_ZN2nn2os11SleepThreadENS_8TimeSpanE") {
 // (ActorBase PreCalc / PostCalc / SleepCalc / PostSensorCalc) yield once per actor while the main thread waits for the frame's jobs: a worker that
 // loses its slice there stalls the frame. TOTK_YIELD=hybrid (the default since the stutter sprint: route ABBA 89 -> 111 fps median, 1 % low 31.7 ->
 // 36.3) | switch (SwitchToThread, as before) | pause (a CPU pause hint, no OS yield) | sleep0 (Sleep(0): equal or higher priority threads only) |
-// hybrid (a pause while this thread's back-to-back yields have lasted under TOTK_YIELD_SPIN_US, default 50; a give-way after: SwitchToThread, or with
-// the opt-in TOTK_YIELD_LOW_US Sleep(0) and a SwitchToThread once a run has lasted that long, give_way above, so a guest loop that needs another
-// thread on this core to run still gets it). A loop whose body runs longer than 20 us between yields starts a new run at every yield and would only
-// ever pause, so hybrid also gives way when this thread has not for TOTK_YIELD_CAP_US (default 1000; 0 = no cap): a ready thread that can only run on
-// this core waits at most that long.
+// hybrid (a pause while this thread's back-to-back yields have lasted under TOTK_YIELD_SPIN_US, default 50; a give-way after: Sleep(0), and a
+// SwitchToThread once this thread has not really switched for TOTK_YIELD_LOW_US, default 4000 (0: SwitchToThread at every give-way, as v0.1.7),
+// give_way above, so a guest loop that needs another thread on this core to run still gets it). A loop whose body runs longer than 20 us between
+// yields starts a new run at every yield and would only ever pause, so hybrid also gives way when this thread has not for TOTK_YIELD_CAP_US (default
+// 1000; 0 = no cap): a ready thread that can only run on this core waits at most that long.
 HLE_AS(os_YieldThread, "_ZN2nn2os11YieldThreadEv") {
     static const s64 spin = getenv("TOTK_YIELD_SPIN_US") ? (s64)atoll(getenv("TOTK_YIELD_SPIN_US")) * 1000 : 50000;
     const s64 t0 = now_ns();
@@ -767,6 +820,9 @@ HLE_AS(os_TimedWaitLightEvent, "_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEvent
 // For HLE modules that own a system event (vi vsync, audio renderer): set it up and signal it from host code.
 void hle_sysevent_init(u64 ev, bool autoclear) { ev_init(ev, false, autoclear ? 1 : 0); }
 void hle_sysevent_signal(u64 ev) { evlog('S', ev, 0); ev_signal(g_event.get(ev)); }
+// (event, lr) as a guest thread starts a WaitSystemEvent, before it blocks: hle_audio paces its frames on the game's
+// audio thread coming back to the renderer's event
+std::atomic<void (*)(u64, u64)> hle_sysevent_wait_hook{nullptr};
 // System events belong to SDK services we do not run yet: never signalled unless an HLE module signals them.
 HLE_AS(os_DestroySystemEvent, "_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE") { g_event.drop(c->x[0]); }
 HLE_AS(os_ClearSystemEvent, "_ZN2nn2os16ClearSystemEventEPNS0_15SystemEventTypeE") { ev_clear(g_event.get(c->x[0])); }
@@ -775,6 +831,7 @@ HLE_AS(os_WaitSystemEvent, "_ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE")
     static std::mutex lm; static std::unordered_map<u64, int> logged;   // first few per event (vsync waits: 60/s)
     { std::lock_guard<std::mutex> l(lm); if (logged[c->x[0]]++ < 8) { printf("[os] WaitSystemEvent(%llx) lr=%llx (blocks until signalled)\n", c->x[0], c->x[30]); fflush(stdout); } }
     evlog('W', c->x[0], c->x[30]);
+    if (auto h = hle_sysevent_wait_hook.load()) h(c->x[0], c->x[30]);
     ev_wait(g_event.get(c->x[0]), -1);
     evlog('w', c->x[0], c->x[30]);
 }

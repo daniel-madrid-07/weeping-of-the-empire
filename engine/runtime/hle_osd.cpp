@@ -27,6 +27,7 @@ typedef uint32_t COLORREF;                                                      
 #endif
 
 extern "C" volatile int g_skip_opening, g_title_phase, g_in_opening, g_skip_hold_ms;   // hle_fs.cpp, hle_hid.cpp
+extern "C" int skip_opening_works(void);   // hle_fs.cpp: 0 on another game version (no skip, no banners)
 extern "C" volatile uint64_t g_in_opening_since;
 extern "C" uint64_t nvn_present_count(void);
 extern "C" int vk_precompile_recorded_progress(int* done, int* total);   // exec.c shader precompile (recorded phase)
@@ -196,7 +197,8 @@ extern "C" const uint32_t* osd_banner(int target_h, int* w, int* h) {
     std::string t;
     bool toast = false;
     if (g_in_opening) {   // in-game skip (hle_hid.cpp skip_restart): hint for the first 20 s in the opening, countdown while Minus is held
-        if (g_skip_hold_ms > 0) {
+        if (!skip_opening_works()) {   // (another game version: no skip, so no hint)
+        } else if (g_skip_hold_ms > 0) {
             char b[96];
             snprintf(b, sizeof b, pc_tr("Skipping to Great Sky Island in %.1f s... (release Minus to cancel)"), (1500 - g_skip_hold_ms) / 1000.0);
             t = b;
@@ -204,7 +206,7 @@ extern "C" const uint32_t* osd_banner(int target_h, int* w, int* h) {
             t = pc_tr("Skip to Great Sky Island: F2 or hold Minus (restarts into a new game)");
         }
     } else if (g_title_phase) {
-        t = g_skip_opening ? pc_tr("Skip opening: ON   (F2 / Minus to change)") : pc_tr("Skip opening: OFF   (F2 / Minus to change)");
+        if (skip_opening_works()) t = g_skip_opening ? pc_tr("Skip opening: ON   (F2 / Minus to change)") : pc_tr("Skip opening: OFF   (F2 / Minus to change)");
     } else if (osd_menu_enabled() && !osd_menu_is_open() && vk_scene_idle_frames() > 45) {   // a pause / System menu holds the picture
         // With the PC overlay: the first 4 s of such a screen only (it sat on every map and inventory screen), not while
         // the overlay is open, and on the first 3 such screens only, never again once F10 has been opened

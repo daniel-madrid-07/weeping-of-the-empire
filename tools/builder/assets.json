@@ -13,6 +13,8 @@
   {"used_by": "setup:Vulkan", "tag": "v0.1.7", "name": "setup-vulkan-sdk.zip", "size": 13064178,
    "sha256": "d3b384e4dd9a8107a37bf1b999120d40e85111f540b374d76b4c1260f7a15c9e"},
   {"used_by": "builder:FFX", "tag": "v0.1.8", "name": "setup-ffx.zip", "size": 2659507,
-   "sha256": "223d3042946b16f51b25f833fcc33c001dd839d6e30fdd0a6b0627d759d7e7c5"}
+   "sha256": "223d3042946b16f51b25f833fcc33c001dd839d6e30fdd0a6b0627d759d7e7c5"},
+  {"used_by": "builder:XESS", "tag": "v0.1.10", "name": "setup-xess.zip", "size": 59673655,
+   "sha256": "87afacde6e875046b4c7aea7e7872fe16be7ac6c5798fdf773b5e9b1397dd1e8"}
  ]
 }

@@ -590,17 +590,32 @@ VkResult vmaCreateBuffer(VmaAllocator a, const VkBufferCreateInfo *bi, const Vma
     if ((r = alloc_for(a, req, ai, 0, alloc, info)) != VK_SUCCESS) { vkDestroyBuffer(a->dev, *buf, NULL); return r; }
     return vkBindBufferMemory(a->dev, *buf, (*alloc)->mem, (*alloc)->offset);
 }
+// The last vmaCreateImage's phases on this thread, ns (textures.c LARECOMP_IMG_SPLIT_MS, the bow's first-aim shadow
+// image: 98 MB in 80 ms where 128 MB took 14): [0] vkCreateImage, [1] the memory (alloc_for), [2] of it vkAllocateMemory
+// at creation (alloc_timed), [3] vkBindImageMemory
+_Thread_local uint64_t vma_shim_split[4];
 VkResult vmaCreateImage(VmaAllocator a, const VkImageCreateInfo *ii, const VmaAllocationCreateInfo *ai, VkImage *img,
                         VmaAllocation *alloc, VmaAllocationInfo *info) {
+    uint64_t *sp = vma_shim_split;
+    sp[0] = sp[1] = sp[2] = sp[3] = 0;
+    uint64_t t0 = SDL_GetTicksNS();
     VkResult r = vkCreateImage(a->dev, ii, NULL, img);
+    uint64_t t1 = SDL_GetTicksNS();
+    sp[0] = t1 - t0;
     if (r != VK_SUCCESS) return r;
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(a->dev, *img, &req);
-    if ((r = alloc_for(a, req, ai, ii->tiling == VK_IMAGE_TILING_OPTIMAL, alloc, info)) != VK_SUCCESS) {
+    const uint64_t s0 = sync_ns;
+    r = alloc_for(a, req, ai, ii->tiling == VK_IMAGE_TILING_OPTIMAL, alloc, info);
+    t0 = SDL_GetTicksNS();
+    sp[1] = t0 - t1, sp[2] = sync_ns - s0;   // (another thread's alloc_timed meanwhile would count here: rare, render thread)
+    if (r != VK_SUCCESS) {
         vkDestroyImage(a->dev, *img, NULL);
         return r;
     }
-    return vkBindImageMemory(a->dev, *img, (*alloc)->mem, (*alloc)->offset);
+    r = vkBindImageMemory(a->dev, *img, (*alloc)->mem, (*alloc)->offset);
+    sp[3] = SDL_GetTicksNS() - t0;
+    return r;
 }
 static void free_alloc(VmaAllocator a, VmaAllocation al) {
     if (!al) return;

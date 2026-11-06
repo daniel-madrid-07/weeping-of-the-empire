@@ -194,7 +194,7 @@ static void cap_pool_contents(PoolWatch *w) {
     uint8_t *c = malloc(n ? n : 1);
     if (n && p->entries) memcpy(c, p->entries, n);
     for (int i = 0; i < p->count; i++) {
-        if (w->sampler) ((NvnSamplerDesc *)c)[i].backend = NULL;
+        if (w->sampler) { NvnSamplerDesc *sd = &((NvnSamplerDesc *)c)[i]; sd->backend = sd->prev[0].backend = sd->prev[1].backend = NULL; }
         else { NvnTexEntry *e = &((NvnTexEntry *)c)[i]; e->tex = (NvnTexture *)(uintptr_t)(e->tex ? cap_tex(e->tex) : 0); }
     }
     CapPoolHdr h = {p->addr, p->count, 0};

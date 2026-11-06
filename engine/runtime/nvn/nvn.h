@@ -45,11 +45,22 @@ typedef struct NvnTexture {
     bool fin_queued, release_queued;  // (async execute) its finalize / zombie release is queued for the render thread
 } NvnTexture;
 
-typedef struct {
-    uint32_t min_filter, mag_filter, wrap[3], compare_mode, compare_func, reduction;
-    float lod_min, lod_max, lod_bias, max_aniso;
+// (the parameters, the same leading fields in NvnSamplerDesc and its kept versions: register_sampler compares and copies
+// them up to offsetof(NvnSamplerDesc, backend))
+#define NVN_SAMPLER_PARAMS                                                     \
+    uint32_t min_filter, mag_filter, wrap[3], compare_mode, compare_func, reduction; \
+    float lod_min, lod_max, lod_bias, max_aniso;                               \
     float border[4];
+typedef struct { NVN_SAMPLER_PARAMS void *backend; uint64_t cv; } NvnSamplerPrev;
+typedef struct {
+    NVN_SAMPLER_PARAMS
     void *backend;
+    // (LARECOMP_POOL_SNAP, a sampler-pool entry; objects.c nvn_sampler_entry_at, the texture pool's shape: NvnTexEntry)
+    // wseq: the submit count of its last change; prev: the values before its last two changes, [0] the newer, cv = the
+    // change's submit count + 1 (0: none); cv_lost: the one before those, which no longer has its value
+    uint64_t wseq;
+    NvnSamplerPrev prev[2];
+    uint64_t cv_lost;
 } NvnSamplerDesc;
 
 typedef struct {
@@ -70,8 +81,21 @@ typedef struct {
     // (debug: what was last registered here and when; "[draw] texN: none" lines print it)
     uint32_t dbg_w, dbg_h, dbg_fmt, dbg_regs;
     uint64_t dbg_addr, dbg_reg_frame, dbg_fin_frame;  // frames + 1 (0 = never)
+    uint64_t wseq;   // g_nvn_submit_seq when its texture / view last changed (exec.c's '[late]' check, the glitch detector)
+    // (LARECOMP_POOL_SNAP, objects.c nvn_pool_entry_at) the values before its last two changes, [0] the newer; cv = the
+    // change's submit count + 1 (0: none); cv_lost: the one before those, which no longer has its value
+    struct { NvnTexture *tex; NvnTextureView view; bool has_view; uint64_t cv; } prev[2];
+    uint64_t cv_lost;
     char dbg_label[24];
 } NvnTexEntry;
+int nvn_pool_snap_on(void);   // LARECOMP_POOL_SNAP=1 (FIX program 11-06 item a): replays read pool entries as their list's submit left them
+// The entry as list `seq` (its g_nvn_submit_seq) was submitted with it, into *out; false: unchanged since, or not kept
+bool nvn_pool_entry_at(const NvnTexEntry *e, uint64_t seq, NvnTexEntry *out);
+// The same for a sampler-pool entry (its parameters and VkSampler as list `seq` was submitted with them)
+bool nvn_sampler_entry_at(const NvnSamplerDesc *e, uint64_t seq, NvnSamplerDesc *out);
+// Command lists submitted so far (backend_execute, the game's threads); an entry changed at a value >= a list's own was
+// changed after that list's submit, which its (async, later) replay then reads
+extern uint64_t g_nvn_submit_seq;
 
 typedef struct NvnDescPool {
     uint64_t addr;
@@ -188,5 +212,7 @@ void backend_async_call(void (*fn)(void *), void *arg);  // fn(arg) after all qu
 void backend_async_fence(NvnSync *s);
 void backend_async_present(NvnTexture *tex);
 void backend_async_wait(uint64_t ticket);       // until the queue has run up to ticket (0: everything queued so far)
+void backend_async_released(uint64_t ticket);   // a guest wait returned for the fence at ticket (the replay lag count)
+int backend_replay_bound(void);                 // LARECOMP_REPLAY_BOUND=1: a fence's wait returns after its frame's replay
 void backend_texture_destroyed(NvnTexture *tex);
 void backend_pool_written(uint64_t addr, uint64_t size);

@@ -502,12 +502,13 @@ int main(int argc, char **argv) {
         int real = vp9_mft_present();   /* the real probe runs (either answer is fine on a test PC) */
         CHECK(real == 1 || real == 0 || real == -1);
     }
-    {   /* lang_init: game.language pt-BR / ru / zh-Hans -> text_pt / ru / zh.inc by the English (English where a table
-         * lacks one), es-419 Spanish, en-US and zh-Hant English; Spanish again after (the texts the checks above expect) */
+    {   /* lang_init: game.language pt-BR / ru / zh-Hans / zh-Hant -> text_pt / ru / zh / zht.inc by the English (English
+         * where a table lacks one), es-419 Spanish, en-US and ja English; Spanish again after (the texts the checks above
+         * expect) */
         swprintf(p, MAX_PATH, L"%ls\\settings.ini", g_base);
-        const wchar_t *vals[] = {L"pt-BR", L"es-419", L"en-US", L"ru", L"zh-Hans", L"zh-Hant"};
-        const int want[] = {TR_PT, TR_EN, TR_EN, TR_RU, TR_ZH, TR_EN};
-        for (int i = 0; i < 6; i++) {
+        const wchar_t *vals[] = {L"pt-BR", L"es-419", L"en-US", L"ru", L"zh-Hans", L"zh-Hant", L"ja"};
+        const int want[] = {TR_PT, TR_EN, TR_EN, TR_RU, TR_ZH, TR_ZHT, TR_EN};
+        for (int i = 0; i < 7; i++) {
             FILE *f = _wfopen(p, L"w, ccs=UTF-8");
             fwprintf(f, L"[game]\ngame.language = %ls\n", vals[i]);
             fclose(f);
@@ -522,7 +523,10 @@ int main(int argc, char **argv) {
         CHECK(!wcscmp(ES_EN(L"El juego ya está en marcha.", L"The game is already running."), L"Игра уже запущена."));
         g_tr = TR_ZH;
         CHECK(!wcscmp(ES_EN(L"El juego ya está en marcha.", L"The game is already running."), L"游戏已在运行。"));
+        g_tr = TR_ZHT;
+        CHECK(!wcscmp(ES_EN(L"El juego ya está en marcha.", L"The game is already running."), L"遊戲已在執行。"));
         CHECK(!wcscmp(tr_of(TR_EN, L"Off"), L"Off") && !wcscmp(tr_of(TR_ZH, L"not in the table"), L"not in the table"));
+        CHECK(!wcscmp(tr_of(TR_ZHT, L"not in the table"), L"not in the table"));
         g_es = 1, g_tr = TR_EN;
         DeleteFileW(p);
     }

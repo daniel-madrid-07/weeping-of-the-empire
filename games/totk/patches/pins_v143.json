@@ -77,6 +77,12 @@
   "why": "the lightning manager's calc: its format-string anchor and the body match agree (ratio 0.29, 153 shared runs, next best 30)",
   "checked": "totk_lightning.cpp: flags +8 (far bolt 1, flash 8), countdown +0xa0, offset +0xa4, target +0x98 (+0x88 / +0x8c), the 90 delay and the 0.013333 / 0.01 chances, the same"
  },
+ "0xb8fd30": {
+  "new": "0x57f0b0",
+  "body": "541cb04d5a8f7f8caf061c6cd8d540b6c225979f6eeb7c6a66d5717dc19dc187",
+  "why": "the screens' animation sound event: the same slot of the screen classes' vtables, anchored by its strings; reordered code, the same calls",
+  "checked": "totk_ui_anim_sound.cpp reads only the call's four arguments (screen, animator, name, frame number); 1.4.3 builds the same event name and hands the same frame on"
+ },
  "0xbb9f74": {
   "new": "0x7216f0",
   "body": "28eccf8386cce1e0ceb0c6cd6fa8457cfc61b73e8c36032ca723de33be9d7716",
@@ -341,6 +347,12 @@
   "why": "the actor's SpecialPower component getter (totk_player_state.cpp): paired by its call",
   "checked": "6 instructions read side by side: the same, Actor +0x220 -> +0x228, the component array +0x478 unchanged"
  },
+ "0x1c0cff8": {
+  "new": "0x22e8e94",
+  "body": "ca6d3c263d75f95e4d414bbd72706c1a1eee57c27ac5f8723e1d394f91bf0878",
+  "why": "return address after the event paraglide update's call of the eased approach hook (third call site)",
+  "checked": "same prologue keeping the node in x21, the same three scale getter calls before it, the same multiply after it"
+ },
  "0x1c17fb0": {
   "new": "0x22f3ba8",
   "body": "4bc3e2ed070226bc81848e93af13f8cbb149ec02007c4a6a5d4ea3be1382bd44",
@@ -502,5 +514,65 @@
   "body": "5b89f33d02ab4957c170de212b6336de42d2579b8c70e8f46800c41d1f8ddb7b",
   "why": "the option choice names slot: read off the selection bind's page load and offset (the data vote's neighbour was wrong)",
   "checked": "decomp options_menu.cpp choice names, decomp-lead's read"
+ },
+ "0x11cd0fc": {
+  "new": "0x28f9564",
+  "body": "4f8d7387e9e94e3ab2b8c4ff7ef2f01453db06d3f65358eb601a5c9cb7a25340",
+  "why": "the box cursor node's decidable test: slot 6 of the node vtable in both builds (the cursor code compares this slot)",
+  "checked": "read side by side: node +0x18 button, +0x20 screen, the button flags; 1.4.3 also inlines a small helper"
+ },
+ "0x1ab035c": {
+  "new": "0x28fffc0",
+  "body": "c41ab56cfadc4a49282040fde1e79d6b62ce2bac073d2da0602bd1e1ead17c3f",
+  "why": "a screen's set-active-node: the node of a button id; the second call of a porter-paired caller in both builds",
+  "checked": "1.4.3 inlines the node search (the same list walk at +0x88 / +0x94) and ends with the same store at +0x148"
+ },
+ "0x22303a0": {
+  "new": "0x28f8f38",
+  "body": "6227fa489905522a0084b890eda57ac0dce2373f18c9acbaf84cd7e60d56e51c",
+  "why": "the box cursor manager's per-frame input method: the same vtable slot in both builds (its vtable pairs slot for slot)",
+  "checked": "read side by side: controls at +0x28 / +0x30, their active node +0x58, the button flags, the UI input words; same order"
+ },
+ "0x22307ec": {
+  "new": "0x878a60",
+  "body": "881a3ccf5920385160494ab23f2ad716c67198a7e995a59220563ffefb485e82",
+  "why": "the box cursor's screen scan (a sibling vtable's slot): walks the screen manager's list for a reserved or active node",
+  "checked": "read side by side: the screen loop reads +0x150 then +0x148 in both; 1.4.3 renames the registers only"
+ },
+ "0x19ea2d8": {
+  "new": "0x20655b0",
+  "body": "31226109f035ecde8b8ef6d6afd1d91d051d2f307ce0961c15516f6fa4564d43",
+  "why": "the slide list's per-frame update: slot 4 of the slide list vtable in both builds (the two vtables pair slot for slot)",
+  "checked": "read side by side: the window flags at +0xbc / +0xbe, the index +0x8c and the page request +0xc3 in the same order"
+ },
+ "0x19ea944": {
+  "new": "0x2065be0",
+  "body": "1211dd4ab290d3dbc8de0f5d235f4e29d84a6e88c760d12e5ef7ae0dc52e81f5",
+  "why": "the slide list's index step: a byte-identical body in 1.4.3 that the porter leaves unconfirmed only as a duplicate",
+  "checked": "identical words: the index +0x8c moves inside the window +0x50 .. +0x40, widened by flag bit 4 of +0xbc"
+ },
+ "0x1a3e83c": {
+  "new": "0x20d79a4",
+  "body": "e1ea72d6961ac094fd3cde6cfaeffca4926f6e35de1ea2273685ac3cfae84e08",
+  "why": "the game's jump / sprint option getter (the PC keys read it): the one same-size function with both of its option hashes",
+  "checked": "read side by side: the same two GameData reads, its first call paired by the porter, only the prologue order differs; unique"
+ },
+ "0x15eca7c": {
+  "new": "0x1bd0138",
+  "body": "c5f6ae90a7679f472e20c5f1814b5336b4150195720942164e5b0aad7b8f3dc5",
+  "why": "the Ultrahand guard's update (public 51): the only call of its 1.0.0 wrapper, at the same place in the wrapper's confirmed pair",
+  "checked": "read side by side: the same state (+0x6a0 == 2), result (+0x6b0) and link (+0x648) reads and no-target exits; only the timer at +0xf30 moved to +0xf54"
+ },
+ "0x7495f8": {
+  "new": "0x155ec",
+  "body": "302b5fbd291bec234fec9b480407a11a7a634586d30b8c4f362ab83b5ce94cdf",
+  "why": "the actor link's set, called by the Ultrahand update at the same place in both: placed for the guard's actor id and link data fields",
+  "checked": "read side by side: the actor's id +0x10, link data +0x1a8 and state +0x24 reads the same; 1.4.3 counts states 7 to 11 as dying (1.0.0: only 7 or 8)"
+ },
+ "0x7cba8c": {
+  "new": "0x2a0d3c",
+  "body": "760099f9436b16c4e655b2c4f45870c5b40fdd1dfb0434e7e0a008059942c642",
+  "why": "the query enqueue the ticket hook wraps (public 51): the porter's call pair, read side by side to pin it past its changed body",
+  "checked": "the same tickets, counters and entry bytes; its slot struct grew by 8 bytes (size 0x150 to 0x158, ticket counter +0x140 to +0x148)"
  }
 }

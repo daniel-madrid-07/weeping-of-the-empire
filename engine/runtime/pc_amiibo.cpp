@@ -7,6 +7,7 @@
 // launcher's amiibo folder beside the game and %APPDATA%\nxrecomp\TotK-engine\amiibo). Before 2026-11-02 hle_oe.cpp
 // answered "no reader"; its Initialize / GetState and the availability event are kept as they were.
 #include "pc_amiibo.h"
+#include "mods_scan.h"   // (env_u8 / from_u8: UTF-8 paths that never throw, public #94)
 
 #include <atomic>
 #include <chrono>
@@ -59,13 +60,12 @@ bool tag_on() { return g_dev == DevTagFound || g_dev == DevTagMounted; }
 
 std::vector<std::string> folders() {
     std::vector<std::string> v;
-    const char *e = getenv("TOTK_AMIIBO_DIR");
-    std::stringstream ss(e ? e : "");
+    std::stringstream ss(mods_scan::env_u8("TOTK_AMIIBO_DIR"));   // (UTF-8, not getenv's ANSI code page: #94)
     for (std::string d; std::getline(ss, d, ';');)
         if (!d.empty()) v.push_back(d);
     return v;
 }
-fs::path from_u8(const std::string &s) { return fs::path(std::u8string(s.begin(), s.end())); }
+fs::path from_u8(const std::string &s) { return mods_scan::from_u8(s); }
 std::string to_u8(const fs::path &p) {
     const std::u8string u = p.u8string();
     return std::string(u.begin(), u.end());

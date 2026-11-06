@@ -373,6 +373,8 @@ class Emitter:
         # --split (Emitter.split_text): these functions (or, `min=N`, every one of N+ guest instructions: tests) as
         # chunks of about split_chunk (--split-chunk) instructions
         self.split, self.split_min, self.split_chunk = set(), 0, 3000
+        # --split-loops: these (hot) functions too, but cut only where no loop crosses (split_text's `loops`)
+        self.split_loops = set()
         # --vlocal all|HEX,...: the V registers of these functions live in locals (vrN_) instead of the real Ctx
         # (rt.h LCtx::v is a reference to it, so every c->v[N] write was a store and every read a load), synced at the
         # X registers' LSO / LSI points (Emitter.lctx_sync). None = off, True = every function, else a set of starts.
@@ -443,7 +445,8 @@ class Emitter:
         last = insns[-1][2] if insns else ''
         if last not in ('ret', 'b', 'br'):
             items.append((end, self.tail(end, end), False))
-        if ((start in self.split or self.split_min and len(insns) >= self.split_min) and start not in self.hooks
+        if ((start in self.split or start in self.split_loops or self.split_min and len(insns) >= self.split_min)
+                and start not in self.hooks
                 and start not in self.timed and start not in self.trace and start not in self.alias
                 and not self.vlocal_on(start) and not (self.lctx_mem and len(insns) >= self.lctx_mem)):
             split = self.split_text(start, items, labels)
@@ -496,14 +499,35 @@ class Emitter:
     # follow it, each declared inside the functions that call it and ending on `} // <name>`, so tusplit.py moves the
     # block whole and a tool that cuts f_<off> out of a TU gets every chunk; build.py's giant_of counts each chunk alone
     # (a split giant is no giant). Measured on the v0.1.7 image at -O1, chunks of 3000: the 17 of build.py's SPLIT_FUNCS
-    # 6.8-44.8 s and <= 0.45 GB each (f_5346a0: 41.8 s instead of 526 s and 2.3 GB).
+    # 6.8-44.8 s and <= 0.45 GB each (f_5346a0: 41.8 s instead of 526 s and 2.3 GB). --split-loops (hot functions,
+    # build.py SPLIT_LOOPS): a cut only where no loop crosses, i.e. no branch from at or after the cut back to before it,
+    # so a chunk switch costs an LSO + musttail once per pass, never per iteration; the first such point once a chunk has
+    # C instructions (fall-through or not). The giants v0.1.9 kept whole (f_5732d0, f_553d80, f_4d9ba0, f_58fd70:
+    # 21.7-23.7k instructions) are each three ~7k-instruction loops in a row, with 150-210 loop-free points between them
+    # and none inside: three chunks, two switches a call.
     LABEL_GOTO = re.compile(r'goto L_([0-9a-f]+);')
     def split_text(self, start, items, labels):
         n, C = len(items), self.split_chunk
+        free = None
+        if start in self.split_loops:
+            at = {a: i for i, (a, _, _) in enumerate(items)}
+            cover = [0] * (n + 1)    # cover[k]: the loops (back edges v <= u) a cut before item k would cross
+            for u, (_, code, _) in enumerate(items):
+                for t in self.LABEL_GOTO.findall(code):
+                    v = at.get(int(t, 16))
+                    if v is not None and v <= u:
+                        cover[v + 1] += 1
+                        cover[u + 1] -= 1
+            for k in range(1, n + 1):
+                cover[k] += cover[k - 1]
+            free = cover
         cuts = [0]
         for i in range(1, n):
             run = i - cuts[-1]
-            if run >= C and (not items[i - 1][2] or run >= C + C // 4) and n - i >= C // 4:
+            if free is not None:
+                if run >= C and free[i] == 0 and n - i >= C // 4:
+                    cuts.append(i)
+            elif run >= C and (not items[i - 1][2] or run >= C + C // 4) and n - i >= C // 4:
                 cuts.append(i)
         if len(cuts) == 1:
             return None
@@ -1904,7 +1928,7 @@ def main():
     global IMGBASE, FN, IMP, TAB
     only = None; tu_insns = 60000; plt_all = False; trace = set(); hooks = set(); timed = set(); alias = {}
     lctx_mem = 0; lctx_keep = set(); vlocal = None; lso_abi_file = None
-    split, split_min, split_chunk = set(), 0, 3000
+    split, split_min, split_chunk, split_loops = set(), 0, 3000, set()
     args = sys.argv[4:]
     for i, x in enumerate(args):
         if x == '--only': only = [int(v, 16) for v in args[i + 1].split(',')]
@@ -1933,6 +1957,8 @@ def main():
             v = args[i + 1]
             split_min, split = (int(v[4:]), set()) if v.startswith('min=') else (0, {int(h, 16) for h in v.split(',')})
         if x == '--split-chunk': split_chunk = int(args[i + 1])
+        # hot giant functions as chunks cut only where no loop crosses (split_text): these (hex offsets)
+        if x == '--split-loops': split_loops = {int(h, 16) for h in args[i + 1].split(',') if h}
         # V registers in locals (Emitter.vlocal): every function, or these
         if x == '--vlocal': vlocal = True if args[i + 1] == 'all' else {int(v, 16) for v in args[i + 1].split(',')}
         # call sites / callees that keep x9-x18 and NZCV at their LSO (abi_scan.py's file; the module's section)
@@ -1988,6 +2014,7 @@ def main():
     em.fcfuse = fcfuse
     em.lctx_mem, em.lctx_keep = lctx_mem, lctx_keep
     em.split, em.split_min, em.split_chunk = split, split_min, split_chunk
+    em.split_loops = split_loops
     em.vlocal = vlocal
     if lso_abi_file: em.lso_abi = load_lso_abi(lso_abi_file, 'sdk' if FN == 's_' else 'main')
     em.fz = fz

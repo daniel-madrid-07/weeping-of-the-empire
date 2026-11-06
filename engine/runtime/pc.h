@@ -23,6 +23,9 @@ void pc_crash_set_enabled(bool on);   // game.crash_reports, live (installs on t
 // same text as a comment stream) from a fresh thread; returns when they are written (at most 60 s). A second crashing
 // thread blocks here forever. exception_pointers: EXCEPTION_POINTERS*.
 void pc_crash_report(void *exception_pointers, const char *reason, const char *runtime_text);
+// The runtime's report for an exception that reaches the unhandled filter (rt_main.cpp on_crash_unhandled: another
+// module's fault its own handlers did not take); called first, it ends the process when it reports.
+void pc_crash_set_runtime_filter(long (*filter)(void *exception_pointers));
 // Key material the process holds (the RomFS section key of the player's dump: rom_source.h). pc_crash_secret: a range
 // zeroed before a minidump is written and left out of it. pc_crash_secret_busy(1 / 0): the calling thread holds key
 // material in its registers or stack until it calls (0); a minidump leaves its context and stack out meanwhile.

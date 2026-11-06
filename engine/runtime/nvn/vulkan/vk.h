@@ -102,6 +102,7 @@ typedef struct TexBackend {
     uint32_t width, height, depth, layers, levels, samples;
     VkImageAspectFlags aspect;
     bool gpu_owned, uploaded, dynamic, cpu_dirty, zero_on_write;  // zero_on_write: recycled depth image, cleared at its first pass  // cpu_dirty: WriteTexels since the last upload check
+    bool fresh_color;   // a new colour image, or one recycled from other storage: cleared, not loaded, if a pass writes it first (exec.c begin_pass)
     uint64_t data_hash, sample_hash, checked_frame, full_frame, ww_seen;  // ww_seen: heap write-watch epoch (textures.c)
     uint64_t full_seq;   // the oldest submission whose heap writes may not have landed at the last full hash (LARECOMP_TEX_GPUW: GPU writes since, exec.c)
     uint8_t gpuw_skips;  // LARECOMP_TEX_GPUW=1: periodic rehashes skipped since the last full hash (every 4th still runs)
@@ -124,7 +125,9 @@ typedef struct TexBackend {
     struct TexBackend *blk;  // block-compressed image rendered through an uncompressed view: the uncompressed shadow image
                              // the passes draw into (one texel per block), copied into this image after each pass
     uint64_t wb_frame;       // textures.c write-back: frame + 1 of the render that queued it
-    uint8_t wb_state;        // 0 none, 1 queued in this execute, 2 written back, 3 excluded (not a candidate / per-frame)
+    uint8_t wb_state;        // 0 none, 1 queued in this execute, 2 written back, 3 excluded (not a candidate / per-frame), 4 copied, batch pending (LARECOMP_WB_DEFER)
+    uint64_t first_up_frame; // textures.c: vk_frame_counter() of its first CPU upload (TOTK_GLITCH_DETECT's late-fill line)
+    bool first_pre;          // that first upload was a stream pre-upload (preupload.c)
     uint32_t wr_epoch;       // exec.c LARECOMP_BARRIERS=tracked: barrier epoch in which a pass last wrote it
     uint64_t last_use;       // vk_frame_counter() of its last use (tex_backend): VRAM residency's LRU order (textures.c)
     bool evicted;            // image dropped by VRAM residency; tex_backend re-creates it and the next use re-uploads it
@@ -140,9 +143,12 @@ typedef struct TexBackend {
     uint64_t snap_tag;       // exec.c LARECOMP_SNAP_DELTA: the feedback snapshot that mirrors this image (0: none), and the box
     int32_t snap_box[4];     // draws wrote in it since (level 0, x0 y0 x1 y1; empty when x1 <= x0)
     bool preuploaded;        // preupload.c: uploaded on the loading screen; its first real use checks it (upload_texture_)
+    bool recycle_check;      // textures.c LARECOMP_RECYCLE_RECHECK: a new object on this storage's pooled image; its first use checks it
     bool smark_ok;           // exec.c LARECOMP_SNAP_MARK: every draw into it since that copy marked its tiles
     uint32_t b2t_levels;     // exec.c copy_buffer_to_texture: the levels buffer copies wrote (bit 31: counted, texture_info_)
     uint32_t remake_gen;     // textures.c g_tex_gen when its scale kind / usage was last checked against the live settings
+    uint64_t use_seq;        // textures.c: the submission (vk_pending_seq) in which a draw last sampled it (LARECOMP_UPLOAD_INLINE)
+    uint64_t use_draw;       // ... and the exec.c ups_refresh scan that stamped its first use there (~0: a vk_tex use)
 } TexBackend;
 VkImageView vk_depth_twin_view(TexBackend *b, const NvnTextureView *v, bool has_view, int textype);  // textures.c: twin view once filled
 bool vk_depth_twin_stale(TexBackend *b);  // textures.c: b is compare-sampled through a twin that needs a copy now (outside a pass)
@@ -150,6 +156,7 @@ uint64_t vk_residency_need_ns(void);  // textures.c: time of the last measuremen
 uint64_t vk_residency_pressure(bool *commit);  // textures.c: bytes over the VRAM budget / under the commit floor (0 = none)
 void vk_depth_twin_copy(VkCommandBuffer cb, TexBackend *b);  // after a pass into b: refresh its twin (exec.c blk_copy_back)
 void vk_writeback_flush(void);  // textures.c: rendered CPU-movable textures' texels -> their guest storage (end of execute)
+void vk_writeback_complete(uint64_t done, bool render_thread);  // textures.c: deferred write-back batches the GPU has done -> storage
 void vk_cpu_read_begin(void);  // textures.c: pass begin: drops notes of a pass that never ended (a device reset)
 void vk_cpu_read_note(NvnTexture *t, TexBackend *b);  // textures.c: pass begin, colour target t: a CPU-read target?
 void vk_cpu_read_flush(VkCommandBuffer cb);  // textures.c: after the pass (outside it): their texels -> our staging, no wait
@@ -235,6 +242,16 @@ bool vk_ffx_fg_ready(void);
 bool vk_ffx_fg_prepare(VkCommandBuffer cb, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, VkFormat fmt, VkFormat hudless_fmt);
 int vk_ffx_fg_evaluate(VkCommandBuffer cb, const VkTemporalInputs *in, VkNgxImage *out, int n);   // frames made (x2: n = 1)
 void vk_ffx_release(void);   // both contexts (device teardown, a backend switch)
+// Intel XeSS super resolution (xess.c, libxess.dll): device.c's start-up requests, then the same interface as FSR's
+uint32_t vk_xess_instance_exts(const char **ext, uint32_t n, uint32_t cap);   // adds XeSS's instance extensions
+uint32_t vk_xess_device_exts(const char *const **names);   // XeSS's device extensions (0: unavailable)
+uint32_t vk_xess_features(void);   // bits: 0 storage-image write without format, 1 mutable descriptor type, 2 int8, 3 dot
+                                   // product, 31 a structure we do not enable
+void vk_xess_device_ready(bool ok);   // device.c: everything XeSS asked for is enabled
+bool vk_xess_sr_ready(void);
+bool vk_xess_sr_prepare(VkCommandBuffer cb, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh);
+bool vk_xess_sr_evaluate(VkCommandBuffer cb, const VkTemporalInputs *in);
+void vk_xess_release(void);
 void vk_ngx_sr_jitter(uint64_t frame, uint32_t render_w, uint32_t out_w, float *jx, float *jy);  // render pixels
 float vk_ngx_sr_mip_bias(uint32_t render_w, uint32_t out_w);
 float vk_ngx_sr_lod_bias(void);   // textures.c: the material textures' bias with SR on (0: none)
@@ -268,6 +285,12 @@ void vk_present_pick_format(const VkSurfaceFormatKHR *fmts, uint32_t nf, VkSurfa
 void vk_present_swapchain_retire(void);                      // after vkCreateSwapchainKHR, before the old views go
 void vk_present_swapchain_ready(VkSurfaceFormatKHR sf, int mode);   // g_vk.sc_* filled (HDR: the canvas replaces them)
 bool vk_present_hdr_encode(VkCommandBuffer cb, uint32_t image);     // instead of the PRESENT_SRC barrier; false: HDR off
+// display.hdr_hue: on (HDR output, or a TOTK_HDR_PROBE frame to come); exec.c keeps the tonemap's scene and its SDR
+// picture at the upscale pass; device.c tells where the game image went in the window (vk_present_draw's rect, pv)
+bool vk_present_hue_on(void);
+void vk_present_hue_capture(VkCommandBuffer cb, TexBackend *scene, TexBackend *sdr);
+void vk_present_hue_map(float vx, float vy, float vw, float vh, const float pv[8], bool crop_is_scene);
+void vk_hue_forget(TexBackend *b);   // exec.c: b destroyed / replaced / pooled (textures.c, beside contact_forget)
 uint64_t vk_present_chain(VkPresentInfoKHR *pi, bool generated);   // present id for this present (0: none)
 void vk_present_note(uint64_t id, uint64_t game_ns, bool generated);   // TOTK_PRESENT_LOG "l" row
 VkResult vk_present_acquire(VkSemaphore sem, uint64_t timeout_ns, uint32_t *image);   // vkAcquireNextImageKHR, under the lock
@@ -298,5 +321,13 @@ VkResult vk_present_queue_result(void);                      // out of date / su
 void vi_pace_present_point(void);                            // hle_vi.cpp: TOTK_PACE_AT=present waits here
 const void *vk_present_swapchain_pnext(void);                // swapchain create chain (exclusive fullscreen) or NULL
 void vk_present_lost(void);                                  // VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT seen
+// TOTK_GLITCH_DETECT's texture-path events per presented frame (exec.c, dumped at a hit beside the pass ring): alias
+// misses (writer gone / of another shape; read guest bytes / own older image), a finalized-while-registered object
+// sampled (unbound / uploaded again from its storage), a bound handle whose slot names nothing, a texture written back,
+// a CPU texture uploaded again with new bytes, one uploaded while the game wrote its pages (the write watch saw a write
+// during the hash and copy)
+enum { TXE_AM_GONE_GUEST, TXE_AM_GONE_OWN, TXE_AM_SHAPE_GUEST, TXE_AM_SHAPE_OWN, TXE_ZOMBIE_NULL, TXE_ZOMBIE_REUP, TXE_NONE, TXE_WB,
+       TXE_CHANGED, TXE_TORN, TXE_LATEFILL, TXE_N };   // (TXE_LATEFILL: new bytes within 8 frames of its first upload)
+void vk_txe_note(int kind, const NvnTexture *t);             // (render thread; t may be NULL)
 
 #include "vkq.h"   // (vkCmd* calls -> the deferred recorder when LARECOMP_VKQ=1)

@@ -10,7 +10,7 @@
 #include <stdbool.h>
 #include "../nvn.h"
 
-#define CAP_MAGIC "NXRCAP01"
+#define CAP_MAGIC "NXRCAP02"   // (02, 11-06: the pool entries grew, NvnTexEntry / NvnSamplerDesc history for LARECOMP_POOL_SNAP; 01 files no longer load)
 enum {
     CAP_HEADER = 1,  // CapHeader
     CAP_MEMPOOL,     // id: NvnPool

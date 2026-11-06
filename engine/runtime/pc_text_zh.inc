@@ -54,7 +54,7 @@ PC_TR("Controls",
 PC_TR("Keyboard layout",
       "键盘布局")
 PC_TR("For the console scheme, and with the PC scheme for the world while Gameplay keys is Console (menus use the PC keys). Classic: Space jump, Shift sprint, E interact, F attack, WASD, arrows camera. PC: E interact, Shift sprint, Space jump, left mouse attack, right mouse bow, Q target, F abilities. Custom: the PC keys changed by the bindings below.",
-      "用于主机方案；游戏按键为主机布局时，世界中也可配合 PC 方案使用（菜单使用 PC 按键）。经典：空格跳跃、Shift 冲刺、E 互动、F 攻击、WASD 移动、方向键控制视角。PC：E 互动、Shift 冲刺、空格跳跃、鼠标左键攻击、鼠标右键拉弓、Q 锁定、F 能力。自定义：经下方按键绑定修改的 PC 按键。")
+      "用于主机方案；游戏按键为主机布局时，世界中也可配合 PC 方案使用（菜单使用 PC 按键）。经典：空格跳跃、Shift 冲刺、E 互动、F 攻击、WASD 移动、方向键控制视角。PC：E 互动、Shift 冲刺、空格跳跃、鼠标左键攻击、鼠标右键拉弓、Q 注视、F 能力。自定义：经下方按键绑定修改的 PC 按键。")
 PC_TR("Classic (the engine's keys)",
       "经典（引擎按键）")
 PC_TR("PC (WASD, mouse)",
@@ -72,9 +72,9 @@ PC_TR("A press of the sprint key starts sprinting and the next one stops it; it 
 PC_TR("On",
       "开启")
 PC_TR("Shield and target toggle",
-      "盾牌与锁定切换")
+      "盾牌与注视切换")
 PC_TR("A press of the shield / target key raises the shield and targets, the next press lowers it; a menu lets it go too. Off: hold it, as on the Switch.",
-      "按一下盾牌 / 锁定键举盾并锁定目标，再按一下放下；打开菜单时也会松开。关闭：按住，与 Switch 相同。")
+      "按一下盾牌 / 注视键举盾并注视目标，再按一下放下；打开菜单时也会松开。关闭：按住，与 Switch 相同。")
 PC_TR("Mouse camera",
       "鼠标视角")
 PC_TR("The mouse turns the camera (click the window to capture the pointer; Esc, F10 or Alt+Tab frees it). 0 = off; above 1 turns faster.",
@@ -240,7 +240,7 @@ PC_TR("L (abilities)",
 PC_TR("R (throw)",
       "R（投掷）")
 PC_TR("ZL (target / shield)",
-      "ZL（锁定 / 盾牌）")
+      "ZL（注视 / 盾牌）")
 PC_TR("ZR (bow)",
       "ZR（弓）")
 PC_TR("+ (menu)",
@@ -384,7 +384,7 @@ PC_TR("Next arrow material",
 PC_TR("Previous arrow material",
       "上一种箭矢素材")
 PC_TR("Shield and lock on",
-      "盾牌与锁定")
+      "盾牌与注视")
 PC_TR("Put away / take out the weapon",
       "收起 / 拿出武器")
 PC_TR("Take out / put away the bow",
@@ -428,7 +428,7 @@ PC_TR("Inventory",
 PC_TR("Map",
       "地图")
 PC_TR("Adventure log",
-      "冒险日志")
+      "冒险笔记")
 PC_TR("Pause menu",
       "暂停菜单")
 PC_TR("Abilities",
@@ -705,12 +705,12 @@ PC_TR("Custom only: how colourful the picture is; 1 is the game's, 0.5 greyer, 2
       "仅自定义：画面的色彩浓度；1 为游戏原值，0.5 更灰，2 为两倍浓度。")
 PC_TR("Custom only: below 1 brightens the dark tones, above 1 darkens them; 1 is the game's.",
       "仅自定义：低于 1 提亮暗部，高于 1 压暗；1 为游戏原值。")
-PC_TR("The resolution the 3D scene is drawn at, against the game's own. Higher is sharper and costs much more GPU; lower is faster and blurrier. 100 % is native.",
-      "3D 场景的绘制分辨率，相对于游戏自身的分辨率。越高越清晰，GPU 开销大得多；越低越快但更模糊。100 % 为原生。")
+PC_TR("The resolution the 3D scene is drawn at, against the game's own. Higher is sharper and costs much more GPU; lower is faster and blurrier. The default: the window's resolution.",
+      "3D 场景的绘制分辨率，相对于游戏自身的分辨率。越高越清晰，GPU 开销大得多；越低越快但更模糊。默认：窗口分辨率。")
 PC_TR("Lowers the 3D resolution only when the GPU falls behind, never below the floor chosen, to hold the frame rate. Off keeps the picture sharp all the time; On is smoother on a slower GPU.",
       "仅当 GPU 跟不上时降低 3D 分辨率，且不低于所选下限，以保持帧率。关闭：画面始终清晰；开启：在较慢的 GPU 上更流畅。")
-PC_TR("Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the game's 1080p stretched. Sharper text for a little GPU. Off by default for now: at some resolutions it can show broken text (being fixed).",
-      "高于 1080p 时，菜单、文字和 HUD 按窗口分辨率绘制，而不是拉伸游戏的 1080p。文字更清晰，GPU 开销很小。目前默认关闭：在某些分辨率下文字可能显示错乱（正在修复）。")
+PC_TR("Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the game's 1080p stretched, and the 3D scene (render scale, DLSS / DLAA) reaches the window's resolution too. Sharper picture for a little GPU.",
+      "高于 1080p 时，菜单、文字和 HUD 按窗口分辨率绘制，而不是拉伸游戏的 1080p；3D 场景（渲染分辨率、DLSS / DLAA）也达到窗口分辨率。画面更清晰，GPU 开销很小。")
 PC_TR("Generated frames between the real ones make motion look smoother, but the game itself does not run faster and input latency rises a little. DLSS x2: RTX 40 and newer, x3 and x4: RTX 50; FSR x2: any GPU. Best when the game already runs well.",
       "在真实帧之间生成的帧使动作更流畅，但游戏本身不会更快，输入延迟会略有增加。DLSS x2：RTX 40 及更新，x3 和 x4：RTX 50；FSR x2：任意 GPU。游戏本身已运行良好时效果最佳。")
 PC_TR("How the 3D scene is scaled up to the output: Bicubic (the port's) or FSR 1 (the game's own). Matters only below 100 % render resolution; either costs little.",
@@ -727,8 +727,8 @@ PC_TR("Keeps ground textures sharp when seen at a shallow angle. Higher is sharp
       "在斜视角度下保持地面纹理清晰。越高越清晰，GPU 开销很小；16x 适合大多数 GPU。游戏自带：使用其自身设置。")
 PC_TR("Which texture detail level is used; 0 is the game's. Below 0 is sharper but can shimmer; above 0 is blurrier and can break textures (red grass). Not a quality slider: leave it at 0.",
       "使用的纹理细节级别；0 为游戏原值。低于 0 更清晰但可能闪烁；高于 0 更模糊，且可能破坏纹理（红色草地）。不是画质滑块：请保持为 0。")
-PC_TR("The resolution of the renderer's shadow maps: 1x is the Switch's, 2x (default) sharper, 3x and 4x sharper still for more GPU time and memory.",
-      "渲染器阴影贴图的分辨率：1x 为 Switch 的水平，2x（默认）更清晰，3x 和 4x 更加清晰，但占用更多 GPU 时间和显存。")
+PC_TR("The resolution of the renderer's shadow maps: 1x is the Switch's, 2x (default) sharper, 3x and 4x sharper still for more GPU time and memory. With little video memory they are lowered to what fits (4 GB cards: 2x).",
+      "渲染器阴影贴图的分辨率：1x 为 Switch 的水平，2x（默认）更清晰，3x 和 4x 更加清晰，但占用更多 GPU 时间和显存。显存较小时会降低到可容纳的倍数（4 GB 显卡：2x）。")
 PC_TR("Sun shadows grow softer the farther they fall from what casts them, as in real light. Off is the game's look; on costs some GPU. A change rebuilds the shadow shaders in the background: the old shadows show until then.",
       "太阳阴影离投射物越远越柔和，如同真实光照。关闭为游戏原样；开启会占用一些 GPU。更改会在后台重建阴影着色器：在此之前仍显示旧阴影。")
 PC_TR("Adds the small sun shadows the shadow maps miss: at feet, under stones, in grass. Off is the game's look; Subtle to Strong cost some GPU.",
@@ -755,6 +755,8 @@ PC_TR("Your monitor's peak brightness in nits, so highlights are neither clipped
       "显示器的峰值亮度，单位 nits，使高光既不被削平也不暗淡。请使用显示器标明的数值。")
 PC_TR("How bright ordinary white (menus, the sky) is in HDR. Raise it if the picture looks dim, lower it if it is too bright.",
       "HDR 下普通白色（菜单、天空）的亮度。画面偏暗时调高，过亮时调低。")
+PC_TR("How much of their real colour bright lights keep in HDR: a torch flame or lava stays orange instead of turning yellow-white. 0 (the default) shows the picture as in SDR, only brighter; the HUD is left as it is.",
+      "HDR 下明亮光源保留多少真实颜色：火把的火焰或岩浆保持橙色，而不是变成黄白色。设为 0（默认）时画面与 SDR 相同，只是更亮；HUD 保持原样。")
 PC_TR("The window's (the default): on a 3:2, 16:10, 21:9, 32:9 or 48:9 window or monitor the picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 among them, keep the game's own. 16:9 / 16:10 / 21:9 / 32:9 / 48:9 / 3:2: that shape whatever the window. A new shape's layouts are made at its first start (about 30 s, once). A wider picture costs more GPU.",
       "跟随窗口（默认）：在 3:2、16:10、21:9、32:9 或 48:9 的窗口或显示器上，画面采用该形状，21:9、32:9 和 48:9 视野更宽；其他形状（包括 16:9）保持游戏原画面。16:9 / 16:10 / 21:9 / 32:9 / 48:9 / 3:2：无论窗口如何都使用该形状。新形状的界面布局会在其首次启动时生成（约 30 秒，仅一次）。画面越宽，GPU 负担越大。")
 PC_TR("On 21:9, 32:9 or 48:9: the HUD at the screen's edges, or in the middle 16:9 (easier to see on a very wide screen). Nothing changes at 16:9. Automatic (the default): the middle on 48:9, the edges otherwise.",
@@ -842,7 +844,7 @@ PC_TR("How long a quick tap of W, A, S or D keeps Link moving, so he takes a ste
 PC_TR("One press of the sprint key starts sprinting and the next stops it. Off: hold it, as on the Switch.",
       "按一下冲刺键开始冲刺，再按一下停止。关闭：按住，与 Switch 相同。")
 PC_TR("One press of the shield / target key raises the shield and targets, the next lowers it. Off: hold it, as on the Switch.",
-      "按一下盾牌 / 锁定键举盾并锁定，再按一下放下。关闭：按住，与 Switch 相同。")
+      "按一下盾牌 / 注视键举盾并注视，再按一下放下。关闭：按住，与 Switch 相同。")
 PC_TR("How fast moving the mouse sideways turns an object while R is held in Ultrahand or Autobuild (1x: as far as the camera turns). The wheel turns it vertically; moving the mouse up or down does not turn it.",
       "在究极手或蓝图中按住 R 时，左右移动鼠标旋转物体的快慢（1x：与镜头转动相同）。滚轮使其纵向旋转；上下移动鼠标不会旋转物体。")
 PC_TR("A non-Nintendo pad's face buttons: by position (the Switch layout: the right button confirms) or by label (Xbox A confirms).",
@@ -863,10 +865,10 @@ PC_TR("How far the left stick must move before it counts. Raise it if Link moves
       "左摇杆需要移动多远才会生效。若摇杆静止时林克仍在移动，请调高；想要更精细的步伐，请调低。0 = 手柄自带。")
 PC_TR("How far the right stick must move before it counts. Raise it if the camera turns with the stick at rest; lower it for finer aiming. 0 = the pad's own.",
       "右摇杆需要移动多远才会生效。若摇杆静止时视角仍在转动，请调高；想要更精细的瞄准，请调低。0 = 手柄自带。")
-PC_TR("The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' language if the game has it, else English.",
-      "游戏的文本和字幕，以及这些设置自身的文字（英语、西班牙语、俄语、巴西葡萄牙语、简体中文）。Português (Brasil)：1.4.3 的文本；1.0.0 需要交给 Setup 的 1.4.3 更新（否则为英语），语音仍为英语。自动：游戏支持时使用 Windows 的语言，否则为英语。")
-PC_TR("A new game skips the opening and starts on the Great Sky Island. F2 or Minus on the title screen also switch it.",
-      "新游戏会跳过开场，直接从初始空岛开始。标题画面上按 F2 或－键也可切换。")
+PC_TR("The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese, Traditional Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' language if the game has it, else English.",
+      "游戏的文本和字幕，以及这些设置自身的文字（英语、西班牙语、俄语、巴西葡萄牙语、简体中文、繁体中文）。Português (Brasil)：1.4.3 的文本；1.0.0 需要交给 Setup 的 1.4.3 更新（否则为英语），语音仍为英语。自动：游戏支持时使用 Windows 的语言，否则为英语。")
+PC_TR("A new game skips the opening and starts on the Great Sky Island. F2 or Minus on the title screen also switch it. Game version 1.0.0 only (on 1.4.x the opening plays and the row is hidden).",
+      "新游戏会跳过开场，直接从初始空岛开始。标题画面上按 F2 或－键也可切换。仅限游戏版本 1.0.0（在 1.4.x 上会播放开场，此行隐藏）。")
 PC_TR("Docked (default) or handheld: handheld renders at the Switch's lower handheld resolution (faster, blurrier).",
       "底座模式（默认）或掌机模式：掌机模式以 Switch 较低的掌机分辨率渲染（更快，更模糊）。")
 PC_TR("Pauses the game, picture and sound, while its window is not in front.",
@@ -897,8 +899,8 @@ PC_TR("Console layout",
       "主机布局")
 PC_TR("Language",
       "语言")
-PC_TR("TOTK_LANG: the game's texts and voices' subtitles, and the PC settings' own texts (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' display language if the game has it, else English.",
-      "TOTK_LANG：游戏文本、语音字幕以及 PC 设置自身的文字（英语、西班牙语、俄语、巴西葡萄牙语、简体中文）。Português (Brasil)：1.4.3 的文本；1.0.0 需要交给 Setup 的 1.4.3 更新（否则为英语），语音仍为英语。自动：游戏支持时使用 Windows 的显示语言，否则为英语。")
+PC_TR("TOTK_LANG: the game's texts and voices' subtitles, and the PC settings' own texts (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese, Traditional Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' display language if the game has it, else English.",
+      "TOTK_LANG：游戏文本、语音字幕以及 PC 设置自身的文字（英语、西班牙语、俄语、巴西葡萄牙语、简体中文、繁体中文）。Português (Brasil)：1.4.3 的文本；1.0.0 需要交给 Setup 的 1.4.3 更新（否则为英语），语音仍为英语。自动：游戏支持时使用 Windows 的显示语言，否则为英语。")
 PC_TR("Automatic (Windows' language)",
       "自动（Windows 语言）")
 PC_TR("Russian",
@@ -1181,16 +1183,18 @@ PC_TR("Large size",
       "大")
 PC_TR("Render resolution",
       "渲染分辨率")
-PC_TR("TOTK_RES_SCALE, of the game's 1600 x 900. Applies at once.",
-      "TOTK_RES_SCALE，相对于游戏的 1600 x 900。立即生效。")
+PC_TR("TOTK_RES_SCALE, of the game's 1600 x 900. Window resolution: the 3D scene as large as the picture in the window (x0.83 of it on an integrated GPU or one under 8 GB; two thirds of it with DLSS, FSR or XeSS, their Quality). Applies at once.",
+      "TOTK_RES_SCALE，相对于游戏的 1600 x 900。窗口分辨率：3D 场景与窗口中的画面一样大（集成显卡或显存低于 8 GB 时为其 x0.83；使用 DLSS、FSR 或 XeSS 时为其三分之二，即质量模式）。立即生效。")
 PC_TR("100 % (native)",
       "100 %（原生）")
-PC_TR("Follow the window height",
-      "跟随窗口高度")
+PC_TR("Window resolution (default)",
+      "窗口分辨率（默认）")
+PC_TR("Window resolution x0.83 (default: integrated GPU or under 8 GB)",
+      "窗口分辨率 x0.83（默认：集成显卡或显存低于 8 GB）")
 PC_TR("Native-resolution interface",
       "原生分辨率界面")
-PC_TR("TOTK_OUT_SCALE: above 1080p, menus, text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched. Off by default: at some resolutions it can show broken text (being fixed). Applies at once.",
-      "TOTK_OUT_SCALE：高于 1080p 时，菜单、文字和 HUD 按窗口分辨率绘制，而不是拉伸游戏的 1920 x 1080。默认关闭：在某些分辨率下文字可能显示错乱（正在修复）。立即生效。")
+PC_TR("TOTK_OUT_SCALE: above 1080p, menus, text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched; the 3D scene reaches it too. On by default. Applies at once.",
+      "TOTK_OUT_SCALE：高于 1080p 时，菜单、文字和 HUD 按窗口分辨率绘制，而不是拉伸游戏的 1920 x 1080；3D 场景也达到该分辨率。默认开启。立即生效。")
 PC_TR("Dynamic resolution",
       "动态分辨率")
 PC_TR("Off: the scene always at the render resolution. On: the game lowers it only when the GPU is short of time, never below the chosen floor, aiming at the frame rate. Applies at once.",
@@ -1586,6 +1590,10 @@ PC_TR("Paper white (nits)",
       "纸白亮度（nits）")
 PC_TR("TOTK_HDR_PAPER: the brightness of SDR white.",
       "TOTK_HDR_PAPER：SDR 白色的亮度。")
+PC_TR("Highlight colour",
+      "高光颜色")
+PC_TR("TOTK_HDR_HUE: the hue of bright lights from the game's HDR scene, 0 to 100.",
+      "TOTK_HDR_HUE：从游戏的 HDR 场景取回明亮光源的色调，0 到 100。")
 PC_TR("Mouse cursor in menus",
       "菜单中的鼠标指针")
 PC_TR("TOTK_MENU_CURSOR: in a menu the pointer shows and selects what it points at; left click is A (back is Esc).",
@@ -1668,8 +1676,8 @@ PC_TR("Cutscenes (21:9, 32:9, 48:9)",
       "过场动画（21:9、32:9、48:9）")
 PC_TR("On a 21:9, 32:9 or 48:9 canvas, real-time cutscenes and conversations: wide like the rest of the game, or the original 16:9 framing with bars at the sides (for a scene that looks odd at the edges). Pre-rendered movies are 16:9 video: always shown in the middle with bars.",
       "在 21:9、32:9 或 48:9 画布上，实时过场动画和对话：与游戏其余部分一样宽，或保持原始 16:9 画面、两侧加黑边（用于边缘显得奇怪的场景）。预渲染影片是 16:9 视频：始终居中显示，带黑边。")
-PC_TR("Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR: any GPU. All cost some GPU; Off is the game's own.",
-      "使用时间性放大器放大 3D 场景，在多帧中累积细节。DLSS：仅限 NVIDIA RTX；DLAA：以完整分辨率运行的 DLSS，画质最佳但占用更多 GPU。FSR：任何 GPU。均会占用一些 GPU；关闭为游戏原样。")
+PC_TR("Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR and XeSS: any GPU (XeSS runs fastest on Intel Arc). All cost some GPU; Off is the game's own.",
+      "使用时间性放大技术放大 3D 场景，在多帧之间累积细节。DLSS：仅限 NVIDIA RTX；DLAA：全分辨率的 DLSS，画质最佳但更耗 GPU。FSR 和 XeSS：任意 GPU（XeSS 在 Intel Arc 上最快）。都会占用一些 GPU；关闭则为游戏自带的方式。")
 PC_TR("Safe mode (if the game crashes)",
       "安全模式（游戏崩溃时）")
 PC_TR("For a game that crashes or hangs: the renderer without its faster paths, DLSS, FSR and frame generation, and without the driver paths some GPUs crash in. Slower. At the next start.",
@@ -1678,6 +1686,10 @@ PC_TR("Wide picture: F10 > Restart the game now to use %s",
       "宽画面：F10 > 立即重启游戏 以使用 %s")
 PC_TR("The window changed shape: F10 > Restart the game now to fit it",
       "窗口形状已改变：F10 > 立即重启游戏 以适配窗口")
+PC_TR("Screen shape: start the game once from TotK Launcher.exe to prepare its layout (16:9 until then)",
+      "屏幕形状：请从 TotK Launcher.exe 启动一次游戏以准备其界面布局（在此之前保持 16:9）")
+PC_TR("This screen shape's layout was not prepared: 16:9 until Setup runs again",
+      "此屏幕形状的界面布局未能准备好：在重新运行 Setup 之前保持 16:9")
 PC_TR("Safe mode is on: DLSS, FSR and frame generation stay off",
       "安全模式已开启：DLSS、FSR 和帧生成保持关闭")
 PC_TR("Frame generation mode",
@@ -1690,8 +1702,8 @@ PC_TR("TOTK_FG_PACE. Smooth: the frames shown match the monitor (real ones at th
       "TOTK_FG_PACE。平滑：显示的帧与显示器同步（真实帧为帧率上限除以倍数）。最高帧率：真实帧与不开帧生成时相同，每个真实帧后加上倍数对应的生成帧，可超过刷新率，开启 VRR 时也是如此（使用 mailbox，没有时用 immediate，可能出现画面撕裂；显示器可能退出 VRR；TOTK_FG_MAX_VRR_FIFO=1 保留 VRR 的 FIFO）。")
 PC_TR("Smooth keeps the frames shown in step with the monitor's refresh. Maximum fps adds the generated frames to every real frame the PC makes, even past the refresh rate: more frames than the screen shows (the fps readout counts them all), for VRR panels or low latency; Smooth looks steadier on a fixed refresh. With V-sync off the picture can tear.",
       "平滑让显示的帧与显示器刷新同步。最高帧率把生成帧加到电脑生成的每个真实帧上，即使超过刷新率：帧数多于屏幕能显示的（帧率显示会全部计入），适合 VRR 显示器或低延迟；固定刷新率下平滑看起来更稳。关闭垂直同步时画面可能撕裂。")
-PC_TR("TOTK_DLSS_SR / TOTK_FSR_SR. DLSS (NVIDIA RTX) or FSR (any GPU) upscales the 3D scene to the output in place of the game's upscaler and its FXAA (DLAA / native AA when Render resolution matches the output).",
-      "TOTK_DLSS_SR / TOTK_FSR_SR。DLSS（NVIDIA RTX）或 FSR（任意 GPU）代替游戏自带的放大器及其 FXAA，将 3D 场景放大到输出分辨率（渲染分辨率与输出一致时为 DLAA / 原生 AA）。")
+PC_TR("TOTK_DLSS_SR / TOTK_FSR_SR / TOTK_XESS_SR. DLSS (NVIDIA RTX), FSR or XeSS (any GPU) upscales the 3D scene to the output in place of the game's upscaler and its FXAA (DLAA / native AA when Render resolution matches the output).",
+      "TOTK_DLSS_SR / TOTK_FSR_SR / TOTK_XESS_SR。DLSS（NVIDIA RTX）、FSR 或 XeSS（任意 GPU）代替游戏自带的放大和 FXAA，将 3D 场景放大到输出分辨率（渲染分辨率与输出相同时为 DLAA / 原生抗锯齿）。")
 PC_TR("FSR (any GPU)",
       "FSR（任意 GPU）")
 PC_TR("TOTK_DLSS_FG / TOTK_FSR_FG. Generated frames between real ones: DLSS x2 on NVIDIA RTX 40 series and newer, x3 and x4 on RTX 50; FSR x2 on any GPU. The frame cap counts the frames shown (at a 30 cap: x2, 60 shown). Adds some input latency.",
@@ -1730,3 +1742,65 @@ PC_TR("Safe GPU mode: the graphics driver crashed in the last runs, so shaders n
       "GPU 安全模式：图形驱动在最近几次运行中崩溃，因此着色器现在以较慢的安全方式编译")
 PC_TR("Safe GPU mode: the graphics driver kept crashing, so shaders are also built unoptimised; the game may run slower until it has run cleanly a few times",
       "GPU 安全模式：图形驱动持续崩溃，因此着色器也将以未优化方式编译；在游戏正常运行几次之前，可能会变慢")
+PC_TR("XeSS (any GPU)",
+      "XeSS（任意 GPU）")
+PC_TR("Shader compile indicator",
+      "着色器编译提示")
+PC_TR("Bottom right while shaders compile: the percentage on a first start, how many are left in play.",
+      "着色器编译时显示在右下角：首次启动时显示百分比，游戏中显示剩余数量。")
+PC_TR("Shows when shaders are being compiled (bottom right): a short stutter while it is up is the compile, not your PC. Off hides it in play (a first start still shows its progress); the compiling still happens.",
+      "在着色器编译时显示（右下角）：此时出现的短暂卡顿来自编译，而不是你的电脑。关闭后在游戏中隐藏提示（首次启动仍会显示进度），编译仍会进行。")
+PC_TR("Shaders left to compile:",
+      "待编译着色器：")
+PC_TR("Last hitch",
+      "上次卡顿")
+PC_TR("No hitch yet",
+      "暂无卡顿")
+PC_TR("GPU wait",
+      "等待 GPU")
+PC_TR("shader builds",
+      "着色器编译")
+PC_TR("texture uploads",
+      "纹理上传")
+PC_TR("new images",
+      "新建图像")
+PC_TR("file reads",
+      "文件读取")
+PC_TR("present (driver / window)",
+      "呈现（驱动 / 窗口）")
+PC_TR("game CPU",
+      "游戏 CPU")
+PC_TR("render CPU",
+      "渲染 CPU")
+PC_TR("s ago",
+      "秒前")
+PC_TR("Upscaler:",
+      "超分辨率：")
+PC_TR("off",
+      "关闭")
+PC_TR("plain scaling",
+      "普通缩放")
+PC_TR("native",
+      "原生")
+PC_TR("Quality",
+      "质量")
+PC_TR("Balanced",
+      "平衡")
+PC_TR("Performance",
+      "性能")
+PC_TR("Ultra Performance",
+      "超级性能")
+PC_TR("idle",
+      "未运行")
+PC_TR("3D output is",
+      "3D 输出为")
+PC_TR("scene",
+      "场景")
+PC_TR("it failed to start",
+      "启动失败")
+PC_TR("starting",
+      "正在启动")
+PC_TR("no 3D view this frame",
+      "本帧无 3D 画面")
+PC_TR("no scene seen",
+      "未见场景")

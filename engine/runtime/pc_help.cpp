@@ -42,6 +42,9 @@ const Help k_help[] = {
     {"display.vrr", PC_T("Variable refresh rate (G-SYNC, FreeSync): the monitor waits for each frame, smooth below its "
                          "refresh rate and without tearing. Needs a VRR monitor with VRR on in Windows or the driver.")},
     {"display.perf_overlay", PC_T("Shows fps, the 1% low and a frame-time graph over the game (F9), to check performance.")},
+    {"display.compile_osd", PC_T("Shows when shaders are being compiled (bottom right): a short stutter while it is up is "
+                                  "the compile, not your PC. Off hides it in play (a first start still shows its progress); "
+                                  "the compiling still happens.")},
     {"display.fps_readout", PC_T("A small frame-rate counter in a corner (F3 shows or hides it). Minimal: fps; Detailed adds "
                                  "the frame time, the 1% low and the worst frame. Off costs nothing.")},
     {"display.fps_position", PC_T("The counter's corner. Top right keeps clear of the hearts and the map.")},
@@ -57,16 +60,16 @@ const Help k_help[] = {
     {"display.color_gamma", PC_T("Custom only: below 1 brightens the dark tones, above 1 darkens them; 1 is the game's.")},
     // Graphics > Rendering
     {"graphics.render_scale", PC_T("The resolution the 3D scene is drawn at, against the game's own. Higher is sharper and "
-                                   "costs much more GPU; lower is faster and blurrier. 100 % is native.")},
+                                   "costs much more GPU; lower is faster and blurrier. The default: the window's resolution.")},
     {"graphics.dynamic_resolution", PC_T("Lowers the 3D resolution only when the GPU falls behind, never below the floor "
                                          "chosen, to hold the frame rate. Off keeps the picture sharp all the time; On is "
                                          "smoother on a slower GPU.")},
     {"graphics.native_ui", PC_T("Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the "
-                                "game's 1080p stretched. Sharper text for a little GPU. Off by default for now: at some "
-                                "resolutions it can show broken text (being fixed).")},
+                                "game's 1080p stretched, and the 3D scene (render scale, DLSS / DLAA) reaches the window's "
+                                "resolution too. Sharper picture for a little GPU.")},
     {"graphics.dlss", PC_T("Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: "
-                           "NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR: any GPU. All "
-                           "cost some GPU; Off is the game's own.")},
+                           "NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR and XeSS: any "
+                           "GPU (XeSS runs fastest on Intel Arc). All cost some GPU; Off is the game's own.")},
     {"graphics.frame_gen", PC_T("Generated frames between the real ones make motion look smoother, but the game itself does "
                                 "not run faster and input latency rises a little. DLSS x2: RTX 40 and newer, x3 and x4: RTX "
                                 "50; FSR x2: any GPU. Best when the game already runs well.")},
@@ -100,7 +103,8 @@ const Help k_help[] = {
                                        "or late textures). Fine colour detail gets a little softer. Automatic turns it "
                                        "on only on such cards.")},
     {"graphics.shadow_scale", PC_T("The resolution of the renderer's shadow maps: 1x is the Switch's, 2x (default) sharper, "
-                                   "3x and 4x sharper still for more GPU time and memory.")},
+                                   "3x and 4x sharper still for more GPU time and memory. With little video memory they are lowered to "
+                                   "what fits (4 GB cards: 2x).")},
     {"graphics.soft_shadows", PC_T("Sun shadows grow softer the farther they fall from what casts them, as in real light. Off "
                                    "is the game's look; on costs some GPU. A change rebuilds the shadow shaders in the "
                                    "background: the old shadows show until then.")},
@@ -131,6 +135,9 @@ const Help k_help[] = {
                               "value the monitor states.")},
     {"display.hdr_paper", PC_T("How bright ordinary white (menus, the sky) is in HDR. Raise it if the picture looks dim, "
                                "lower it if it is too bright.")},
+    {"display.hdr_hue", PC_T("How much of their real colour bright lights keep in HDR: a torch flame or lava stays orange "
+                             "instead of turning yellow-white. 0 (the default) shows the picture as in SDR, only brighter; "
+                             "the HUD is left as it is.")},
     // Graphics > Game patches
     {"graphics.aspect_ratio", PC_T("The window's (the default): on a 3:2, 16:10, 21:9, 32:9 or 48:9 window or monitor the "
                                    "picture takes that shape, 21:9, 32:9 and 48:9 with a wider view; other shapes, 16:9 "
@@ -236,11 +243,13 @@ const Help k_help[] = {
                                      "the stick at rest; lower it for finer aiming. 0 = the pad's own.")},
     // Game
     {"game.language", PC_T("The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Brazilian "
-                           "Portuguese, Simplified Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the "
+                           "Portuguese, Simplified Chinese, Traditional Chinese). Português (Brasil): 1.4.3's texts; "
+                           "with 1.0.0 they need the "
                            "1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' "
                            "language if the game has it, else English.")},
     {"game.skip_opening", PC_T("A new game skips the opening and starts on the Great Sky Island. F2 or Minus on the title "
-                               "screen also switch it.")},
+                               "screen also switch it. Game version 1.0.0 only (on 1.4.x the opening plays and the row "
+                               "is hidden).")},
     {"game.console_mode", PC_T("Docked (default) or handheld: handheld renders at the Switch's lower handheld resolution "
                                "(faster, blurrier).")},
     {"game.pause_unfocused", PC_T("Pauses the game, picture and sound, while its window is not in front.")},

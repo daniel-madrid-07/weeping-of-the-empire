@@ -1,7 +1,8 @@
 // pc_text.cpp: pc_tr (pc_text.h). A table per language, English -> its text, looked up by the English text itself, so a
 // row's label, help and choice names need no ids; a text a table lacks shows in English. Spanish (pc_text_es.inc,
-// PC_ES lines: every text has one, tools/engine/check_texts.py), Russian, Brazilian Portuguese and Simplified Chinese
-// (pc_text_ru.inc / _pt / _zh, PC_TR lines, pc-ui 11-02); pc_ui_lang (pc_lang.cpp) picks one. The few texts every
+// PC_ES lines: every text has one, tools/engine/check_texts.py), Russian, Brazilian Portuguese, Simplified Chinese
+// (pc_text_ru.inc / _pt / _zh, PC_TR lines, pc-ui 11-02) and Traditional Chinese (_zht, Taiwan's words, lang-ptbr
+// 11-04); pc_ui_lang (pc_lang.cpp) picks one. The few texts every
 // player meets in any language (the first start's shader pass, the restart notice) have the game's other languages too
 // (pc_text_langs.inc).
 #include "pc_text.h"
@@ -29,6 +30,9 @@ const Pair kPt[] = {
     {nullptr, nullptr}};
 const Pair kZh[] = {
 #include "pc_text_zh.inc"
+    {nullptr, nullptr}};
+const Pair kZht[] = {
+#include "pc_text_zht.inc"
 #undef PC_TR
     {nullptr, nullptr}};
 
@@ -47,6 +51,7 @@ const Table *table() {
         else if (!strcmp(ui, "ru")) m = make(kRu);
         else if (!strcmp(ui, "pt")) m = make(kPt);
         else if (!strcmp(ui, "zh-Hans")) m = make(kZh);
+        else if (!strcmp(ui, "zh-Hant")) m = make(kZht);
         else return (const Table *)nullptr;
         return (const Table *)&m;
     }();

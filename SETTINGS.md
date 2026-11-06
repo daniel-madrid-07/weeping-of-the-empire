@@ -21,6 +21,7 @@ Your settings are kept in `%APPDATA%\nxrecomp\TotK-engine\settings.ini` and surv
 - **Vsync**: On (default): no tearing. Off: slightly less input latency, with tearing lines.
 - **Variable refresh (VRR)**: Variable refresh rate (G-SYNC, FreeSync): the monitor waits for each frame, smooth below its refresh rate and without tearing. Needs a VRR monitor with VRR on in Windows or the driver.
 - **Perf overlay (F9)**: Shows fps, the 1% low and a frame-time graph over the game (F9), to check performance.
+- **Shader compile indicator**: Shows when shaders are being compiled (bottom right): a short stutter while it is up is the compile, not your PC. Off hides it in play (a first start still shows its progress); the compiling still happens.
 - **Fps readout (F3)**: A small frame-rate counter in a corner (F3 shows or hides it). Minimal: fps; Detailed adds the frame time, the 1% low and the worst frame. Off costs nothing.
 - **Fps readout corner**: The counter's corner. Top right keeps clear of the hearts and the map.
 - **Fps readout size**: The counter's size. It also grows with the window's height.
@@ -35,10 +36,10 @@ Your settings are kept in `%APPDATA%\nxrecomp\TotK-engine\settings.ini` and surv
 
 ## Graphics > Rendering
 
-- **Render resolution**: The resolution the 3D scene is drawn at, against the game's own. Higher is sharper and costs much more GPU; lower is faster and blurrier. 100 % is native.
+- **Render resolution**: The resolution the 3D scene is drawn at, against the game's own. Higher is sharper and costs much more GPU; lower is faster and blurrier. The default: the window's resolution.
 - **Dynamic resolution**: Lowers the 3D resolution only when the GPU falls behind, never below the floor chosen, to hold the frame rate. Off keeps the picture sharp all the time; On is smoother on a slower GPU.
-- **Native-resolution interface**: Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the game's 1080p stretched. Sharper text for a little GPU. Off by default for now: at some resolutions it can show broken text (being fixed).
-- **Upscaler**: Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR: any GPU. All cost some GPU; Off is the game's own.
+- **Native-resolution interface**: Above 1080p, menus, text and the HUD are drawn at the window's resolution instead of the game's 1080p stretched, and the 3D scene (render scale, DLSS / DLAA) reaches the window's resolution too. Sharper picture for a little GPU.
+- **Upscaler**: Upscales the 3D scene with a temporal upscaler that builds detail over several frames. DLSS: NVIDIA RTX only; DLAA: DLSS at full resolution, the best image for more GPU. FSR and XeSS: any GPU (XeSS runs fastest on Intel Arc). All cost some GPU; Off is the game's own.
 - **Frame generation**: Generated frames between the real ones make motion look smoother, but the game itself does not run faster and input latency rises a little. DLSS x2: RTX 40 and newer, x3 and x4: RTX 50; FSR x2: any GPU. Best when the game already runs well.
 - **Frame generation mode**: Smooth keeps the frames shown in step with the monitor's refresh. Maximum fps adds the generated frames to every real frame the PC makes, even past the refresh rate: more frames than the screen shows (the fps readout counts them all), for VRR panels or low latency; Smooth looks steadier on a fixed refresh. With V-sync off the picture can tear.
 - **DLSS model**: Which AI model DLSS and DLAA use. NVIDIA's default picks one for each quality. Preset K is the sharpest; preset J ghosts a little less behind moving things but flickers a little more. Changing it rebuilds DLSS once (a short pause).
@@ -51,7 +52,7 @@ Your settings are kept in `%APPDATA%\nxrecomp\TotK-engine\settings.ini` and surv
 - **Anisotropic filtering**: Keeps ground textures sharp when seen at a shallow angle. Higher is sharper for a little GPU; 16x suits most GPUs. The game's: its own setting.
 - **Texture LOD bias**: Which texture detail level is used; 0 is the game's. Below 0 is sharper but can shimmer; above 0 is blurrier and can break textures (red grass). Not a quality slider: leave it at 0.
 - **Compact textures (low VRAM)**: For graphics cards with 4 GB of video memory or less: the textures take a quarter of the memory, so the game no longer runs out of it (stutters, blurry or late textures). Fine colour detail gets a little softer. Automatic turns it on only on such cards.
-- **Shadow map scale (renderer)**: The resolution of the renderer's shadow maps: 1x is the Switch's, 2x (default) sharper, 3x and 4x sharper still for more GPU time and memory.
+- **Shadow map scale (renderer)**: The resolution of the renderer's shadow maps: 1x is the Switch's, 2x (default) sharper, 3x and 4x sharper still for more GPU time and memory. With little video memory they are lowered to what fits (4 GB cards: 2x).
 - **Soft shadows**: Sun shadows grow softer the farther they fall from what casts them, as in real light. Off is the game's look; on costs some GPU. A change rebuilds the shadow shaders in the background: the old shadows show until then.
 - **Contact shadows**: Adds the small sun shadows the shadow maps miss: at feet, under stones, in grass. Off is the game's look; Subtle to Strong cost some GPU.
 - **Shipped shader list**: Prepares the shaders shipped with this version before you meet them, so new places stutter less the first time. Off: only the shaders this PC has built itself. On is better.
@@ -68,6 +69,7 @@ Your settings are kept in `%APPDATA%\nxrecomp\TotK-engine\settings.ini` and surv
 - **HDR output**: HDR output for an HDR monitor (HDR10 or scRGB). Needs HDR on for that monitor in Windows; otherwise the picture stays SDR.
 - **Peak brightness (nits)**: Your monitor's peak brightness in nits, so highlights are neither clipped nor dim. Use the value the monitor states.
 - **Paper white (nits)**: How bright ordinary white (menus, the sky) is in HDR. Raise it if the picture looks dim, lower it if it is too bright.
+- **Highlight colour**: How much of their real colour bright lights keep in HDR: a torch flame or lava stays orange instead of turning yellow-white. 0 (the default) shows the picture as in SDR, only brighter; the HUD is left as it is.
 
 ## Graphics > Game patches
 
@@ -135,8 +137,8 @@ Your settings are kept in `%APPDATA%\nxrecomp\TotK-engine\settings.ini` and surv
 
 ## Game
 
-- **Language**: The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' language if the game has it, else English.
-- **Skip the opening**: A new game skips the opening and starts on the Great Sky Island. F2 or Minus on the title screen also switch it.
+- **Language**: The game's texts and subtitles, and these settings' own (English, Spanish, Russian, Brazilian Portuguese, Simplified Chinese, Traditional Chinese). Português (Brasil): 1.4.3's texts; with 1.0.0 they need the 1.4.3 update given to Setup (English otherwise), voices stay English. Automatic: Windows' language if the game has it, else English.
+- **Skip the opening**: A new game skips the opening and starts on the Great Sky Island. F2 or Minus on the title screen also switch it. Game version 1.0.0 only (on 1.4.x the opening plays and the row is hidden).
 - **Console mode**: Docked (default) or handheld: handheld renders at the Switch's lower handheld resolution (faster, blurrier).
 - **Pause when the window loses focus**: Pauses the game, picture and sound, while its window is not in front.
 - **Temperature unit**: The temperature on the Purah Pad's map: °C or °F. Automatic follows the game's language.

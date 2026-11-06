@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <string>
 #include <mutex>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
@@ -43,8 +44,18 @@
 
 namespace fsys = std::filesystem;
 #ifdef _WIN32
-// (a variable set but empty counts as unset: "" was taken as the path, i.e. The current directory)
-static const char* env_dir(const char* name, const char* def) { const char* v = getenv(name); return v && *v ? v : def; }
+// (a variable set but empty counts as unset: "" was taken as the path, i.e. The current directory) UTF-8 (the launcher
+// sets these wide, under the profile for TOTK_USERDATA): getenv gave the ANSI code page's bytes, which widen() read as
+// UTF-8, so a profile 'Moisés' put the saves in a 'Mois?s' folder (public #94). Kept for the run.
+static const char* env_dir(const char* name, const char* def) {
+    static std::mutex mu;
+    static std::deque<std::string> keep;   // (the pointers stay valid: kRomDir / kUserDir are char*)
+    std::string v = mods_scan::env_u8(name);
+    if (v.empty()) return def;
+    std::lock_guard<std::mutex> l(mu);
+    keep.push_back(std::move(v));
+    return keep.back().c_str();
+}
 static const char* kRomDir  = env_dir("TOTK_ROMFS", "C:/totk/extract/romfs");
 // TOTK_USERDATA=<dir>: saves/cache elsewhere (test runs that start a New Game must not touch the player's saves)
 static const char* kUserDir = env_dir("TOTK_USERDATA", "C:/totk/userdata");
@@ -69,12 +80,45 @@ static const std::string kUserStr = env_or("TOTK_USERDATA", data_home() + "/user
 static const char* kRomDir  = kRomStr.c_str();
 static const char* kUserDir = kUserStr.c_str();
 static const std::string& overlay_dir() { static const std::string d = env_or("TOTK_OVERLAY", std::string(rt_posix_exe_dir()) + "/data/overlay/romfs"); return d; }
-static const std::string kSkipDir = env_or("TOTK_SKIP_DIR", std::string(rt_posix_exe_dir()) + "/data/overlay/skip_opening/romfs");
-static const std::string& skip_dir() { return kSkipDir; }
+// The skip-the-opening set, as on Windows (public #65's fix, below): TOTK_SKIP_DIR, else the skip_opening folder beside
+// the overlay's (player.txt overlay= -> TOTK_OVERLAY: <engine>/overlay/romfs, the set at <engine>/overlay/skip_opening),
+// else the old default. Linux kept only that default, which no install has: the setting showed On and the opening played
+// (linux-test D#83, justelesis). Read at its first use (totk_engine_boot may set TOTK_OVERLAY first).
+static const std::string& skip_dir() {
+    static const std::string d = [] {
+        const char* v = getenv("TOTK_SKIP_DIR");
+        if (v && *v) return std::string(v);
+#if !defined(TOTK_GAME_VERSION) || TOTK_GAME_VERSION == 100
+        const char* o = getenv("TOTK_OVERLAY");
+        std::string ov = o ? o : "";
+        while (!ov.empty() && ov.back() == '/') ov.pop_back();
+        const size_t cut = ov.find_last_of('/');
+        if (cut != std::string::npos) {
+            const std::string s = ov.substr(0, cut) + "/skip_opening";
+            struct stat st;
+            if (stat(s.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return s;
+        }
+#endif
+        return std::string(rt_posix_exe_dir()) + "/data/overlay/skip_opening/romfs";
+    }();
+    return d;
+}
 #endif
 extern "C" { volatile int g_skip_opening = 0, g_title_phase = 1, g_in_opening = 0; volatile uint64_t g_in_opening_since = 0; }
 extern "C" { volatile int g_title_stage = 0; }   // the title's stage (TitleScene_*) is loading or up (hle_vi.cpp TOTK_TITLE_FPS)
-static const int skip_init = (g_skip_opening = getenv("TOTK_SKIP_OPENING") && atoi(getenv("TOTK_SKIP_OPENING")) ? 1 : 0);
+// Another game version has no skip: the set is 1.0.0's opening flow, and the 1.4.x opening's event flow is not opened
+// where the decider below sees it (9.1 gate skipopen143, 11-04: the setting showed On, the opening played). There the
+// setting stays off (its F10 row hidden, pc_settings.cpp), and the title's F2 / Minus toggle, the in-opening restart and
+// their banners are off too (hle_hid.cpp, hle_osd.cpp)
+extern "C" int skip_opening_works(void) {
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    return 0;
+#else
+    return 1;
+#endif
+}
+static const bool skip_asked = getenv("TOTK_SKIP_OPENING") && atoi(getenv("TOTK_SKIP_OPENING"));
+static const int skip_init = (g_skip_opening = skip_asked && skip_opening_works() ? 1 : 0);
 extern "C" uint64_t nvn_present_count(void);
 
 static const u32 kOk = 0, kPathNotFound = 0x202, kPathExists = 0x402, kOutOfRange = 0x3E02 /* not exact */, kUnsupported = 0x6402;
@@ -100,11 +144,10 @@ static std::wstring widen(const std::string& s) {
 // first use, as overlay_dir() (totk_engine_boot may set TOTK_OVERLAY first).
 static const std::string& skip_dir() {
     static const std::string d = [] {
-        const char* v = getenv("TOTK_SKIP_DIR");
-        if (v && *v) return std::string(v);
+        const std::string v = mods_scan::env_u8("TOTK_SKIP_DIR");   // (UTF-8 for widen(), #94)
+        if (!v.empty()) return v;
 #if !defined(TOTK_GAME_VERSION) || TOTK_GAME_VERSION == 100
-        const char* o = getenv("TOTK_OVERLAY");
-        std::string ov = o ? o : "";
+        std::string ov = mods_scan::env_u8("TOTK_OVERLAY");
         while (!ov.empty() && (ov.back() == '/' || ov.back() == '\\')) ov.pop_back();
         const size_t cut = ov.find_last_of("/\\");
         if (cut != std::string::npos) {
@@ -126,6 +169,19 @@ static bool host_file_exists(const std::string& p) {
 }
 #else
 static const std::string& widen(const std::string& s) { return s; }   // (host paths are UTF-8 already)
+#endif
+// fopen of a UTF-8 host path (the overlay / glyph / RomFS folders come from the environment as UTF-8 since #94: a narrow
+// fopen would read a profile 'Moisés' in the ANSI code page)
+static FILE* ufopen(const std::string& p, const char* mode) {
+#ifdef _WIN32
+    wchar_t m[8] = {};
+    for (int i = 0; i < 7 && mode[i]; i++) m[i] = (wchar_t)mode[i];
+    return _wfopen(widen(p).c_str(), m);
+#else
+    return fopen(p.c_str(), mode);
+#endif
+}
+#ifndef _WIN32
 // Windows file systems ignore case, Linux ones do not: the guest asks for the names the romfs lists, but when a lookup fails
 // each path component is matched case-insensitively against its directory (the first hit wins; result cached per path).
 static std::mutex g_ci_mtx;
@@ -252,7 +308,7 @@ struct GlyphBank {
 };
 static GlyphBank g_bank;   // (loaded once by glyph_dir, read-only after)
 static bool bank_load(const std::string& d) {
-    FILE* f = fopen((d + "/glyphs.txt").c_str(), "r");
+    FILE* f = ufopen((d + "/glyphs.txt").c_str(), "r");
     if (!f) return false;
     GlyphBank b;
     b.dir = d;
@@ -311,13 +367,13 @@ static bool bank_load(const std::string& d) {
         printf("[fs] glyph bank %s: glyphs.txt incomplete\n", d.c_str());
         return false;
     }
-    if (FILE* m = fopen((d + "/" + bankfile).c_str(), "rb")) {
+    if (FILE* m = ufopen((d + "/" + bankfile).c_str(), "rb")) {
         b.maskbank.resize((size_t)b.groups * b.count * b.mw * b.mh);
         if (fread(b.maskbank.data(), 1, b.maskbank.size(), m) != b.maskbank.size()) b.maskbank.clear();
         fclose(m);
     }
     if (!bank4file.empty())
-        if (FILE* m = fopen((d + "/" + bank4file).c_str(), "rb")) {
+        if (FILE* m = ufopen((d + "/" + bank4file).c_str(), "rb")) {
             b.maskbank4.resize((size_t)bank4n * b.count * b.bc4_bytes);
             if (fread(b.maskbank4.data(), 1, b.maskbank4.size(), m) != b.maskbank4.size()) b.maskbank4.clear();
             fclose(m);
@@ -623,7 +679,7 @@ static void glyph_live_served(const std::string& hp, bool common, int style) {
     g_live.mask_orig.assign(b.masks.size(), {});
     g_live.mask_now.assign(b.masks.size(), {});
     g_live.mask_at.assign(b.masks.size(), {});
-    FILE* f = fopen(hp.c_str(), "rb");
+    FILE* f = ufopen(hp.c_str(), "rb");
     if (!f) return;
     for (size_t i = 0; i < b.masks.size(); i++) {
         const auto& m = b.masks[i];
@@ -1258,7 +1314,7 @@ static const char* const kGlyphRstb = "System/Resource/ResourceSizeTable.Product
 #endif
 static std::pair<u64, u64> fnv_file(const std::string& path) {   // (size, FNV-1a 64); size 0 when missing
     u64 h = 0xcbf29ce484222325ull, n = 0;
-    if (FILE* f = fopen(path.c_str(), "rb")) {
+    if (FILE* f = ufopen(path.c_str(), "rb")) {
         unsigned char buf[65536]; size_t r;
         while ((r = fread(buf, 1, sizeof buf, f)) > 0) { n += r; for (size_t i = 0; i < r; i++) h = (h ^ buf[i]) * 0x100000001b3ull; }
         fclose(f);
@@ -1268,7 +1324,7 @@ static std::pair<u64, u64> fnv_file(const std::string& path) {   // (size, FNV-1
 static bool glyph_base_ok(const std::string& d) {   // base.fnv matches the overlay's Common archive (and its RSTB)
     static const std::pair<u64, u64> have = fnv_file(overlay_dir() + "/UI/LayoutArchive/Common.Product.100.Nin_NX_NVN.blarc.zs");
     unsigned long long size = 0, want = 0, rsize = 0, rwant = 0;
-    if (FILE* f = fopen((d + "/base.fnv").c_str(), "r")) {
+    if (FILE* f = ufopen((d + "/base.fnv").c_str(), "r")) {
         if (fscanf(f, "%llu %llx", &size, &want) != 2) size = 0;
         if (fscanf(f, " rstb %llu %llx", &rsize, &rwant) != 2) rsize = 0;
         fclose(f);
@@ -1299,8 +1355,8 @@ static const std::string& glyph_dir() {
     const char* e = getenv("TOTK_GLYPHS");
     if (!e || !*e) e = "auto";
     if (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "switch")) return dir;
-    const char* gd = getenv("TOTK_GLYPHS_DIR");
-    const std::string od = overlay_dir(), base = gd && *gd ? gd : od + "/../../glyphs";
+    const std::string gd = mods_scan::env_u8("TOTK_GLYPHS_DIR");   // (UTF-8, as overlay_dir(): #94)
+    const std::string od = overlay_dir(), base = !gd.empty() ? gd : od + "/../../glyphs";
     // the bank built on the overlay in use: an aspect overlay (graphics.aspect_ratio, romfs-aspect-<w>x<h>) has its own
     // Common archive, so its own bank, engine+glyphs@aspect-<w>x<h>[-center] (build.py glyph_bank; -center: the HUD in
     // the middle 16:9, graphics.hud_layout); the 16:9 one engine+glyphs
@@ -1311,7 +1367,7 @@ static const std::string& glyph_dir() {
         if (od.compare(e, 7, "-center") == 0) e += 7;
         bank += "@" + od.substr(a, e - a);
     }
-    if (FILE* t = fopen((bank + "/glyphs.txt").c_str(), "r")) {
+    if (FILE* t = ufopen((bank + "/glyphs.txt").c_str(), "r")) {
         fclose(t);
         if (glyph_base_ok(bank) && bank_load(bank)) {
             dir = g_bank.dir;
@@ -1442,7 +1498,14 @@ static bool host_path_ours(const char* p, std::string* out) {
             g_title_phase = 0;
             printf("[fs] title over: stage %s at present %llu\n", rel.c_str(), (unsigned long long)nvn_present_count());
         } else if (g_title_phase) g_title_stage = 1;
-        if (op && !g_in_opening) { g_in_opening = 1; g_in_opening_since = nvn_present_count(); g_title_phase = 0; printf("[fs] entered the opening stage" "\n"); }
+        if (op && !g_in_opening) {
+            g_in_opening = 1; g_in_opening_since = nvn_present_count(); g_title_phase = 0; printf("[fs] entered the opening stage" "\n");
+            static bool said;
+            if (skip_asked && !skip_opening_works() && !said) {
+                said = true;
+                printf("[fs] skip the opening is on, but this game version has no skip (1.0.0 only): the opening plays\n");
+            }
+        }
         else if (!op && g_in_opening) { g_in_opening = 0; printf("[fs] left the opening stage (%s)" "\n", rel.c_str()); }
     }
     {   // measure what marks the end of the title screen (Continue / Load / New Game)
@@ -1515,7 +1578,7 @@ static std::string temp_file(const char* prefix, const std::vector<u8>& z) {
 #endif
     // (increment(ec), not a range-for: its operator++ throws on an iteration error, here inside call_once)
     for (fsys::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-        const std::string n = it->path().filename().string();
+        const std::string n = mods_scan::u8(it->path().filename());   // (.string() throws on a name outside the code page)
         std::error_code e2;
         if (n.rfind(prefix, 0) == 0 &&
             fsys::last_write_time(it->path(), e2) < fsys::file_time_type::clock::now() - std::chrono::hours(24) && !e2)
@@ -2267,13 +2330,14 @@ template <class T> struct Slots {
 // TOTK_ROMFS_PACK may also name the extraction's RomFS image (romfs.bin: romfs_image.h), indexed at start in ~0.1 s; the
 // default since 2026-10-27, no NXRP copy needed. Since v0.1.8 it may name romfs-source.txt instead (rom_source.h): the same
 // image read straight from the player's dump, each read decrypted in place (AES-CTR), so a player's install keeps no 17 GB
-// romfs.bin.
-#ifdef _WIN32
+// romfs.bin. Linux (linux-test D#83, linux-port 11-04): the same reader on a file descriptor (pread for the overlapped
+// ReadFile, posix_fadvise RANDOM for FILE_FLAG_RANDOM_ACCESS): Setup reads the RomFS in place there too (no folder), and
+// the Windows-only reader left every game file missing (a crash in the game's heap setup a second in).
 namespace {
 struct PackEntry { u64 hash; u32 path_off, path_len; u64 data_off, size; };
 static_assert(sizeof(PackEntry) == 32, "NXRP v1 entry");
 struct RomPack {
-    HANDLE h = INVALID_HANDLE_VALUE;
+    FH h = kNoFile;
     const RomSource* src = nullptr;   // the image in the player's dump (romfs-source.txt), else h is the image itself
     std::vector<PackEntry> ents; std::string paths; std::vector<u32> order;
 };
@@ -2284,7 +2348,8 @@ u64 fnv1a64(const char* s, size_t n) {
 }
 std::string_view pack_path(const RomPack* p, u32 i) { const PackEntry& x = p->ents[i]; return {p->paths.data() + x.path_off, x.path_len}; }
 // bytes read at `off` (stops at a short read or an error)
-u64 pack_read(HANDLE h, u64 off, void* buf, u64 size) {
+#ifdef _WIN32
+u64 pack_read(FH h, u64 off, void* buf, u64 size) {
     // (closed when the thread exits: a plain thread_local HANDLE leaked one event per reading thread that ended)
     static thread_local struct ReadEvent {
         HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -2301,21 +2366,60 @@ u64 pack_read(HANDLE h, u64 off, void* buf, u64 size) {
     }
     return done;
 }
+void pack_close(FH h) { CloseHandle(h); }
+bool pack_size(FH h, u64* size) {
+    LARGE_INTEGER s{};
+    if (!GetFileSizeEx(h, &s)) return false;
+    *size = (u64)s.QuadPart;
+    return true;
+}
+#else
+u64 pack_read(FH h, u64 off, void* buf, u64 size) {
+    u64 done = 0;
+    while (done < size) {
+        const size_t want = (size_t)std::min<u64>(size - done, 1u << 30);
+        const ssize_t n = ::pread(h, (u8*)buf + done, want, (off_t)(off + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        done += (u64)n;
+    }
+    return done;
+}
+void pack_close(FH h) { close(h); }
+bool pack_size(FH h, u64* size) {
+    struct stat st;
+    if (fstat(h, &st) != 0) return false;
+    *size = (u64)st.st_size;
+    return true;
+}
+#endif
 // The game dump stopped answering during play (its drive unplugged, a network share gone: the open handle keeps the
 // file itself from being moved or deleted): one clear message, then the game ends with "DMP0" (the launcher shows no
 // second dialog, tries no older package, and checks the dump at the next start). Never a hang or a garbled file.
-[[noreturn]] static void dump_lost(const RomSource* src) {
-    static std::atomic<bool> once{false};
-    if (once.exchange(true))
-        for (;;) Sleep(INFINITE);   // (another reader is showing the message)
-    printf("[fatal] the game dump %s cannot be read any more (moved, deleted or its drive unplugged)\n", src->dump.c_str());
-    fflush(stdout);
-    EnumWindows([](HWND w, LPARAM) -> BOOL {   // (the game's own windows out of the way: a fullscreen one hides the box)
+#ifdef _WIN32
+// A fatal message box the player sees: the game's own windows out of the way first (a fullscreen one hides the box and
+// the game looks frozen). dump_lost and romfs_or_fatal.
+static void fatal_box(const std::wstring& msg) {
+    EnumWindows([](HWND w, LPARAM) -> BOOL {
         DWORD pid = 0;
         GetWindowThreadProcessId(w, &pid);
         if (pid == GetCurrentProcessId() && IsWindowVisible(w)) ShowWindow(w, SW_HIDE);
         return TRUE;
     }, 0);
+    MessageBoxW(nullptr, msg.c_str(), L"TotK", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+}
+#endif
+[[noreturn]] static void dump_lost(const RomSource* src) {
+    static std::atomic<bool> once{false};
+    if (once.exchange(true))
+#ifdef _WIN32
+        for (;;) Sleep(INFINITE);   // (another reader is showing the message)
+#else
+        for (;;) pause();
+#endif
+    printf("[fatal] the game dump %s cannot be read any more (moved, deleted or its drive unplugged)\n", src->dump.c_str());
+    fflush(stdout);
+#ifdef _WIN32
     const std::wstring d = widen(src->dump);
     const std::wstring msg =
         L"No se puede leer tu copia del juego (el dump):\n" + d +
@@ -2324,12 +2428,13 @@ u64 pack_read(HANDLE h, u64 off, void* buf, u64 size) {
         L"Your game dump can't be read any more:\n" + d +
         L"\n\nIt was moved, deleted or its drive was unplugged. The game has to close. Plug the drive back in, or pick "
         L"the dump again when you start the game.";
-    MessageBoxW(nullptr, msg.c_str(), L"TotK", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
-    _exit((int)0x444D5030u);   // "DMP0" (launcher.c DUMP_LOST_CODE)
+    fatal_box(msg);
+#endif   // (Linux: launcher_linux.py shows the [fatal] line above, from the log, for this exit code)
+    _exit((int)0x444D5030u);   // "DMP0" (launcher.c DUMP_LOST_CODE; Linux keeps its low byte)
 }
 // image bytes at `off`: the file itself, or (src) the image in the player's dump: raw bytes, decrypted in place. A short
 // read inside the image is tried once more after a moment, then ends the game with a message (dump_lost).
-u64 rom_read(HANDLE h, const RomSource* src, u64 off, void* buf, u64 size) {
+u64 rom_read(FH h, const RomSource* src, u64 off, void* buf, u64 size) {
     if (!src) return pack_read(h, off, buf, size);
     if (off >= src->image_size) return 0;
     const u64 want = std::min<u64>(size, src->image_size - off);
@@ -2345,32 +2450,43 @@ u64 rom_read(HANDLE h, const RomSource* src, u64 off, void* buf, u64 size) {
 u64 pack_read(const RomPack* pk, u64 off, void* buf, u64 size) { return rom_read(pk->h, pk->src, off, buf, size); }
 RomPack* rompack() {
     static RomPack* pk = []() -> RomPack* {
-        const char* e = getenv("TOTK_ROMFS_PACK");
-        if (!e || !*e) return nullptr;
+        static const std::string pack = mods_scan::env_u8("TOTK_ROMFS_PACK");   // (UTF-8 for widen(): #94)
+        if (pack.empty()) return nullptr;
+        const char* e = pack.c_str();   // (the variable as set: the log lines below)
+        std::string file = pack, src_why;
         RomSource* src = nullptr;   // romfs-source.txt: the image in the player's dump (never freed: the run's)
-        std::string file = e, src_why;
         if (file.size() >= 16 && _stricmp(file.c_str() + file.size() - 16, "romfs-source.txt") == 0) {
             rom_source_on_secret = pc_crash_secret;      // (the key never reaches a crash dump: pc_crash.cpp)
             rom_source_on_busy = pc_crash_secret_busy;
             src = new RomSource;
-            if (!rom_source_load(widen(file).c_str(), src, &src_why)) {
+#ifdef _WIN32
+            const bool loaded = rom_source_load(widen(file).c_str(), src, &src_why);
+#else
+            const bool loaded = rom_source_load(file.c_str(), src, &src_why);
+#endif
+            if (!loaded) {
                 printf("[fs] romfs source %s: %s; serving the folder\n", e, src_why.c_str());
                 delete src;
                 return nullptr;
             }
             file = src->dump;
         }
-        HANDLE h = CreateFileW(widen(file).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                               FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+#ifdef _WIN32
+        FH h = CreateFileW(widen(file).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+#else
+        FH h = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+        if (h != kNoFile) posix_fadvise(h, 0, 0, POSIX_FADV_RANDOM);   // (FILE_FLAG_RANDOM_ACCESS: no read-ahead)
+#endif
         auto fail = [&](const char* why) -> RomPack* {
             printf("[fs] romfs pack %s: %s; serving the folder\n", e, why);
-            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            if (h != kNoFile) pack_close(h);
             delete src;
             return nullptr;
         };
-        if (h == INVALID_HANDLE_VALUE) return fail(src ? "cannot open the game dump it reads (moved or deleted?)" : "cannot open");
-        LARGE_INTEGER sz{};
-        if (src && (!GetFileSizeEx(h, &sz) || (u64)sz.QuadPart != src->dump_size))
+        if (h == kNoFile) return fail(src ? "cannot open the game dump it reads (moved or deleted?)" : "cannot open");
+        u64 sz = 0;
+        if (src && (!pack_size(h, &sz) || sz != src->dump_size))
             return fail("the game dump it reads changed size since Setup read it");
         u8 hd[128];
         if (rom_read(h, src, 0, hd, sizeof hd) != sizeof hd) return fail("short header");
@@ -2384,13 +2500,13 @@ RomPack* rompack() {
             u64 h0;
             memcpy(&h0, hd, 8);
             if (h0 != 0x50) return fail(src ? "the image in the game dump does not decrypt to a RomFS" : "neither an NXRP v1 pack nor a RomFS image");
-            if (src) sz.QuadPart = (LONGLONG)src->image_size;
-            else if (!GetFileSizeEx(h, &sz)) return fail("no file size");
+            if (src) sz = src->image_size;
+            else if (!pack_size(h, &sz)) return fail("no file size");
             const u64 t0 = GetTickCount64();
             std::vector<RomImageFile> files;
             std::string paths;
             const char* why = "";
-            if (!romfs_image_index([h, src](u64 off, void* buf, u64 n) { return rom_read(h, src, off, buf, n); }, (u64)sz.QuadPart,
+            if (!romfs_image_index([h, src](u64 off, void* buf, u64 n) { return rom_read(h, src, off, buf, n); }, sz,
                                    &files, &paths, &why))
                 return fail(why);
             RomPack* r = new RomPack;
@@ -2431,7 +2547,7 @@ RomPack* rompack() {
             return r;
         }
         if (ver != 1) return fail("not an NXRP v1 pack");
-        if (!GetFileSizeEx(h, &sz) || (u64)sz.QuadPart != total) return fail("file size differs from its header");
+        if (!pack_size(h, &sz) || sz != total) return fail("file size differs from its header");
         if (io + (u64)n * 32 > total || po + pb > total || oo + (u64)n * 4 > total) return fail("tables out of bounds");
         RomPack* r = new RomPack;
         r->ents.resize(n); r->paths.resize(pb); r->order.resize(n);
@@ -2521,19 +2637,14 @@ static RomPack* rompack_first_open() {
     if (pk) printf("[fs] romfs index: the first open waited %.1f ms for it\n", ready > t0 ? (ready - t0) / 1e6 : 0.0);
     return pk;
 }
-#else
-extern "C" void hle_fs_index_romfs_early(void) {}
-#endif
 
 // ---- the game's own RomFS (the pack, else the folder) under the replacements, for the mods' file count and table
 // The game's RomFS has `rel` ("/a/b") as: 1 file, 0 directory, -1 neither
 static int rom_base_type(const std::string& rel) {
-#ifdef _WIN32
     if (RomPack* pk = rompack()) {
         const size_t a = rel.find_first_not_of('/');
         return pack_type(pk, a == std::string::npos ? std::string() : rel.substr(a));
     }
-#endif
     std::string hp = kRomDir + rel;
     ci_fix(hp);
     std::error_code ec;
@@ -2542,7 +2653,6 @@ static int rom_base_type(const std::string& rel) {
 }
 // The first bytes of the game's own file `rel` (no replacement) and its size; false: no such file
 static bool rom_base_head(const std::string& rel, u8* head, size_t n, size_t* got, u64* size) {
-#ifdef _WIN32
     if (RomPack* pk = rompack()) {
         const PackEntry* e = pack_find(pk, rel.substr(rel.find_first_not_of('/')));
         if (!e) return false;
@@ -2550,7 +2660,6 @@ static bool rom_base_head(const std::string& rel, u8* head, size_t n, size_t* go
         *got = (size_t)pack_read(pk, e->data_off, head, std::min<u64>(n, e->size));
         return true;
     }
-#endif
     std::string hp = kRomDir + rel;
     ci_fix(hp);
     std::ifstream f(fsys::path(widen(hp)), std::ios::binary | std::ios::ate);
@@ -2721,7 +2830,26 @@ static Slots<HFile> g_files;
 static HFile* file(u64 v) { return g_files.get(v); }
 
 HLE_AS(fs_QueryMountRomCacheSize, "_ZN2nn2fs22QueryMountRomCacheSizeEPm") { *(u64*)c->x[0] = 0x1000; c->x[0] = 0; }
-HLE_AS(fs_MountRom, "_ZN2nn2fs8MountRomEPKcPvm") { mount((const char*)c->x[0], kRomDir); c->x[0] = 0; }
+// The game's data must come from somewhere: the pack (TOTK_ROMFS_PACK: the image in the dump, romfs.bin or an NXRP
+// pack) or the RomFS folder. Neither: one clear [fatal] and the dump-lost exit ("DMP0": the launcher says why and checks
+// the dump at the next start), instead of every file missing and a crash in the game's heap setup a second later
+// (linux-test D#83: the Linux build had no pack reader and Setup had unpacked no folder).
+static void romfs_or_fatal() {
+    if (rompack()) return;
+    std::error_code ec;
+    if (fsys::is_directory(fsys::path(widen(kRomDir)), ec)) return;
+    const char* e = getenv("TOTK_ROMFS_PACK");
+    printf("[fatal] the game data cannot be found: %s%s, and no RomFS folder at %s; run Setup again\n",
+           e && *e ? "the game dump could not be read through " : "no game dump or RomFS image is set (TOTK_ROMFS_PACK)",
+           e && *e ? e : "", kRomDir);
+    fflush(stdout);
+#ifdef _WIN32
+    fatal_box(L"Your game data cannot be found (the game dump or its RomFS). Run Setup again.\n\n"
+              L"No se encuentran los datos del juego (el dump o su RomFS). Vuelve a ejecutar Setup.");
+#endif
+    _exit((int)0x444D5030u);   // "DMP0" (launcher.c DUMP_LOST_CODE; Linux keeps its low byte)
+}
+HLE_AS(fs_MountRom, "_ZN2nn2fs8MountRomEPKcPvm") { mount((const char*)c->x[0], kRomDir); romfs_or_fatal(); c->x[0] = 0; }
 #ifdef _WIN32
 // the save mount reads and writes this process's working copy; Commit publishes it (atomic save commits above)
 HLE_AS(fs_MountSaveData, "_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE") { mount((const char*)c->x[0], save_mount_dir()); c->x[0] = 0; }
@@ -2948,7 +3076,6 @@ HLE_AS(fs_OpenFile, "_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci") {
     if (!host_path(p, &hp)) { printf("[fs] OpenFile %s: unknown mount\n", p); c->x[0] = kPathNotFound; return; }
     u32 fail = kPathNotFound;
     bool pack_missed = false;   // (a RomFS path the pack lacks: counted once the folder really has it)
-#ifdef _WIN32
     if (RomPack* pk = mode == 1 ? rompack_first_open() : nullptr) {   // the RomFS pack, after the overlay folders (host_path)
         std::string rel;
         const bool in_rom = pack_rel(hp, &rel);
@@ -2966,6 +3093,7 @@ HLE_AS(fs_OpenFile, "_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci") {
         }
         pack_missed = in_rom;   // a RomFS path the pack lacks: the folder serves it (or it does not exist)
     }
+#ifdef _WIN32
     DWORD acc = GENERIC_READ | ((mode & 2) ? GENERIC_WRITE : 0);
     HANDLE h;
     for (int i = 0;; i++) {   // N11: a file held open by another process (sync client, antivirus) is locked, not missing
@@ -3058,6 +3186,13 @@ static u64 host_pread(HFile* f, s64 off, void* buf, u64 size) {
         done = n ? pack_read(rompack(), f->pk_off + (u64)off, buf, n) : 0;
         size = done;   // (no loose-file loop below)
     }
+#else
+    if (f->packed) {   // (as above; pread writes guest memory: a write-watched page must take the kernel's write)
+        u64 n = off < 0 || (u64)off >= f->pk_size ? 0 : std::min<u64>(size, f->pk_size - (u64)off);
+        if (n) rt_ww_prepare_kernel_write(buf, (size_t)n);
+        done = n ? pack_read(rompack(), f->pk_off + (u64)off, buf, n) : 0;
+        size = done;
+    }
 #endif
     while (done < size) {
 #ifdef _WIN32
@@ -3090,12 +3225,8 @@ static u64 host_pread(HFile* f, s64 off, void* buf, u64 size) {
         static std::atomic<u32> slow{0};
         const u32 k = ++slow;
         if (k <= 100 || k % 100 == 0) {
-#ifdef _WIN32
             const RomPack* pk = f->packed ? rompack() : nullptr;
             const char* from = !pk ? "folder" : pk->src && pk->src->ctr ? "dump, decrypted" : pk->src ? "dump" : "romfs image";
-#else
-            const char* from = "folder";
-#endif
             printf("[fs] slow read %u: %s, %llu KB at +%llu in %.1f ms (%s) on %s\n", k, f->path.c_str(),
                    (unsigned long long)(done >> 10), (unsigned long long)off, ns / 1e6, from,
                    t_game_thread ? "the game's presenting thread" : "another game thread (a loader?)");
@@ -3149,6 +3280,7 @@ HLE_AS(fs_GetFileSize, "_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE") {
     *(s64*)c->x[0] = s.QuadPart; c->x[0] = 0;
 #else
     HFile* f = file(c->x[1]); struct stat st;
+    if (f && f->packed) { *(s64*)c->x[0] = (s64)f->pk_size; c->x[0] = 0; return; }
     if (!f || fstat(f->h, &st) != 0) { c->x[0] = kUnsupported; return; }
     *(s64*)c->x[0] = (s64)st.st_size; c->x[0] = 0;
 #endif
@@ -3195,12 +3327,10 @@ template <class Op> static void retry_locked(std::error_code& ec, Op op) {
 HLE_AS(fs_GetEntryType, "_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc") {
     std::string hp; std::error_code ec;
     if (!host_path((const char*)c->x[1], &hp)) { c->x[0] = kPathNotFound; return; }
-#ifdef _WIN32
     if (RomPack* pk = rompack()) {   // a RomFS path the pack knows (else the folder, below)
         std::string rel; int t = pack_rel(hp, &rel) ? pack_type(pk, rel) : -1;
         if (t >= 0) { *(u32*)c->x[0] = (u32)t; c->x[0] = 0; return; }
     }
-#endif
     ci_fix(hp);
     auto st = fsys::status(widen(hp), ec);
     if (ec || !fsys::exists(st)) {
@@ -3273,7 +3403,6 @@ HLE_AS(fs_OpenDirectory, "_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci")
     std::string hp; std::error_code ec; int mode = (int)c->x[2];
     if (!host_path((const char*)c->x[1], &hp)) { c->x[0] = kPathNotFound; return; }
     DirEnts ents;
-#ifdef _WIN32
     std::string rel;
     if (RomPack* pk = rompack(); pk && pack_rel(hp, &rel) && pack_type(pk, rel) == 0) {   // listed from the pack's index
         const std::string pre = rel.empty() ? std::string() : rel + "/";
@@ -3290,7 +3419,6 @@ HLE_AS(fs_OpenDirectory, "_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci")
             }
         }
     } else
-#endif
     if (std::string mrel; ci_fix(hp), !fsys::is_directory(widen(hp), ec)) {
         if (user_mods().empty() || !rom_rel(hp, &mrel) || !mods_index().dirs.count(lower(mrel))) { c->x[0] = kPathNotFound; return; }
     } else {   // (else a folder only the player's mods have: their entries, below)
@@ -3346,7 +3474,6 @@ extern "C" void hle_fs_set_save_backups(int n) {
 // file). rel: RomFS-relative, '/' separators. False (out empty) when the file is not there.
 bool hle_fs_read_romfs(const char* rel, std::vector<u8>* out) {
     out->clear();
-#ifdef _WIN32
     if (RomPack* pk = rompack()) {
         if (const PackEntry* e = pack_find(pk, rel)) {
             out->resize((size_t)e->size);
@@ -3355,7 +3482,6 @@ bool hle_fs_read_romfs(const char* rel, std::vector<u8>* out) {
             return false;
         }
     }
-#endif
     *out = read_host_file(std::string(kRomDir) + "/" + rel);
     return !out->empty();
 }
@@ -3378,15 +3504,26 @@ bool hle_fs_pack_slice(const std::string& hp, void** h, u64* off, u64* size) {
 // hle_movie.cpp: a RomFS file the pack serves from the encrypted game dump (no mapping can show it decrypted): its
 // bytes, read whole and decrypted. False: not such a file (hle_fs_pack_slice or hp itself).
 bool hle_fs_pack_bytes(const std::string& hp, std::vector<u8>* out) {
-#ifdef _WIN32
     std::string rel;
-    if (RomPack* pk = rompack(); pk && pk->src && pk->src->ctr && pack_rel(hp, &rel))
+#ifdef _WIN32
+    RomPack* pk = rompack();
+    pk = pk && pk->src && pk->src->ctr ? pk : nullptr;   // (any other pack: hle_fs_pack_slice maps it)
+#else
+    RomPack* pk = rompack();   // (no slice mapping off Windows: every packed file's bytes)
+#endif
+    if (pk && pack_rel(hp, &rel))
         if (const PackEntry* e = pack_find(pk, rel)) {
             out->resize((size_t)e->size);
-            if (pack_read(pk, e->data_off, out->data(), e->size) == e->size) return true;
+            if (pack_read(pk, e->data_off, out->data(), e->size) == e->size) {
+#ifndef _WIN32
+                static std::atomic<bool> said{false};  // (the soak can see what a movie costs in RAM)
+                if (!said.exchange(true))
+                    printf("[fs] movie %s read whole from the RomFS pack: %.1f MB in memory while it plays\n", rel.c_str(),
+                           e->size / 1048576.0);
+#endif
+                return true;
+            }
             out->clear();
         }
-#endif
-    (void)hp; (void)out;
     return false;
 }

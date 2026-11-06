@@ -27,13 +27,13 @@ std::atomic<bool> g_need_restart{false};   // mods_need_restart
 
 std::vector<std::string> env_list(const char* var) {
     std::vector<std::string> v;
-    const char* e = getenv(var);
+    const std::string e = ms::env_u8(var);   // (UTF-8: getenv would give a profile 'Moisés' in the ANSI code page, #94)
 #ifdef _WIN32
     const char sep = ';';
 #else
     const char sep = ':';
 #endif
-    for (std::string s = e ? e : ""; !s.empty();) {
+    for (std::string s = e; !s.empty();) {
         size_t k = s.find(sep);
         std::string d = s.substr(0, k);
         while (d.size() > 1 && (d.back() == '/' || d.back() == '\\')) d.pop_back();

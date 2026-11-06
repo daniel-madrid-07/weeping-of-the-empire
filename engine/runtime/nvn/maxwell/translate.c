@@ -1017,14 +1017,29 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
     }
     char L[600], xs[1600], P[2000];
     if (lod_kind == 1) snprintf(L, sizeof L, "int(%s)", lod); else strcpy(L, "0");
+    // A constant texel offset (AOFFI) is in the game's texels: divided by the GUEST size (the host size over the texture's
+    // scale, rscale[1 + slot]), it moves the same part of the image at any scale. Divided by the host size, a 1-texel tap of
+    // a texture at x1.333 moved 0.75 of a guest texel: outlines / drop shadows built from offset taps came out soft or thin
+    // (ram-diet #62, native UI On). At scale 1 the same value. Only for the output canvas's kind by default (the #62
+    // evidence; a scene blur / PCF built from offset taps at render or shadow scale would skip host texels),
+    // LARECOMP_AOFFI_GUEST=all every scaled texture (exec.c), =0 the host size everywhere (old).
+    static int aoffi_guest = -1;   // (read at translation: the shader text, so the pipeline cache key, follows it)
+    if (aoffi_guest < 0) { const char *e = getenv("LARECOMP_AOFFI_GUEST"); aoffi_guest = !(e && *e == '0'); }
+    char G[96] = "", G1[96] = "";
+    if (off && aoffi_guest) {
+        // (rscale's .w: 1 for the textures it applies to, exec.c stage_set: the output canvas's kind by default)
+        snprintf(G, sizeof G, " * mix(vec2(1.0f), rscale[%d].xy, rscale[%d].w)", 1 + slot, 1 + slot);
+        snprintf(G1, sizeof G1, " * mix(1.0f, rscale[%d].x, rscale[%d].w)", 1 + slot, 1 + slot);
+        c->uses_rscale = true;
+    }
     if (n == 1) {
-        if (off) snprintf(xs, sizeof xs, "(%s + float((%s).x) / float(tsize%d(%s).x))", co[0], off, slot, L);
+        if (off) snprintf(xs, sizeof xs, "(%s + float((%s).x)%s / float(tsize%d(%s).x))", co[0], off, G1, slot, L);
         else snprintf(xs, sizeof xs, "%s", co[0]);
     } else if (n == 2) {
-        if (off) snprintf(xs, sizeof xs, "(vec2(%s, %s) + vec2(%s) / vec2(tsize%d(%s).xy))", co[0], co[1], off, slot, L);
+        if (off) snprintf(xs, sizeof xs, "(vec2(%s, %s) + vec2(%s)%s / vec2(tsize%d(%s).xy))", co[0], co[1], off, G, slot, L);
         else snprintf(xs, sizeof xs, "vec2(%s, %s)", co[0], co[1]);
     } else {
-        if (off && !cube) snprintf(xs, sizeof xs, "vec3(vec2(%s, %s) + vec2(%s) / vec2(tsize%d(%s).xy), %s)", co[0], co[1], off, slot, L, co[2]);
+        if (off && !cube) snprintf(xs, sizeof xs, "vec3(vec2(%s, %s) + vec2(%s)%s / vec2(tsize%d(%s).xy), %s)", co[0], co[1], off, G, slot, L, co[2]);
         else snprintf(xs, sizeof xs, "vec3(%s, %s, %s)", co[0], co[1], co[2]);  // cube lookups take no offset
     }
     const char *extra = NULL;  // separate compare argument (cube array shadow)

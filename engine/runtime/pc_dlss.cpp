@@ -47,8 +47,8 @@ void safe_mode_refuse() {
 
 constexpr int FG_FSR = 16;   // (vk.h VK_NGX_FG_FSR)
 
-const char *const V_DLSS[] = {"", "1", "dlaa", "fsr", nullptr};
-const char *const N_DLSS[] = {"Off", "DLSS (NVIDIA RTX)", "DLAA (NVIDIA RTX)", "FSR (any GPU)", nullptr};
+const char *const V_DLSS[] = {"", "1", "dlaa", "fsr", "xess", nullptr};
+const char *const N_DLSS[] = {"Off", "DLSS (NVIDIA RTX)", "DLAA (NVIDIA RTX)", "FSR (any GPU)", "XeSS (any GPU)", nullptr};
 const char *const V_FG[] = {"", "1", "2", "3", "fsr", nullptr};
 const char *const N_FG[] = {"Off", "DLSS x2", "DLSS x3", "DLSS x4", "FSR x2", nullptr};
 
@@ -56,6 +56,7 @@ void sr_to_env(const char *v) {   // (v: one of V_DLSS)
     _putenv_s("TOTK_DLSS_SR", !strcmp(v, "1") || !strcmp(v, "dlaa") ? "1" : "");
     _putenv_s("TOTK_DLSS_DLAA", !strcmp(v, "dlaa") ? "1" : "");
     _putenv_s("TOTK_FSR_SR", !strcmp(v, "fsr") ? "1" : "");
+    _putenv_s("TOTK_XESS_SR", !strcmp(v, "xess") ? "1" : "");   // (Intel XeSS, xess.c)
 }
 void fg_to_env(const char *v) {   // (v: one of V_FG; Off removes them all, so a hand-set TOTK_DLSS=fg still works)
     const bool fsr = !strcmp(v, "fsr");
@@ -65,7 +66,7 @@ void fg_to_env(const char *v) {   // (v: one of V_FG; Off removes them all, so a
 }
 void sr_apply(const char *v) {
     if (*v && safe_mode()) return safe_mode_refuse();   // (Off goes through: nothing to refuse)
-    vk_ngx_request(!*v ? 0 : !strcmp(v, "fsr") ? 2 : !strcmp(v, "dlaa") ? 3 : 1, -1);
+    vk_ngx_request(!*v ? 0 : !strcmp(v, "fsr") ? 2 : !strcmp(v, "dlaa") ? 3 : !strcmp(v, "xess") ? 4 : 1, -1);
 }
 void fg_apply(const char *v) {
     if (*v && strcmp(v, "0") && safe_mode()) return safe_mode_refuse();
@@ -92,9 +93,9 @@ void trails_to_env(const char *v) { _putenv_s("TOTK_DLSS_TRAILS", v); }
 void trails_apply(const char *v) { vk_ngx_set_trails(*v ? atoi(v) : 100); }
 
 const pc_setting k_dlss[] = {
-    {"graphics.dlss", "Graphics", "Rendering", "Upscaler", "TOTK_DLSS_SR / TOTK_FSR_SR. DLSS (NVIDIA "
-     "RTX) or FSR (any GPU) upscales the 3D scene to the output in place of the game's upscaler and its FXAA (DLAA / "
-     "native AA when Render resolution matches the output).", "",
+    {"graphics.dlss", "Graphics", "Rendering", "Upscaler", "TOTK_DLSS_SR / TOTK_FSR_SR / TOTK_XESS_SR. "
+     "DLSS (NVIDIA RTX), FSR or XeSS (any GPU) upscales the 3D scene to the output in place of the game's upscaler and its "
+     "FXAA (DLAA / native AA when Render resolution matches the output).", "",
      V_DLSS, N_DLSS, 0, 0, 0, 0, nullptr, sr_to_env, sr_apply, nullptr},
     {"graphics.frame_gen", "Graphics", "Rendering", "Frame generation", "TOTK_DLSS_FG / TOTK_FSR_FG. Generated "
      "frames between real ones: DLSS x2 on NVIDIA RTX 40 series and newer, x3 and x4 on RTX 50; FSR x2 on any GPU. The "

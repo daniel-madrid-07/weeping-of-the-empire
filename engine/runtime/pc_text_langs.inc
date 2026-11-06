@@ -52,3 +52,13 @@ PC_LANGS("Applies when the game starts again: F10 > Restart the game now",
          "다음 게임 실행 시 적용됩니다: F10 > Restart the game now",
          "将在下次启动游戏时生效：F10 > Restart the game now",
          "將在下次啟動遊戲時生效：F10 > Restart the game now")
+PC_LANGS("Shaders left to compile:",
+         "Shaders restant à compiler :",
+         "Noch zu kompilierende Shader:",
+         "Shader da compilare:",
+         "Nog te compileren shaders:",
+         "Осталось скомпилировать шейдеров:",
+         "コンパイル待ちのシェーダー：",
+         "남은 셰이더 컴파일:",
+         "待编译着色器：",
+         "待編譯著色器：")

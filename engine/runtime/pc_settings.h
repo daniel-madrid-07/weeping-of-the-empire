@@ -69,6 +69,8 @@ bool pc_settings_copy(const char *key, char *out, size_t n);   // a row's value 
 void pc_settings_set(const char *key, const char *value);
 // pc_overlay_vk.c, once, when the device is an integrated GPU: the first start's Frame rate becomes "steady" (pc_settings.cpp)
 void pc_settings_first_start_igpu(void);
+// totk_hooks.c, once, when "auto" render resolution keeps the smaller pick on this GPU: the row's choice says so
+void pc_settings_auto_scale_small(void);
 // Any key: NX_SET_<KEY>, else the file's value, registered row or not (pc_input.cpp's per-context bindings)
 bool pc_settings_raw(const char *key, char *out, size_t n);
 // Any thread: writes (value NULL: removes) a key that has no registered row (pc_input.cpp's pc_bind_set:

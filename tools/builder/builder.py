@@ -118,12 +118,7 @@ OVERLAY_SETS = ['--texture-cache', '1.5,2,2.5,3',
 HEARTBEAT_S = 60     # a step silent this long prints a 'still working' line (step 4 can be quiet for minutes)
 
 
-NESTED = []   # (non-empty while an --update install also brings its 1.0.0 game up to date: main_100)
-
-
 def say(msg):
-    if NESTED:   # (that pass's lines: '1.0.0: ...', its steps as 'step N of M', so Setup's progress (StepLine 'step N/M')
-        msg = '1.0.0: ' + re.sub(r'\bstep (\d+)/(\d+)', r'step \1 of \2', msg)   # does not go back)
     print(f'[Builder] {msg}', flush=True)
 
 
@@ -974,10 +969,38 @@ def shader_seed(work, dry):
         try:
             toolchain.download('the shader seed', PGO_URL.format(**SEED), dest, SEED['sha256'], SEED['size'])
             open(mine, 'w').write(SEED['sha256'])
+            shader_seed_extra(work)
             return
         except Exception as e:
             say(f'shader seed: not used ({e}); the game compiles each shader at its first sight (short hitches)')
     if os.path.exists(mine):
+        for p in (dest, mine):
+            if os.path.exists(p):
+                os.remove(p)
+    shader_seed_extra(work, keep=False)   # (no seed: no extra either, the game loads it only beside a seed)
+
+
+# The seed's extra records: the programs and pipelines the soak routes built in play that the seed lacks (towns, Depths,
+# Ultrahand, bow, climb, records-only like the seed, seed_audit.py passes). Next to precompile.bin, so package.py's
+# cache-seed carries it; the game loads it after the seed in its start-up background pass (exec.c pc_start), and Setup's
+# own --prepare (step 9) does not, so the install does not grow. A release asset, pinned like the seed; None: this
+# source pins none (nothing fetched, nothing said). Any failure: no extra, said, the build goes on.
+SEED_EXTRA = pinned_asset('builder:SEED_EXTRA')
+
+
+def shader_seed_extra(work, keep=True):
+    dest = os.path.join(work, 'engine', 'seed', 'precompile_extra.bin')
+    mine = dest + '.builder'
+    if SEED_EXTRA and keep:
+        import toolchain
+        try:
+            toolchain.download('the shader seed extra', PGO_URL.format(**SEED_EXTRA), dest, SEED_EXTRA['sha256'],
+                               SEED_EXTRA['size'])
+            open(mine, 'w').write(SEED_EXTRA['sha256'])
+            return
+        except Exception as e:
+            say(f'shader seed extra: not used ({e}); those shaders compile at their first sight')
+    if os.path.exists(mine):   # (an earlier install's extra under another pin, or this one's fetch failed)
         for p in (dest, mine):
             if os.path.exists(p):
                 os.remove(p)
@@ -992,7 +1015,7 @@ FFX = pinned_asset('builder:FFX')
 
 
 def fsr_runtime(work, dry):
-    if not FFX or dry:
+    if not FFX or dry or LINUX:   # (a Windows DLL: the Linux build has no FidelityFX runtime, ffx.c)
         return
     import toolchain
     import zipfile
@@ -1007,6 +1030,41 @@ def fsr_runtime(work, dry):
                 os.replace(os.path.join(d, n + '.tmp'), os.path.join(d, n))
     except Exception as e:   # (never stops the build)
         say(f'FSR not available this time ({e}): the game runs without it (its rows say so)')
+
+
+# Intel's XeSS runtime (amd-compat, runtime/nvn/vulkan/xess.c; the value 'xess' of graphics.dlss): libxess.dll + Intel's
+# licence text + the SDK's third-party-programs.txt (XeSS SDK v3.0.2; Intel Simplified Software License: redistributed
+# in binary form only, unmodified, with its notices), mirrored as our release asset setup-xess.zip; unpacked into <work>/engine/xess, where build.py finds them
+# and package.py points TOTK_XESS_DIR. Optional, as FSR: a failure is one line and XeSS is not available this time.
+XESS = pinned_asset('builder:XESS')
+
+
+def xess_runtime(work, dry):
+    if not XESS or dry or LINUX:   # (Windows DLLs: the Linux build has no XeSS runtime, xess.c)
+        return
+    import toolchain
+    import zipfile
+    sys.path.insert(0, os.path.join(REPO, 'tools', 'engine'))
+    import build
+    want = {os.path.basename(k): v for k, v in build.XESS_DLLS.items()}   # (build.py's snapshot keeps only these files:
+                                                                            # each member checked, else it downloads them)
+    d = os.path.join(work, 'engine', 'xess')
+    z = os.path.join(d, XESS['name'])
+    try:
+        toolchain.download('the XeSS runtime (Intel)', PGO_URL.format(**XESS), z, XESS['sha256'], XESS['size'])
+        with zipfile.ZipFile(z) as zf:
+            for n in want:
+                t = os.path.join(d, n + '.tmp')
+                with zf.open(n) as src, open(t, 'wb') as out:
+                    shutil.copyfileobj(src, out)
+                with open(t, 'rb') as f:
+                    got = hashlib.sha256(f.read()).hexdigest()
+                if got != want[n]:
+                    os.remove(t)
+                    raise ValueError(f'{n} in {XESS["name"]} is not the pinned one (sha256 {got[:12]}...)')
+                os.replace(t, os.path.join(d, n))
+    except Exception as e:   # (never stops the build)
+        say(f'XeSS not available this time ({e}): the game runs without it (its row says so)')
 
 
 # Step 9: totk.exe --prepare builds every program and pipeline the package's records-only list (cache-seed) names, from
@@ -1143,6 +1201,10 @@ def prepare_shaders(pkg, n, dry, cmd=None):
     elif rc == 2:
         say('shaders: nothing to prepare (no shader list or shader archive); the game builds each one the first time '
             'it is seen')
+    elif any('No available video device' in t for t in tail):   # (SDL_Init with no display: Setup run over SSH or in WSL)
+        say('shaders: not prepared here, no display (Setup ran outside a desktop session): the game builds each one the '
+            'first time it is seen (short hitches the first time you play an area); the next Setup run on the desktop '
+            'prepares them')
     else:
         say(f'shaders: not prepared (exit {rc}, {secs} s: {" | ".join(tail[-3:])}); the game builds each one the first '
             'time it is seen (short hitches the first time you play an area)')
@@ -1371,7 +1433,8 @@ def download_kit(argv):
     say('download kit: the Python packages')
     toolchain.kit_wheels({'setup': toolchain.PACKAGES, 'venv': build.VENV_PACKAGES})
     for what, asset in (('the release\'s profile (PGO)', PGO), ('the profile\'s training record', PGO_RECORD),
-                        ('the shader seed', SEED), ('the FSR runtime (AMD FidelityFX)', FFX)):
+                        ('the shader seed', SEED), ('the FSR runtime (AMD FidelityFX)', FFX),
+                        ('the XeSS runtime (Intel)', XESS)):
         if asset:
             toolchain.download(what, PGO_URL.format(**asset), os.path.join(scratch, 'assets', asset['name']),
                                asset['sha256'], asset['size'])
@@ -1385,47 +1448,6 @@ def download_kit(argv):
     size = sum(e.get('size', 0) for e in doc['files'])
     say(f'download kit complete: {len(doc["files"])} files, {size / 2**30:.1f} GB')
     say(f'KIT: {d}')
-
-
-def main_100(argv, out, head):
-    """An --update install builds only UPDATE_VERSION, and Setup offers the update dump again at every run (Builder.cs
-    RestoreChoices): a 1.0.0 game folder from an older Setup would stay on its old code for good. So when this install
-    has a 1.0.0 folder that another commit made, the same run builds 1.0.0 too (main() again without --update: its
-    steps reuse what is there, minutes with the object cache); a failure there leaves the UPDATE_VERSION build done and
-    says how to update 1.0.0. No 1.0.0 folder: none is made (a player who chose UPDATE_VERSION only), only the line
-    saying how."""
-    old = newest_package(out, '')
-    if not old:
-        say(f'1.0.0: not built (this run builds {UPDATE_VERSION} only): to play 1.0.0 too, run Setup again without the '
-            f'{UPDATE_VERSION} update')
-        return
-    if same_100_package(out, head):
-        return
-    # (minutes when its build reuses the earlier objects; tens of minutes when it can't: exFAT, a cleared cache)
-    say(f'1.0.0: your 1.0.0 game ({os.path.basename(old)}) is from an older Setup: updating it too (usually a few '
-        'minutes; up to 45 minutes when its earlier build files are gone or the drive is exFAT)')
-    rest, skip = [], 0
-    for x in argv:   # (the same inputs and folders, without the update and without the window's pid: this run follows it)
-        if skip:
-            skip -= 1
-        elif x in ('--update', '--gui-pid'):
-            skip = 1
-        elif not x.startswith(('--update=', '--gui-pid=')):
-            rest.append(x)
-    NESTED.append(1)
-    ok = False
-    try:
-        main(rest)
-        ok = True
-    except SystemExit as e:   # (fail(): its ERROR line is above)
-        ok = not e.code
-    except Exception as e:
-        say(f'ERROR: {type(e).__name__}: {e}')
-    finally:
-        NESTED.clear()
-    if not ok:
-        say(f'1.0.0: not updated (see the 1.0.0 lines above); your {UPDATE_VERSION} game is ready. To update 1.0.0, run '
-            f'Setup again without the {UPDATE_VERSION} update')
 
 
 def main(argv=None):
@@ -1542,12 +1564,14 @@ def main(argv=None):
     fs = filesystem(work)
     if fs.upper().startswith('FAT') and a.until != 'tools':
         problems.append(f'{os.path.realpath(work)[:2]} is formatted {fs}, which cannot hold files over 4 GB (the game '
-                        'data has one of 17 GB): choose a folder on ' + ('an ext4, btrfs, xfs or exFAT drive' if LINUX
+                        'data has one of 17 GB): choose a folder on ' + ('an ext4, btrfs or xfs drive' if LINUX
                                                                            else 'an NTFS drive'))
     problems += check_pc()
     ram, _ = memory_gb()   # (no floor: under WARN_RAM_GB said, and Setup asked 'Continue anyway?' before this)
     cores = host_linux.cpu_count() if LINUX else os.cpu_count()   # (Linux: affinity and the cgroup's quota)
     game_jobs, rt_jobs = jobs_for(ram, cores or 2)
+    if LINUX:
+        say(host_linux.pc_line())
     say(f'{cores} cores, {ram:.0f} GB RAM: up to {game_jobs} compiles at once')
     if ram_warning(ram):
         say(ram_warning(ram))
@@ -1636,12 +1660,14 @@ def main(argv=None):
     # Windows font otherwise), so a firmware these keys cannot open is said and the build goes on (#26: keys dumped by
     # a tool older than the firmware lack its key_area_key_*_NN and the whole install stopped after the game's files)
     if fw and not fonts:
-        ok, out = run(f'1/{n} extract', [py, '-m', 'pipeline.build', '--nsp', game] + keyarg + ['--work', work,
-                                         '--steps', 'fonts,ready', '--firmware', fw] + common,
-                      env, a.dry_run, quiet=True, tolerate=True)
+        # (fw_out, not out: out is the game folder; the fonts step's text in it made step 8's --out that text, 'File
+        #  name too long', for every player whose firmware's fonts failed: linux-test D#83, v0.1.9 / v0.1.9.1 too)
+        ok, fw_out = run(f'1/{n} extract', [py, '-m', 'pipeline.build', '--nsp', game] + keyarg + ['--work', work,
+                                            '--steps', 'fonts,ready', '--firmware', fw] + common,
+                         env, a.dry_run, quiet=True, tolerate=True)
         if not ok:
-            why = next((ln.strip() for ln in reversed(out.splitlines()) if 'FAILED' in ln or 'Missing' in ln),
-                       (out.strip().splitlines() or ['no output'])[-1].strip())
+            why = next((ln.strip() for ln in reversed(fw_out.splitlines()) if 'FAILED' in ln or 'Missing' in ln),
+                       (fw_out.strip().splitlines() or ['no output'])[-1].strip())
             say(f'firmware: its fonts could not be read ({why}); the game is built without them: Korean and Chinese '
                 f'text uses a Windows font. With keys dumped from a console on that firmware (a key dumper that '
                 f'knows it), or another firmware, the next Install adds them')
@@ -1761,10 +1787,10 @@ def main(argv=None):
             for f in glob.glob(os.path.join(work, 'engine', 'overlay', 'romfs-aspect-*.failed')):
                 os.remove(f)
         stamps.done(7, 'overlay', in7)
-    # DLSS's runtime DLLs (~66 MB): an NVIDIA RTX GPU only (build.py dlss_dlls), at every run, so an RTX card added
-    # later gets them at the next Setup; never stops Setup (offline: DLSS unavailable until a run that is online).
-    # Before step 8: package.py writes TOTK_DLSS_DIR only when the DLLs are there, and in8 says whether they are, so
-    # the run that fetches them packages again
+    # DLSS's runtime DLLs (~66 MB): an NVIDIA RTX GPU on Windows only (build.py dlss_dlls), at every run, so an RTX
+    # card added later gets them at the next Setup; never stops Setup (offline: DLSS unavailable until a run that is
+    # online). Before step 8: package.py writes TOTK_DLSS_DIR only when the DLLs are there, and in8 says whether
+    # they are, so the run that fetches them packages again
     ok, out_dlss = run('DLSS (NVIDIA RTX only)', [py, build, 'dlss'], env, a.dry_run, quiet=True, tolerate=True)
     if not a.dry_run:
         said = [ln.split('] ', 1)[-1] for ln in out_dlss.splitlines() if 'DLSS' in ln]
@@ -1773,6 +1799,7 @@ def main(argv=None):
     if not update:   # (1.4.3: package.py ships no seed)
         shader_seed(work, a.dry_run)
         fsr_runtime(work, a.dry_run)
+        xess_runtime(work, a.dry_run)
     # (--commit: the source the exe was just built from. Without it package.py names the folder after the commit the
     #  key was first made from, so an update that changed only the runtime kept the older version's name)
     rel = release_of(REPO)   # (the launcher's automatic update: this build's release tag and where it comes from)
@@ -1820,13 +1847,6 @@ def main(argv=None):
     if a.dry_run:
         say('check done (--dry-run): nothing was built')
         return
-    if NESTED:   # (the 1.0.0 pass of an --update install: the --update run says DONE, with its own folder)
-        if install:
-            prune(out, newest)
-        say(f'updated: {newest}')
-        return
-    if update and install:
-        main_100(argv, out, head)
     if install:
         prune(out, newest)
         try:   # (what a later update does not need: earlier builds, unused cached objects; tools/builder/tidy.py)

@@ -8,7 +8,8 @@
 //   TOTK_FRAMES_IN_FLIGHT 1..3, default 2: frames the GPU may be behind the CPU (3 = the engine as it was)
 //   TOTK_SWAPCHAIN_IMAGES 2..4 (default: the surface's minimum + 1)
 //   TOTK_HDR              off | hdr10 | scrgb;  TOTK_HDR_PEAK (nits, 1000), TOTK_HDR_PAPER (nits, 200),
-//                         TOTK_HDR_EXPAND (exponent of the highlight expansion, 3), TOTK_HDR_GAMMA (srgb | 2.2)
+//                         TOTK_HDR_EXPAND (exponent of the highlight expansion, 3), TOTK_HDR_GAMMA (srgb | 2.2),
+//                         TOTK_HDR_HUE (0..100, 50: the highlights' hue from the HDR scene)
 //   TOTK_PRESENT_LOG      <file>: one CSV row per game present, window present and display time
 //   TOTK_PACE_STATS       1: the "[pace]" line every 2 s (also on with TOTK_PRESENT_LOG)
 // hle_vi.cpp: TOTK_VSYNC=display (start value only), TOTK_PACE_AT=frame (default: present) and TOTK_PACE_SPIN_US=<us>
@@ -45,6 +46,8 @@ enum { VKP_HDR_OFF = 0, VKP_HDR10 = 1, VKP_HDR_SCRGB = 2 };
 void vk_present_set_hdr(int mode, float peak_nits, float paper_nits);
 int vk_present_hdr_supported(int mode);      // 1 / 0: the surface offers that format; -1 before the window exists
 int vk_present_hdr_active(void);             // mode of the current swapchain (VKP_HDR_OFF if the request fell back)
+// The highlights' hue from the game's HDR scene (a torch flame stays orange, not yellow-white): 0 off .. 1
+void vk_present_set_hdr_hue(float strength);
 
 #ifdef __cplusplus
 }

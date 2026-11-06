@@ -3,6 +3,7 @@
 #include "pc_settings.h"
 #include "pc_overlay.h"
 #include "pc_display_caps.h"
+#include "pc_text.h"
 #include "host_wine.h"
 #include "../../games/totk/include/totk/totk_patches.h"  // totk_quality_presets() (the preset table)
 #include <windows.h>
@@ -961,10 +962,10 @@ extern "C" void hle_fs_set_save_backups(int n);  // hle_fs.cpp: from the next sa
 void crash_reports_apply(const char *v) { pc_crash_set_enabled(strcmp(v, "0") != 0); }
 void save_backups_apply(const char *v) { hle_fs_set_save_backups(atoi(v)); }
 void volume_apply(const char *v) { hle_audio_set_master((float)atof(v)); }   // (one aligned float: a mix sees the old or the new)
-// textures.c: TOTK_OUT_SCALE, off by default (unset) since 2026-11-03 (public #62: broken text at x1.333). The default
-// leaves the variable alone, so a TOTK_OUT_SCALE=0 / 1 given at start (tests, A/B boots) is not undone by a settings file
-// that holds the default row; On writes the 1. A file from before holds "" (the old On default: Off now, as the LEAD
-// asked for every install) or "0" (no value of the row now: ignored, so the default, Off).
+// textures.c: TOTK_OUT_SCALE, on by default (unset) again since #62's fix (textures.c cpu1x_demote; off from 2026-11-03
+// to v0.1.10). The default leaves the variable alone, so a TOTK_OUT_SCALE=0 / 1 given at start (tests, A/B boots) is not
+// undone by a settings file that holds the default row; Off writes the 0. A v0.1.9.x file holds "" (its Off default: On
+// now, the point of the change) or "1" (its On: no value of the row now, so the default, On).
 void native_ui_env(const char *v) { if (*v) env_put("TOTK_OUT_SCALE", v); }
 void fps_env(const char *v) {   // hle_vi.cpp: TOTK_FPS (unset: the game's own 30) and TOTK_UNLOCK_FPS (no pacing)
     // "steady": unlocked, paced at a rate the frames hold (hle_vi.cpp steady_fps, TOTK_UNLOCK_STEADY)
@@ -989,7 +990,7 @@ extern "C" void vk_set_dynres_clock(const char *v);         // exec.c: the resol
 extern "C" void renderer_set_aniso(const char *v);          // textures.c: samplers re-made at the next present
 extern "C" void renderer_set_lod_bias(const char *v);
 void render_scale_apply(const char *v) { output_set_res_scale(v); }
-void native_ui_apply(const char *v) { renderer_set_native_ui(strcmp(v, "1") == 0); }
+void native_ui_apply(const char *v) { renderer_set_native_ui(strcmp(v, "0") != 0); }
 void soft_shadows_apply(const char *v) { vk_set_soft_shadows(v); }
 void upscaler_3d_apply(const char *v) { vk_set_upscaler_3d(v); }
 void scene_upscaler_apply(const char *v) { vk_set_scene_upscaler(v); }
@@ -1030,9 +1031,11 @@ const char *const N_FPSPOS[] = {"Top right (default)", "Top left", "Bottom right
 const char *const V_FPSSIZE[] = {"small", "medium", "large", nullptr};
 const char *const N_FPSSIZE[] = {"Small (default)", "Medium size", "Large size", nullptr};
 const char *const V_SCALE[] = {"0.67", "0.8", "0.9", "1", "1.5", "2", "auto", nullptr};
-const char *const N_SCALE[] = {"67 %", "80 %", "90 %", "100 % (native)", "150 %", "200 %", "Follow the window height", nullptr};
-const char *const V_NATIVE_UI[] = {"", "1", nullptr};
-const char *const N_NATIVE_UI[] = {"Off (default)", "On", nullptr};
+// "auto": the window's resolution (totk_hooks.c res_scale), or the smaller pick on an integrated GPU or one under 8 GB,
+// which pc_settings_auto_scale_small names in its choice (the render thread, once; a pointer store the overlay reads)
+const char *N_SCALE[] = {"67 %", "80 %", "90 %", "100 % (native)", "150 %", "200 %", "Window resolution (default)", nullptr};
+const char *const V_NATIVE_UI[] = {"", "0", nullptr};
+const char *const N_NATIVE_UI[] = {"On (default)", "Off", nullptr};
 const char *const V_OFFON[] = {"0", "1", nullptr};
 // Dynamic resolution as one row. The row writes both; its value is read back from them (a preset, F11 or an old settings
 // file moves them), the floor to the nearest step. Both are live: the floor through the data page, the clock's aim
@@ -1114,6 +1117,8 @@ const pc_setting k_engine[] = {
      V_STEADY_FLOOR, N_STEADY_FLOOR, 0, 0, 0, 0, "TOTK_STEADY_FLOOR", nullptr, steady_floor_apply, nullptr},
     {"display.perf_overlay", "Graphics", "Display", "Perf overlay (F9)", "Fps, 1% low and the frame-time graph.", "0",
      V_OFFON, N_OFFON, 0, 0, 0, 0, nullptr, perf_apply, perf_apply, perf_now},
+    {"display.compile_osd", "Graphics", "Display", "Shader compile indicator", "Bottom right while shaders compile: the percentage on a first start, how many are left in play.", "1",
+     V_OFFON, N_OFFON, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr},
     {"display.fps_readout", "Graphics", "Display", "Fps readout (F3)", "TOTK_FPS_OVERLAY. F3 shows or hides it in game.",
      "0", V_FPSOSD, N_FPSOSD, 0, 0, 0, 0, "TOTK_FPS_OVERLAY", nullptr, fps_readout_apply, fps_readout_now},
     {"display.fps_position", "Graphics", "Display", "Fps readout corner", "Top right keeps clear of the hearts and the "
@@ -1121,10 +1126,11 @@ const pc_setting k_engine[] = {
     {"display.fps_size", "Graphics", "Display", "Fps readout size", "Follows the window height (1080p to 4K).", "small",
      V_FPSSIZE, N_FPSSIZE, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr},
     {"graphics.render_scale", "Graphics", "Rendering", "Render resolution", "TOTK_RES_SCALE, of the game's 1600 x 900. "
-     "Applies at once.", "1", V_SCALE, N_SCALE, 0, 0, 0, 0, "TOTK_RES_SCALE", nullptr, render_scale_apply, nullptr},
+     "Window resolution: the 3D scene as large as the picture in the window (x0.83 of it on an integrated GPU or one "
+     "under 8 GB; two thirds of it with DLSS, FSR or XeSS, their Quality). Applies at once.", "auto", V_SCALE, N_SCALE, 0, 0, 0, 0, "TOTK_RES_SCALE", nullptr, render_scale_apply, nullptr},
     {"graphics.native_ui", "Graphics", "Rendering", "Native-resolution interface", "TOTK_OUT_SCALE: above 1080p, menus, "
-     "text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched. Off by default: at "
-     "some resolutions it can show broken text (being fixed). Applies at once.", "",
+     "text and the HUD drawn at the window's resolution instead of the game's 1920 x 1080 stretched; the 3D scene "
+     "reaches it too. On by default. Applies at once.", "",
      V_NATIVE_UI, N_NATIVE_UI, 0, 0, 0, 0, nullptr, native_ui_env, native_ui_apply, nullptr},
     {"graphics.dynamic_resolution", "Graphics", "Rendering", "Dynamic resolution", "Off: the scene always at the render "
      "resolution. On: the game lowers it only when the GPU is short of time, never below the chosen floor, aiming at the "
@@ -1182,8 +1188,15 @@ const pc_setting k_engine[] = {
      nullptr, nullptr, nullptr},
     {"controls.gyro", "Controls", "Pad", "Motion controls", "TOTK_GYRO.", "", V_GYRO, N_GYRO, 0, 0, 0, R, "TOTK_GYRO",
      nullptr, nullptr, nullptr},
+#if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
+    // (hidden, page "": the skip set is 1.0.0's opening flow, so another game version plays the opening, hle_fs.cpp
+    // skip_opening_works; 9.1 gate skipopen143)
+    {"game.skip_opening", "", "", "Skip the opening", nullptr, "", V_SKIP, N_SKIP, 0, 0, 0, R, "TOTK_SKIP_OPENING", nullptr,
+     nullptr, nullptr},
+#else
     {"game.skip_opening", "Game", "Start", "Skip the opening", "TOTK_SKIP_OPENING. F2 or Minus on the title screen "
      "also toggles it.", "", V_SKIP, N_SKIP, 0, 0, 0, R, "TOTK_SKIP_OPENING", nullptr, nullptr, nullptr},
+#endif
     {"game.console_mode", "Game", "Start", "Console mode", "TOTK_HANDHELD: handheld renders at the lower resolution.", "",
      V_MODE, N_MODE, 0, 0, 0, R, "TOTK_HANDHELD", nullptr, nullptr, nullptr},
 };
@@ -1329,3 +1342,7 @@ struct AddEngine {
 } g_add_engine PC_SETTINGS_FIRST;
 
 }  // namespace
+
+extern "C" void pc_settings_auto_scale_small(void) {
+    N_SCALE[6] = PC_T("Window resolution x0.83 (default: integrated GPU or under 8 GB)");
+}

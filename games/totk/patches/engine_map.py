@@ -151,6 +151,8 @@ HOOK_FREE = {0x704b7c: 'submesh cull (speed)', 0x27b6e64: 'load lap labels (diag
              0x1713290: "calcGrab's Y stick exponent for the mouse feed (read-only)",
              0xba6d48: 'climb root-motion log (diagnostic, TOTK_DEBUG_CLIMB)',
              0x274a3c: 'Havok step log (diagnostic, TOTK_HAVOK_STEP_LOG)',
+             0x7d7a98: 'stagger probe, the % 10 turn (diagnostic, TOTK_STAGGER_PROBE)',
+             0xe12b0c: 'stagger probe, the % 60 turn (diagnostic, TOTK_STAGGER_PROBE)',
              0x11276cc: 'loader thread count (A/B)',
              0x9c2ef0: 'aal flush hold: without it the runtime keeps its 180 fps hold (hle_vi audio_fps_max), under the '
                        '200 where the jam watchdog cuts audio',
@@ -158,6 +160,8 @@ HOOK_FREE = {0x704b7c: 'submesh cull (speed)', 0x27b6e64: 'load lap labels (diag
                        'the flush hold (or the 180 fps hold) no jam forms above 200',
              0xabb518: 'ambient one-shot settle in game time: without it the game plays, short ambient one-shots just '
                        'come closer together above 30 fps',
+             0xb8fd30: "UI animation sound events once per animation frame: without it the game's own per-call events "
+                       'run, a UI sound repeats once per frame above 30 fps (the horse spur recharge stacks)',
              0x91a290: "map temperature sign: without it the sign follows the game's language (the number still "
                        'follows the setting where the tempunit patch is placed)',
              0xa6fd14: "placement timers in game time (CPU): without it the game's own frame counts run, 8x the "
@@ -168,7 +172,8 @@ HOOK_FREE = {0x704b7c: 'submesh cull (speed)', 0x27b6e64: 'load lap labels (diag
              0x7cba8c: "query result entries kept apart (#51): without it new requests may share a live request's entry, as "
                        'before (the Ultrahand read guard still stops a dead target)',
              0x844634: "model scene report-row guard (#52): without it the game follows a report row index "
-                       'unchecked, as before'}
+                       "unchecked, as before (1.4.3 inlines the function into main+0xa1f84: there sites_v143 "
+                       "reportguard checks the rows instead)"}
 
 
 def hook_policy(kept, hooks, version=None):
@@ -355,14 +360,17 @@ def check_fields(d, structs=None):
 
 def mem_imm(w):
     """(the instruction with its offset masked, the byte offset) of an LDR / STR (unsigned offset,
-    any size, general or SIMD), LDUR / STUR, LDP / STP (signed offset) or ADD (immediate) word; None for anything else"""
+    any size, general or SIMD), LDUR / STUR, LDR / STR (pre-indexed), LDP / STP (signed offset) or ADD (immediate) word;
+    None for anything else"""
     if w & 0x3b000000 == 0x39000000:                       # LDR / STR, unsigned 12-bit offset, scaled
         size, v, opc = w >> 30, (w >> 26) & 1, (w >> 22) & 3
         scale = 4 if v and opc & 2 else size
         return w & ~(0xfff << 10), ((w >> 10) & 0xfff) << scale
-    if w & 0x3b200c00 == 0x38000000:                       # LDUR / STUR, signed 9-bit offset
-        imm = (w >> 12) & 0x1ff
+    if w & 0x3b200c00 == 0x38000000 or w & 0x3b200c00 == 0x38000c00:   # LDUR / STUR, or LDR / STR pre-indexed:
+        imm = (w >> 12) & 0x1ff                                         # signed 9-bit, the access at base + imm
         return w & ~(0x1ff << 12), imm - 0x200 if imm & 0x100 else imm
+    if w & 0x3b200c00 == 0x38000400:                       # LDR / STR post-indexed: the access is at base + 0
+        return w & ~(0x1ff << 12), 0                       # (then base += imm: a writeback, _moved_base)
     if w & 0x3a000000 == 0x28000000 and (w >> 23) & 3 == 2:   # LDP / STP, signed 7-bit offset, scaled
         opc, v = w >> 30, (w >> 26) & 1
         scale = (2 + opc) if v else (3 if opc & 2 else 2)
@@ -523,6 +531,90 @@ def field_evidence(porter, at, off, new, pinned, kinds=None, renamed_ok=False):
     return f'{why}; renamed: {r}'
 
 
+def _writeback(w):
+    """the base register a pre- / post-indexed LDR / STR / LDP / STP word moves (writeback), else None"""
+    if w & 0x3b200400 == 0x38000400 or (w & 0x3a000000 == 0x28000000 and (w >> 23) & 3 in (1, 3)):
+        return (w >> 5) & 31
+    return None
+
+
+def _branch_targets(img, fs, size):
+    """the in-function targets of the function's direct branches (b, b.cc, cbz / cbnz, tbz / tbnz; not bl). An
+    indirect br's (a jump table's) targets are not known and not counted: treating them as 'anywhere' refused a field
+    main ships (UltraHand+0x18 at 0x7db668: x20 reloaded the word before, in a function with two br x10)"""
+    from .engine import branch
+    out = set()
+    for a in range(fs, fs + size, 4):
+        w = _word(img, a)
+        br = branch(w, a)
+        if br and br[0] != 'bl' and fs <= br[1] < fs + size:
+            out.add(br[1])
+    return out
+
+
+def _moved_base(img, fs, size, at, rn):
+    """the address of a writeback that moved rn since its last definition before at (in the function [fs, fs + size)), else
+    None: after it, [rn, #k] is no longer +k of that base. A later full write of rn (a mov, an add, a load into it)
+    starts a new base, so the walk back stops there, but only when no branch lands in (that write, at] (the walk is in
+    address order: a path that skips the write would bring the moved base in; then the walk goes on and reports the
+    writeback). Gap left: a jump-table (br) target landing in (write, access] is not seen."""
+    targets = None
+    for a in range(at - 4, fs - 4, -4):
+        w = _word(img, a)
+        if _writeback(w) == rn:
+            return a
+        if _writes_gpr(w, rn):
+            if targets is None:
+                targets = _branch_targets(img, fs, size)
+            if not any(a < t <= at for t in targets):
+                return None
+    return None
+
+
+def _writes_gpr(w, reg):
+    """the word writes general register reg: a data-processing word with rd = reg (_writer's classes), or a load (not a
+    store, not into a SIMD register) with rt or a pair's rt2 = reg"""
+    if w & 0x0a000000 == 0x08000000:                       # loads / stores
+        if (w >> 26) & 1:
+            return False                                   # SIMD / FP registers
+        if w & 0x3a000000 == 0x28000000:                   # pairs: L at bit 22
+            return bool((w >> 22) & 1) and reg in (w & 31, (w >> 10) & 31)
+        if w & 0x3b000000 in (0x39000000, 0x38000000):     # single: opc 00 = store
+            return (w >> 22) & 3 != 0 and w & 31 == reg
+        if w & 0x3f000000 == 0x08000000:                   # exclusives: a load writes rt, a store its status rs
+            return (w & 31 if (w >> 22) & 1 else (w >> 16) & 31) == reg
+        return w & 31 == reg                               # (anything else of the class: counted as a write)
+    return w & 31 == reg and (w & 0x1c000000 in (0x10000000, 0x18000000) or w & 0x0a000000 == 0x0a000000)
+
+
+def _is_call(w):
+    return w & 0xfc000000 == 0x94000000 or w & 0xfffffc1f == 0xd63f0000   # BL / BLR
+
+
+def _exact(porter, fo, at, fn, off, new):
+    """the exact form: in a confirmed pair or a passing pin (the caller checks), the 1.0.0 word at `at` (an immediate
+    access at off), registers and all, occurs exactly once in its function and exactly once in the 1.4.3 one, and its
+    base register rn is written by nothing from the function's entry to the access in either build (no write, no
+    writeback, no call when rn is caller-saved x0-x18): rn is the same incoming value. Same word = same offset, so it
+    only ever confirms an UNCHANGED field. A weaker, labelled level ('exact'): engine-map and
+    CommittedTablesOnMainsTest name the fields it alone places, and a field the runtime writes needs a second piece
+    too (gated_fields). None when it holds, else why not."""
+    if new != off:
+        return f'{at:#x}: the exact form only confirms an unchanged offset ({off:#x} -> {new:#x})'
+    w = _word(porter.old, at)
+    olds = [a for a in range(fo, fo + porter.size_o[fo], 4) if _word(porter.old, a) == w]
+    news = [a for a in range(fn, fn + porter.size_n[fn], 4) if _word(porter.new, a) == w]
+    if olds != [at] or len(news) != 1:
+        return f'{at:#x}: the identical word occurs {len(olds)} / {len(news)} times in the two functions'
+    rn = (w >> 5) & 31
+    for img, fs, a in ((porter.old, fo, at), (porter.new, fn, news[0])):
+        for b in range(fs, a, 4):
+            wb = _word(img, b)
+            if _writes_gpr(wb, rn) or _writeback(wb) == rn or (rn <= 18 and _is_call(wb)):
+                return f'{at:#x}: its base x{rn} is written before it ({b:#x}): not the incoming value'
+    return None
+
+
 def _field_evidence(porter, at, off, new, pinned, kinds=None):
     import difflib
     fo = porter.func_of(0, at)
@@ -533,6 +625,10 @@ def _field_evidence(porter, at, off, new, pinned, kinds=None):
     m0 = access(porter.old, fo, at)
     if m0 is None or m0[1] != off:
         return f'{at:#x} is not an access at {off:#x}'
+    if m0[2] == 'imm':
+        moved = _moved_base(porter.old, fo, porter.size_o[fo], at, (_word(porter.old, at) >> 5) & 31)
+        if moved is not None:
+            return f'{at:#x}: its base was moved by a writeback at {moved:#x} (not +{off:#x} of the incoming base)'
     fn = porter.fwd[fo]
     x = (at - fo) // 4
     a, b = porter._norm(0, fo).tolist(), porter._norm(1, fn).tolist()
@@ -595,6 +691,10 @@ def _field_evidence(porter, at, off, new, pinned, kinds=None):
                 i = idiom()
                 return None if i == 'ok' else (f'{at:#x}: {len(same)} same accesses in its rewritten stretch of '
                                                f'{fn:#x} (none or ambiguous)' + (f'; {i}' if i else ''))
+            if m0[2] == 'imm' and _exact(porter, fo, at, fn, off, new) is None:   # (moved, e.g. one word on)
+                if kinds is not None:
+                    kinds.append('exact')
+                return None
             return f'{at:#x}: not aligned in {fn:#x}'
     return f'{at:#x}: outside its function'
 
@@ -603,8 +703,9 @@ def gated_fields(shipped, porter, pinned, report=None):
     """(the flat field map fields_inc takes, refusals) from a checked shipped map: an entry when all its evidence holds.
     A piece matched only inside a rewritten stretch ('stretch', weaker than an aligned one: a lone same-shape access
     there can be the next member) needs a second agreeing piece, aligned or in another function. So does a 'renamed'
-    piece (field_evidence's renamed form, only for an entry marked "ro": the runtime never writes it). report:
-    {'Struct+off': [[address, 'aligned' | 'stretch' | 'renamed' |...],...]} for the audit."""
+    piece (field_evidence's renamed form, only for an entry marked "ro": the runtime never writes it). An entry placed
+    only by ONE 'exact' piece (the identical word, unchanged offset) needs a second piece of any kind unless it is
+    "ro". report: {'Struct+off': [[address, 'aligned' | 'stretch' | 'renamed' |...],...]} for the audit."""
     out, refused = {}, []
     for st, offs in shipped.items():
         for k, v in offs.items():
@@ -617,6 +718,9 @@ def gated_fields(shipped, porter, pinned, report=None):
             pieces = list(zip([int(x, 16) for x in v['for']], kinds)) if not bad else []
             if report is not None and pieces:
                 report[f'{st}+{k}'] = [[hex(a), kd] for a, kd in pieces]
+            if not bad and kinds and all(kd == 'exact' for kd in kinds) and len(kinds) < 2 and v.get('ro') is not True:
+                bad.append('placed only by one exact piece and written by the runtime (not "ro"): a second piece of '
+                           'any kind is needed')
             weak = [kd for kd in ('stretch', 'renamed') if kd in kinds]
             if not bad and weak:
                 fns = {porter.func_of(0, a) for a, _ in pieces}
@@ -828,6 +932,9 @@ def generate(old_nso, new_nso, version, diagnostic=False, beta=False, pins=None,
         report['fieldmap'], refused = gated_fields(fields, porter, pinned, report['field_evidence'])
         if refused:
             engine['fields_refused'] = refused
+        exact = sorted(k for k, pieces in report['field_evidence'].items() if all(kd == 'exact' for _, kd in pieces))
+        if exact:  # (fields standing on one identical word: a reviewer sees which)
+            engine['fields_exact'] = exact
     return addrs, engine, report
 
 
@@ -856,6 +963,9 @@ def main_engine_map(args):
         print(f'[engine-map] pin refused, its hook stays dropped: {why}', file=sys.stderr)
     for why in engine.get('fields_refused', []):   # (each: the field stays unknown, its readers on the beta sentinel)
         print(f'[engine-map] field not applied, its evidence does not hold here: {why}', file=sys.stderr)
+    for f in engine.get('fields_exact', []):
+        print(f'[engine-map] field placed by the exact form alone (one identical word, no aligned piece): {f}',
+              file=sys.stderr)
     n = version_number(args.version)
     inc = ROOT / 'engine' / 'runtime' / f'totk_main_v{n}.inc'
     js = ROOT / 'games' / 'totk' / 'patches' / f'v{n}.engine.json'

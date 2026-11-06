@@ -170,20 +170,22 @@ void mode_gain(double* gx, double* gy) {   // (each count: the window thread, th
 }
 // TOTK_MOUSE_STEP_MAX=<degrees> (v0.1.9 gate, LEAD 10:47: the "camera elsewhere" one-frame hits cluster at the see
 // script's mouse flicks, TOTK_CTL "mouse 600 0" every 50 ms, often two or three read together): the veneer applies
-// whatever the totals moved since its last camera step, after the game's clamp, so a burst turns the camera ~28 deg
-// per 600 counts in ONE step (rate 0.02 x 70 deg/s / 30), where a pad's full tilt turns 2.3 deg a step at 30 fps. One
-// such frame renders from a camera the game's collision has not caught up with (strip g19_see_kak_329_006995: one frame
-// pulled in past the wall, its neighbours alike). With the switch the published totals move at most that many degrees
-// a camera step (DP_MOUSE_BEAT, stamped by the veneer at each) and the rest goes out at the next steps: no motion is
+// whatever the totals moved since its last camera step, after the game's clamp, so a burst turns the camera ~28 deg per
+// 600 counts in ONE step (rate 0.02 x 70 deg/s / 30), where a pad's full tilt turns 2.3 deg a step at 30 fps. One such
+// frame renders from a camera the game's collision has not caught up with (strip g19_see_kak_329_006995: one frame
+// pulled in past the wall, its neighbours alike). With the switch the published totals move at most that many degrees a
+// camera step (DP_MOUSE_BEAT, stamped by the veneer at each) and the rest goes out at the next steps: no motion is
 // lost, a flick past the limit takes a few frames. After a stale beat (no step for more than MOUSE_STALE presents) the
-// veneer drops the motion anyway, so no backlog is kept there. 0 / unset: everything at once, as before. Published
-// from the raw events and from every input read (pc_mouse_stick_counts) and keeper tick, so the rest goes out without
-// new motion.
+// veneer drops the motion anyway, so no backlog is kept there. 0: everything at once, as before v0.1.10. Published from
+// the raw events and from every input read (pc_mouse_stick_counts) and keeper tick, so the rest goes out without new
+// motion. Default ON since v0.1.10, Link climbing or against a wall and the near surface clipped away for one frame; a
+// real mouse flick at 30-60 fps reaches 20-30 deg a step too. Unset: kStepMaxDefault.
+const double kStepMaxDefault = 20;
 const unsigned kPresents = 88;   // TOTK_DP_PRESENTS
 double step_max_deg() {
     static const double d = [] {
         const char* e = getenv("TOTK_MOUSE_STEP_MAX");
-        const double v = e && *e ? atof(e) : 0;
+        const double v = e && *e ? atof(e) : kStepMaxDefault;
         if (v > 0) printf("[mouse] camera turn at most %.1f deg a camera step (TOTK_MOUSE_STEP_MAX), the rest at the next steps\n", v);
         return v > 0 ? v : 0;
     }();
