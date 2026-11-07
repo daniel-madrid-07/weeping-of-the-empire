@@ -696,7 +696,9 @@ void fps_readout(uint32_t w, uint32_t h) {
     snprintf(label, sizeof label, "%s", pc_tr("fps"));
     for (char *q = label; *q; q++)  // (FPS ASCII only, so a UTF-8 translation stays whatever the locale)
         if ((unsigned char)*q < 0x80) *q = (char)toupper((unsigned char)*q);
-    snprintf(sub, sizeof sub, "%s %.0f", pc_tr("real"), real);
+    // . With the multiplier the shown frames make of the real ones, measured, so frames the window dropped lower it
+    if (fg && real > 0.5f) snprintf(sub, sizeof sub, "%s %.0f  x%.0f", pc_tr("real"), real, (real + gen) / real);
+    else snprintf(sub, sizeof sub, "%s %.0f", pc_tr("real"), real);
     const int nrows = mode == 2 ? 4 : 0;
     if (nrows) {
         // (with frame generation these are measured between real frames, so they say so)
@@ -808,11 +810,11 @@ void compile_indicator(uint32_t w, uint32_t h) {
     ImFont *f = g_fps_font ? g_fps_font : ImGui::GetFont();   // (the overlay's font while the game's is still read)
     float s = h / 1080.0f;
     s = s < 0.75f ? 0.75f : s > 3.0f ? 3.0f : s;
-    // In the corner strip under the minimap, as hle_osd.cpp's banner was (LEAD 10:58): the HUD-safe margin would put it on the
-    // map, so the whole block stays below that margin's line by kUnderMap (assumes the HUD keeps that margin at 21:9 / 32:9 and
-    // with the native UI: the A/B's shots per aspect check it)
+    // In the corner strip under the minimap, as hle_osd.cpp's banner was: the HUD-safe margin would put it on the map, so the
+    // whole block stays below that margin's line by kUnderMap (assumes the HUD keeps that margin at 21:9 / 32:9 and with the
+    // native UI: the A/B's shots per aspect check it)
     const float bar = std::max(2.0f, 3.0f * s), m = kCornerGap * s, room = (kMarginY - kUnderMap) * s - m;
-    float T = 18.0f * s;   // (one size step up from 16, LEAD 16:12: "read at a glance"; the strip still fits it)
+    float T = 18.0f * s;  // (one size step up from 16: "read at a glance"; the strip still fits it)
     char t[192];
     const bool phase = g_cind.total > 0;
     if (phase) {   // (the banner's texts, hle_osd.cpp; their translations exist)
@@ -1109,10 +1111,17 @@ void settings_page(const char *page) {
         ImGui::TextDisabled("%s", pc_tr("No settings on this page yet."));
     } else {
         ImGui::Spacing();
+        // (passes until none moves: a row's apply can set another row of the page after it was reset, as a key
+        // binding's sets Keyboard layout to Custom, so one pass left Controls on Custom; an invalid default never moves)
         if (ImGui::Button(pc_tr("Reset this page to defaults")))
-            for (int i = 0; i < n; i++) {
-                pc_setting_view s = pc_settings_at(i);
-                if (!strcmp(s.def->page, page) && s.def->def) pc_settings_set(s.def->key, s.def->def);
+            for (int pass = 0, moved = 1; moved && pass < 4; pass++) {
+                moved = 0;
+                for (int i = 0; i < n; i++) {
+                    pc_setting_view s = pc_settings_at(i);
+                    if (strcmp(s.def->page, page) || !s.def->def || !strcmp(s.value, s.def->def)) continue;
+                    pc_settings_set(s.def->key, s.def->def);
+                    moved += strcmp(pc_settings_at(i).value, s.def->def) == 0;
+                }
             }
     }
     ImGui::EndChild();

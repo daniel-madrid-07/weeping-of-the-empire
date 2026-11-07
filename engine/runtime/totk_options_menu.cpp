@@ -60,10 +60,10 @@ struct PcRow {
 // (min..max) must have them in its range, and the choice shown is the nearest one.
 // "steady" (the highest rate the scene holds, in whole refreshes of the monitor) so Options shows every frame-rate mode
 // F10 has, a first run's detected one included
-const char *const kFps[] = {"30", "40", "45", "60", "75", "90", "120", "144", "165", "180", "200", "240", "unlocked",
+const char *const kFps[] = {"30", "40", "45", "60", "75", "90", "120", "144", "150", "165", "180", "200", "240", "unlocked",
                             "steady", nullptr};   // (300 / 360: v0.1.9, pc_settings.cpp V_FPS)
 const char *const kPreset[] = {"low", "medium", "high", "ultra", "ultra+", "custom", nullptr};
-const char *const kScale[] = {"0.67", "0.8", "0.9", "1", "1.5", "2", "auto", nullptr};
+const char *const kScale[] = {"0.6", "0.67", "0.8", "0.9", "1", "1.5", "1.6", "2", "auto", nullptr};
 // Mouse sensitivity: 0.1 steps up to 2 (10 % or less a step around the default), coarser above, up to 20
 const char *const kSens[] = {"0.1", "0.2", "0.3", "0.4", "0.5", "0.6", "0.7", "0.8", "0.9", "1", "1.1", "1.2", "1.3",
                              "1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "2", "2.2", "2.4", "2.6", "2.8", "3", "3.2",

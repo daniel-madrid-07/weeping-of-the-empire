@@ -31,8 +31,8 @@ constexpr uint64_t kA = 1u << 0, kB = 1u << 1, kX = 1u << 2, kY = 1u << 3, kL = 
                    kDL = 1u << 12, kDU = 1u << 13, kDR = 1u << 14, kDD = 1u << 15;
 constexpr int32_t kStickMax = 32767;
 // controls.ability.rotate_speed (TOTK_PC_ROTATE_SPEED, live): Ultrahand / Autobuild rotation with R held, in the game's
-// 45-degree steps (R + the d-pad). It replaced controls.ability.rotate_step, 40 raw counts a step (about a millimetre on
-// a common mouse: "tiny moves rotate a lot")
+// 45-degree steps (R + the d-pad). It replaced controls.ability.rotate_step, 40 raw counts a step (about a millimetre on a
+// common mouse: "tiny moves rotate a lot")
 std::atomic<double> g_rotate_speed{1.0};
 const char *const kSpeeds[] = {"0.5", "0.75", "1", "1.5", "2", nullptr};
 const char *const kSpeedNames[] = {"0.5x (slow)", "0.75x", "1x", "1.5x", "2x (fast)", nullptr};

@@ -294,15 +294,14 @@ uint64_t renderer_present_count(void);
 // Output canvas (TOTK_OUT_SCALE, 2026-10-17): TotK's 1920x1080 targets (the canvas its upscale pass writes and the UI draws on,
 // the window textures, the menus' layers and 3D model buffers) at the window's resolution (device.c: viewport height / 1080), so
 // the scene reaches the window in one resample (exec.c, the upscale pass) and the UI draws at full size. On by default
-// 2026-10-27.. 11-03; off by default again since 2026-11-03 (LEAD, the v0.1.9 fix cut: public #62, the game's text broken at
-// 2560x1440 = x1.333, and only the stretched canvas showed it right). TOTK_OUT_SCALE=1 / the Options row graphics.native_ui =
-// On: the canvas at the window's resolution; unset / 0: the old stretched canvas. Active only when the window's 16:9 picture is
-// taller than 1080 lines when first asked (the game's first 1920x1080 target or the upscale program, after the start's window
-// mode is applied): at 1080 or less the canvas is the game's own size anyway, and every target and the upscale pass stay exactly
-// as they were. Decided once, like the textures' sizes: a window made larger later keeps the start's choice until a restart, or
-// until the row changes: graphics.native_ui is live (renderer_set_native_ui, applied at the next present:
-// renderer_set_out_scale), the canvas targets remade between two frames with their contents (tex_live_check), the upscale
-// program in the form a start would give it (exec.c knobs).
+// 2026-10-27.. 11-03; off by default again since 2026-11-03. TOTK_OUT_SCALE=1 / the Options row graphics.native_ui = On: the
+// canvas at the window's resolution; unset / 0: the old stretched canvas. Active only when the window's 16:9 picture is taller
+// than 1080 lines when first asked (the game's first 1920x1080 target or the upscale program, after the start's window mode is
+// applied): at 1080 or less the canvas is the game's own size anyway, and every target and the upscale pass stay exactly as they
+// were. Decided once, like the textures' sizes: a window made larger later keeps the start's choice until a restart, or until
+// the row changes: graphics.native_ui is live (renderer_set_native_ui, applied at the next present: renderer_set_out_scale), the
+// canvas targets remade between two frames with their contents (tex_live_check), the upscale program in the form a start would
+// give it (exec.c knobs).
 static float g_out_s = 1;
 static int g_out_on = -1;   // TOTK_OUT_SCALE, then the live row (render thread)
 static int out_scale_on(void) {
@@ -506,19 +505,18 @@ static uint32_t shadow_rung(uint32_t n) {
     const uint32_t step = o / (uint32_t)k, r = (n + step - 1) / step * step;
     return r > g_vk.props.limits.maxImageDimension2D ? n : r;
 }
-// Promoted targets: TotK renders some non-compressible targets in one pass with a scaled one of the same size (fs
-// dd9edc34: an R8 1600x900 mask with the scene's depth buffer, every frame; fs 7e405a3d: R11G11B10F + R8 800x450 while
-// loading). begin_pass renders the smallest attachment extent, so at TOTK_RES_SCALE=2 the pass used a quarter of the
-// scaled attachment. exec.c begin_pass promotes the unscaled one (storage address + size) to the scene's scale from its
-// next backend (TotK re-creates its targets every frame). LARECOMP_NO_PROMOTE=1: off. The shadow-map kind too
-// (2026-10-30: a square 512x512 D32 classed as a shadow map, at TOTK_SHADOW_SCALE 4 = 2048x2048, drawn with an unscaled
-// R8 512x512 colour target: fs c509b81e / 6c4e6d40 / 915cd25e / 123a608c rendered at 1.0 into the top-left sixteenth of
-// the depth, testing against the wrong texels): the colour target takes the depth's kind. LARECOMP_PROMO_SHADOW=0: scene
-// scale only (old). The promotion and depth-grow tables (below): an entry per storage address + guest size + format,
-// written by exec.c begin_pass on the render thread, read where images are made. A full table reuses its least recently
-// matched entry (P1.4: they kept their first 64 entries for good and dropped later ones silently, so every later pair
-// stayed mixed each frame; the gate's boots made at most 3). A rewritten entry goes through an odd version, so a reader
-// never takes half of one.
+// Promoted targets: TotK renders some non-compressible targets in one pass with a scaled one of the same size (fs dd9edc34:
+// an R8 1600x900 mask with the scene's depth buffer, every frame; fs 7e405a3d: R11G11B10F + R8 800x450 while loading).
+// begin_pass renders the smallest attachment extent, so at TOTK_RES_SCALE=2 the pass used a quarter of the scaled attachment.
+// exec.c begin_pass promotes the unscaled one (storage address + size) to the scene's scale from its next backend (TotK
+// re-creates its targets every frame). LARECOMP_NO_PROMOTE=1: off. The shadow-map kind too (2026-10-30: a square 512x512 D32
+// classed as a shadow map, at TOTK_SHADOW_SCALE 4 = 2048x2048, drawn with an unscaled R8 512x512 colour target: fs c509b81e /
+// 6c4e6d40 / 915cd25e / 123a608c rendered at 1.0 into the top-left sixteenth of the depth, testing against the wrong texels):
+// the colour target takes the depth's kind. LARECOMP_PROMO_SHADOW=0: scene scale only (old). The promotion and depth-grow
+// tables (below): an entry per storage address + guest size + format, written by exec.c begin_pass on the render thread, read
+// where images are made. A full table reuses its least recently matched entry (P1.4: they kept their first 64 entries for
+// good and dropped later ones silently, so every later pair stayed mixed each frame; the gate's boots made at most 3). A
+// rewritten entry goes through an odd version, so a reader never takes half of one.
 #define KT_MAX 256
 typedef struct { uint32_t ver, w, h, fmt, a, b; uint64_t addr, used; } KtEnt;
 typedef struct { KtEnt e[KT_MAX]; int n; const char *what; } KTab;
@@ -1664,25 +1662,31 @@ static int recycle_off(void) {
     if (off < 0) off = getenv("LARECOMP_VK_NO_RECYCLE") != NULL;
     return off;
 }
-// Same-storage re-check (LARECOMP_RECYCLE_RECHECK, default 0 until its arm FIX_PROGRAM_1106 item c, ONEFRAME_REPORT #3).
-// recycle_get gives a new object over the storage of a finalized one that storage's pooled image, with its upload state
-// (uploaded, data_hash, ww_seen, checked_frame). That state describes the storage: one checked earlier in the frame is
-// not asked again in it, and a non-dynamic one is asked every 8th frame. A tile streamed into reused storage then samples
-// the previous tile's texels at N (wrong but plausible terrain), and new bytes are only seen at a later check. =1: a
-// CPU-filled image (not GPU-owned) taken back at the same storage is checked at the new object's first use, as a stream
-// pre-upload's first use is: the write watch since the last hash, shader writes since it, else a full hash; uploaded
-// again only if its bytes changed (no blind re-upload; cost: one watch query or hash per recycled image). A GPU-owned,
-// unscaled colour image is only counted when the CPU wrote its storage since the put ("[recycle]" line). =2: that
-// GPU-owned image is a CPU texture from then on (gpu_owned off, uploaded at its first use), when it was finalized in an
-// earlier submission (the upload buffer runs before the open submission's draws). The watch is asked on the storage's
-// interior pages only (rc_own_ww): a neighbour's write-back on a shared edge page is ours.
+// Same-storage re-check (LARECOMP_RECYCLE_RECHECK, default 1 since cand6 (LEAD 09:07), =0 off FIX_PROGRAM_1106 item c, ONEFRAME_REPORT
+// #3). Arm 11-06 (field 15 min, 8181bbf17): 8394 of 27548 CPU images taken back at the same storage had new bytes at first use (mostly
+// 260x260 terrain tiles), late-fill lines 21 -> 1, fps unchanged (median 120.0 / 119.9, 1% low 109 / 110). recycle_get gives a new
+// object over the storage of a finalized one that storage's pooled image, with its upload state (uploaded, data_hash, ww_seen,
+// checked_frame). That state describes the storage: one checked earlier in the frame is not asked again in it, and a non-dynamic one
+// is asked every 8th frame. A tile streamed into reused storage then samples the previous tile's texels at N (wrong but plausible
+// terrain), and new bytes are only seen at a later check. =1: a CPU-filled image (not GPU-owned) taken back at the same storage is
+// checked at the new object's first use, as a stream pre-upload's first use is: the write watch since the last hash, shader writes
+// since it, else a full hash; uploaded again only if its bytes changed (no blind re-upload; cost: one watch query or hash per recycled
+// image). A GPU-owned, unscaled colour image is only counted when the CPU wrote its storage since the put ("[recycle]" line). =2: that
+// GPU-owned image is a CPU texture from then on (gpu_owned off, uploaded at its first use), when it was finalized in an earlier
+// submission (the upload buffer runs before the open submission's draws). The watch is asked on the storage's interior pages only
+// (rc_own_ww): a neighbour's write-back on a shared edge page is ours. With the default at 1 (no variable) only the CPU-image check
+// runs: the GPU-owned watch (a sweep per put and per get, 749017 picks in the arm's 15 min) and the periodic counts line are for a set
+// variable (=1 arm, =2) only.
+static bool g_rc_set;   // (LARECOMP_RECYCLE_RECHECK set: GPU-owned watch + "[recycle] ... since the last line")
 static int recycle_recheck(void) {
     static int lv = -1;
     if (lv < 0) {
         const char *e = getenv("LARECOMP_RECYCLE_RECHECK");
-        lv = e ? atoi(e) : 0;
-        if (lv) LOG("[recycle] same-storage re-check on (LARECOMP_RECYCLE_RECHECK=%d): a new object on a pooled image of its storage is checked at its first use%s\n",
-                    lv, lv >= 2 ? "; a GPU-owned one whose storage the CPU wrote since is a CPU texture" : "");
+        g_rc_set = e != NULL;
+        lv = e ? atoi(e) : 1;
+        // (the gate's line: '[recycle] same-storage re-check on (default 1)' in a package run without the variable)
+        if (lv) LOG("[recycle] same-storage re-check on (%s%d): a new object on a pooled image of its storage is checked at its first use%s\n",
+                    e ? "LARECOMP_RECYCLE_RECHECK=" : "default ", lv, lv >= 2 ? "; a GPU-owned one whose storage the CPU wrote since is a CPU texture" : "");
     }
     return lv;
 }
@@ -1697,7 +1701,7 @@ static int rc_own_ww(uint64_t addr, uint64_t size, uint64_t *seen) {
 }
 // device.c's "[vram] images" line: the re-check's counts since the last line (an arm reads a rate, not silence; 375-c SHOULD 1)
 void vk_recycle_recheck_line(void) {
-    if (!recycle_recheck()) return;
+    if (!recycle_recheck() || !g_rc_set) return;
     static uint64_t l_c, l_n, l_o, l_oc, l_od;
     LOG("[recycle] same-storage re-check since the last line: %llu CPU images checked at first use, %llu had new bytes; %llu GPU-owned "
         "picks watched, %llu with CPU writes since the put, %llu made CPU textures\n",
@@ -1724,14 +1728,13 @@ static int recycle_cap_fixed(void) {   // 1: LARECOMP_VK_RECYCLE_MB set (g_recyc
     return f;
 }
 static uint64_t recycle_cap(void) { recycle_cap_fixed(); return g_recycle_cap; }
-// The hot transients (LEAD 08:20 P0, v0.1.9 gate 32:9 at TOTK_RES_SCALE=1.6: 8192x2304 targets of 75-150 MB each, ours
-// + 6.5 GB of other processes past the 16 GB card): short of VRAM the cap fell to 512 MB and the pool to 0-177 MB, so the
-// targets TotK finalizes and makes again every frame were freed at each put and made again at each get (349 / 847 image
-// creations per [vram] line against 33 at 16:9; 19 / 42 fps): those frees saved nothing. The bytes taken back from the
-// pool each frame that had been pooled under 2 s, and the bytes the cap evicted that had been pooled under 2 s (the two
-// make the frame's transient set: a pool smaller than the set hits ~never), are kept for 2 s; the cap never goes under
-// 5/4 of their largest frame (at most half the budget's top), short or not, so the pool holds one frame's transients and
-// the shortage falls on idle textures and mirrors. LARECOMP_POOL_HOT=0: no floor (old).
+// The hot transients: short of VRAM the cap fell to 512 MB and the pool to 0-177 MB, so the targets TotK finalizes and makes
+// again every frame were freed at each put and made again at each get (349 / 847 image creations per [vram] line against 33
+// at 16:9; 19 / 42 fps): those frees saved nothing. The bytes taken back from the pool each frame that had been pooled under
+// 2 s, and the bytes the cap evicted that had been pooled under 2 s (the two make the frame's transient set: a pool smaller
+// than the set hits ~never), are kept for 2 s; the cap never goes under 5/4 of their largest frame (at most half the
+// budget's top), short or not, so the pool holds one frame's transients and the shortage falls on idle textures and mirrors.
+// LARECOMP_POOL_HOT=0: no floor (old).
 static uint64_t hot_frame, hot_bytes, hot_ring_b[64], hot_ring_t[64];
 static int hot_ring_n;
 static uint64_t hot_floor(void) {   // (render thread) 5/4 of the largest frame's transients in the last 2 s; 0 = off
@@ -1865,7 +1868,7 @@ static bool recycle_put(NvnTexture *t, TexBackend *b) {
     // LARECOMP_VK_RECYCLE_MB=<n>: a fixed cap (0 = none; 512 = the old default).
     const uint64_t cap = recycle_cap();
     uint64_t ww = 0;   // (LARECOMP_RECYCLE_RECHECK: the CPU's writes into a GPU-owned image's storage from here on, recycle_get)
-    const bool ww_ok = recycle_recheck() && b->gpu_owned && rc_own_kind(b) && t->addr &&
+    const bool ww_ok = recycle_recheck() && g_rc_set && b->gpu_owned && rc_own_kind(b) && t->addr &&
                        rc_own_ww(t->addr, tegra_total_size(&t->layout), &ww) >= 0;
     TexBackend *evict[8];
     uint64_t ev_put[8];
@@ -1948,7 +1951,7 @@ static TexBackend *recycle_get(NvnTexture *t) {
             Recycled *r = &g_recycle[i];
             if (r->addr == t->addr && recycle_shape(r, t, sc) && (r->gpu_owned || r->seq < cur)) {
                 // (a shadow rung at a new guest size is a fresh texture on the same image: zeroed when taken, never the
-                // old size's depth at the old ratio, LEAD 07:52)
+                // old size's depth at the old ratio)
                 const bool sz = r->w == t->width && r->h == t->height;
                 if (rung_t && !sz && !can_clear) continue;
                 pick = i; same = sz; owned = r->gpu_owned;
@@ -1973,8 +1976,8 @@ static TexBackend *recycle_get(NvnTexture *t) {
     // 10-16 ms, then ~50 GPU-slow frames). Taken only when it is a depth image the GPU rendered (a render target: nothing
     // uploads guest texels into it), and given fresh state below: its pass ended, then on this submission's main command
     // buffer (where those uses are recorded) a barrier from UNDEFINED (contents discarded) and a clear to zero, then a full
-    // barrier; so it never shows the old depth (LEAD rule: a reused depth image never exposes old contents) and nothing
-    // writes it before those uses ran. LARECOMP_SHADOW_OPEN_PICK=0: refused.
+    // barrier; so it never shows the old depth and nothing writes it before those uses ran. LARECOMP_SHADOW_OPEN_PICK=0:
+    // refused.
     bool open_pick = false;
     if (pick < 0 && !any && rung_t && can_clear && shadow_open_pick_on())
         for (int i = 0; i < g_nrecycle; i++) {
@@ -3863,7 +3866,9 @@ static void upload_texture_(NvnTexture *t, TexBackend *b) {
         }
         if (ch == 0 && !(b->tp > 0 && b->tp_gen != texpatch_generation())) { prof_tex_ww_clean++; return; }
         if (ch > 0) full = true, lf_why |= lf_why & 4 ? 0 : 2;   // written: hash it now (dynamic or not)
-        if (ch < 0 && (pre_first || rc_first)) full = true;  // (no watch here: a full check, as the first upload it stands for)
+        // (no watch here: a full check, as the first upload it stands for. A recycled pick by default takes the sample hash
+        // below instead, set at every full hash: no unbudgeted full hash per pick on Linux / Wine, 378-c)
+        if (ch < 0 && (pre_first || (rc_first && g_rc_set))) full = true;
     }
     if (!full && frame - b->full_frame >= 120 && full_hash_budget >= total) { full = true; full_hash_budget -= total; lf_why |= 8; }
     uint64_t uh0 = __rdtsc();   // (TSC ticks, as cum_up_hash_tk)
@@ -4468,8 +4473,8 @@ void vk_writeback_flush(void) {
 // on the GPU, so the game could free or reuse the pool memory first and the copy then wrote the target's texels into whatever lived there (found while chasing B's
 // v0.1.8 crash; not its cause). The data the CPU gets is that of the newest finished frame (one or two frames older than on hardware; the camera's pick does not mind).
 // A generation older than RB_MAX_AGE presents is never served. A target in a CPU_UNCACHED pool is not served (the game reads it without an invalidate: logged). Only
-// whole small targets, one level: a few dozen bytes a pass. On by default since v0.1.9 (LEAD 2026-11-03, saves-compat's code check); LARECOMP_VK_CPU_READ_RT=0 turns it
-// off. Known residual (low, saves-compat): a CPU write into such a target after its render and the game's invalidate is overwritten by the older GPU texels.
+// whole small targets, one level: a few dozen bytes a pass. On by default since v0.1.9; LARECOMP_VK_CPU_READ_RT=0 turns it off. Known residual (low, saves-compat): a
+// CPU write into such a target after its render and the game's invalidate is overwritten by the older GPU texels.
 #define RB_MAX_TEXELS 256u
 #define RB_MAX_REGIONS 256
 #define RB_MAX_RUNS RB_MAX_REGIONS   // (guest-layout runs a target: block-linear 16-byte runs, linear one per row)

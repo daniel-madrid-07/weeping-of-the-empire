@@ -1,5 +1,5 @@
-// totk_grab_stick.cpp: Ultrahand moves a held object as far as the mouse moved (v0.1.10: "while holding an
-// object the mouse sensitivity drops a lot, moving things takes ages").
+// totk_grab_stick.cpp: Ultrahand moves a held object as far as the mouse moved (v0.1.10: "while holding an object the
+// mouse sensitivity drops a lot, moving things takes ages").
 //
 // ExecutePlayerUltraHand::updateUltraHand (main+0x1d28e94) reads two analog actions through the input mapper (main+0xaf69b0,
 // hashes 0x8c5522fc / 0xdd849f22), negates each per the invert options, and copies them with the rest of a 0x28-byte block

@@ -8,6 +8,8 @@
    "sha256": "3f98fcde299a65f789a18abed30f2bcf2d4268bff15ed705c96080b0382a28c8"},
   {"used_by": "builder:SEED", "tag": "v0.1.8", "name": "precompile.bin", "size": 5910704,
    "sha256": "f8332fb2166720892f634b23b47492b749a17d4b81e951277c5cde54c8ccac61"},
+  {"used_by": "builder:SEED_EXTRA", "tag": "v0.1.10.1", "name": "precompile_extra.bin", "size": 363544,
+   "sha256": "00f1f6b68c0985af8e7c3473088b1f34e77af898a947adc81883ebf137f812c5"},
   {"used_by": "setup:Llvm", "tag": "v0.1.7", "name": "setup-llvm.zip", "size": 80852283,
    "sha256": "27bf3fd2ea4340580a38662502eb287a5bf1e4a953ae606f368b22d80906aee1"},
   {"used_by": "setup:Vulkan", "tag": "v0.1.7", "name": "setup-vulkan-sdk.zip", "size": 13064178,

@@ -88,6 +88,16 @@ PC_TR("The button pictures in every prompt and menu, for the keys and buttons bo
       "所有提示和選單中的按鍵圖示，對應已繫結的按鍵和按鈕。自動：跟隨最近使用的裝置，即鍵盤和滑鼠、Xbox（XInput）控制器、DualSense / DualShock 4，或使用 Nintendo 控制器時的遊戲自帶圖示。更改立即在所有提示和標籤中生效；使用控制器時，選單會隱藏滑鼠指標，直到滑鼠移動。")
 PC_TR("Automatic (the device used last)",
       "自動（最近使用的裝置）")
+PC_TR("Menu buttons",
+      "選單按鍵")
+PC_TR("Same as the game",
+      "與遊戲相同")
+PC_TR("Printed A accepts, B goes back",
+      "印有 A 的鍵確認，B 返回")
+PC_TR("Switch layout (right accepts, bottom goes back)",
+      "Switch 配置（右鍵確認，下鍵返回）")
+PC_TR("The pad's four face buttons in menus, dialogues and the title screen. Same as the game: as Face buttons and the Pad buttons rows give them. Printed A accepts, B goes back: the button printed A (Cross) confirms and B (Circle) goes back, whatever jump and interact use in the world. Switch layout: the right button confirms, the bottom one goes back. Nothing changes in the world. A change applies at once.",
+      "選單、對話和標題畫面中控制器的四個面鍵。與遊戲相同：依「面鍵」和「控制器按鈕」各列的設定。印有 A 的鍵確認，B 返回：印有 A（叉）的鍵確認，印有 B（圈）的鍵返回，不論世界中跳躍和互動用哪個鍵。Switch 配置：右鍵確認，下鍵返回。世界中的操作不變。變更立即生效。")
 PC_TR("Switch (the game's)",
       "Switch（遊戲自帶）")
 PC_TR("Keyboard and mouse",
@@ -814,6 +824,8 @@ PC_TR("The keys of the Console scheme: Classic, PC (WASD), or Custom (the key bi
       "主機方案的按鍵：經典、PC（WASD）或自訂（下方的按鍵繫結）。")
 PC_TR("The button pictures in prompts and menus. Automatic follows the device you used last: keyboard and mouse, Xbox, PlayStation or Nintendo.",
       "提示和選單中的按鍵圖示。自動跟隨你最近使用的裝置：鍵盤和滑鼠、Xbox、PlayStation 或 Nintendo。")
+PC_TR("The pad's face buttons in menus and dialogues: as the game, printed A accepts and B goes back, or the Switch layout (right accepts). The world keeps its layout.",
+      "選單和對話中控制器的面鍵：與遊戲相同、印有 A 的鍵確認且 B 返回，或 Switch 配置（右鍵確認）。世界中的配置不變。")
 PC_TR("In menus a mouse pointer shows and selects what it points at; left click is A, Esc goes back.",
       "選單中會顯示滑鼠指標並選取其指向的項；左鍵為 A，Esc 返回。")
 PC_TR("In the pause menu and the Purah Pad: Esc goes back, PageUp / PageDown or the wheel switch tabs, left click selects and right click goes back.",

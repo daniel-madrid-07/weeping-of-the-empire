@@ -1,6 +1,5 @@
 // totk_stagger_probe.cpp: what the game's frame staggers cost at high frame rates (rival-034, v0.1.10 diagnostic: a
-// shared 30 Hz counter for the staggers is coded only if this shows more than 0.1 ms of work per frame at 240 fps
-// (LEAD 11-03 07:40).
+// shared 30 Hz counter for the staggers is coded only if this shows more than 0.1 ms of work per frame at 240 fps.
 //
 // The two calls the staggers gate (1.0.0):
 // - main+0x7d7a98 (AreaCullingMgr::updatePosRot, a low-confidence name): an actor whose turn it is (BaseProcMgr frame

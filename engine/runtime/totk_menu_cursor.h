@@ -39,7 +39,9 @@ enum TotkMenuScreen {
 };
 // TMS_QUICKMENU's sub value
 enum { TMS_QM_WHEEL = 0, TMS_QM_WEAPON = 1, TMS_QM_SHIELD = 2, TMS_QM_MATERIAL = 3, TMS_QM_ARROW = 4,
-       TMS_QM_AUTOBUILD = 5 };   // (5: the Autobuild list, AutoBuilder_00)
+       TMS_QM_AUTOBUILD = 5,   // (5: the Autobuild list, AutoBuilder_00)
+       TMS_QM_TREASURE = 6 };  // (6: a chest's full-pouch strip, TreasureFullShortCut_00: public #106)
+#define TOTK_TMS_QM_TREASURE 6   // = TMS_QM_TREASURE, for #ifdef in readers (hle_hid's wheel)
 #define TOTK_TMS_QUICKMENU 13  // = TMS_QUICKMENU, for #ifdef in readers (the pc_ctx_decide)
 #define TOTK_TMS_CAMERA 14      // = TMS_CAMERA, likewise
 #define TOTK_TMS_SCOPE 15       // = TMS_SCOPE, likewise
@@ -47,10 +49,12 @@ enum { TMS_QM_WHEEL = 0, TMS_QM_WEAPON = 1, TMS_QM_SHIELD = 2, TMS_QM_MATERIAL =
 enum { TMS_RECIPE_CARDS = 0, TMS_RECIPE_HISTORY = 1 };   // TMS_RECIPE's sub value
 #ifdef __cplusplus
 static_assert(TMS_QUICKMENU == TOTK_TMS_QUICKMENU && TMS_CAMERA == TOTK_TMS_CAMERA && TMS_SCOPE == TOTK_TMS_SCOPE &&
-              TMS_RECIPE == TOTK_TMS_RECIPE, "TOTK_TMS_* out of step with the enum");
+              TMS_RECIPE == TOTK_TMS_RECIPE && TMS_QM_TREASURE == TOTK_TMS_QM_TREASURE,
+              "TOTK_TMS_* out of step with the enum");
 #else
 _Static_assert(TMS_QUICKMENU == TOTK_TMS_QUICKMENU && TMS_CAMERA == TOTK_TMS_CAMERA && TMS_SCOPE == TOTK_TMS_SCOPE &&
-               TMS_RECIPE == TOTK_TMS_RECIPE, "TOTK_TMS_* out of step with the enum");
+               TMS_RECIPE == TOTK_TMS_RECIPE && TMS_QM_TREASURE == TOTK_TMS_QM_TREASURE,
+               "TOTK_TMS_* out of step with the enum");
 #endif
 uint32_t totk_menu_screen(void);
 // The construct's attach screen (the MAC_CONSTRUCT_ATTACH: the attach mode is UIAttachTargetSelectCommandScreen, eui

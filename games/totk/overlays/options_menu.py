@@ -193,7 +193,7 @@ ENTRIES = [
                   'zht': '遊戲執行的最高影格率（PC）。\n'
                          '越高越耗效能。立即生效。'},
          choices=[{'en': '30'}, {'en': '40'}, {'en': '45'}, {'en': '60'}, {'en': '75'}, {'en': '90'}, {'en': '120'},
-                  {'en': '144'}, {'en': '165'}, {'en': '180'}, {'en': '200'}, {'en': '240'},
+                  {'en': '144'}, {'en': '150'}, {'en': '165'}, {'en': '180'}, {'en': '200'}, {'en': '240'},
                   {'en': 'Unlocked', 'es': 'Sin límite', 'fr': 'Illimitée', 'de': 'Unbegrenzt', 'it': 'Illimitato',
                    'nl': 'Onbeperkt', 'ru': 'Без ограничения', 'ja': '無制限', 'ko': '무제한', 'zhs': '无限制',
                    'zht': '無限制', 'pt': 'Sem limite'},
@@ -366,11 +366,11 @@ ENTRIES = [
                   'zht': '3D 場景的繪製解析度，相對於\n'
                          '遊戲原本的（PC）。越高越耗\n'
                          '效能。立即生效。'},
-         choices=[{'en': '67 %'}, {'en': '80 %'}, {'en': '90 %'},
+         choices=[{'en': '60 %'}, {'en': '67 %'}, {'en': '80 %'}, {'en': '90 %'},
                   {'en': '100 % (native)', 'es': '100 % (nativa)', 'fr': '100 % (native)', 'de': '100 % (nativ)',
                    'it': '100 % (nativa)', 'nl': '100 % (native)', 'ru': '100 % (исходное)', 'ja': '100 %（ネイティブ）',
                    'ko': '100 % (기본)', 'zhs': '100 %（原生）', 'zht': '100 %（原生）', 'pt': '100 % (nativa)'},
-                  {'en': '150 %'}, {'en': '200 %'},
+                  {'en': '150 %'}, {'en': '160 %'}, {'en': '200 %'},
                   {'en': 'Window height', 'es': 'Altura de la ventana', 'fr': 'Hauteur de la fenêtre',
                    'de': 'Fensterhöhe', 'it': 'Altezza della finestra', 'nl': 'Vensterhoogte', 'ru': 'Высота окна',
                    'ja': 'ウィンドウの高さ', 'ko': '창 높이', 'zhs': '窗口高度', 'zht': '視窗高度', 'pt': 'Altura da janela'}]),

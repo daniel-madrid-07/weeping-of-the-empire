@@ -324,7 +324,7 @@ struct MenuItem { const char* key; const char* label; const char* def; std::vect
 static const std::vector<MenuItem>& menu_items() {
     static const std::vector<MenuItem> v = {
         {"TOTK_RES_SCALE", "Render resolution", "1",
-         {{"0.67", "67 %"}, {"0.8", "80 %"}, {"0.9", "90 %"}, {"1", "100 % (native)"}, {"1.5", "150 %"}, {"2", "200 %"}}},
+         {{"0.6", "60 %"}, {"0.67", "67 %"}, {"0.8", "80 %"}, {"0.9", "90 %"}, {"1", "100 % (native)"}, {"1.5", "150 %"}, {"1.6", "160 %"}, {"2", "200 %"}}},
         {"TOTK_DYNRES", "Dynamic resolution", "0", {{"0", "Off"}, {"1", "On (holds the frame rate)"}}},
         {"TOTK_SSAA", "3D upscaler", "", {{"", "Bicubic (recomp)"}, {"fetch", "FSR 1 (the game's)"}}},
         {"TOTK_UPSCALE", "Window upscaler", "", {{"", "Bilinear"}, {"fsr", "FSR 1 (window above 1080p)"}}},

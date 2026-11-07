@@ -30,10 +30,9 @@ constexpr u64 kGlideCall = totk_main(0x1cc9510);   // return address of ExecuteP
 constexpr u64 kGlideVt = totk_main(0x4376e68);     // its vtable (slot 1 getRuntimeTypeInfo 0x1cc9acc, 26 updateImpl_)
 constexpr u64 kVel = 0x24;                          // node: the eased velocity (3 floats)
 constexpr float kEase = 0.1f;                       // the caller's per-call factor (main+0x3776090)
-// The paraglider (ExecutePlayerParasailGlide::updatePhysics, main+0x1d0d0a8; fps360's per-frame sweep, LEAD 11-03): the
-// same ease after the same call, v(+0x24..0x2c) += (min(s, cap) * dir - v) * ScaleWithGravity(0.1, 0.1)
-// (main+0x1d0d16c..0x1d0d1f0), dir at the caller's sp + 0x30, the cap 0.4 / 0.74 (main+0x3746b38, by the Player
-// component's +0xb06 bit 3) unless the node's +0x18 bit 1 is set
+// The paraglider: the same ease after the same call, v(+0x24..0x2c) += (min(s, cap) * dir - v) * ScaleWithGravity(0.1, 0.1)
+// (main+0x1d0d16c..0x1d0d1f0), dir at the caller's sp + 0x30, the cap 0.4 / 0.74 (main+0x3746b38, by the Player component's
+// +0xb06 bit 3) unless the node's +0x18 bit 1 is set
 constexpr u64 kParaCall = totk_main(0x1d0d16c);     // return address of its approachTargetSpeed call
 constexpr u64 kParaVt = totk_main(0x437ec50);       // its vtable (slot 1 getRuntimeTypeInfo 0x1d0d7f0, 26 updateImpl_);
                                                     // not placed in 1.4.3: there the call site alone (its x20 is always the node)

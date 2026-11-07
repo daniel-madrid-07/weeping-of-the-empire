@@ -799,20 +799,25 @@ std::atomic<int> g_pad_page{-1};   // the Pad page the census saw open and shown
 std::atomic<bool> g_dialog_open{false};
 // The quickmenus: the L ability wheel ShortCutMainItem_00 (UIShortCutMainItemScreen) and the D-pad strips
 // ShortCut_00 (UIShortCutScreen, +0x1b8 mCategory: 0 weapon, 1 shield, 2 bow and arrows, 3 material). Gameplay
-// class: the cursor stays off there. g_quick: -1 none, else the TMS_QM_* sub value. A screen counts only with its
-// layout's root pane shown: HUD-like screens can stay Opened while hidden.
+// class: the cursor stays off there. The chest's full-pouch strip (TreasureFullShortCut_00,
+// UIShortCutTreasureFullScreen: "Select [RS] / Sort [Y] / Back [B]", no focus box) is one too: opened inside the
+// chest's event (ExecuteOpenTreasureFullShortcutUI, the event waits for its close), it read as no screen, so the
+// router stayed in the event's rows (E / Esc / Space only) and nothing could pick or leave it (public #106).
+// g_quick: -1 none, else the TMS_QM_* sub value. A screen counts only with its layout's root pane shown: HUD-like
+// screens can stay Opened while hidden.
 std::atomic<int> g_quick{-1};
 // The controls diagrams' screens (glyph_pass): CtrlGuide_00, SystemActionGuide_00 when Opened (scr 0: not), and
 // whether the root is shown. Written by the census, read by the hook, both under g_frame_lock.
 struct Guide { u64 scr; bool shown; } g_guide[3];
 int quick_of(u64 scr, const char* nm) {
     const bool wheel = !strcmp(nm, "ShortCutMainItem_00"), strip = !strcmp(nm, "ShortCut_00"),
-               build = !strcmp(nm, "AutoBuilder_00");
-    if (!wheel && !strip && !build) return -1;
+               build = !strcmp(nm, "AutoBuilder_00"), treasure = !strcmp(nm, "TreasureFullShortCut_00");
+    if (!wheel && !strip && !build && !treasure) return -1;
     const u64 lyt = rd<u64>(scr + kScrLayout), root = ptr_ok(lyt) ? rd<u64>(lyt + kLytRoot) : 0;
     if (!ptr_ok(root) || !pane_shown(root)) return -1;
     if (wheel) return TMS_QM_WHEEL;
     if (build) return TMS_QM_AUTOBUILD;
+    if (treasure) return TMS_QM_TREASURE;   // (no strip field read: its class's offsets are not proven UIShortCutScreen's)
     // (the strip's category unplaced: still a quickmenu, so the census keeps it gameplay-class and the cursor off over
     // it; the generic kind, the weapons', where the category is unknown - qm_feed / qm_apply decline it: hle_hid's flicks)
     if (!kMcStripKnown) return TMS_QM_WEAPON;
@@ -884,6 +889,16 @@ void census(u64 now) {
     }
     g_dialog_open.store(dialog);
     g_quick.store(quick);
+    {   // (its open / close on a line of its own: the census's own lines stop at 200, #106's log had none left)
+        static bool treasure;
+        static int treasure_lines;
+        if ((quick == TMS_QM_TREASURE) != treasure && treasure_lines < 50) {
+            treasure_lines++;
+            printf("[menu-cursor] chest's full-pouch strip (TreasureFullShortCut_00) %s\n",
+                   !treasure ? "open: a quickmenu" : "gone");
+        }
+        treasure = quick == TMS_QM_TREASURE;
+    }
     for (int i = 0; i < 3; i++) g_guide[i] = {guide[i], guide_shown[i]};
     // (the flags at every read, about 30 screens; the log line on a change, at most every 250 ms)
     if (h == last_hash || lines >= 200 || now - last_at < 250) return;
@@ -1803,9 +1818,11 @@ u32 qm_apply(u64 ui, ULONGLONG now) {
             wr<float>(ui + kUcStickY, wy);
         } else wx = wy = 0;
     }
-    if (!quick || sub == TMS_QM_WHEEL || sub == TMS_QM_AUTOBUILD)
+    if (!quick || sub == TMS_QM_WHEEL || sub == TMS_QM_AUTOBUILD || sub == TMS_QM_TREASURE)
         g_qm_strip_usable.store(false, std::memory_order_relaxed);
-    if (!quick) return 0;
+    // (the chest's full-pouch strip: none of this file's feeds, its fields unproven; hle_hid's wheel flicks step it and
+    // the router's rows pick / leave it. Not ShortCut_00's path below, which would step a hidden D-pad strip)
+    if (!quick || sub == TMS_QM_TREASURE) return 0;
     // (a notch is one item; on the wheel Wheel Down is the next slot, as QUICKMENU's Wheel Down = weapon_next)
     static const char* const test_qm = getenv("TOTK_MC_TEST_QM");
     if (const char* t = test_qm) {   // tests: "<notches>" once per quickmenu kind, 1 s after it opened, no router

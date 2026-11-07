@@ -32,15 +32,25 @@ MARKER_ROOT = {
     'AttentionLockOn_00': ('N_Offset_00',),                     # N_PosRoot_00 moves; N_Offset_00 animates y
     'EnemyInfo_00': ('Pa_EnemyLife_00', 'Pa_EnemyNotice_00'),   # the parts move; N_EnemyLifeArea_* stay canvas-sized
     'BalloonMessage_00': ('Pa_BalloonMessage_00',),
+    # The ability reticle (seen with Recall): the code moves N_App_00 to the target (a pane's own scale does not scale its
+    # position) and its children's scales are animated, so k goes on N_App_00 itself; the bow and throw pointers stay
+    # centred. From the same repository, commit d3f841a.
+    'Pointer_00': ('N_App_00', 'N_Arrow_00', 'N_WeaponThrow_00'),
+    # The Recall gauge ring: the code moves N_Trans_00 to the object and sets its scale by distance, so the scale goes on
+    # the ring's pictures. They ship mirrored (-1) and are turned only 0 or 180 degrees, so k keeps the shipped sign.
+    'ModorecoGauge_00': ('P_Smoke_00', 'P_Sh_00') + tuple(f'P_{p}{s}_00' for p in ('Base', 'Glow', 'Main', 'MainLight',
+                                                                                 'BandLight') for s in 'LR'),
 }
 
 def scale_markers(blarc, layout, pane_offset, field, k):
-    """A MARKER_ROOT layout: its root stays at 1, its listed panes take the scale k (each checked at 1 first)."""
+    """A MARKER_ROOT layout: its root stays at 1, its listed panes take the scale k (each checked at 1, or -1 for a
+    mirrored picture, first; the sign is kept)."""
     for pane in ('RootPane',) + MARKER_ROOT[layout]:
         at = pane_offset(layout, pane) + field
         have = struct.unpack_from('<f', blarc, at)[0]
-        if abs(have - 1.0) > 1e-3: raise SystemExit(f'{layout} {pane}: scale {have}, expected 1.0')
-        if pane != 'RootPane': struct.pack_into('<f', blarc, at, k)
+        if abs(abs(have) - 1.0) > 1e-3 or (pane == 'RootPane' and have < 0):
+            raise SystemExit(f'{layout} {pane}: scale {have}, expected 1.0 (-1.0 only on a mirrored picture)')
+        if pane != 'RootPane': struct.pack_into('<f', blarc, at, k * have)
 
 def edits(k, hud_corner):
     """(layout, pane, field, value) for the aspect: k = 16/9 over the aspect (the root's scale), w = how far a 1920-wide

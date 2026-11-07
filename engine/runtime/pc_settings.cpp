@@ -566,17 +566,16 @@ void boot() {
                 set("display.hdr_peak", p, true);
             }
         }
-        // A Steam Deck's first start, the Deck profile (rival parity, PARITY.md 4.2 #3): fullscreen, vsync on, the
-        // scene drawn for the 1280 x 800 panel, and the panel's own rate: 60 on the LCD, 90 on the OLED. Only the
-        // package's own values move (its 120 and auto, windowed; any value for vsync, whose default is on); not the
-        // iGPU's steady (g_first_cap stays empty). The package's render scale auto is max(1, window height / 1080)
-        // (totk_hooks.c res_scale): 900 lines on the 800-line panel and on a 1080p TV, 2160 / 1080 x 900 on a 4K one,
-        // more than the Deck's GPU holds and no more than the panel shows. On its own panel (the desktop 800 lines or
-        // less) 0.8: 1:1 with the panel in both shapes, the 16:10 scene's 1600 x 1000 -> 1280 x 800 and the 16:9 one's
-        // 1600 x 900 -> 1280 x 720 (its letterboxed area), nothing the panel could show lost, 21 % fewer pixels than
-        // 0.9. Docked (a taller desktop) 0.9, 810 lines: 0.8 would be a visible step down on a TV (LEAD 11-02). Only
-        // the first start's screen counts: a Deck first started on its panel and docked later keeps 0.8 until the
-        // player changes it.
+        // A Steam Deck's first start, the Deck profile (rival parity, PARITY.md 4.2 #3): fullscreen, vsync on, the scene
+        // drawn for the 1280 x 800 panel, and the panel's own rate: 60 on the LCD, 90 on the OLED. Only the package's own
+        // values move (its 120 and auto, windowed; any value for vsync, whose default is on); not the iGPU's steady
+        // (g_first_cap stays empty). The package's render scale auto is max(1, window height / 1080) (totk_hooks.c
+        // res_scale): 900 lines on the 800-line panel and on a 1080p TV, 2160 / 1080 x 900 on a 4K one, more than the Deck's
+        // GPU holds and no more than the panel shows. On its own panel (the desktop 800 lines or less) 0.8: 1:1 with the
+        // panel in both shapes, the 16:10 scene's 1600 x 1000 -> 1280 x 800 and the 16:9 one's 1600 x 900 -> 1280 x 720 (its
+        // letterboxed area), nothing the panel could show lost, 21 % fewer pixels than 0.9. Docked (a taller desktop) 0.9,
+        // 810 lines: 0.8 would be a visible step down on a TV. Only the first start's screen counts: a Deck first started on
+        // its panel and docked later keeps 0.8 until the player changes it.
         if (deck) {
             // (from: the one value replaced, nullptr any; no line: added unless from is nullptr. The line itself too: a
             // row pc_window.cpp registers after this start's save keeps its line as it was until then)
@@ -1011,11 +1010,12 @@ const char *const N_SIZE[] = {"1280 x 720 (default)", "1600 x 900", "1920 x 1080
 // TOTK_UNLOCK_CEIL), never "raw", up to 240: the game's real-time step stops at 1/240 s (steps under it crash Havok's
 // solver: 3 of 4 runs), so a higher cap would run the game fast; 300 / 360 come back with the solver fixed
 // (TOTK_STEP_360=1 is that path, TOTK_FPS only; a saved 300 / 360 is 240, fps_cap_saved). 40 / 45 (rival parity, their
-// fps_limit): between the game's 30 and 60 for a PC that cannot hold 60; the clock pacer (hle_vi.cpp TOTK_FPS 31..59)
-// and the realtime step keep the game at full speed
-const char *const V_FPS[] = {"30", "40", "45", "60", "75", "90", "120", "144", "165", "180", "200", "240", "unlocked",
+// fps_limit): between the game's 30 and 60 for a PC that cannot hold 60; the clock pacer (hle_vi.cpp TOTK_FPS 31..59) and
+// the realtime step keep the game at full speed. 150: frame generation's 'Maximum fps' caps the real frames, so a rate
+// the PC holds gives a flat shown rate (150 x4 = 600, as 144 x4 = 576, 165 x4 = 660)
+const char *const V_FPS[] = {"30", "40", "45", "60", "75", "90", "120", "144", "150", "165", "180", "200", "240", "unlocked",
                              "steady", nullptr};
-const char *const N_FPS[] = {"30 (the game's own)", "40", "45", "60", "75", "90", "120", "144", "165", "180", "200",
+const char *const N_FPS[] = {"30 (the game's own)", "40", "45", "60", "75", "90", "120", "144", "150", "165", "180", "200",
                              "240", "Unlocked (monitor rate)", "Unlocked, steady (a rate it can hold)", nullptr};
 // Steady's lowest rung (hle_vi.cpp steady_floor, #23): 30 by default; 20 / 15 for a PC that cannot hold 30, each frame
 // on 3 / 4 refreshes of a 60 Hz panel (whole refreshes on others: 20.6 and 16 at 144 Hz) instead of 3, 4 or 5 unevenly
@@ -1030,10 +1030,12 @@ const char *const V_FPSPOS[] = {"top_right", "top_left", "bottom_right", "bottom
 const char *const N_FPSPOS[] = {"Top right (default)", "Top left", "Bottom right", "Bottom left", nullptr};
 const char *const V_FPSSIZE[] = {"small", "medium", "large", nullptr};
 const char *const N_FPSSIZE[] = {"Small (default)", "Medium size", "Large size", nullptr};
-const char *const V_SCALE[] = {"0.67", "0.8", "0.9", "1", "1.5", "2", "auto", nullptr};
+// (0.6: 960 x 540, exactly half of a 1080p output: DLSS Performance there; 0.8 is it at 1440p. 1.6, LEAD 11-07: 2560 x
+// 1440, native at 1440p, which "auto" gives only without an upscaler on a GPU of 8 GB or more: DLAA there)
+const char *const V_SCALE[] = {"0.6", "0.67", "0.8", "0.9", "1", "1.5", "1.6", "2", "auto", nullptr};
 // "auto": the window's resolution (totk_hooks.c res_scale), or the smaller pick on an integrated GPU or one under 8 GB,
 // which pc_settings_auto_scale_small names in its choice (the render thread, once; a pointer store the overlay reads)
-const char *N_SCALE[] = {"67 %", "80 %", "90 %", "100 % (native)", "150 %", "200 %", "Window resolution (default)", nullptr};
+const char *N_SCALE[] = {"60 %", "67 %", "80 %", "90 %", "100 % (native)", "150 %", "160 %", "200 %", "Window resolution (default)", nullptr};
 const char *const V_NATIVE_UI[] = {"", "0", nullptr};
 const char *const N_NATIVE_UI[] = {"On (default)", "Off", nullptr};
 const char *const V_OFFON[] = {"0", "1", nullptr};
@@ -1344,5 +1346,5 @@ struct AddEngine {
 }  // namespace
 
 extern "C" void pc_settings_auto_scale_small(void) {
-    N_SCALE[6] = PC_T("Window resolution x0.83 (default: integrated GPU or under 8 GB)");
+    N_SCALE[8] = PC_T("Window resolution x0.83 (default: integrated GPU or under 8 GB)");
 }

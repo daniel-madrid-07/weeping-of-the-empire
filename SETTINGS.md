@@ -107,6 +107,7 @@ Your settings are kept in `%APPDATA%\nxrecomp\TotK-engine\settings.ini` and surv
 - **Gameplay keys**: PC (default): one key per action (Space jumps, Shift sprints, F attacks...). Console layout: the old keys in the world. Menus use the PC keys either way.
 - **Keyboard layout**: The keys of the Console scheme: Classic, PC (WASD), or Custom (the key bindings below).
 - **Button prompts**: The button pictures in prompts and menus. Automatic follows the device you used last: keyboard and mouse, Xbox, PlayStation or Nintendo.
+- **Menu buttons**: The pad's face buttons in menus and dialogues: as the game, printed A accepts and B goes back, or the Switch layout (right accepts). The world keeps its layout.
 - **Mouse cursor in menus**: In menus a mouse pointer shows and selects what it points at; left click is A, Esc goes back.
 - **Menu keys**: In the pause menu and the Purah Pad: Esc goes back, PageUp / PageDown or the wheel switch tabs, left click selects and right click goes back.
 - **Mouse camera**: How fast the mouse turns the camera (click the window to capture the pointer; Esc, F10 or Alt+Tab frees it). 0 = off; above 1 turns faster.

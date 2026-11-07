@@ -83,6 +83,16 @@ PC_TR("The button pictures in every prompt and menu, for the keys and buttons bo
       "Картинки кнопок во всех подсказках и меню, для назначенных клавиш и кнопок. «Автоматически» следует за последним использованным устройством: клавиатура и мышь, геймпад Xbox (XInput), DualSense / DualShock 4 или значки игры при геймпаде Nintendo. Изменение видно сразу, во всех подсказках и надписях; при использовании геймпада меню скрывают курсор мыши, пока мышь не сдвинется.")
 PC_TR("Automatic (the device used last)",
       "Автоматически (последнее устройство)")
+PC_TR("Menu buttons",
+      "Кнопки в меню")
+PC_TR("Same as the game",
+      "Как в игре")
+PC_TR("Printed A accepts, B goes back",
+      "A — принять, B — назад (по надписям)")
+PC_TR("Switch layout (right accepts, bottom goes back)",
+      "Как на Switch (правая — принять, нижняя — назад)")
+PC_TR("The pad's four face buttons in menus, dialogues and the title screen. Same as the game: as Face buttons and the Pad buttons rows give them. Printed A accepts, B goes back: the button printed A (Cross) confirms and B (Circle) goes back, whatever jump and interact use in the world. Switch layout: the right button confirms, the bottom one goes back. Nothing changes in the world. A change applies at once.",
+      "Четыре лицевые кнопки геймпада в меню, диалогах и на титульном экране. Как в игре: как их задают «Лицевые кнопки» и строки «Кнопки геймпада». A — принять, B — назад: кнопка с буквой A (Крест) подтверждает, а с буквой B (Круг) возвращает назад, какие бы кнопки ни были у прыжка и действия в мире. Как на Switch: правая кнопка подтверждает, нижняя возвращает назад. В мире ничего не меняется. Изменение действует сразу.")
 PC_TR("Switch (the game's)",
       "Switch (как в игре)")
 PC_TR("Keyboard and mouse",
@@ -791,6 +801,8 @@ PC_TR("The keys of the Console scheme: Classic, PC (WASD), or Custom (the key bi
       "Клавиши консольной схемы: Классика, ПК (WASD) или Свой (привязки клавиш ниже).")
 PC_TR("The button pictures in prompts and menus. Automatic follows the device you used last: keyboard and mouse, Xbox, PlayStation or Nintendo.",
       "Картинки кнопок в подсказках и меню. «Автоматически» следует за последним использованным устройством: клавиатура и мышь, Xbox, PlayStation или Nintendo.")
+PC_TR("The pad's face buttons in menus and dialogues: as the game, printed A accepts and B goes back, or the Switch layout (right accepts). The world keeps its layout.",
+      "Лицевые кнопки геймпада в меню и диалогах: как в игре, A — принять и B — назад по надписям, или как на Switch (правая — принять). В мире раскладка не меняется.")
 PC_TR("In menus a mouse pointer shows and selects what it points at; left click is A, Esc goes back.",
       "В меню показывается курсор мыши и выбирает то, на что указывает; левый щелчок — A, Esc — назад.")
 PC_TR("In the pause menu and the Purah Pad: Esc goes back, PageUp / PageDown or the wheel switch tabs, left click selects and right click goes back.",

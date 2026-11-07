@@ -15,11 +15,10 @@
 // (the caller reads the parameter itself). gen.py --hook 1347600 in GEN_MAIN; TOTK_ABILITY_PITCH=0: the original alone.
 // tools/oracle/test_ability_pitch.py; games/totk/tests/verify_ability_pitch.py checks the caller's words.
 //
-// The live scales (v0.1.10, LEAD 13:37: Ultrahand with the mouse): the same mode update reads LatStickScale here and
-// LngStickScale (getter main+0x1347654, return address main+0x1ce7684) for its yaw; both values go to the data page
-// as read (TOTK_DP_ABIL_LAT / _LNG, data_page.h), so pc_mouse's ability gains divide by the active mode's scales, not
-// the SpecialPower block's 1.5 / 0.8 (another mode, e.g. grabbing, may use other ones). Read-only: the yaw call keeps
-// the game's value. gen.py --hook 1347654 too.
+// The live scales: the same mode update reads LatStickScale here and LngStickScale (getter main+0x1347654, return address
+// main+0x1ce7684) for its yaw; both values go to the data page as read (TOTK_DP_ABIL_LAT / _LNG, data_page.h), so
+// pc_mouse's ability gains divide by the active mode's scales, not the SpecialPower block's 1.5 / 0.8 (another mode, e.g.
+// grabbing, may use other ones). Read-only: the yaw call keeps the game's value. gen.py --hook 1347654 too.
 #include "rt.h"
 #include "totk_globals.h"
 

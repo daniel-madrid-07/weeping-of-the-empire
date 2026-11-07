@@ -19,7 +19,7 @@ Most of the code was written by AI coding agents directed by one developer, who 
   <sub>Captured from the developer's own copy on a Ryzen 7 9800X3D + RTX 5080 (developer build): a 2560x1415 window, unlocked frame rate, the port's fps overlay at the top right.</sub>
 </p>
 
-- **Frame rate:** 30 to 240 (40 and 45 for a PC that cannot hold 60, and the usual monitor rates 60, 75, 90, 120, 144, 165, 180, 200, 240) or unlocked, up to your monitor's refresh rate (240 fps at most), at the game's real speed.
+- **Frame rate:** 30 to 240 (40 and 45 for a PC that cannot hold 60, and the usual monitor rates 60, 75, 90, 120, 144, 150, 165, 180, 200, 240) or unlocked, up to your monitor's refresh rate (240 fps at most), at the game's real speed.
 - **Measured on one PC only** (Ryzen 7 9800X3D + RTX 5080, developer build, 2560x1440 window, 2133x1200 render, one run per place): 116.2-119.7 fps average at the 120 cap, 159.1-178.4 unlocked. Builds made by Setup get a list of the developer build's shaders instead of its full shader cache (the difference is not measured), so expect the same or lower. [Full table, and what is not measured](#performance-measured).
 - **Display:** any resolution, ultrawide, borderless or exclusive fullscreen; VRR and HDR options (not measured); colour profiles (Vivid, Brighter dark tones, Custom); upscaling and frame generation as options: NVIDIA DLSS / DLAA on RTX cards with DLSS frame generation x2-x4 on RTX 40 / 50, AMD FSR 3.1 upscaling and frame generation on any GPU, FSR 1, SMAA. Setup downloads the DLSS files itself: nothing to copy by hand.
 - **Controls:** keyboard and mouse with PC prompts in the game; Xbox, PlayStation and Switch controllers; settings window in game (F10). Every key and every setting: [CONTROLS.md](CONTROLS.md), [SETTINGS.md](SETTINGS.md).
@@ -82,7 +82,7 @@ numbers are welcome: use the
 
 | | |
 |---|---|
-| **Frame rate** | 30 to 240 (30, 40, 45, 60, 75, 90, 120, 144, 165, 180, 200, 240) or unlocked (up to your monitor's refresh rate, 240 fps at most), with the game running at its real speed |
+| **Frame rate** | 30 to 240 (30, 40, 45, 60, 75, 90, 120, 144, 150, 165, 180, 200, 240) or unlocked (up to your monitor's refresh rate, 240 fps at most), with the game running at its real speed |
 | **Display** | Any window size and render resolution, ultrawide 21:9 / 32:9, triple-screen 48:9, 16:10 and 3:2 (Surface, Framework) (F10 > Graphics > Game patches > Aspect ratio; from v0.1.9 it follows your window's shape by default), borderless or exclusive fullscreen, VRR, HDR |
 | **Upscaling** | NVIDIA DLSS super resolution and DLAA on RTX cards, DLSS frame generation x2 / x3 / x4 on RTX 40 / 50 series, AMD FSR 3.1 upscaling and frame generation on any GPU, FSR 1, SMAA, all optional. Setup downloads NVIDIA's DLSS files itself (pinned by hash), so there is nothing to copy by hand |
 | **Colour** | The game's own colours by default; Vivid, Brighter dark tones, or Custom brightness, contrast, saturation and gamma (F10 > Graphics > Colour) |

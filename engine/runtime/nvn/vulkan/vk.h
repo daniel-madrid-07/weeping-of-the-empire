@@ -298,7 +298,7 @@ void vk_swapchain_lock(void);                                // around vkQueuePr
 void vk_swapchain_unlock(void);
 void vk_swapchain_life_lock(void);                           // around making / destroying a swapchain (present.c)
 void vk_swapchain_life_unlock(void);
-void vk_present_done(uint64_t frame, uint64_t id, uint64_t seq, VkResult r, uint64_t t_submit, uint64_t t_paced);
+void vk_present_done(uint64_t frame, uint64_t id, uint64_t seq, VkResult r, uint64_t t_submit, uint64_t t_paced, bool gen);
 void vk_present_skipped(uint64_t frame);                     // a frame not shown (held / minimised)
 bool vk_present_queue_wanted(void);                          // TOTK_FG_PRESENT_THREAD=1 (device.c: a second queue for it)
 void vk_present_queue_init(VkQueue q, bool shared);          // FG present thread (present.c) on this queue (NULL: none;
@@ -310,7 +310,9 @@ VkResult vk_engine_graphics_pipeline(const char *name, VkPipelineCache cache, Vk
 VkResult vk_engine_compute_pipeline(const char *name, VkComputePipelineCreateInfo *ci, VkPipeline *out);
 void vk_queue_lock(void);                                  // g_vk.queue's host access while the FG present thread shares it
 void vk_queue_unlock(void);                                  // (device.c; no-op otherwise)
+bool vk_present_fg_even(void);                              // TOTK_FG_PQ=2: even FG slots, n + 2 window images
 bool vk_present_queue_on(void);                              // DLSS-G on and the thread there: presents go through it
+bool vk_fg_fif_real(void);                                   // TOTK_FG_FIF=real: generated presents are not frames in flight
 bool vk_fg_max(void);                                        // FG 'Maximum fps' (TOTK_FG_PACE=max, the F10 row; device.c)
 void vk_set_fg_max(bool on);                                 // (pc_dlss.cpp: the row live)
 bool vk_fg_max_free(void);                                   // and the VRR row off (no present waits for a vblank)

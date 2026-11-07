@@ -54,6 +54,7 @@ enum { SHIM_WINDOWED, SHIM_BORDERLESS, SHIM_EXCLUSIVE };
 static volatile LONG g_fs, g_mode, g_fs_kind = SHIM_BORDERLESS, g_monitor, g_excl_w, g_excl_h, g_excl_hz, g_excl_away;
 static WINDOWPLACEMENT g_wp = {sizeof g_wp};
 static wchar_t g_dm_dev[32];   // monitor whose display mode we changed ("" none)
+static DWORD g_dm_w, g_dm_h, g_dm_hz;   // (window thread) the mode we set there (WM_DISPLAYCHANGE: ours or not)
 void vk_present_set_exclusive(void *hmonitor);   // present.c: the swapchain's full-screen-exclusive monitor (NULL: none)
 
 typedef struct { int want, n; HMONITOR found; } MonPick;
@@ -116,11 +117,16 @@ static void display_mode_set(HMONITOR mon) {
     if ((!g_excl_w && !g_excl_hz) || !GetMonitorInfoW(mon, (MONITORINFO *)&mi)) return;
     DEVMODEW dm = {.dmSize = sizeof dm};
     if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) return;
-    static pcd_mode modes[512];
+    // (each width x height x rate once: Windows lists a mode per colour depth and scaling too.)
+    static pcd_mode modes[1024];
     int n = 0;
     DEVMODEW e = {.dmSize = sizeof e};
-    for (DWORD i = 0; n < 512 && EnumDisplaySettingsW(mi.szDevice, i, &e); i++)
-        modes[n++] = (pcd_mode){(int)e.dmPelsWidth, (int)e.dmPelsHeight, (int)e.dmDisplayFrequency};
+    for (DWORD i = 0; n < 1024 && EnumDisplaySettingsW(mi.szDevice, i, &e); i++) {
+        const pcd_mode m = {(int)e.dmPelsWidth, (int)e.dmPelsHeight, (int)e.dmDisplayFrequency};
+        int dup = 0;
+        for (int j = 0; j < n && !dup; j++) dup = modes[j].w == m.w && modes[j].h == m.h && modes[j].hz == m.hz;
+        if (!dup) modes[n++] = m;
+    }
     const pcd_mode desk = {(int)dm.dmPelsWidth, (int)dm.dmPelsHeight, (int)dm.dmDisplayFrequency};
     pcd_mode to;
     if (!pcd_pick(modes, n, desk, (int)g_excl_w, (int)g_excl_h, (int)g_excl_hz, &to)) {
@@ -133,7 +139,10 @@ static void display_mode_set(HMONITOR mon) {
     LONG r = ChangeDisplaySettingsExW(mi.szDevice, &dm, NULL, CDS_FULLSCREEN, NULL);
     fprintf(stderr, "[win] exclusive display mode %lux%lu @ %lu Hz on %ls: %s\n", dm.dmPelsWidth, dm.dmPelsHeight,
             dm.dmDisplayFrequency, mi.szDevice, r == DISP_CHANGE_SUCCESSFUL ? "set" : "refused (the desktop mode stays)");
-    if (r == DISP_CHANGE_SUCCESSFUL) wcscpy_s(g_dm_dev, 32, mi.szDevice);
+    if (r == DISP_CHANGE_SUCCESSFUL) {
+        wcscpy_s(g_dm_dev, 32, mi.szDevice);
+        g_dm_w = dm.dmPelsWidth, g_dm_h = dm.dmPelsHeight, g_dm_hz = dm.dmDisplayFrequency;
+    }
 }
 
 static void cover_monitor(HWND h, HMONITOR mon) {
@@ -201,13 +210,65 @@ static void apply_fullscreen(HWND h, bool fs) {
     int mode = fs ? (int)g_fs_kind : SHIM_WINDOWED;
     if (mode != (int)g_mode) apply_mode(h, mode, 0);
 }
-// exclusive and alt-tab: away = desktop mode back + minimised; back = the mode again
+// Exclusive, in front, and the monitor's mode changed by someone else (fps360 11-07, fif5_x3_unl_new: the monitor went
+// from our 1920x1080 @ 240 back to the desktop's 2560x1440 with no focus loss; the window followed the monitor and the
+// game went on at the desktop size, silently): our mode again and the monitor covered, logged. Our own changes send
+// WM_DISPLAYCHANGE too: the current mode equal to ours is one of them. At most 3 times in 10 s, then logged and left as
+// it is (another program that keeps setting its own mode wins, no fight). Only in front: a window never activated (a
+// TOTK_NO_FOCUS boot, a foreground-locked start) would blank the monitors for nothing; its activation checks once.
 void vk_present_exclusive_retry(void);   // present.c: exclusive again after a refused acquire
+static void exclusive_display_change(HWND h, bool activating) {
+    if (g_mode != SHIM_EXCLUSIVE || g_excl_away || g_applying || IsIconic(h) || !g_excl_mon) return;
+    if (!activating && GetForegroundWindow() != h) return;   // (activating: the foreground may not be set yet)
+    if (!g_dm_dev[0]) { cover_monitor(h, g_excl_mon); return; }   // (we kept the desktop mode: its new rect)
+    DEVMODEW cur = {.dmSize = sizeof cur};
+    if (!EnumDisplaySettingsW(g_dm_dev, ENUM_CURRENT_SETTINGS, &cur)) return;
+    if (cur.dmPelsWidth == g_dm_w && cur.dmPelsHeight == g_dm_h && cur.dmDisplayFrequency == g_dm_hz) {
+        // Our mode, but the window off its monitor: with several displays a mode set re-arranges the desktop after
+        // cover_monitor placed the window (fps360 11-07, qm_release100: exclusive on DISPLAY1, the window then on
+        // DISPLAY3, the exclusive swapchain refused (-3) and the game in a 1262x664 frame). Covered again.
+        MONITORINFO mi = {sizeof mi};
+        RECT wr;
+        if (GetMonitorInfoW(g_excl_mon, &mi) && GetWindowRect(h, &wr) && !EqualRect(&wr, &mi.rcMonitor)) {
+            static int logs;
+            if (logs++ < 20)
+                fprintf(stderr, "[win] exclusive: the window off its monitor after a display change (%ld,%ld %ldx%ld): "
+                                "covered again\n", wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top);
+            g_applying = true;
+            cover_monitor(h, g_excl_mon);
+            g_applying = false;
+            vk_present_exclusive_retry();  // (the refused acquire (-3) left it borderless until an alt-tab)
+        }
+        return;
+    }
+    static ULONGLONG since;
+    static int n, told;
+    const ULONGLONG now = GetTickCount64();
+    if (!since || now - since > 10000) since = now, n = 0;
+    if (n >= 3) {
+        if (!told++)
+            fprintf(stderr, "[win] display mode of %ls changed outside the game again (%lux%lu @ %lu Hz): left as "
+                            "it is\n", g_dm_dev, cur.dmPelsWidth, cur.dmPelsHeight, cur.dmDisplayFrequency);
+        return;
+    }
+    n++;
+    fprintf(stderr, "[win] display mode of %ls changed outside the game (%lux%lu @ %lu Hz, ours %lux%lu @ %lu Hz): "
+                    "set again\n", g_dm_dev, cur.dmPelsWidth, cur.dmPelsHeight, cur.dmDisplayFrequency, g_dm_w, g_dm_h,
+            g_dm_hz);
+    g_applying = true;
+    display_mode_set(g_excl_mon);
+    cover_monitor(h, g_excl_mon);
+    g_applying = false;
+}
+// exclusive and alt-tab: away = desktop mode back + minimised; back = the mode again
 static void exclusive_focus(HWND h, bool active) {
     // (g_applying: an activation inside apply_mode sees the new mode before its display mode / exclusive present are
     // set, either way)
     if (g_mode != SHIM_EXCLUSIVE || g_applying) return;
-    if (active && !g_excl_away) vk_present_exclusive_retry();   // (started or left behind another window: borderless till now)
+    if (active && !g_excl_away) {
+        vk_present_exclusive_retry();   // (started or left behind another window: borderless till now)
+        exclusive_display_change(h, true);   // (a mode changed while it was behind)
+    }
     if (!active && !g_excl_away) {
         InterlockedExchange(&g_excl_away, 1);
         vk_present_set_exclusive(NULL);
@@ -581,6 +642,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         exclusive_focus(h, w != 0); oe_focus_update(w != 0); pc_input_focus(w != 0); break;
     case WM_DISPLAYCHANGE:   // a desktop resolution / layout change: borderless covers its monitor again
         if (g_mode == SHIM_BORDERLESS) cover_monitor(h, pick_monitor(h));
+        else exclusive_display_change(h, false);   // (exclusive: our mode again if someone else changed it)
         break;
     case WM_WINDOWPOSCHANGING: {   // fullscreen: a move or resize by anything but apply_mode lands on the monitor rect
         // before it applies, so the swapchain never follows a wrong size (osc4kw_a, after 9f079c0c: the popup went back

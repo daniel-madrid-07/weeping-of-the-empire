@@ -839,13 +839,13 @@ static int game_set_of(int c) {
         if (g_glyph_tab[c][b] > 0 && g_glyph_tab[c][b] != g_glyph_tab[PCX_WORLD][b]) return c;
     return PCX_WORLD;
 }
-// The glyph intent (pc_input.h). Tab drew the ability's "Quit" in on foot's Shift for a moment, then Tab: the context
-// follows the game (verb 61 some frames after the press, then the 30 ms debounce), the live rewrite follows the context
-// (20-40 ms, then the font cache reset), and the HUD bar holds a set 100 ms; whatever the game laid out meanwhile drew
-// the old set. The router knows the set a press puts up (an ability key, a strip key, a menu hotkey; Tab leaving an
-// ability; a strip closing; the bow drawn or let go), so it names it at the press: the glyph lookups answer that set from
-// then, and hle_fs rewrites at once (the kick). Held until the context's own sets move (the game followed, or did
-// something else: dropped for good) or kIntentMs pass (the game refused the press: the old set again). Under g_glyph_mu.
+// The glyph intent. Tab drew the ability's "Quit" in on foot's Shift for a moment, then Tab: the context follows the game
+// (verb 61 some frames after the press, then the 30 ms debounce), the live rewrite follows the context (20-40 ms, then
+// the font cache reset), and the HUD bar holds a set 100 ms; whatever the game laid out meanwhile drew the old set. The
+// router knows the set a press puts up (an ability key, a strip key, a menu hotkey; Tab leaving an ability; a strip
+// closing; the bow drawn or let go), so it names it at the press: the glyph lookups answer that set from then, and hle_fs
+// rewrites at once (the kick). Held until the context's own sets move (the game followed, or did something else: dropped
+// for good) or kIntentMs pass (the game refused the press: the old set again). Under g_glyph_mu.
 constexpr ULONGLONG kIntentMs = 400;
 static int g_gi_ctx = -1, g_gi_sub, g_gi_font_from, g_gi_game_from;
 static ULONGLONG g_gi_until;
@@ -1289,7 +1289,20 @@ int pc_ctx_decide(bool overlay, bool title_phase, uint32_t menu_screen, int gues
         case (TotkMenuScreen)TOTK_TMS_RECIPE: c = PCX_RECIPE; break;
 #endif
 #ifdef TOTK_TMS_QUICKMENU
-        case (TotkMenuScreen)TOTK_TMS_QUICKMENU: c = PCX_QUICKMENU; g_qm_sub = TOTK_MENU_SUB(menu_screen); break;
+        case (TotkMenuScreen)TOTK_TMS_QUICKMENU: {
+            const int sub = (int)TOTK_MENU_SUB(menu_screen);
+#ifdef TOTK_TMS_QM_TREASURE
+            // (a chest's full-pouch strip counts only inside the chest's event that opened it and waits for its close:
+            // a root left shown past the close must not carry the strips' rows into the world, LMB = A and E dead)
+            if (sub == TOTK_TMS_QM_TREASURE && (title_phase || !in_event())) {
+                c = guess == 1 ? PCX_PAD : guess == 2 ? PCX_PAUSE : PCX_WORLD;
+                break;
+            }
+#endif
+            c = PCX_QUICKMENU;
+            g_qm_sub = sub;
+            break;
+        }
 #endif
         default:  // none: hle_hid's screen guess (1 the Purah Pad
                    // else an event (below every UI context: choices, menus win), else gameplay
@@ -1619,11 +1632,11 @@ void pc_route(const PcRouteIn &in, PcRouteOut *out) {
             }
             const int16_t eff = t_now ? hold_of(now_row) : now_row;   // (a held key onto a T pair: its hold row)
             const bool held_row = eff >= 0 && (kRows[eff].kind == 'H' || kRows[eff].kind == 'G');
-            // (public #79, LEAD 09:11, rival v0.3.7's 'input ignored after a menu closes while a key still reads held': a
-            // move key, W / A / S / D on its 'H' row, held through a teleport's loading, an event or a menu went dead for
-            // good; it stays dead in between (no menu focus moves from a held W) and gets its hold back where a later
-            // context routes the same move again, as a pad's stick held through does. s.lay: a held move row went dead;
-            // buttons (E, Esc: no stick direction) keep the rule)
+            // (public #79, rival v0.3.7's 'input ignored after a menu closes while a key still reads held': a move key, W / A /
+            // S / D on its 'H' row, held through a teleport's loading, an event or a menu went dead for good; it stays dead in
+            // between (no menu focus moves from a held W) and gets its hold back where a later context routes the same move
+            // again, as a pad's stick held through does. s.lay: a held move row went dead; buttons (E, Esc: no stick direction)
+            // keep the rule)
             if (s.dead && s.lay && held_row && same_action(s.row, eff)) { s.dead = false; s.lay = false; s.row = eff; s.trow = -1; }
             else if (s.dead || eff < 0 || !same_action(s.row, eff) || !held_row || was == 'P' || was == 'O' || was == 'F') {
                 if (!s.dead && s.row >= 0 && (kRows[s.row].kind == 'H' || kRows[s.row].kind == 'G') &&

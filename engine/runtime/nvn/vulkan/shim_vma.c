@@ -129,6 +129,23 @@ static bool big_on(void) {
     if (on < 0) { const char *e = getenv("LARECOMP_VMA_BIG"); on = !(e && *e == '0'); }
     return on;
 }
+// Colour targets bind in 0.0 ms either way, so only depth / stencil is moved. The driver says which ones
+// (prefersDedicatedAllocation: every depth target here, no sampled texture). A dedicated allocation is never carved from a
+// block, so it costs a vkAllocateMemory at creation where a small one fitted a block. LARECOMP_DEDICATED_DEPTH_MB=<n>:
+// those of n MB or more (65: only the ones over BIG_MAX, already their own allocation, so no allocation is added; 0: all).
+// Unset / negative: off (as before). A driver that REQUIRES a dedicated allocation (requiresDedicatedAllocation) gets one
+// always.
+static long long dedicated_depth_bytes(void) {   // (-1: off)
+    static long long v = -2;
+    if (v == -2) {
+        const char *e = getenv("LARECOMP_DEDICATED_DEPTH_MB");
+        v = e && *e && atoll(e) >= 0 ? atoll(e) << 20 : -1;
+        if (v >= 0) fprintf(stderr, "[vma] depth / stencil images the driver prefers dedicated, of %lld MB or more: their own "
+                                    "dedicated allocation (LARECOMP_DEDICATED_DEPTH_MB)\n", v >> 20);
+    }
+    return v;
+}
+static bool depth_format(VkFormat f) { return f >= VK_FORMAT_D16_UNORM && f <= VK_FORMAT_D32_SFLOAT_S8_UINT; }
 // spare[t][kind]: an empty block of memory type t made off the render thread (kinds 1 and 2, device-local types only), and
 // [t][SPARE_OWN] one OWN_SPARE allocation for a buffer's own allocation (below) The VRAM mirrors' 16 MB blocks (exec.c
 // mirror_block: a device-local buffer each, made when a draw first binds a range in it) are buffers over SUB_MAX: each was
@@ -465,8 +482,9 @@ static int pick_type(VmaAllocator a, uint32_t bits, VkMemoryPropertyFlags need, 
 }
 
 // kind: 0 buffer or linear image, 1 optimal image (sub-allocated apart)
+// ded: the image a dedicated allocation is made for (vmaCreateImage, dedicated_depth_bytes), VK_NULL_HANDLE otherwise
 static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAllocationCreateInfo *ai, uint32_t kind,
-                          VmaAllocation *out, VmaAllocationInfo *info) {
+                          VkImage ded, VmaAllocation *out, VmaAllocationInfo *info) {
     bool host = ai->flags & (VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
                              VMA_ALLOCATION_CREATE_MAPPED_BIT);
     const bool cold = kind == 1 && vma_shim_cold;   // (optimal images only: the caller's word for a CPU-filled sampled texture)
@@ -509,7 +527,7 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
     VkDeviceSize own_size = 0;   // (the ready OWN_SPARE allocation taken: its real size, for the counts)
     int t;
     if (kind == 1 && req.size > SUB_MAX && req.size <= BIG_MAX && req.alignment <= (1u << 20) && big_on()) kind = 2;
-    if (sub_on() && (req.size <= SUB_MAX || kind == 2) && !(ai->flags & VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT)) {
+    if (!ded && sub_on() && (req.size <= SUB_MAX || kind == 2) && !(ai->flags & VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT)) {
         t = pick_type(a, bits, need, want);   // (the loop's first choice; a full heap goes on to the loop's retries)
         if (t < 0 && host) t = pick_type(a, bits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, want);
         if (t < 0) t = pick_type(a, bits, 0, want);
@@ -527,6 +545,8 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
         VkMemoryPriorityAllocateInfoEXT pi;
         VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)t,
                                    .pNext = prio_info(a, (uint32_t)t, cold ? PRIO_COLD : PRIO_HOT, &pi)};
+        VkMemoryDedicatedAllocateInfo di = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = mi.pNext, .image = ded};
+        if (ded) mi.pNext = &di;
         al = calloc(1, sizeof *al);
         // (a device-local buffer of OWN_SPARE / 2.. OWN_SPARE: the helper's ready allocation, see spare[][SPARE_OWN]; not a
         // smaller one, which would hold up to twice its size: a range's last, shorter mirror block makes its own)
@@ -546,7 +566,8 @@ static VkResult alloc_for(VmaAllocator a, VkMemoryRequirements req, const VmaAll
             pthread_mutex_unlock(&sub_mu);
         }
         if (took && a->set_prio) a->set_prio(a->dev, al->mem, PRIO_HOT);   // (a buffer: the spare's PRIO_BLOCK raised)
-        r = took ? VK_SUCCESS : alloc_timed(a->dev, &mi, &al->mem, req.size > BIG_MAX ? "own allocation, over 64 MB"
+        r = took ? VK_SUCCESS : alloc_timed(a->dev, &mi, &al->mem, ded ? "dedicated to a depth / stencil image"
+                                                : req.size > BIG_MAX ? "own allocation, over 64 MB"
                                                 : kind == 2 && vk_residency_tight() ? "own allocation, VRAM short: no new big block"
                                                 : req.alignment > (1u << 20) ? "own allocation, alignment over 1 MB"
                                                 : "own allocation");
@@ -587,7 +608,7 @@ VkResult vmaCreateBuffer(VmaAllocator a, const VkBufferCreateInfo *bi, const Vma
     if (r != VK_SUCCESS) return r;
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(a->dev, *buf, &req);
-    if ((r = alloc_for(a, req, ai, 0, alloc, info)) != VK_SUCCESS) { vkDestroyBuffer(a->dev, *buf, NULL); return r; }
+    if ((r = alloc_for(a, req, ai, 0, VK_NULL_HANDLE, alloc, info)) != VK_SUCCESS) { vkDestroyBuffer(a->dev, *buf, NULL); return r; }
     return vkBindBufferMemory(a->dev, *buf, (*alloc)->mem, (*alloc)->offset);
 }
 // The last vmaCreateImage's phases on this thread, ns (textures.c LARECOMP_IMG_SPLIT_MS, the bow's first-aim shadow
@@ -603,10 +624,16 @@ VkResult vmaCreateImage(VmaAllocator a, const VkImageCreateInfo *ii, const VmaAl
     uint64_t t1 = SDL_GetTicksNS();
     sp[0] = t1 - t0;
     if (r != VK_SUCCESS) return r;
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(a->dev, *img, &req);
+    VkMemoryDedicatedRequirements dr = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+    VkMemoryRequirements2 r2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, .pNext = &dr};
+    vkGetImageMemoryRequirements2(a->dev, &(VkImageMemoryRequirementsInfo2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+                                                                          .image = *img}, &r2);
+    const VkMemoryRequirements req = r2.memoryRequirements;
+    const long long dd = dedicated_depth_bytes();
+    const bool ded = dr.requiresDedicatedAllocation ||
+                     (dd >= 0 && dr.prefersDedicatedAllocation && depth_format(ii->format) && req.size >= (VkDeviceSize)dd);
     const uint64_t s0 = sync_ns;
-    r = alloc_for(a, req, ai, ii->tiling == VK_IMAGE_TILING_OPTIMAL, alloc, info);
+    r = alloc_for(a, req, ai, ii->tiling == VK_IMAGE_TILING_OPTIMAL, ded ? *img : VK_NULL_HANDLE, alloc, info);
     t0 = SDL_GetTicksNS();
     sp[1] = t0 - t1, sp[2] = sync_ns - s0;   // (another thread's alloc_timed meanwhile would count here: rare, render thread)
     if (r != VK_SUCCESS) {

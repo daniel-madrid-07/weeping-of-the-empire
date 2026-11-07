@@ -34,6 +34,7 @@ extern "C" void* shim_window_hwnd(void);   // linux/shim_sdl3.c: the game window
 extern "C" uint64_t hid_game_buttons(void);   // hle_hid.cpp: the Npad buttons the game was given last (bit 9 ZR)
 #include "pc_device_switch.h"   // the released pointer's "moved on purpose" (MotionGate)
 #include "pc_clip.h"            // when the pointer is confined to the window (every context in fullscreen)
+#include "pc_mouse_gyro.h"      // where a count goes: the gyro aiming or the camera (#104)
 
 extern "C" bool shim_window_fullscreen(void);   // shim_win.c (borderless or exclusive)
 extern "C" bool pc_overlay_open(void);          // pc_overlay.cpp: the settings window (or the Welcome one) is open
@@ -67,6 +68,14 @@ WNDPROC g_orig;
 #endif
 std::atomic<bool> g_on{false};
 std::atomic<bool> g_menu{false};   // a menu screen has the mouse (pc_mouse_menu)
+// hle_hid.cpp's mouse gyro aims (TOTK_MOUSE_GYRO, an aim button held: the bow drawn, a throw): the counts go to the
+// gyro (pc_mouse_take) and not to the camera's totals too, with TOTK_MOUSE_GYRO_TOTALS=0. Since the veneer took the
+// totals, both turn the aim (#104 Yveldi, mouse_gyro=always: the gyro's linear pitch plus the veneer's, shaped for the
+// on-foot camera, "vertical feels like a stick, horizontal raw"); the mouse gyro was meant as "meanwhile the mouse
+// does not drive the camera". Opt-in: with the game's own Motion Controls off the gyro turns nothing, and the bow
+// would get no mouse at all; unset / 1 = both, as before, until that option can be read (jump_option_poll's way).
+// Never while not aiming (mouse_gyro=always in the world: the camera's).
+std::atomic<bool> g_gyro_aim{false};   // pc_mouse_gyro_aim
 std::atomic<unsigned> g_presses[3];   // DOWN messages so far, per button (left, right, middle): pc_mouse_presses
 std::atomic<unsigned> g_buttons{0};   // left / right / middle down, from the window's button messages (posted ones too)
 std::atomic<bool> g_cursor{false};   // a menu shows the pointer as a cursor (pc_mouse_cursor_mode, totk_menu_cursor.cpp)
@@ -111,7 +120,18 @@ uint8_t* page() { return (uint8_t*)totk_data_page_current(); }
 // deg/s a unit once shaped: +0xc2c taken as that same 51). Aiming keeps the game's own slower bow camera.
 // TOTK_MOUSE_ABILITY_GAIN=<x>,<y> overrides the two factors.
 const double kAbilityGainX = 1 / 0.8, kAbilityGainY = 70.0 / (1.5 * 51.0);
-float pitch_gain_now() { return pc_ctx() == PCX_ABILITY ? 0.0f : (float)kPitchGain; }
+// TOTK_MOUSE_AIM_PITCH=linear (#104; off by default): the bow drawn takes pitch linear too, as an ability. The bow
+// camera's own pitch law is not decoded, so the on-foot shaping, which a linear law would turn into a stick-like
+// curve (small moves fastest), stays the default until a boot measures it. Its speed is not matched
+// (controls.mouse_aim_scale sets it).
+bool bow_aim();
+bool aim_pitch_linear() {
+    static const bool on = [] { const char* e = getenv("TOTK_MOUSE_AIM_PITCH"); return e && !strcmp(e, "linear"); }();
+    return on;
+}
+float pitch_gain_now() {
+    return pc_ctx() == PCX_ABILITY || (aim_pitch_linear() && bow_aim()) ? 0.0f : (float)kPitchGain;
+}
 void pitch_gain_apply() {   // any thread, once the veneer shapes pitch: g at +128 as the context wants it
     if (!g_pitch_veneer.load(std::memory_order_acquire)) return;
     uint8_t* p = page();
@@ -168,18 +188,18 @@ void mode_gain(double* gx, double* gy) {   // (each count: the window thread, th
     *gx = (ability ? x : 1) * aim; *gy = (ability ? y : 1) * aim;
     pitch_gain_apply();
 }
-// TOTK_MOUSE_STEP_MAX=<degrees> (v0.1.9 gate, LEAD 10:47: the "camera elsewhere" one-frame hits cluster at the see
-// script's mouse flicks, TOTK_CTL "mouse 600 0" every 50 ms, often two or three read together): the veneer applies
-// whatever the totals moved since its last camera step, after the game's clamp, so a burst turns the camera ~28 deg per
-// 600 counts in ONE step (rate 0.02 x 70 deg/s / 30), where a pad's full tilt turns 2.3 deg a step at 30 fps. One such
-// frame renders from a camera the game's collision has not caught up with (strip g19_see_kak_329_006995: one frame
-// pulled in past the wall, its neighbours alike). With the switch the published totals move at most that many degrees a
-// camera step (DP_MOUSE_BEAT, stamped by the veneer at each) and the rest goes out at the next steps: no motion is
-// lost, a flick past the limit takes a few frames. After a stale beat (no step for more than MOUSE_STALE presents) the
-// veneer drops the motion anyway, so no backlog is kept there. 0: everything at once, as before v0.1.10. Published from
-// the raw events and from every input read (pc_mouse_stick_counts) and keeper tick, so the rest goes out without new
-// motion. Default ON since v0.1.10, Link climbing or against a wall and the near surface clipped away for one frame; a
-// real mouse flick at 30-60 fps reaches 20-30 deg a step too. Unset: kStepMaxDefault.
+// TOTK_MOUSE_STEP_MAX=<degrees> (v0.1.9 gate: the "camera elsewhere" one-frame hits cluster at the see script's mouse
+// flicks, TOTK_CTL "mouse 600 0" every 50 ms, often two or three read together): the veneer applies whatever the totals
+// moved since its last camera step, after the game's clamp, so a burst turns the camera ~28 deg per 600 counts in ONE
+// step (rate 0.02 x 70 deg/s / 30), where a pad's full tilt turns 2.3 deg a step at 30 fps. One such frame renders from
+// a camera the game's collision has not caught up with (strip g19_see_kak_329_006995: one frame pulled in past the wall,
+// its neighbours alike). With the switch the published totals move at most that many degrees a camera step
+// (DP_MOUSE_BEAT, stamped by the veneer at each) and the rest goes out at the next steps: no motion is lost, a flick
+// past the limit takes a few frames. After a stale beat (no step for more than MOUSE_STALE presents) the veneer drops
+// the motion anyway, so no backlog is kept there. 0: everything at once, as before v0.1.10. Published from the raw
+// events and from every input read (pc_mouse_stick_counts) and keeper tick, so the rest goes out without new motion.
+// Default ON since v0.1.10, Link climbing or against a wall and the near surface clipped away for one frame; a real
+// mouse flick at 30-60 fps reaches 20-30 deg a step too. Unset: kStepMaxDefault.
 const double kStepMaxDefault = 20;
 const unsigned kPresents = 88;   // TOTK_DP_PRESENTS
 double step_max_deg() {
@@ -303,11 +323,11 @@ void grab_switch() {   // the input thread, each read
 
 // The stick while Ultrahand holds: the velocity path below turns a move into deflection only while it lasts, so a quick
 // move's counts past full deflection were lost, and the ability's own stick scales (yaw x 0.8, pitch x 1.5) came on top.
-// Here each count is owed as full-tilt seconds at the camera's own degrees a count (mode_gain's factors undo the
-// ability's scales, as for the veneer) and paid out with a 30 ms time constant, at most full deflection: the same turn
-// as the camera for the same move, at any frame rate and read cadence (only the deflection's time integral counts), the
-// part past the full tilt's speed a little later instead of never (at most kGrabOweS owed: no long drift after a big
-// flick). The full tilt's speed itself still bounds a fast move: past it only a hook in the ability camera would help.
+// Here each count is owed as full-tilt seconds at the camera's own degrees a count (mode_gain's factors undo the ability's
+// scales, as for the veneer) and paid out with a 30 ms time constant, at most full deflection: the same turn as the camera
+// for the same move, at any frame rate and read cadence (only the deflection's time integral counts), the part past the full
+// tilt's speed a little later instead of never (at most kGrabOweS owed: no long drift after a big flick). The full tilt's
+// speed itself still bounds a fast move: past it only a hook in the ability camera would help.
 const double kGrabTau = 0.03, kGrabOweS = 0.35;
 const double kGrabBiasRaw = 0.2 + 0.8 * 0.001;   // (the dead zone pc_mouse assumes, 0.2, and 0.001 of a full tilt past it)
 // fps360-grabstick's page slots (data_page.h TOTK_DP_GRAB_*): the held object's stick from the mouse, X / Y (f32,
@@ -357,10 +377,10 @@ void grab_stick(double dx, double dy, double dt, double full, int32_t* rx, int32
     if (!(dt > 0 && dt < 0.25)) return;   // (a first read or a stall: owed, paid from the next read)
     double px = g_owe_x / kGrabTau, py = g_owe_y / kGrabTau;
     const double m = sqrt(px * px + py * py);
-    // fps360-grabstick's hook on calcGrab (v0.1.10, LEAD 13:59) present on this key: its exponents on the page (written
-    // as calcGrab reads them; 0 on a key without the hook or before calcGrab ran). Then the held object takes the owed
-    // rate itself, past full tilt (at most kGrabFeedMax), from the page: paid at that rate; the emulated stick (the
-    // camera's) stays at most full deflection. Without it, paid at most full deflection, as the emulated stick delivers
+    // fps360-grabstick's hook on calcGrab present on this key: its exponents on the page (written as calcGrab reads them; 0
+    // on a key without the hook or before calcGrab ran). Then the held object takes the owed rate itself, past full tilt (at
+    // most kGrabFeedMax), from the page: paid at that rate; the emulated stick (the camera's) stays at most full deflection.
+    // Without it, paid at most full deflection, as the emulated stick delivers
     const float pexp_x = page_f32_at_or0(kGrabPx), pexp_y = page_f32_at_or0(kGrabPy);
     const bool feed = pexp_x > 0 || pexp_y > 0;   // (the pair is written; paid past full tilt only once the hook took it)
     const double cap = feed && grab_acked() ? kGrabFeedMax : 1.0;
@@ -375,14 +395,14 @@ void grab_stick(double dx, double dy, double dt, double full, int32_t* rx, int32
     const double mm = fmin(m, 1.0);
     if (feed && m > 1) px /= fmin(m, cap), py /= fmin(m, cap);   // (the camera's stick: full deflection at most)
     if (mm < 0.01) {   // (still: the pad's or the keys' stick stays; with none, the bias below)
-        // (fps360's trace of the ability camera, LEAD 13:48: a frame whose processed stick is exactly 0 can take its 'no
-        // stick' path, which resets the turn state; a still mouse gave one every frame between moves. So with no other
-        // stick a still mouse holds X just past the game's dead zone, the sign alternating with the game's frames
-        // (present parity): never exactly 0, no turn on balance. OFF by default since fps360's check: it assumes the
-        // input mapper's dead zone is the 0.2 pc_mouse takes; were it smaller (the camera step's own is 0.005 on the
-        // processed value) the bias would reach the game as a +-0.2 tilt flip each present, and the held object moves by
-        // calcGrab, not the camera, so (C) is no longer the lead. TOTK_MOUSE_GRAB_BIAS=1 turns it on (the gate's A/B
-        // with the [ability-cam] path lines)
+        // (fps360's trace of the ability camera: a frame whose processed stick is exactly 0 can take its 'no stick' path,
+        // which resets the turn state; a still mouse gave one every frame between moves. So with no other stick a still
+        // mouse holds X just past the game's dead zone, the sign alternating with the game's frames (present parity):
+        // never exactly 0, no turn on balance. OFF by default since fps360's check: it assumes the input mapper's dead
+        // zone is the 0.2 pc_mouse takes; were it smaller (the camera step's own is 0.005 on the processed value) the bias
+        // would reach the game as a +-0.2 tilt flip each present, and the held object moves by calcGrab, not the camera,
+        // so (C) is no longer the lead. TOTK_MOUSE_GRAB_BIAS=1 turns it on (the gate's A/B with the [ability-cam] path
+        // lines)
         static const bool bias = [] { const char* e = getenv("TOTK_MOUSE_GRAB_BIAS"); return e && !strcmp(e, "1"); }();
         if (bias && *rx == 0 && *ry == 0) *rx = (int32_t)((nvn_present_count() & 1 ? 1 : -1) * kGrabBiasRaw * 32767);
         return;
@@ -639,13 +659,14 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 }
             }
             AcquireSRWLockExclusive(&g_lock);
-            if (cap && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && g_redirect.load()) {
+            // (a menu screen's mouse, the map's: its stick only, never the camera's totals, or the camera turns by all
+            // the map's scrolling when it closes; the mouse gyro aiming: the gyro's)
+            const unsigned to = pcmg::route(g_redirect.load(), g_menu.load(), g_gyro_aim.load(std::memory_order_relaxed));
+            if (cap && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && (to & pcmg::SinkRedirect)) {
                 g_rx += ri.data.mouse.lLastX; g_ry += ri.data.mouse.lLastY;
             } else if (cap && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
                 g_dx += ri.data.mouse.lLastX; g_dy += ri.data.mouse.lLastY;
-                // (a menu screen's mouse, the map's: its stick only, never the camera's totals, or the camera turns by
-                // all the map's scrolling when it closes)
-                if (!g_menu.load()) {
+                if (to & pcmg::SinkTotals) {
                     double gx, gy;
                     mode_gain(&gx, &gy);
                     g_tx += ri.data.mouse.lLastX * g_sens * gx; g_ty += ri.data.mouse.lLastY * g_sens * g_inv * gy;
@@ -1171,13 +1192,17 @@ extern "C" void pc_mouse_reload(void) {
 extern "C" void pc_mouse_inject(double dx, double dy) {
     if (!enabled()) return;
     AcquireSRWLockExclusive(&g_lock);
-    if (g_redirect.load()) { g_rx += dx; g_ry += dy; }   // (a macro has the mouse)
+    // (no menu check here, as before: the injection's tests turn the camera from a menu's mouse too)
+    const unsigned to = pcmg::route(g_redirect.load(), false, g_gyro_aim.load(std::memory_order_relaxed));
+    if (to & pcmg::SinkRedirect) { g_rx += dx; g_ry += dy; }   // (a macro has the mouse)
     else {
         g_dx += dx; g_dy += dy;
-        double gx, gy;
-        mode_gain(&gx, &gy);
-        g_tx += dx * g_sens * gx; g_ty += dy * g_sens * g_inv * gy;
-        page_totals();
+        if (to & pcmg::SinkTotals) {   // (the mouse gyro aiming: the gyro's only)
+            double gx, gy;
+            mode_gain(&gx, &gy);
+            g_tx += dx * g_sens * gx; g_ty += dy * g_sens * g_inv * gy;
+            page_totals();
+        }
     }
     ReleaseSRWLockExclusive(&g_lock);
     g_injected_until.store(GetTickCount64() + 1000);
@@ -1380,6 +1405,14 @@ extern "C" bool pc_mouse_client_size(int* w, int* h) {
 // hle_hid.cpp keyboard_read: a menu screen has the mouse (the map's cursor, the menu keys): the stick from the mouse
 // (the cursor) ignores the camera's Y inversion there.
 extern "C" void pc_mouse_menu(bool on) { g_menu.store(on); }
+// hle_hid.cpp mouse_read, each input read: the mouse gyro aims (g_gyro_aim above)
+extern "C" void pc_mouse_gyro_aim(bool on) {
+    static const bool both = [] { const char* e = getenv("TOTK_MOUSE_GYRO_TOTALS"); return !e || strcmp(e, "0") != 0; }();
+    on = on && !both;
+    static int logs;
+    if (g_gyro_aim.exchange(on) != on && logs++ < 40)
+        printf("[mouse] gyro aim %s: the camera's totals %s\n", on ? "on" : "off", on ? "paused" : "back");
+}
 // Mouse counts per degree of the camera's turn on foot at the current rows (the veneer's and the stick's rate alike:
 // full tilt, 70 deg/s, at g_full / (sensitivity x multiplier) counts a second): pc_gameplay.cpp's Ultrahand rotation
 // sizes its 45-degree steps by it, so a step takes the move that turns the camera 45 degrees
@@ -1440,11 +1473,13 @@ extern "C" void pc_mouse_sdl_motion(float xrel, float yrel) {
         return;
     }
     AcquireSRWLockExclusive(&g_lock);
-    if (g_redirect.load()) {
+    // (a menu screen's mouse: its stick only, never the camera's totals; the mouse gyro aiming: the gyro's)
+    const unsigned to = pcmg::route(g_redirect.load(), g_menu.load(), g_gyro_aim.load(std::memory_order_relaxed));
+    if (to & pcmg::SinkRedirect) {
         g_rx += xrel; g_ry += yrel;
     } else {
         g_dx += xrel; g_dy += yrel;
-        if (!g_menu.load()) {   // (a menu screen's mouse: its stick only, never the camera's totals)
+        if (to & pcmg::SinkTotals) {
             double gx, gy;
             mode_gain(&gx, &gy);
             g_tx += xrel * g_sens * gx; g_ty += yrel * g_sens * g_inv * gy;

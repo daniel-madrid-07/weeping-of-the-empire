@@ -79,6 +79,11 @@ static class KitTest
             run("-C \"" + b + "\" fetch --quiet --depth 1 --force \"" + url + "\" vL");
             Expect("lightweight tag: its commit", BuilderForm.FetchedCommit(git, b) == commit, BuilderForm.FetchedCommit(git, b) ?? "null");
         }
+        // the download dialog quotes git's own last line (Reddit 11-07: "git.exe failed (exit code 128)" hid it)
+        Expect("git said: quoted on its own line", BuilderForm.GitSaid(new BuilderForm.HelperFailed("x", "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com")) ==
+               "\ngit: fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com");
+        Expect("git said: nothing said, nothing added", BuilderForm.GitSaid(new BuilderForm.HelperFailed("x", null)) == "");
+        Expect("git said: another IOException adds nothing", BuilderForm.GitSaid(new IOException("x")) == "");
         Console.WriteLine(fails == 0 ? "kit (Setup): all passed" : "kit (Setup): " + fails + " FAIL");
         return fails == 0 ? 0 : 1;
     }

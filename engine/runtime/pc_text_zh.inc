@@ -87,6 +87,16 @@ PC_TR("The button pictures in every prompt and menu, for the keys and buttons bo
       "所有提示和菜单中的按键图标，对应已绑定的按键和按钮。自动：跟随最近使用的设备，即键盘和鼠标、Xbox（XInput）手柄、DualSense / DualShock 4，或使用 Nintendo 手柄时的游戏自带图标。更改立即在所有提示和标签中生效；使用手柄时，菜单会隐藏鼠标指针，直到鼠标移动。")
 PC_TR("Automatic (the device used last)",
       "自动（最近使用的设备）")
+PC_TR("Menu buttons",
+      "菜单按键")
+PC_TR("Same as the game",
+      "与游戏相同")
+PC_TR("Printed A accepts, B goes back",
+      "印有 A 的键确认，B 返回")
+PC_TR("Switch layout (right accepts, bottom goes back)",
+      "Switch 布局（右键确认，下键返回）")
+PC_TR("The pad's four face buttons in menus, dialogues and the title screen. Same as the game: as Face buttons and the Pad buttons rows give them. Printed A accepts, B goes back: the button printed A (Cross) confirms and B (Circle) goes back, whatever jump and interact use in the world. Switch layout: the right button confirms, the bottom one goes back. Nothing changes in the world. A change applies at once.",
+      "菜单、对话和标题画面中手柄的四个面键。与游戏相同：按“面键”和“手柄按钮”各行的设置。印有 A 的键确认，B 返回：印有 A（叉）的键确认，印有 B（圈）的键返回，不论世界中跳跃和互动用哪个键。Switch 布局：右键确认，下键返回。世界中的操作不变。更改立即生效。")
 PC_TR("Switch (the game's)",
       "Switch（游戏自带）")
 PC_TR("Keyboard and mouse",
@@ -813,6 +823,8 @@ PC_TR("The keys of the Console scheme: Classic, PC (WASD), or Custom (the key bi
       "主机方案的按键：经典、PC（WASD）或自定义（下方的按键绑定）。")
 PC_TR("The button pictures in prompts and menus. Automatic follows the device you used last: keyboard and mouse, Xbox, PlayStation or Nintendo.",
       "提示和菜单中的按键图标。自动跟随你最近使用的设备：键盘和鼠标、Xbox、PlayStation 或 Nintendo。")
+PC_TR("The pad's face buttons in menus and dialogues: as the game, printed A accepts and B goes back, or the Switch layout (right accepts). The world keeps its layout.",
+      "菜单和对话中手柄的面键：与游戏相同、印有 A 的键确认且 B 返回，或 Switch 布局（右键确认）。世界中的布局不变。")
 PC_TR("In menus a mouse pointer shows and selects what it points at; left click is A, Esc goes back.",
       "菜单中会显示鼠标指针并选中其指向的项；左键为 A，Esc 返回。")
 PC_TR("In the pause menu and the Purah Pad: Esc goes back, PageUp / PageDown or the wheel switch tabs, left click selects and right click goes back.",

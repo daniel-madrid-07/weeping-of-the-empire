@@ -194,6 +194,8 @@ const Help k_help[] = {
                                       "below).")},
     {"controls.glyphs", PC_T("The button pictures in prompts and menus. Automatic follows the device you used last: keyboard "
                              "and mouse, Xbox, PlayStation or Nintendo.")},
+    {"controls.menu_buttons", PC_T("The pad's face buttons in menus and dialogues: as the game, printed A accepts and B "
+                                   "goes back, or the Switch layout (right accepts). The world keeps its layout.")},
     {"controls.menu_cursor", PC_T("In menus a mouse pointer shows and selects what it points at; left click is A, Esc goes "
                                   "back.")},
     {"controls.menu_keys", PC_T("In the pause menu and the Purah Pad: Esc goes back, PageUp / PageDown or the wheel switch "

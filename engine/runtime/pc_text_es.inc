@@ -70,6 +70,16 @@ PC_ES("The button pictures in every prompt and menu, for the keys and buttons bo
       "Las imágenes de los botones en cada indicación y menú, según las teclas y botones asignados. Automático sigue el último dispositivo usado: teclado y ratón, un mando de Xbox (XInput), un DualSense / DualShock 4, o los del propio juego con un mando de Nintendo. Los cambios se ven al momento en cada indicación y etiqueta; con un mando en uso, los menús ocultan el puntero hasta que muevas el ratón.")
 PC_ES("Automatic (the device used last)",
       "Automático (el último dispositivo usado)")
+PC_ES("Menu buttons",
+      "Botones en los menús")
+PC_ES("Same as the game",
+      "Como en el juego")
+PC_ES("Printed A accepts, B goes back",
+      "La A impresa acepta, la B vuelve")
+PC_ES("Switch layout (right accepts, bottom goes back)",
+      "Distribución de Switch (derecha acepta, abajo vuelve)")
+PC_ES("The pad's four face buttons in menus, dialogues and the title screen. Same as the game: as Face buttons and the Pad buttons rows give them. Printed A accepts, B goes back: the button printed A (Cross) confirms and B (Circle) goes back, whatever jump and interact use in the world. Switch layout: the right button confirms, the bottom one goes back. Nothing changes in the world. A change applies at once.",
+      "Los cuatro botones frontales del mando en menús, diálogos y la pantalla de título. Como en el juego: como los dan Botones frontales y las filas de Botones del mando. La A impresa acepta, la B vuelve: el botón con la A (Cruz) confirma y el de la B (Círculo) vuelve atrás, usen lo que usen saltar e interactuar en el mundo. Distribución de Switch: el botón derecho confirma y el de abajo vuelve atrás. En el mundo no cambia nada. El cambio se aplica al momento.")
 PC_ES("Switch (the game's)",
       "Switch (los del juego)")
 PC_ES("Xbox",
@@ -1663,6 +1673,8 @@ PC_ES("The keys of the Console scheme: Classic, PC (WASD), or Custom (the key bi
       "Las teclas del esquema Consola: Clásica, PC (WASD) o Personalizada (las asignaciones de teclas de abajo).")
 PC_ES("The button pictures in prompts and menus. Automatic follows the device you used last: keyboard and mouse, Xbox, PlayStation or Nintendo.",
       "Los dibujos de los botones en avisos y menús. Automático sigue el último dispositivo usado: teclado y ratón, Xbox, PlayStation o Nintendo.")
+PC_ES("The pad's face buttons in menus and dialogues: as the game, printed A accepts and B goes back, or the Switch layout (right accepts). The world keeps its layout.",
+      "Los botones frontales del mando en menús y diálogos: como en el juego, la A impresa acepta y la B vuelve, o la distribución de Switch (derecha acepta). El mundo mantiene su distribución.")
 PC_ES("In menus a mouse pointer shows and selects what it points at; left click is A, Esc goes back.",
       "En los menús aparece un puntero del ratón que selecciona lo que señala; el clic izquierdo es A, Esc vuelve atrás.")
 PC_ES("In the pause menu and the Purah Pad: Esc goes back, PageUp / PageDown or the wheel switch tabs, left click selects and right click goes back.",

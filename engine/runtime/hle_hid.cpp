@@ -11,6 +11,8 @@
 #include "pc_settings.h"
 #include "pc_device_switch.h"   // the device the prompts follow: what counts as a use, the anti-flicker guards
 #include "pc_key_hold.h"        // the move keys' minimum hold (keyboard_read)
+#include "pc_menu_face.h"       // the pads' face buttons in menus (menu_face_buttons)
+#include "pc_mouse_gyro.h"      // the mouse gyro's turn (mouse_gyro_feed)
 #include "pc_text.h"            // pc_tr (the dead-zone rows' readout)
 #include "pc_input_rec.h"       // TOTK_INPUT_RECORD / TOTK_INPUT_SCRIPT lines (npad_fill)
 #include "totk_menu_cursor.h"
@@ -137,7 +139,9 @@ static u64 scripted_buttons() {
 enum : u64 { BtnA = 1u << 0, BtnB = 1u << 1, BtnX = 1u << 2, BtnY = 1u << 3, BtnLS = 1u << 4, BtnRS = 1u << 5,
              BtnL = 1u << 6, BtnR = 1u << 7, BtnZL = 1u << 8, BtnZR = 1u << 9, BtnPlus = 1u << 10, BtnMinus = 1u << 11,
              BtnLeft = 1u << 12, BtnUp = 1u << 13, BtnRight = 1u << 14, BtnDown = 1u << 15 };
-struct HostInput { u64 buttons; s32 lx, ly, rx, ry; };
+// face: the A / B / X / Y bits the pads' face buttons gave (not a paddle's, a key's, a script's); xface: those of them
+// from a pad whose printed letters are not the Switch's positions (Xbox, PlayStation): menu_face_buttons' input
+struct HostInput { u64 buttons; s32 lx, ly, rx, ry; u64 face = 0, xface = 0; };
 // Back paddles (rival-parity 11-02; the Switch has none): P1 right top, P2 right bottom, P3 left top, P4 left bottom (the
 // Xbox Elite's names Windows.Gaming.Input below), sony_decode). controls.paddle_1.. _4 (TOTK_PADDLE_1.. 4, live) give
 // each the Switch button it presses; none by default. Bits 0..3 = P1..P4.
@@ -164,6 +168,15 @@ static void paddles_load() {   // the start's environment, once (the rows' appli
     (void)once;
 }
 static std::atomic<int> g_padmap_gen{1};   // the pad bindings changed (overlay rows): pad_remap rebuilds
+// controls.menu_buttons (TOTK_MENU_BUTTONS, live; menu_face_buttons): 0 as the game, 1 by the printed letter ("label"),
+// 2 by position ("position"); -1 until the start's environment is read
+static std::atomic<int> g_menu_buttons{-1};
+static int menu_buttons_of(const char* v) { return v && !strcmp(v, "label") ? 1 : v && !strcmp(v, "position") ? 2 : 0; }
+static int menu_buttons_mode() {
+    int m = g_menu_buttons.load(std::memory_order_relaxed);
+    if (m < 0) g_menu_buttons = m = menu_buttons_of(getenv("TOTK_MENU_BUTTONS"));
+    return m;
+}
 
 #ifdef _WIN32
 struct XPad { WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; };     // XINPUT_GAMEPAD
@@ -430,7 +443,13 @@ static void pad_read(HostInput* in) {
         {0x0100 /*LB*/, BtnL, BtnL}, {0x0200 /*RB*/, BtnR, BtnR}, {0x0040 /*LTHUMB*/, BtnLS, BtnLS},
         {0x0080 /*RTHUMB*/, BtnRS, BtnRS}, {0x0010 /*START*/, BtnPlus, BtnPlus}, {0x0020 /*BACK*/, BtnMinus, BtnMinus},
         {0x0001, BtnUp, BtnUp}, {0x0002, BtnDown, BtnDown}, {0x0004, BtnLeft, BtnLeft}, {0x0008, BtnRight, BtnRight}};
-    for (auto& m : map) if (p.buttons & m.x) in->buttons |= labels ? m.lab : m.pos;
+    for (auto& m : map)
+        if (p.buttons & m.x) {
+            const u64 b = labels ? m.lab : m.pos;
+            in->buttons |= b;
+            in->xface |= b & (BtnA | BtnB | BtnX | BtnY);   // (an XInput pad has the Xbox letters)
+        }
+    in->face |= in->xface;
     if (p.lt > 30) in->buttons |= BtnZL;      // XINPUT_GAMEPAD_TRIGGER_THRESHOLD
     if (p.rt > 30) in->buttons |= BtnZR;
     stick(p.lx, p.ly, dead_zone(0, 7849), &in->lx, &in->ly, 0);   // XINPUT_GAMEPAD_LEFT / RIGHT_THUMB_DEADZONE
@@ -1497,12 +1516,21 @@ static void pad_read(HostInput* in) {
         switch (SDL_GetGamepadButtonLabel(g, b)) {
         case SDL_GAMEPAD_BUTTON_LABEL_A: return BtnA; case SDL_GAMEPAD_BUTTON_LABEL_B: return BtnB;
         case SDL_GAMEPAD_BUTTON_LABEL_X: return BtnX; case SDL_GAMEPAD_BUTTON_LABEL_Y: return BtnY;
+        // (a PlayStation pad's shapes as the raw-HID reader and the prompts have them: Cross = A, Circle = B)
+        case SDL_GAMEPAD_BUTTON_LABEL_CROSS: return BtnA; case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: return BtnB;
+        case SDL_GAMEPAD_BUTTON_LABEL_SQUARE: return BtnX; case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE: return BtnY;
         default: return pos;
         }
     };
     struct { SDL_GamepadButton b; u64 pos; } face[] = {{SDL_GAMEPAD_BUTTON_EAST, BtnA}, {SDL_GAMEPAD_BUTTON_SOUTH, BtnB},
                                                         {SDL_GAMEPAD_BUTTON_NORTH, BtnX}, {SDL_GAMEPAD_BUTTON_WEST, BtnY}};
-    for (auto& f : face) if (btn(f.b)) in->buttons |= labels ? lab(f.b, f.pos) : f.pos;
+    for (auto& f : face)
+        if (btn(f.b)) {
+            const u64 l = lab(f.b, f.pos), b = labels ? l : f.pos;
+            in->buttons |= b;
+            in->face |= b;
+            if (l != f.pos) in->xface |= b;   // (a Nintendo pad's letters are its positions)
+        }
     static const struct { SDL_GamepadButton b; u64 sw; } map[] = {
         {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, BtnL}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, BtnR}, {SDL_GAMEPAD_BUTTON_LEFT_STICK, BtnLS},
         {SDL_GAMEPAD_BUTTON_RIGHT_STICK, BtnRS}, {SDL_GAMEPAD_BUTTON_START, BtnPlus}, {SDL_GAMEPAD_BUTTON_BACK, BtnMinus},
@@ -1655,7 +1683,10 @@ static void hidpad_read(HostInput* in) {
     bool lset = in->lx || in->ly, rset = in->rx || in->ry;
     for (auto& p : g_hidpad) {
         if (!p.live) continue;
-        in->buttons |= p.buttons.load() | paddle_buttons(p.paddles.load(std::memory_order_relaxed));
+        const u64 b = p.buttons.load(), face = b & (BtnA | BtnB | BtnX | BtnY);
+        in->buttons |= b | paddle_buttons(p.paddles.load(std::memory_order_relaxed));
+        in->face |= face;
+        if (p.kind == PadDualSense || p.kind == PadDS4) in->xface |= face;   // (a Nintendo pad's letters are its positions)
         s32 lx = p.lx, ly = p.ly, rx = p.rx, ry = p.ry;
         if (!lset && (lx || ly)) { in->lx = lx; in->ly = ly; lset = true; }
         if (!rset && (rx || ry)) { in->rx = rx; in->ry = ry; rset = true; }
@@ -1883,14 +1914,9 @@ static void mouse_gyro_feed(double dx, double dy) {
     double dt = last.QuadPart ? (double)(now.QuadPart - last.QuadPart) / (double)f.QuadPart : 0;
     last = now;
     if (!(dt > 0) || dt > 0.05) dt = 0.004;
-    double k = 0.002 * speed;   // rad per count (sensitivity applied by pc_mouse_take)
-    double w[3] = {-dy * k / dt, 0, -dx * k / dt};   // rad/s: right = yaw right (-z), down = pitch down (-x)
-    for (int r = 0; r < 3; r++) {   // fixed reference axes seen from the turning controller: r' = r - (w x r) dt
-        double* v = R[r], cr[3] = {w[1] * v[2] - w[2] * v[1], w[2] * v[0] - w[0] * v[2], w[0] * v[1] - w[1] * v[0]};
-        for (int i = 0; i < 3; i++) v[i] -= cr[i] * dt;
-        double n = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-        for (int i = 0; i < 3; i++) v[i] /= n;
-    }
+    double w[3];   // rad/s (pc_mouse_gyro.h: the same k on both axes; sensitivity applied by pc_mouse_take)
+    pcmg::rate(dx, dy, dt, speed, w);
+    pcmg::turn(R, w, dt);   // (the fixed reference axes seen from the turning controller)
     const float acc[3] = {(float)-R[2][0], (float)-R[2][1], (float)-R[2][2]};   // gravity, read as -up (face up: z = -1 g)
     const float gyro[3] = {(float)(w[0] / 6.2831853), (float)(w[1] / 6.2831853), (float)(w[2] / 6.2831853)};   // rev/s
     motion_fuse(&g_mousepad, &fusion, acc, gyro, (float)dt);
@@ -1964,6 +1990,7 @@ static void screen_track(u64 buttons) {
 extern "C" bool pc_mouse_injected(void);   // pc_mouse.cpp: TOTK_CTL "mouse" motion in the last second
 extern "C" int pc_mouse_wheel_take(void);
 extern "C" void pc_mouse_menu(bool on);
+extern "C" void pc_mouse_gyro_aim(bool on);   // pc_mouse.cpp: the mouse gyro aims, the camera's totals pause
 // The mouse wheel, one step per notch: 70 ms of input, then 70 ms of none so the game sees separate steps.
 // - In a quick menu (TOTK_MOUSE_WHEEL, on unless 0): while one is held open (d-pad right: weapons, left: shields, up:
 //   special items; ZR + right: bows), a right-stick flick through the list, down = right = next (4.22: Wheel Down =
@@ -2003,8 +2030,11 @@ static void wheel_read(HostInput* in, u64 buttons) {
     g_wheel_left = 0;
     const MouseCfg& mc = mouse_cfg();
     // (the pause menu's tabs also while the menu cursor is on: its wheel, whatever TOTK_MENU_KEYS says)
+    // (a chest's full-pouch strip, TreasureFullShortCut_00, is open with no d-pad held: its "Select" is the right stick
+    // as the strips', so the notches flick it the same way; public #106)
+    const bool treasure = pc_scheme_on() && pc_ctx() == PCX_QUICKMENU && pc_quickmenu_sub() == TOTK_TMS_QM_TREASURE;
     const int m = map_screen() && mc.map ? 2 : scr == ScrMenu && (mc.menus || pc_mouse_cursor_on()) ? 3
-                : mc.wheel && (buttons & (BtnLeft | BtnRight | BtnUp)) ? 1 : 0;
+                : mc.wheel && ((buttons & (BtnLeft | BtnRight | BtnUp)) || treasure) ? 1 : 0;
     if (m != mode) { pending = 0; phase = 0; mode = m; }
     if (!m) return;
     pending += n;
@@ -2040,6 +2070,7 @@ static void mouse_read(HostInput* in, bool aiming) {
     // mouse stops; WASD (set before) is kept while the mouse is still. No free cursor, no drag (doc 4.29).
     if (map_screen() && mouse_cfg().map) {
         mouse_gyro_stop();
+        pc_mouse_gyro_aim(false);
         int32_t x = 0, y = 0;
         double cx = 0, cy = 0;
         if (!pc_mouse_cursor_on()) pc_mouse_stick_counts(&x, &y, &cx, &cy);   // (released: no counts, the map stays)
@@ -2058,10 +2089,12 @@ static void mouse_read(HostInput* in, bool aiming) {
     }
     aiming = aiming || ((g_ctl_held.load() | in->buttons) & aim_mask());
     if (pc_mouse_enabled() && gyro_on() && mouse_gyro_mode() && (mouse_gyro_mode() == 2 || aiming) && !real_imu_live()) {
+        pc_mouse_gyro_aim(aiming);   // (#104: aiming, with TOTK_MOUSE_GYRO_TOTALS=0 the gyro alone turns the aim)
         double dx, dy;
         if (pc_mouse_take(&dx, &dy)) { mouse_gyro_feed(dx, dy); mouse_motion_note(dx, dy); }   // TOTK_MOUSE_GYRO: the mouse turns the controller
     } else {
         mouse_gyro_stop();
+        pc_mouse_gyro_aim(false);
         double cx, cy;
         pc_mouse_stick_counts(&in->rx, &in->ry, &cx, &cy);   // TOTK_MOUSE_CAMERA (pc_mouse.cpp): a moving mouse wins over the stick
         mouse_motion_note(cx, cy);
@@ -2476,6 +2509,7 @@ static const char* dead_zone_format_r(float) { return dead_zone_format(1); }
 CTL_APPLY(ap_key_hold, "TOTK_KEY_MIN_HOLD_MS", (void)0)
 CTL_APPLY(ap_sprint_toggle, "TOTK_SPRINT_TOGGLE", pc_input_toggle_set(0, v))
 CTL_APPLY(ap_lock_toggle, "TOTK_LOCK_TOGGLE", pc_input_toggle_set(1, v))
+CTL_APPLY(ap_menu_buttons, "TOTK_MENU_BUTTONS", g_menu_buttons = menu_buttons_of(v))
 static void kbm_custom() {
     const char* l = pc_settings_get("controls.keyboard_layout");
     if (!l || strcmp(l, "custom")) pc_settings_set("controls.keyboard_layout", "custom");
@@ -2506,6 +2540,9 @@ static const char* const kAimScaleV[] = {"0.1", "0.15", "0.2", "0.25", "0.3", "0
 static const char* const kCtlGlyphV[] = {"auto", "switch", "xbox", "ps", "kbm", nullptr};
 static const char* const kCtlGlyphN[] = {"Automatic (the device used last)", "Switch (the game's)", "Xbox", "PlayStation",
                                           "Keyboard and mouse", nullptr};
+static const char* const kMenuBtnV[] = {"", "label", "position", nullptr};
+static const char* const kMenuBtnN[] = {"Same as the game", "Printed A accepts, B goes back",
+                                        "Switch layout (right accepts, bottom goes back)", nullptr};
 #define KM "Keyboard and mouse"
 static const pc_setting k_ctl_rows[] = {
     {"controls.keyboard_layout", "Controls", KM, "Keyboard layout", "For the console scheme, and with the PC scheme for "
@@ -2530,6 +2567,11 @@ static const pc_setting k_ctl_rows[] = {
      "DualShock 4, or the game's own with a Nintendo pad. A change shows at once, in every prompt and label; with a pad "
      "in use, menus hide the mouse pointer until the mouse moves.", "auto", kCtlGlyphV,
      kCtlGlyphN, 0, 0, 0, 0, "TOTK_GLYPHS", nullptr, ap_glyphs, nullptr},
+    {"controls.menu_buttons", "Controls", "Pad", "Menu buttons", "The pad's four face buttons in menus, dialogues and the "
+     "title screen. Same as the game: as Face buttons and the Pad buttons rows give them. Printed A accepts, B goes back: "
+     "the button printed A (Cross) confirms and B (Circle) goes back, whatever jump and interact use in the world. Switch "
+     "layout: the right button confirms, the bottom one goes back. Nothing changes in the world. A change applies at once.",
+     "", kMenuBtnV, kMenuBtnN, 0, 0, 0, 0, "TOTK_MENU_BUTTONS", nullptr, ap_menu_buttons, nullptr},
     {"controls.mouse_aim", "Controls", KM, "Left mouse shoots while aiming", "With the bow drawn (a ZR key or button held), "
      "the left button shoots instead of attacking.", "", kCtlOnV, kCtlOnN, 0, 0, 0, 0, "TOTK_MOUSE_AIM", nullptr, ap_mouse_aim, nullptr},
     // (no page: not shown) 1 once the saved mouse sensitivity is the direct mouse look's (pc_mouse.cpp migrate_sensitivity)
@@ -3040,6 +3082,29 @@ static u64 pad_remap(u64 pos) {
     for (int b = 0; b < 16; b++) if (pos >> b & 1) out |= to[b];
     return out;
 }
+// controls.menu_buttons (pc_menu_face.h, Reddit musical-miller): in a UI context (pc_ctx_is_ui: menus, dialogues, the
+// title) the pads' four face buttons give the game the A / B / X / Y of the row's layout, past Face buttons and the Pad
+// buttons rows; the other buttons keep their bindings. Same as the game, or no face button pressed as the menu's:
+// pad_remap alone, as before.
+static u64 menu_face_buttons(const HostInput& in) {   // host_input's refresh (under its lock)
+    static pcmf::Latch latch;
+    const int mode = menu_buttons_mode();
+    uint64_t game, ui;
+    pcmf::split(latch, in.face, in.xface, pad_labels_on(), mode, mode && pc_ctx_is_ui(pc_ctx()), &game, &ui);
+    if (!ui) return pad_remap(in.buttons);
+    return pad_remap((in.buttons & ~in.face) | game) | ui;
+}
+// The face glyphs of a UI context differ from the world's (the row on, and Face buttons or a face action's binding not
+// its layout already): hid_glyph_epoch moves with the context then, so the menus' prompts show the row's buttons
+static bool menu_face_glyphs_differ() {
+    const int mode = menu_buttons_mode();
+    if (!mode) return false;
+    if ((mode == 1) != pad_labels_on()) return true;
+    u64 src[16];
+    padbind_sources(src, true);
+    for (int a = 0; a < 4; a++) if (src[a] != 1ull << a) return true;
+    return false;
+}
 
 // Glyph bank: which bank glyph shows a game control (bank.py's SLOTS / MASKS names: A, L, PLUS, DPAD_UP, LS, LS_UPDOWN,
 // RS_PUSH, RS_SHAKE,...) in a style, from the bindings in force: kbm the keyboard and mouse ones (the first key of each
@@ -3051,11 +3116,14 @@ static u64 pad_remap(u64 pos) {
 // style in use or a binding (the fs side re-patches then). With keys and mouse, the PC scheme's prompts follow the
 // context: its signature changes only when that context's prompts differ from the last one's (a menu opening does not
 // reset the font cache when its keys show the same). (the game's Jump / Sprint swap too: kbm_glyph trades B and X by it,
-// and toggling it in Options changes no context, so the System tab's diagram would keep the old keys)
+// and toggling it in Options changes no context, so the System tab's diagram would keep the old keys) (a pad's in a UI
+// context too while Menu buttons gives its face buttons other glyphs there: menu_face_glyphs_differ)
 extern "C" unsigned hid_glyph_epoch(void) {
     const int style = hid_glyph_active();
+    const bool pad_ui = (style == GlyphXbox || style == GlyphPs) && pc_ctx_is_ui(pc_ctx()) && menu_face_glyphs_differ();
     return ((unsigned)style | (unsigned)g_ctl_gen.load() << 2 | (unsigned)g_padmap_gen.load() << 17) ^
-           (style == GlyphKbm ? pc_glyph_sig() << 2 : 0u) ^ (g_jump_swapped.load() ? 1u << 31 : 0u);
+           (style == GlyphKbm ? pc_glyph_sig() << 2 : 0u) ^ (g_jump_swapped.load() ? 1u << 31 : 0u) ^
+           (pad_ui ? 1u << 30 : 0u);
 }
 static const char* glyph_intern(const std::string& s) {
     static std::mutex m;
@@ -3178,7 +3246,8 @@ static const char* kbm_glyph(const char* c, int set = -1) {
     if (!strcmp(d, "_DOWN")) return key(base + 3);
     return nullptr;
 }
-static const char* pad_glyph(bool ps, const char* c) {
+// ui: a UI context's glyphs (Menu buttons gives the face actions its own buttons there, menu_face_buttons)
+static const char* pad_glyph(bool ps, const char* c, bool ui) {
     static const bool labels = pad_labels_on();   // (as pad_read has it)
     // the reader's button bits -> the button: by position A = right, B = bottom, X = top, Y = left; by label the letter
     static const char* const face[2][2][4] = {
@@ -3194,7 +3263,9 @@ static const char* pad_glyph(bool ps, const char* c) {
          "playstation_dpad_left", "playstation_dpad_up", "playstation_dpad_right", "playstation_dpad_down"}};
     u64 src[16];
     padbind_sources(src, true);
+    const int menu = ui ? menu_buttons_mode() : 0;
     auto act = [&](int a) -> const char* {
+        if (a < 4 && menu) return face[ps][menu == 1][a];   // (by letter: action A = the printed A)
         for (int bit = 0; bit < 16; bit++)
             if (src[a] >> bit & 1) return bit < 4 ? face[ps][labels][bit] : rest[ps][bit - 4];
         return nullptr;
@@ -3218,12 +3289,14 @@ static const char* pad_glyph(bool ps, const char* c) {
 // The bank glyph for a control in a style (GlyphKbm / GlyphXbox / GlyphPs); null: none (the game's own glyph stays).
 extern "C" const char* hid_glyph_for(int style, const char* control) {
     if (style == GlyphKbm) return kbm_glyph(control);
-    if (style == GlyphXbox || style == GlyphPs) return pad_glyph(style == GlyphPs, control);
+    if (style == GlyphXbox || style == GlyphPs) return pad_glyph(style == GlyphPs, control, pc_ctx_is_ui(pc_ctx()));
     return nullptr;
 }
-// The same in the PC scheme's glyph set `set` (pc_glyph_vk_in) for keys and mouse; the pads' do not depend on it
+// The same in the PC scheme's glyph set `set` (pc_glyph_vk_in) for keys and mouse; the pads' by whether it is a UI one
 extern "C" const char* hid_glyph_for_set(int style, const char* control, int set) {
-    return style == GlyphKbm ? kbm_glyph(control, set) : hid_glyph_for(style, control);
+    if (style == GlyphXbox || style == GlyphPs)
+        return pad_glyph(style == GlyphPs, control, pc_ctx_is_ui(set >= 0 ? set : pc_ctx()));
+    return style == GlyphKbm ? kbm_glyph(control, set) : nullptr;
 }
 // what a reader added to the sample (the buttons it set, the sticks it moved)
 static HostInput input_added(const HostInput& before, const HostInput& after) {
@@ -3332,7 +3405,7 @@ static HostInput host_input() {
         in.buttons |= g_ctl_pad.load();
         g_f2_down = false;
         const u64 pad_buttons = in.buttons;   // (before the keyboard's buttons: the overlay has the keys themselves)
-        in.buttons = pad_remap(in.buttons);   // (and before the bindings: the overlay stays reachable)
+        in.buttons = menu_face_buttons(in);   // (and before the bindings: the overlay stays reachable)
         const HostInput pin = in;
         keyboard_read(&in);
         glyph_note_use(GlyphKbm, input_added(pin, in));
@@ -3434,6 +3507,12 @@ static HostInput host_input() {
 // activates in quick menus"): not while a pause menu or the map already holds the picture (no 3D scene drawn for a few
 // frames; the game's time multiplier gives no such signal), not R + Left / Right / Down (Ultrahand rotation; R + Up =
 // throw materials), and a hold that opened no menu (the scene keeps being drawn) drops Switch timing.
+// TOTK_DPAD_RELEASE_MS=<ms> (LEAD 11-07, Reddit: the quick menus ran at 60 with the cap above): Switch timing ends that
+// long after the menu opened, and the rest of the hold runs at the cap. The background is captured once, as the menu
+// opens (its capture panes at animation frame 0.0, overlays/__init__.py CAPTURE_MEMBERS), before 'menu opened' (the scene
+// no longer drawn). Default 100 ms (fps360 qm2 11-07, field save, shield / weapon / material held 4 s: menus open 140 ms
+// after the press, Switch timing off 109 ms after that, backgrounds the captured scene at open / +1 s / +3 s, 209-239 fps
+// in the menu against 60 before, time multiplier 1.000 throughout); =0: the whole hold, as before.
 extern "C" { volatile int g_dpad_switch_timing = 0; }   // read by hle_vi.cpp (pacing + speed fix)
 extern "C" uint64_t vk_scene_idle_frames(void);         // nvn/vulkan/exec.c: presents since the 3D scene was last drawn
 extern "C" int vi_fps_setting(void), vi_unlock_setting(void);   // hle_vi.cpp: the frame-rate setting, live (display.fps_cap)
@@ -3441,17 +3520,22 @@ static u64 dpad_gate(u64 buttons) {
     static const bool on = !getenv("TOTK_DPAD_30") || strcmp(getenv("TOTK_DPAD_30"), "0");
     // (above the game's 30: a cap or unlocked, which the start-time TOTK_FPS read missed)
     const bool fast = vi_fps_setting() > 30 || vi_unlock_setting() != 0;
-    if (!on || !fast) { g_dpad_switch_timing = 0; return buttons; }   // (a cap set to 30 mid-hold drops it too)
+    static const u64 release_ms = [] {
+        const char *e = getenv("TOTK_DPAD_RELEASE_MS");
+        return !e || !*e ? (u64)100 : atoi(e) > 0 ? (u64)atoi(e) : (u64)0;
+    }();
+    static int carry;   // (Switch timing as before this switch: the hold and 150 ms after it; a quick re-press's gate)
+    if (!on || !fast) { g_dpad_switch_timing = carry = 0; return buttons; }   // (a cap set to 30 mid-hold drops it too)
     // (Down = whistle, no quick menu: user 2026-10-19)
     const u64 dmask = buttons & BtnR ? BtnUp : BtnUp | BtnLeft | BtnRight;
-    static u64 held_since, released_at;
+    static u64 held_since, released_at, opened_at;
     static int gated, opened;   // this hold: Switch timing on; a menu took the scene away
     u64 now = GetTickCount64();
     if (buttons & dmask) {
         if (!held_since) {
             held_since = now;
             u64 idle = vk_scene_idle_frames();
-            gated = g_dpad_switch_timing || idle <= 4;
+            gated = carry || idle <= 4;
             opened = 0;
             printf("[dpad] press %llx: scene idle %llu frames -> %s\n", (unsigned long long)(buttons & dmask),
                    (unsigned long long)idle, gated ? "Switch timing" : "no gate (menu holds the picture)");
@@ -3459,19 +3543,26 @@ static u64 dpad_gate(u64 buttons) {
         released_at = 0;
         // (gameplay itself shows idle 1 between a present and the next scene draw, every press)
         if (gated && !opened && now - held_since > 40 && vk_scene_idle_frames() >= 3) {
-            opened = 1;
+            opened = 1, opened_at = now;
             printf("[dpad] menu opened %llu ms after the press\n", (unsigned long long)(now - held_since));
         }
         if (gated && !opened && now - held_since > 400) {
             gated = 0;
             printf("[dpad] no menu 400 ms after the press: Switch timing off for this hold\n");
         }
-        g_dpad_switch_timing = gated;
+        carry = gated;
+        const bool done = release_ms && opened && now - opened_at >= release_ms;   // (TOTK_DPAD_RELEASE_MS)
+        if (done && g_dpad_switch_timing)
+            printf("[dpad] Switch timing off %llu ms after the menu opened: the cap again\n", (unsigned long long)(now - opened_at));
+        g_dpad_switch_timing = gated && !done;
         if (gated && now - held_since < 40) buttons &= ~dmask;
     } else {
+        // (taps and quick re-presses keep Switch timing briefly; after a menu TOTK_DPAD_RELEASE_MS ended it, only the
+        // next press's gate)
+        if (held_since && release_ms && opened && now - opened_at >= release_ms) g_dpad_switch_timing = 0;
         held_since = 0;
         if (!released_at) released_at = now;
-        if (now - released_at > 150) g_dpad_switch_timing = 0;   // (taps and quick re-presses keep Switch timing briefly)
+        if (now - released_at > 150) g_dpad_switch_timing = carry = 0;
     }
     return buttons;
 }

@@ -1,6 +1,6 @@
-// step_check.h: does the game read the realtime step? (hle_vi.cpp hook_f_7a83e4; v0.1.10, LEAD 12:52.) The game's
-// frame-delta setter stores ratio = interval / 2 unpatched, the data page's ratio with the realtime patch; this votes on
-// the two, frame by frame. tools/engine/test_step_check.py.
+// step_check.h: does the game read the realtime step? The game's frame-delta setter stores ratio = interval / 2
+// unpatched, the data page's ratio with the realtime patch; this votes on the two, frame by frame.
+// tools/engine/test_step_check.py.
 #pragma once
 #include <cmath>
 

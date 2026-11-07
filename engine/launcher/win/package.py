@@ -49,7 +49,7 @@ IMPORT = os.path.join(WORK, 'saves', '100pct')   # offered by the launcher's imp
 SETTINGS = """\
 # Valores iniciales del paquete. El juego los cambia desde el menú F10 (pc_settings.cpp).
 display.window_mode = borderless  # Pantalla completa sin bordes (F11 o Alt+Intro cambian)
-display.fps_cap = 120  # 120 fps; F10 > Gráficos ofrece 30 a 240 (40, 45, 60, 75, 90, 120, 144, 165...) o Unlocked (hasta la frecuencia del monitor, máx. 240)
+display.fps_cap = 120  # 120 fps; F10 > Gráficos ofrece 30 a 240 (40, 45, 60, 75, 90, 120, 144, 150, 165...) o Unlocked (hasta la frecuencia del monitor, máx. 240)
 graphics.render_scale = auto  # Resolución de render: la altura de la ventana
 game.screenshots = 1  # F12 guarda una captura en Imágenes\\Capturas de pantalla
 game.crash_reports = 1  # Informe y minivolcado si el juego se cierra por un fallo

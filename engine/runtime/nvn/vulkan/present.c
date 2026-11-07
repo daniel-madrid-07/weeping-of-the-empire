@@ -390,13 +390,13 @@ static void pace_report_locked(uint64_t now) {
 }
 
 // ================================================================== composed window check (one log line) Whether the desktop
-// composes the game window (DWM: overlays, overlapping windows, a window across monitors, some multi-monitor desktops)
-// instead of flipping it to the screen on its own: composed, the VRR row's FIFO gets neither VRR nor the monitor's rate and
-// holds every present for the compositor's refresh. Windows), how long the render thread was held by the presentation engine
-// per present (window image acquire + the queued-frame limit), and the verdict of composed_check.h (FIFO only: on screen no
-// faster than 1.5 monitor periods, under 3/4 of its rate, held a quarter of the interval, 75 % of the intervals within 0.6 ms
-// of 1-4 compositor periods CPU test tools/engine/test_composed_check.py). Not seen: presents of the FG present thread
-// (DLSS-G on: vk_present_done does not run).
+// composes the game window (DWM: overlays, overlapping windows, a window across monitors, some multi-monitor desktops) instead
+// of flipping it to the screen on its own: composed, the VRR row's FIFO gets neither VRR nor the monitor's rate and holds every
+// present for the compositor's refresh. Windows), how long the render thread was held by the presentation engine per present
+// (window image acquire + the queued-frame limit), and the verdict of composed_check.h (FIFO only: on screen no faster than 1.5
+// monitor periods, under 3/4 of its rate, held a quarter of the interval, 75 % of the intervals within 0.6 ms of 1-4 compositor
+// periods CPU test tools/engine/test_composed_check.py). Not seen: presents of the FG present thread (DLSS-G on: vk_present_done
+// does not run).
 static uint32_t g_cmp_iv[256];             // on-screen intervals, us (pw_thread)
 static atomic_uint g_cmp_ivn;
 static uint64_t g_cmp_last_seen;           // (pw_thread)
@@ -594,9 +594,23 @@ static void present_record(uint64_t frame, uint64_t id, VkResult r, uint64_t t_s
     } else if (id > g_shown_id) g_shown_id = id;   // (not presented: nothing to wait for)
     ReleaseSRWLockExclusive(&g_pw_lock);
 }
+// TOTK_FG_FIF=real (opt-in; the showcase's player.txt line): frames in flight are real frames: a generated frame's
+// present is not one. By default the ring below takes every present, and with frame generation each generated frame is
+// one (the FG present thread's push, or the inline presenter's): at x2 to x4 a frame's second pass waits for the GPU to
+// finish the first, i.e. The whole real frame, so the render thread's CPU and the GPU run in series. device.c's frame
+// slots too (x4: 96 -> 128 real without them, fif5). It was the default in cand6 only.
+bool vk_fg_fif_real(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_FG_FIF");
+        v = e && !strcmp(e, "real");
+        if (v) LOG("[present] frames in flight: real frames only (TOTK_FG_FIF=real)\n");
+    }
+    return v;
+}
 // (The latency limits, on the thread that makes the next frame. extra: generated frames that do not count against the
-// queued-frame limit, so with frame generation it limits real frames.)
-static void present_limits(uint64_t id, uint64_t seq, int extra) {
+// queued-frame limit, so with frame generation it limits real frames. gen: this one is a generated frame.)
+static void present_limits(uint64_t id, uint64_t seq, int extra, bool gen) {
     const uint64_t t_lim = SDL_GetTicksNS();
     if (id) {
         AcquireSRWLockExclusive(&g_pw_lock);
@@ -634,14 +648,16 @@ static void present_limits(uint64_t id, uint64_t seq, int extra) {
     }
     // frames in flight: the GPU work of the frame fif - 1 back has to be done before the next frame starts
     static uint64_t fseq[8], fn;
-    fseq[fn++ & 7] = seq;
-    int fif = atomic_load(&g_fif);
-    if (fif < 3 && fn >= (uint64_t)fif) vk_wait_seq(fseq[(fn - (uint64_t)fif) & 7]);
+    if (!gen || !vk_fg_fif_real()) {
+        fseq[fn++ & 7] = seq;
+        int fif = atomic_load(&g_fif);
+        if (fif < 3 && fn >= (uint64_t)fif) vk_wait_seq(fseq[(fn - (uint64_t)fif) & 7]);
+    }
     vk_present_jit_wait(SDL_GetTicksNS() - t_lim);   // (a wait after the frame read its input: the engine's low latency)
 }
-void vk_present_done(uint64_t frame, uint64_t id, uint64_t seq, VkResult r, uint64_t t_submit, uint64_t t_paced) {
+void vk_present_done(uint64_t frame, uint64_t id, uint64_t seq, VkResult r, uint64_t t_submit, uint64_t t_paced, bool gen) {
     present_record(frame, id, r, t_submit, t_paced, g_vk.swapchain);
-    present_limits(id, seq, 0);
+    present_limits(id, seq, 0, gen);
     g_cmp_pres++;
     cmp_check();
 }
@@ -969,6 +985,17 @@ static void pq_wait_until(HANDLE timer, uint64_t due) {   // (high-resolution ti
     while (SDL_GetTicksNS() < due) YieldProcessor();
 }
 
+// TOTK_FG_PQ=2 (off by default): the FG present thread's even slots below and n + 2 window images
+// (vk_present_image_count, device.c remakes the swapchain on an x2 / x3 / x4 change)
+bool vk_present_fg_even(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_FG_PQ");
+        v = e && *e == '2';
+    }
+    return v;
+}
+
 static DWORD WINAPI pq_thread(void *arg) {
     (void)arg;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -979,6 +1006,22 @@ static DWORD WINAPI pq_thread(void *arg) {
     // every 10 s: generated frames, how many arrived after their slot / presented over 1 ms past due; real frames and
     // their hold after arrival
     uint64_t st_t = 0, st_gen = 0, st_after = 0, st_real = 0, st_hold = 0, st_past = 0;
+    // (st_first: of those after their slot, a batch's first generated frame: due a slot after the LAST real arrival,
+    // a whole interval back when the render thread pushes the batch with its real frame, so it goes out as it comes;
+    // that is most of the 'after their slot' at x3 / x4, not lateness: 'over 1 ms past due' is)
+    uint64_t st_first = 0;
+    // TOTK_FG_PQ=2 (fps360, opt-in, off by default): even slots for multi-frame generation while the frame cap paces
+    // the real frames (its period within 10 % of their arrivals: the 'constant' showcase, e.g. 150 x4). The default
+    // presents the batch's first generated frame as it comes and holds the real one at most half a slot after the last
+    // generated one. Here, from the batch's first generated frame's ARRIVAL: frame k at k - 1 slots, the real one at n
+    // slots (I / (n + 1) each, I = the cap's period), none held past n slots after its own arrival. Nothing is counted
+    // from a present and I never comes from the arrivals, so a hold cannot slow the next frame and lengthen I: the
+    // first version did both, ~45 real) the holds grew 27 -> 35 ms while real fell 53 -> 41 (a ratchet). Uncapped or a
+    // cap not held: the default placement. Both modes count presents less than a quarter slot after the one before
+    // (bunched).
+    const bool even = vk_present_fg_even();
+    LOG("[present] FG present thread placement: %s\n", even ? "even slots while the cap holds (TOTK_FG_PQ=2)" : "default");
+    uint64_t arr[16], narr = 0, wmean = 0, anchor = 0, prev_t = 0, st_bunch = 0, st_even = 0;
     for (;;) {
         AcquireSRWLockExclusive(&g_pq_lock);
         while (g_pq_tail == g_pq_head) SleepConditionVariableSRW(&g_pq_cv, &g_pq_lock, INFINITE, 0);
@@ -987,18 +1030,40 @@ static DWORD WINAPI pq_thread(void *arg) {
         g_pq_tail++;
         ReleaseSRWLockExclusive(&g_pq_lock);
         uint64_t due = 0;
+        extern int64_t vi_pace_period_ns(void);
+        const int64_t pp = vi_pace_period_ns();
         {   // (the cap's period for the real frames when it paces them, else the running mean of their arrivals; the
             // longer of the two: a rung the game does not hold arrives slower than its period)
-            extern int64_t vi_pace_period_ns(void);
-            const int64_t pp = vi_pace_period_ns();
             interval = pp > 0 && (uint64_t)pp > mean ? (uint64_t)pp : mean;
         }
-        if (e.kind == 1) {
+        if (e.kind == 1) {   // (the real arrivals, both modes: the running mean, and the last 16's mean for TOTK_FG_PQ=2)
             if (last_arrival && e.t_push > last_arrival) {
                 uint64_t d = e.t_push - last_arrival;
                 if (d < 100000000ull) mean = mean ? (mean * 4 + d) / 5 : d;
             }
             last_arrival = e.t_push;
+            if (narr && e.t_push - arr[(narr - 1) % 16] >= 100000000ull) narr = 0;   // (a pause: start over)
+            arr[narr++ % 16] = e.t_push;
+            const uint64_t c = narr < 16 ? narr : 16;
+            wmean = c >= 4 ? (e.t_push - arr[(narr - c) % 16]) / (c - 1) : 0;
+        }
+        // (the cap holds: its period at least 90 % of the real frames' mean interval)
+        const bool even_now = even && e.n > 0 && pp > 0 && wmean && (uint64_t)pp * 10 >= wmean * 9;
+        if (even_now) {
+            const uint64_t slot = (uint64_t)pp / (uint64_t)(e.n + 1), most = e.t_push + slot * (uint64_t)e.n;
+            if (e.kind == 1) {
+                if (anchor) due = anchor + slot * (uint64_t)e.n;
+                anchor = 0;
+            } else if (e.kind == 2) {
+                if (e.k <= 1 || !anchor) anchor = e.t_push;
+                due = anchor + slot * (uint64_t)(e.k - 1);
+                if (due < e.t_push) due = e.t_push, st_after++;
+                st_gen++, st_even++;
+            }
+            if (due > most) due = most;
+            if (e.kind == 1) gen_t = 0;
+        } else if (e.kind == 1) {
+            anchor = 0;
             // (as it comes: the cap already paced it; held only when the generated frame went out less than half a slot
             // before, so that one still shows. A full slot after it held the real frames 3-7 ms, +5 ms game -> screen.)
             if (e.n > 0 && gen_t && interval) {
@@ -1014,7 +1079,7 @@ static DWORD WINAPI pq_thread(void *arg) {
             // screen. Aiming at the middle of a refresh interval did not help: in a window, present wait's times
             // are not on the refresh grid, so there was no phase to aim at.)
             due = e.k > 1 && gen_t ? gen_t + slot : last_arrival ? last_arrival + slot : e.t_push;
-            if (due < e.t_push) due = e.t_push, st_after++;
+            if (due < e.t_push) due = e.t_push, st_after++, st_first += e.k <= 1;
             if (due > e.t_push + slot) due = e.t_push + slot;
             st_gen++;
         }
@@ -1022,6 +1087,8 @@ static DWORD WINAPI pq_thread(void *arg) {
         uint64_t t_paced = SDL_GetTicksNS();
         if (e.kind == 2 && due && t_paced > due + 1000000ull) st_past++;
         if (e.kind == 2) gen_t = t_paced;
+        if (e.kind && prev_t && interval && e.n > 0 && t_paced - prev_t < interval / (uint64_t)(e.n + 1) / 4) st_bunch++;
+        prev_t = t_paced;
         VkPresentIdKHR pid = {.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR, .swapchainCount = 1, .pPresentIds = &e.id};
         VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .pNext = e.id ? &pid : NULL, .waitSemaphoreCount = 1,
                                .pWaitSemaphores = &e.wait, .swapchainCount = 1, .pSwapchains = &e.sc, .pImageIndices = &e.img};
@@ -1048,11 +1115,12 @@ static DWORD WINAPI pq_thread(void *arg) {
         if (!st_t) st_t = t_paced;
         if (t_paced - st_t >= 10000000000ull) {
             if (st_gen)
-                LOG("[present] FG present thread, %.1f s: %llu generated (%llu after their slot), %llu real held %.2f ms avg after "
-                    "arriving, real interval %.2f ms, %llu generated over 1 ms past due\n", (t_paced - st_t) / 1e9,
-                    (unsigned long long)st_gen, (unsigned long long)st_after, (unsigned long long)st_real,
-                    st_real ? st_hold / 1e6 / (double)st_real : 0.0, interval / 1e6, (unsigned long long)st_past);
-            st_t = t_paced, st_gen = st_after = st_real = st_hold = st_past = 0;
+                LOG("[present] FG present thread, %.1f s: %llu generated (%llu after their slot, %llu of them a batch's first), %llu real held %.2f ms avg after "
+                    "arriving, real interval %.2f ms, %llu generated over 1 ms past due, %llu bunched, %llu on even slots\n", (t_paced - st_t) / 1e9,
+                    (unsigned long long)st_gen, (unsigned long long)st_after, (unsigned long long)st_first, (unsigned long long)st_real,
+                    st_real ? st_hold / 1e6 / (double)st_real : 0.0, interval / 1e6, (unsigned long long)st_past,
+                    (unsigned long long)st_bunch, (unsigned long long)st_even);
+            st_t = t_paced, st_gen = st_after = st_real = st_hold = st_past = st_bunch = st_even = st_first = 0;
         }
     }
     return 0;
@@ -1089,7 +1157,7 @@ void vk_present_queue_push(uint32_t img, VkSemaphore wait, uint64_t id, uint64_t
     g_pq[g_pq_head++ % PQN] = e;
     WakeAllConditionVariable(&g_pq_cv);
     ReleaseSRWLockExclusive(&g_pq_lock);
-    present_limits(id, seq, kind ? n : 0);
+    present_limits(id, seq, kind ? n : 0, kind == 2);
 }
 // Before the swapchain is made again or the device waits idle (both need the queue and the swapchain to themselves):
 // everything pushed presented. 500 ms at most (a present the compositor holds; then on as before).
@@ -1134,8 +1202,13 @@ void vk_present_lost(void) {
 // ================================================================== swapchain (device.c create_swapchain)
 uint32_t vk_present_image_count(const VkSurfaceCapabilitiesKHR *caps) {
     cfg_init();
-    // (FG present thread: a generated and a real image wait there while the next frame acquires: two more)
-    uint32_t count = (uint32_t)env_int("TOTK_SWAPCHAIN_IMAGES", (int)caps->minImageCount + (vk_present_queue_on() ? 3 : 1), 2, 8);
+    // (FG present thread: a generated and a real image wait there while the next frame acquires: two more. TOTK_FG_PQ=2:
+    // the n generated and the real one, n + 1 more, so x4 +5: with +3, x4's four images a frame and the one on screen
+    // took all five of a minimum of 2, and the render thread's acquire waited for the GPU to finish the last frame's
+    // generated ones, no CPU / GPU overlap; fps360 11-05 showcase)
+    const bool pq = vk_present_queue_on();
+    const int fgn = pq && vk_present_fg_even() ? vk_ngx_fg_frames() : 0;
+    uint32_t count = (uint32_t)env_int("TOTK_SWAPCHAIN_IMAGES", (int)caps->minImageCount + (fgn > 0 ? fgn + 2 : pq ? 3 : 1), 2, 8);
     if (count < caps->minImageCount) count = caps->minImageCount;
     if (caps->maxImageCount && count > caps->maxImageCount) count = caps->maxImageCount;
     return count > 8 ? 8 : count;

@@ -159,10 +159,10 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
 // Maxwell's float ops mostly run.FTZ and NVIDIA's driver flushes 32-bit denormals, so a game value in the denormal range is
 // 0 there; AMD's keeps denormals and hands 1 / x or rsqrt(x) a tiny non-zero instead: a huge finite result where the game's
 // maths expected 0 -> inf, which its clamps handle, so it passes them, and bloom spreads it (Reddit, an 8 GB AMD card: white
-// specks and short white streaks with glow in a dark temple LEAD 11-04 P1.5; the same mechanism as public #39's white
-// blow-outs on Arc). With preserve above, AMD then computes float maths as NVIDIA does. A module with a 16 / 64-bit float
-// type where the driver's denormBehaviorIndependence is NONE (one mode for every width: VUID 06290; translate.c emits
-// doubles for DADD / DMUL) keeps the driver's default there. The returned mask: 1 preserve, 2 FTZ.
+// specks and short white streaks with glow in a dark temple; the same mechanism as public #39's white blow-outs on Arc).
+// With preserve above, AMD then computes float maths as NVIDIA does. A module with a 16 / 64-bit float type where the
+// driver's denormBehaviorIndependence is NONE (one mode for every width: VUID 06290; translate.c emits doubles for DADD /
+// DMUL) keeps the driver's default there. The returned mask: 1 preserve, 2 FTZ.
 static bool g_ftz_shared;   // (the denormal mode is one for every width on this device: no FTZ where 16 / 64-bit floats are)
 static int float_preserve(void) {
     static int on = -1;

@@ -96,11 +96,11 @@ void backend_texture_created(NvnTexture *t) {
     pthread_mutex_unlock(&pre_mu);
 }
 
-// The flag-skipped textures among a load's first uploads (LEAD 04:56, for v0.1.10's wider pre-upload): each one's NVN
-// flags (pre_kind's 0xdd: DISPLAY 0x1, IMAGE 0x4, COMPRESSIBLE 0x8, LINEAR 0x10, LINEAR_RENDER_TARGET 0x40,
-// ADAPTIVE_ZCULL 0x80) and, at the account (240 frames on), what its backend is: a scaled kind, rendered / written by the
-// GPU since (gpu_owned: a render target or storage image in use), or sampled only. Which classes a wider pre-upload
-// could take safely is read from that line. Render thread only (first_sight, forget, the account).
+// The flag-skipped textures among a load's first uploads: each one's NVN flags (pre_kind's 0xdd: DISPLAY 0x1, IMAGE 0x4,
+// COMPRESSIBLE 0x8, LINEAR 0x10, LINEAR_RENDER_TARGET 0x40, ADAPTIVE_ZCULL 0x80) and, at the account (240 frames on), what
+// its backend is: a scaled kind, rendered / written by the GPU since (gpu_owned: a render target or storage image in use),
+// or sampled only. Which classes a wider pre-upload could take safely is read from that line. Render thread only
+// (first_sight, forget, the account).
 typedef struct { NvnTexture *t; uint32_t flags; uint64_t bytes; } FsEnt;
 enum { FS_MAX = 2048 };
 static FsEnt fs_e[FS_MAX];

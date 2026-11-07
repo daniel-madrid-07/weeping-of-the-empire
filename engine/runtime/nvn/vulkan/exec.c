@@ -1247,21 +1247,18 @@ static int new_chunk(uint64_t size) {
     return nchunks - 1;
 }
 
-// Chunks are recycled lazily in vk_transient; here (after each submission) idle ones go back to the driver. A burst (the
-// open world's first streaming wave, a load) grew the ring and nothing shrank it again: with resizable BAR its chunks are
-// VRAM, held for the rest of the session (vram-fit 2026-11-02, the 4K 10 GB report). vk_transient takes the lowest-numbered
-// free chunk, so the steady working set stays at the front and a burst's chunks fall idle at the back. A chunk no
-// allocation took for 1 s while residency is short, or for LARECOMP_VK_RING_IDLE_MS (default 60000) otherwise (a freed
-// chunk is made again by the next burst: a 64 MB vkAllocateMemory on the render thread), whose submissions completed and
-// that the open guest list did not use (guest_copy shares spans across its submissions; wider than vk_transient's
-// keep_list, which reuses rather than destroys), is freed: the newest first, one per 250 ms, never below RING_KEEP chunks.
-// A later burst makes chunks again as before. Hysteresis (LEAD 11-04, public #77's 8 GB 2080 S: residency short for most of
-// the session, so the 1 s rule gave a 64 MB chunk back and the next burst made it again, 'peak 1024 MB, 520 made, 518 given
-// back', a vkAllocateMemory and its first bind on the render thread each time): for RING_NEED_S after a chunk was made, the
-// ring keeps as many chunks as it held then (the burst's size), at most RING_SPARE_MAX beyond RING_KEEP while residency is
-// short (that much VRAM kept for the ring rather than given to textures: the fit-room's bound); a burst that comes back
-// within the window finds its chunks and starts the window again (vk_transient), so only a ring left unused for RING_NEED_S
-// shrinks. LARECOMP_VK_RING_IDLE_MS=0: never freed (old).
+// Chunks are recycled lazily in vk_transient; here (after each submission) idle ones go back to the driver. A burst (the open
+// world's first streaming wave, a load) grew the ring and nothing shrank it again: with resizable BAR its chunks are VRAM, held
+// for the rest of the session (vram-fit 2026-11-02, the 4K 10 GB report). vk_transient takes the lowest-numbered free chunk, so
+// the steady working set stays at the front and a burst's chunks fall idle at the back. A chunk no allocation took for 1 s
+// while residency is short, or for LARECOMP_VK_RING_IDLE_MS (default 60000) otherwise (a freed chunk is made again by the next
+// burst: a 64 MB vkAllocateMemory on the render thread), whose submissions completed and that the open guest list did not use
+// (guest_copy shares spans across its submissions; wider than vk_transient's keep_list, which reuses rather than destroys), is
+// freed: the newest first, one per 250 ms, never below RING_KEEP chunks. A later burst makes chunks again as before.
+// Hysteresis: for RING_NEED_S after a chunk was made, the ring keeps as many chunks as it held then (the burst's size), at most
+// RING_SPARE_MAX beyond RING_KEEP while residency is short (that much VRAM kept for the ring rather than given to textures: the
+// fit-room's bound); a burst that comes back within the window finds its chunks and starts the window again (vk_transient), so
+// only a ring left unused for RING_NEED_S shrinks. LARECOMP_VK_RING_IDLE_MS=0: never freed (old).
 enum { RING_KEEP = 2, RING_SPARE_MAX = 4, RING_NEED_S = 30 };
 static void ring_retire(void) {
     static int64_t idle_ns = -1;
@@ -1525,11 +1522,11 @@ void sync_guard_note(uint64_t addr, uint64_t len);
 void sync_guard_note_write(uint64_t addr, uint64_t len);
 void sync_guard_fence(const void *key, uint64_t ticket);
 void sync_guard_hold(int on);
-// Frame snapshot (LEAD 2026-11-03 P0, the v0.1.9 gate's one-frame rain streaks / missing roof): the replay read uniform data
-// and CPU-written vertex / instance streams from guest memory when it got to them, and with objects.c's SyncWait ticket lag
-// a slow replay (a GPU wait: the bytes of [addr, addr + size) as the frame of the op being replayed left them, or NULL (not
-// captured: read live, as before). guest_copy takes them from there, and a vertex stream it covers is copied instead of
-// bound in place (guest_direct: the GPU would read guest memory even later). LARECOMP_FRAME_SNAP=0: always live (old).
+// Frame snapshot: the replay read uniform data and CPU-written vertex / instance streams from guest memory when it got to
+// them, and with objects.c's SyncWait ticket lag a slow replay (a GPU wait: the bytes of [addr, addr + size) as the frame of
+// the op being replayed left them, or NULL (not captured: read live, as before). guest_copy takes them from there, and a
+// vertex stream it covers is copied instead of bound in place (guest_direct: the GPU would read guest memory even later).
+// LARECOMP_FRAME_SNAP=0: always live (old).
 const void *(*vk_snap_src)(uint64_t addr, uint64_t size);
 void *frame_snap_take(uint64_t handle);   // frame_snap.c (the capture half): at the submit, on the game's thread
 void frame_snap_apply(void *snap);        // the render thread: the list's snapshot current while it is replayed
@@ -1538,8 +1535,28 @@ void frame_snap_note(uint64_t addr, uint64_t len);   // a guest write the snapsh
 static uint64_t stat_snap_reads, stat_snap_bytes;
 // The frame's buffer-path events for the glitch detector (bxe_note, printed per hit by vk_cov_dump after the texture
 // events; hdr 11-05, so the vertex / uniform paths that read guest memory late or live)
-enum { BXE_VX_STRADDLE, BXE_VX_INFLIGHT, BXE_PG_LIVE, BXE_PG_INFLIGHT, BXE_UBO_V7, BXE_SNAP_NEWER, BXE_LATE_TIC, BXE_REPLAY_LATE, BXE_HOST_FALL, BXE_N };
+enum { BXE_VX_STRADDLE, BXE_VX_INFLIGHT, BXE_PG_LIVE, BXE_PG_INFLIGHT, BXE_UBO_V7, BXE_SNAP_NEWER, BXE_LATE_TIC, BXE_REPLAY_LATE, BXE_HOST_FALL,
+       // Counted per texture_info_ call, which the per-frame memo skips on its hits: read them as present / absent between N and
+       // N-1, not as samples)
+       BXE_CSW_VS_CUR, BXE_CSW_VS_PREV, BXE_CSW_VS_OLD, BXE_CSW_FS_CUR, BXE_CSW_FS_PREV, BXE_CSW_FS_OLD, BXE_CSW_STAMPED, BXE_CSW_DISP, BXE_N };
 static uint64_t g_replay_seq;   // (async) the replayed list's g_nvn_submit_seq, 0 outside a list / synchronous
+// the storage ranges dispatches stored into lately, with the frame + 1 of the store: a ring of the last 256 store
+// targets. Matched by range [addr, addr + size), so a texture over part of the storage (a layer / mip view with its own
+// base) counts too, and by storage, not object (the game stores through an image object and samples through another
+// texture object). csw2's counts read 0 at every hit: BXE_CSW_STAMPED counts the frame's store targets, the control that
+// says whether a 0 means anything.
+static struct { uint64_t a, e, f; } g_csw[256];
+static uint32_t g_csw_n;
+static void csw_mark(uint64_t addr, uint64_t size, uint64_t f) {
+    if (!addr || !size) return;
+    for (int i = 0; i < 256; i++) if (g_csw[i].a == addr) { g_csw[i].e = addr + size; g_csw[i].f = f; return; }
+    g_csw[g_csw_n++ & 255] = (typeof(g_csw[0])){addr, addr + size, f};
+}
+static uint64_t csw_get(uint64_t addr) {   // (the newest store whose range holds addr, 0: none)
+    uint64_t f = 0;
+    for (int i = 0; i < 256; i++) if (addr >= g_csw[i].a && addr < g_csw[i].e && g_csw[i].f > f) f = g_csw[i].f;
+    return f;
+}
 static bool g_tic_snapped;      // (LARECOMP_POOL_SNAP) texture_info_ took an entry's value at its list's submit: not memoized
 static uint64_t stat_pool_snap, stat_pool_snap_miss;
 // LARECOMP_POOL_SNAP (objects.c nvn_pool_entry_at): the entry as the replayed list's submit left it, else e itself
@@ -1732,11 +1749,11 @@ static void dq_out(void) { tl_dq_in = false; }
 static int dq_level(uint64_t key);
 static uint64_t hash_mem(uint64_t h, const void *p, size_t n);
 // The engine's own fixed pipelines (present, post / SMAA, clears, HDR encode, the overlay, texture decode, contact
-// shadows, latch, motion vectors, snapshot marks, write-backs; public #55 follow-up, LEAD v0.1.10): built inside the
-// same per-thread scope as the game's programs, keyed by their name, so a driver crash in one is recorded too
-// (vk_shader_crashed) and the next start on that GPU and driver builds it with the driver's optimizer off. They are
-// never skipped (the game cannot run without them: shader_quar.h caps "engine" at SQ_NOOPT); safe GPU mode turns the
-// optimizer off for them as for every program. The scope is saved and restored, so one inside a game build keeps it.
+// shadows, latch, motion vectors, snapshot marks, write-backs; public #55 follow-up): built inside the same per-thread
+// scope as the game's programs, keyed by their name, so a driver crash in one is recorded too (vk_shader_crashed) and the
+// next start on that GPU and driver builds it with the driver's optimizer off. They are never skipped (the game cannot run
+// without them: shader_quar.h caps "engine" at SQ_NOOPT); safe GPU mode turns the optimizer off for them as for every
+// program. The scope is saved and restored, so one inside a game build keeps it.
 static VkPipelineCreateFlags engine_build_begin(const char *name, uint64_t save[2], const char **save_what, bool *save_in) {
     save[0] = tl_dq_key, save[1] = (uint64_t)tl_dq_lvl, *save_what = tl_dq_what, *save_in = tl_dq_in;
     const uint64_t key = hash_mem(0x656e67696e65ull, name, strlen(name)) | 1;
@@ -2676,19 +2693,37 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
                 e28, f28, e48, f48, e60, f60);
         }
     }
-    // LARECOMP_GPUPROF_SLOW=<ms>: GPU-profile the frame after one slower than <ms> (up to 4 times, >= 120 frames apart;
-    // device.c also saves the image and a [mem] report). For the Deck's intermittent ~200 ms GPU frames.
-    static long slow_ms = -1;
-    static int slow_n;
-    static uint64_t slow_last;
-    if (slow_ms < 0) slow_ms = getenv("LARECOMP_GPUPROF_SLOW") ? atol(getenv("LARECOMP_GPUPROF_SLOW")) : 0;
-    if (slow_ms > 0 && last_t && now - last_t > (uint64_t)slow_ms * 1000000ull && slow_n < 4 && (!slow_n || frame > slow_last + 120)) {
-        extern volatile int g_gpuprof_request;
-        slow_n++;
-        slow_last = frame;
-        g_gpuprof_request = 1;
-        LOG("[gpuprof] frame %llu took %.0f ms: profiling the next frame (slow trigger %d of 4)\n", (unsigned long long)frame,
-            (now - last_t) / 1e6, slow_n);
+    // LARECOMP_GPUPROF_SLOW=<ms>[,<n>[,loads]]: GPU-profile the frame after one slower than <ms> (up to n times, default 8, >= 120
+    // frames apart; device.c also saves the image and a [mem] report). For the Deck's intermittent ~200 ms GPU frames. Not in a
+    // load: no trigger while a loading screen is up (hle_vi.cpp vi_loading_screen), in the 300 frames after one (the world's first
+    // frames), nor before frame 3000 until a first one ended (start-up, title; a replay or a game without loading screens triggers
+    // from frame 3000). Public #92: its 4 triggers all went to start-up / load stalls (frames 1 / 125 / 250 / 1272), none to the
+    // cave asked for. ',loads': loads too.
+    static long slow_ms = -1, slow_max;
+    static int slow_n, slow_loads, slow_was_loading, slow_in_loads;
+    static uint64_t slow_last, slow_load_end, slow_skipped;
+    if (slow_ms < 0) {
+        const char *e = getenv("LARECOMP_GPUPROF_SLOW"), *c = e ? strchr(e, ',') : NULL;
+        slow_ms = e ? atol(e) : 0;
+        slow_max = c && atol(c + 1) > 0 ? atol(c + 1) : 8;
+        slow_in_loads = c && strstr(c, ",loads") != NULL;
+    }
+    if (slow_ms > 0) {
+        extern int vi_loading_screen(void);   // hle_vi.cpp
+        const int ld = vi_loading_screen();
+        if (ld) slow_was_loading = 1;
+        else if (slow_was_loading) { slow_was_loading = 0; slow_loads++; slow_load_end = frame; }
+        if (last_t && now - last_t > (uint64_t)slow_ms * 1000000ull && slow_n < slow_max && (!slow_n || frame > slow_last + 120)) {
+            if (!slow_in_loads && (ld || (slow_loads ? frame < slow_load_end + 300 : frame < 3000))) slow_skipped++;
+            else {
+                extern volatile int g_gpuprof_request;
+                slow_n++;
+                slow_last = frame;
+                g_gpuprof_request = 1;
+                LOG("[gpuprof] frame %llu took %.0f ms: profiling the next frame (slow trigger %d of %ld; %llu slow frames in loads "
+                    "skipped)\n", (unsigned long long)frame, (now - last_t) / 1e6, slow_n, slow_max, (unsigned long long)slow_skipped);
+            }
+        }
     }
     last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
 }
@@ -4115,16 +4150,16 @@ static void contact_pass_hook(VkCommandBuffer cb) {
     if (contact_pass_begin(&p)) contact_run(cb);
 }
 
-// (textures.c renderer_texture_promote) an unscaled 2D attachment of the same guest size as one at the scene's scale
-// renders at that scale; the shadow-map kind too (a square depth at TOTK_SHADOW_SCALE drawn with an unscaled colour target
-// of its size). begin_pass decides it BEFORE its promotion loop, so the pass that first meets the pair is already whole
-// (P1.4: decided after the attachments, that pass rendered the smallest attachment's area and the scaled targets' right /
-// bottom 1 - 1 / scale kept older pixels for a frame), and again after the attachments for a partner whose backend the
-// attachment loop made. LARECOMP_PROMO_FIRST=0: only after the attachments (old). An attachment without a backend yet
-// counts at the scale the attachment loop will make it at: a first meeting where the scaled target's image is new this
-// pass (the scene-scale RGBA16F 640x360 next to its unscaled R8 twin, #70's logs) mixed there once, its render area the
-// unscaled one's, and the scaled image's uncovered right / bottom kept whatever it held: a recycled image's older picture
-// of the run. LARECOMP_PROMO_NEW=0: backends only.
+// (textures.c renderer_texture_promote) an unscaled 2D attachment of the same guest size as one at the scene's scale renders
+// at that scale; the shadow-map kind too (a square depth at TOTK_SHADOW_SCALE drawn with an unscaled colour target of its
+// size). begin_pass decides it BEFORE its promotion loop, so the pass that first meets the pair is already whole (P1.4:
+// decided after the attachments, that pass rendered the smallest attachment's area and the scaled targets' right / bottom 1 -
+// 1 / scale kept older pixels for a frame), and again after the attachments for a partner whose backend the attachment loop
+// made. LARECOMP_PROMO_FIRST=0: only after the attachments (old). An attachment without a backend yet counts at the scale the
+// attachment loop will make it at: a first meeting where the scaled target's image is new this pass (the scene-scale RGBA16F
+// 640x360 next to its unscaled R8 twin, #70's logs) mixed there once, its render area the unscaled one's, and the scaled
+// image's uncovered right / bottom kept whatever it held: a recycled image's older picture of the run. LARECOMP_PROMO_NEW=0:
+// backends only.
 static void promote_partners(void) {
     extern void renderer_get_scale(float *sx, float *sy);
     extern void renderer_texture_planned_scale(const NvnTexture *t, float *sx, float *sy);
@@ -4711,6 +4746,109 @@ void vk_txe_note(int kind, const NvnTexture *t) {
 static void bxe_note(int kind) {   // (relaxed: the mirror sync may run off the render thread; a count, nothing more)
     if (vk_glitch_on()) __atomic_fetch_add(&g_cov[__atomic_load_n(&g_cov_cur, __ATOMIC_RELAXED)].bxe[kind], 1, __ATOMIC_RELAXED);
 }
+// LEAD 11-07 item 1(a), hdr): heights, material, grass), on the draws' side. Per presented frame, in the pass ring's slots,
+// the parameters of every terrain draw, a draw whose vertex or fragment stage samples a 260x260 or 320x320 texture (the
+// terrain tiles: heights, normals, the Depths tiles): its programs (vs code address, fs hash), its first colour target, the
+// tile (the first such texture's address), its textures (the bound handle, the pool entry's object, its address and shape,
+// the image behind it, the hash of its bytes at their last upload, LATE: the entry changed after the list's submit), the
+// uniform buffers both stages read, the vertex stage's storage buffers, its vertex streams and its index range (address,
+// bound size and a hash of the bytes as the draw is recorded: up to 16 KB of a uniform / index range, the first 4 KB of a
+// storage / vertex buffer) and its counts. At a hit vk_cov_dump compares frame N with N-1 and N+1, a draw matched by
+// programs, target, tile and its rank among such draws: in each matched draw the values where N differs from both
+// neighbours while they agree (the one-frame change), named by where the value came from (the list's binding, the pool
+// entry, the image, the bytes); the draws only in N (paired, where one is, with the neighbours' draw of the same programs
+// and target it took the place of: another tile); the neighbours' draws missing in N (skipped draws are not recorded: the
+// hit line's 'skipped' counts them); the same counts for N-2 against N-3 / N-1 as the control, an ordinary frame's
+// (glitch_draws.h tdr_compare). TOTK_GLITCH_DRAWS=all: every draw into a target of 256 px or more. The pool is read live (a
+// LARECOMP_POOL_SNAP arm draws an entry's submit value: LATE marks those). Render thread only; ~2 MB per pass-ring slot
+// (12) once on; the bytes hashed per frame are in the summary line.
+#include "glitch_draws.h"
+static TdrFrame *g_tdr;   // [COV_F], slot for slot with g_cov (allocated at the first recorded draw)
+static int tdr_mode(void) {   // 0 off, 1 terrain draws, 2 every draw into a target of 256 px or more
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("TOTK_GLITCH_DRAWS");
+        m = !e || !*e || !strcmp(e, "0") ? 0 : !strcmp(e, "all") ? 2 : 1;
+        if (m) LOG("[glitch] draw ring on (TOTK_GLITCH_DRAWS): %s; compared at each detector hit\n",
+                   m == 2 ? "every draw into a target of 256 px or more" : "terrain draws (a 260x260 / 320x320 tile sampled)");
+    }
+    return m && vk_glitch_on() ? m : 0;
+}
+static void tdr_buf(TdrDraw *d, int kind, int stage, int slot, uint64_t addr, uint64_t size, uint64_t want, uint64_t cap) {
+    if (!addr || d->nb >= TDR_B) return;
+    uint64_t n = size && size < want ? size : want;
+    if (n > cap) n = cap;
+    d->b[d->nb++] = (TdrBuf){addr, size, n ? hash_mem(0, (const void *)(uintptr_t)addr, n) : 0, n, (uint8_t)kind, (uint8_t)stage, (uint8_t)slot};
+}
+// draw_, a draw that is recorded (its count, first vertex / base vertex, instances, index address and size)
+static void tdr_note(const ShaderInfo *vi, const ShaderInfo *fi, bool indexed, uint32_t count, uint32_t first, int32_t base_vertex,
+                     uint32_t inst, uint32_t base_inst, uint64_t iaddr, uint32_t isz) {
+    const int mode = tdr_mode();
+    if (!mode) return;
+    const NvnTexture *rt0 = st.rt.ncolor ? st.rt.color[0] : NULL;
+    if (mode == 2 && (!rt0 || (rt0->width < 256 && rt0->height < 256))) return;
+    if (!g_tdr && !(g_tdr = calloc(COV_F, sizeof *g_tdr))) return;
+    extern NvnTexture *renderer_texture_alias_writer(NvnTexture *t);
+    extern uint64_t g_draws_frame;
+    TdrFrame *f = &g_tdr[g_cov_cur];
+    static TdrDraw spare;   // (the frame's list full: judged here, then counted as dropped)
+    TdrDraw *d = f->n < TDR_N ? &f->d[f->n] : &spare;
+    d->tile = 0, d->nt = d->nb = 0;
+    const ShaderInfo *si[2] = {vi, fi};
+    for (int sg = 0; sg < 2; sg++)
+        for (int i = 0; si[sg] && i < si[sg]->ntex; i++) {
+            const ShaderTexture *x = &si[sg]->tex[i];
+            if (x->is_image) continue;
+            const int sl = ((int)x->handle_offset - 0x20) / 8;   // (as texture_info_: the handle the list bound, its pool entry)
+            const uint64_t h = sl >= 0 && sl < 32 ? st.tex[sg][sl] : 0;
+            const uint32_t tic = (uint32_t)(h & 0xFFFFF);
+            const NvnTexEntry *e = h && st.tpool && tic < (uint32_t)st.tpool->count ? &((const NvnTexEntry *)st.tpool->entries)[tic] : NULL;
+            NvnTexture *t = e ? e->tex : NULL;
+            const bool tile = t && t->width == t->height && (t->width == 260 || t->width == 320);
+            if (tile && !d->tile) d->tile = t->addr;
+            int k = d->nt;
+            if (k == TDR_T) {   // (full: a tile takes the place of the last texture that is not one)
+                if (!tile) continue;
+                while (k > 0 && d->t[k - 1].tile) k--;
+                if (!k) continue;
+                k--;
+            } else d->nt++;
+            const TexBackend *own = t ? t->backend : NULL;
+            d->t[k] = (TdrTex){t, t ? t->addr : 0, 0, own ? own->data_hash : 0, (uint32_t)h, t ? t->width : 0, t ? t->height : 0,
+                               t ? t->format : 0, (uint8_t)sg, (uint8_t)i, e && g_replay_seq && e->wseq >= g_replay_seq, tile};
+        }
+    if (mode == 1 && !d->tile) return;
+    for (int k = 0; k < d->nt; k++) {   // (the image the draw samples: its alias writer's, else its own; looked up for kept draws only)
+        NvnTexture *t = (NvnTexture *)d->t[k].t, *w = t ? renderer_texture_alias_writer(t) : NULL;
+        const TexBackend *b = t ? (w ? w : t)->backend : NULL;
+        d->t[k].img = b ? (uint64_t)(uintptr_t)b->image : 0;
+    }
+    d->vs = st.program->stages[0].code_addr, d->fs = g_cur_fs_hash;
+    d->rt = rt0 ? rt0->addr : 0, d->rtw = rt0 ? rt0->width : 0, d->rth = rt0 ? rt0->height : 0;
+    d->idx = g_draws_frame, d->indexed = indexed, d->count = count, d->first = first, d->base_vertex = base_vertex;
+    d->inst = inst, d->base_inst = base_inst, d->iaddr = iaddr;
+    for (int sg = 0; sg < 2; sg++)
+        for (int i = 0; si[sg] && i < 18 && d->nb < TDR_B - 5; i++)
+            if (si[sg]->cbuf_mask >> i & 1)
+                tdr_buf(d, TDRB_UBO, sg, i, st.ubuf[sg][i].addr, st.ubuf[sg][i].size,
+                        si[sg]->cbuf_dynamic >> i & 1 ? st.ubuf[sg][i].size : si[sg]->cbuf_size[i], 16 << 10);
+    for (int i = 0, n = 0; vi && vi->uses_gmem && i < 16 && n < 2; i++)
+        if (st.sbuf[0][i].addr) tdr_buf(d, TDRB_SSBO, 0, i, st.sbuf[0][i].addr, st.sbuf[0][i].size, st.sbuf[0][i].size, 4 << 10), n++;
+    for (int s = 0, n = 0; s < st.nstream && s < 16 && n < 2; s++)
+        if (st.vbuf[s].addr) tdr_buf(d, TDRB_VTX, 0, s, st.vbuf[s].addr, st.vbuf[s].size, st.vbuf[s].size, 4 << 10), n++;
+    if (indexed && iaddr) tdr_buf(d, TDRB_IDX, 0, 0, iaddr, 0, (uint64_t)count * isz, 16 << 10);
+    if (d == &spare) f->dropped++;
+    else f->n++;
+    for (int k = 0; k < d->nb; k++) f->hashed += d->b[k].hashed;
+}
+// vk_cov_dump: frame N's recorded draws against N-1 and N+1, N-2 against N-3 / N-1 as the control (pass-ring slots,
+// N-3 .. N+1; -1: not kept)
+static void tdr_dump(uint64_t frame, const int slot[5]) {
+    if (!tdr_mode()) return;
+    const TdrFrame *row[5];
+    for (int r = 0; r < 5; r++) row[r] = g_tdr && slot[r] >= 0 ? &g_tdr[slot[r]] : NULL;
+    tdr_compare(frame, tdr_mode() == 2 ? "draws" : "terrain draws", row);
+}
 // glitch.c vk_glitch_frame: the passes since the last call were this presented frame's
 void vk_cov_frame(uint64_t frame) {
     extern uint64_t cum_up_sent, prof_alias_writer_changes;   // (textures.c: cumulative)
@@ -4724,6 +4862,7 @@ void vk_cov_frame(uint64_t frame) {
     memset(g_cov[g_cov_cur].txe, 0, sizeof g_cov[g_cov_cur].txe);
     memset(g_cov[g_cov_cur].bxe, 0, sizeof g_cov[g_cov_cur].bxe);
     g_cov[g_cov_cur].frame = 0;
+    if (g_tdr) g_tdr[g_cov_cur].n = g_tdr[g_cov_cur].dropped = 0, g_tdr[g_cov_cur].hashed = 0;
     for (int i = 0; i < 8; i++) cov_att[i] = -1;
     cov_any = false;
 }
@@ -4823,14 +4962,24 @@ void vk_cov_dump(uint64_t frame) {
                                              "uniform range newer in memory than the frame snapshot (FRAME_SNAP=1)",
                                              "texture pool entry changed after its list's submit (late tic)",
                                              "list replayed after the game's wait for its fence returned (replay lag)",
-                                             "storage buffer read in place on the GPU timeline (host fallback)"};
+                                             "storage buffer read in place on the GPU timeline (host fallback)",
+                                             "vertex stage: written this frame", "written the frame before", "written earlier",
+                                             "fragment stage: written this frame", "written the frame before", "written earlier",
+                                             "store targets this frame (control)", "image-store dispatches this frame (control)"};
     o = 0;
-    for (int k = 0; k < BXE_N && o < (int)sizeof line - 256; k++) {   // (counts at a frame's edge are approximate: off-thread notes)
+    for (int k = 0; k < BXE_CSW_VS_CUR && o < (int)sizeof line - 256; k++) {   // (counts at a frame's edge are approximate: off-thread notes)
         o += snprintf(line + o, sizeof line - o, "%s%s ", k ? "; " : "", bname[k]);
         for (int r = 0; r < 4; r++)
             o += row[r] ? snprintf(line + o, sizeof line - o, "%s%u", r ? "/" : "", row[r]->bxe[k]) : snprintf(line + o, sizeof line - o, "%s-", r ? "/" : "");
     }
     LOG("[glitch]     frame %llu buffer events (N-2/N-1/N/N+1): %s\n", (unsigned long long)frame, line);
+    o = 0;
+    for (int k = BXE_CSW_VS_CUR; k < BXE_N && o < (int)sizeof line - 256; k++) {
+        o += snprintf(line + o, sizeof line - o, "%s%s ", k > BXE_CSW_VS_CUR ? "; " : "", bname[k]);
+        for (int r = 0; r < 4; r++)
+            o += row[r] ? snprintf(line + o, sizeof line - o, "%s%u", r ? "/" : "", row[r]->bxe[k]) : snprintf(line + o, sizeof line - o, "%s-", r ? "/" : "");
+    }
+    LOG("[glitch]     frame %llu compute-written images sampled (N-2/N-1/N/N+1): %s\n", (unsigned long long)frame, line);
     int nnew = 0;   // (frame N's objects with an event the frame before did not have for them)
     for (int k = 0; k < s->nt; k++) {
         const CovTex *c = &s->t[k];
@@ -4843,6 +4992,12 @@ void vk_cov_dump(uint64_t frame) {
     if (nnew || s->tdropped)
         LOG("[glitch]     frame %llu: %d object(s) with a texture event the frame before did not have%s\n", (unsigned long long)frame,
             nnew, s->tdropped || (p && p->tdropped) ? " (list full: some not kept)" : "");
+    {   // (TOTK_GLITCH_DRAWS: the draw ring, N-3 .. N+1)
+        const CovFrame *n3 = cov_back(at, 3);
+        const int slot[5] = {n3 ? (int)(n3 - g_cov) : -1, row[0] ? (int)(row[0] - g_cov) : -1, p ? (int)(p - g_cov) : -1, at,
+                             row[3] ? (int)(row[3] - g_cov) : -1};
+        tdr_dump(frame, slot);
+    }
 }
 
 // Metal convention (y up in NDC, origin top-left) through a negative-height viewport.
@@ -8671,8 +8826,13 @@ uint64_t vk_scene_idle_frames(void) { return pk_scene_frame == ~0ull ? 0 : rende
 // passes the 1000-draw test above (the Purah Pad's zoomed-out Surface map with its icons, an inventory tab switch), the
 // upscale only runs for the world. TotK's scene -> canvas passes: EASU (fs 32845c90c668fdbb) at 1600x900; at the dynamic
 // resolution's 1280x720 tier fs 6dc5011326ac42a2 instead. Before it was known, SR never ran and "the upscale" looked idle
-// for as long as the game held that tier.
-static inline bool is_upscale_fs(uint64_t h) { return h == 0x32845c90c668fdbbull || h == 0x6dc5011326ac42a2ull; }
+// for as long as the game held that tier. 1.4.3 rewrote the EASU stage (agl_technique_pfx.sharcb, code 0x900 -> 0xa00): fs
+// 3ff709fcfa6e5343 there, no 32845c90, so on 1.4.3 the 1600x900 tier had no SR / FG takeover, no pause scene arrival, no
+// late-latch arm. Identification only: the EASU texelFetch rewrite (translate knob, 32845c90 only) assumes 1.0.0's body
+// and is not applied to it. Its first draw logs its sampled size once (upscale_143_said).
+static inline bool is_upscale_fs(uint64_t h) {
+    return h == 0x32845c90c668fdbbull || h == 0x6dc5011326ac42a2ull || h == 0x3ff709fcfa6e5343ull;
+}
 static uint64_t pk_upscale_frame = ~0ull;
 uint64_t vk_upscale_idle_frames(void) { return pk_upscale_frame == ~0ull ? ~0ull : renderer_present_count() - pk_upscale_frame; }
 
@@ -8803,6 +8963,8 @@ static void pk_draw(Prog *pr) {   // (draw_, before the fragment textures resolv
         pk_scene_since_clear = true;
         pk_cap_frame = ~0ull;
     }
+    // (8d0bd2a0: 1.0.0's present / capture copy; in no parsed archive of either version, so its 1.4.3 value needs a 1.4.3
+    // log of a weapon-wheel opening: no '[pause]' line there = it differs, the workaround never engages)
     if (g_cur_fs_hash != 0x8d0bd2a0046fd06aull || pr->fi->ntex < 1) return;
     NvnTexture *src = shader_texture_object(1, &pr->fi->tex[0]), *dst = st.rt.color[0];
     // (the capture frame itself is presented black at 144 fps, one frame per wheel opening. Presenting the kept canvas from
@@ -10077,9 +10239,9 @@ typedef struct { uint64_t addr, size, off, seq, up, cap; } GdevRegion;  // seq: 
 // carried into, chunked submission); up: the submission whose upload buffer copied it in; cap: the bytes from addr its
 // window slot reserves (size <= cap: a later binding of the same start may grow into it, gdev_map) The device window's
 // region table. Up to 256 regions by default: a submission that binds more storage buffers than that left the rest in
-// host memory: ~5000 '(256 regions, half 0)' host fallbacks per 2 s LEAD 10:57, the gate's one-frame foreign-mesh
-// glitches). LARECOMP_GDEV_REGIONS=<n> (16.. 2048): a larger table (an A/B arm: the 'host fallbacks' figure of the [vk]
-// line should drop; every lookup scans the table, so the CPU cost grows with it).
+// host memory: ~5000 '(256 regions, half 0)' host fallbacks per 2 s, the gate's one-frame foreign-mesh glitches).
+// LARECOMP_GDEV_REGIONS=<n> (16.. 2048): a larger table (an A/B arm: the 'host fallbacks' figure of the [vk] line should
+// drop; every lookup scans the table, so the CPU cost grows with it).
 #define GDEV_REGS 2048
 static GdevRegion gdev_reg[GDEV_REGS];
 static int gdev_lim(void) {
@@ -11919,7 +12081,8 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
     if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
         NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
         NvnTexture *tex = e->tex;  // read once (finalize clears entries; nvn.h backend_exec_lock)
-        // Detector only, a count + 4 lines a frame.
+        // one-frame research T1: an entry the game changed after this list's submit, read now by its later replay (the async
+        // queue's lag): the list draws with the next frame's texture there. Detector only, a count + 4 lines a frame.
         if (g_replay_seq && e->wseq >= g_replay_seq && vk_glitch_on()) {
             bxe_note(BXE_LATE_TIC);
             static uint64_t lf; static int ln;
@@ -11935,6 +12098,11 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
         if (se != e) e = &snap_e, tex = e->tex, g_tic_snapped = true;
         if (tex && stage == 5 && st_->is_image && cov_img_n < 8) cov_img[cov_img_n++] = tex;   // (pass ring: this dispatch's store targets)
         if (tex && ufr_unsampled) ufr_sampled(tex, stage);   // (#70: who reads an unscaled scene-fraction target)
+        uint64_t cwf;
+        if (tex && (stage == 0 || stage == 1) && !st_->is_image && vk_glitch_on() && (cwf = csw_get(tex->addr))) {
+            const uint64_t f = vk_frame_counter() + 1;
+            bxe_note((stage == 0 ? BXE_CSW_VS_CUR : BXE_CSW_FS_CUR) + (cwf == f ? 0 : cwf + 1 == f ? 1 : 2));
+        }
         if (tex) {
             // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
             // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
@@ -12805,6 +12973,16 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
                 const uint64_t pg = st.program->stages[5].code_addr;
                 cov_dispatch(pg, gx * cp->local[0], gy * cp->local[1]);
                 for (int m = 0; m < cov_img_n; m++) cov_image_store(cov_img[m], pg);
+                // (No side effects: shader_texture_object would re-upload a zombie)
+                bxe_note(BXE_CSW_DISP);
+                for (int q = k; q < cp->si->ntex; q++) {
+                    if (!cp->si->tex[q].is_image) continue;
+                    const int sl = ((int)cp->si->tex[q].handle_offset - 0x20) / 8;
+                    const uint64_t h = sl >= 0 && sl < 32 ? st.tex[5][sl] : 0;
+                    const uint32_t tic = (uint32_t)(h & 0xFFFFF);
+                    NvnTexture *t = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
+                    if (t) csw_mark(t->addr, tegra_total_size(&t->layout), vk_frame_counter() + 1), bxe_note(BXE_CSW_STAMPED);
+                }
             }
             break;
         }
@@ -13056,14 +13234,25 @@ static void draw_(CmdRec *r, bool indexed) {
         {   // SR / FG on (vk_ngx_sr_on: SR ready, or FG, which takes the pass over for its inputs) and neither upscale
             // pass seen in 5 minutes of presents (at 60): neither ever runs, as at the 1280x720 tier before 6dc5 was
             // known. Once; a mod's or another version's upscale shader shows here
-            static bool up_seen, up_said;
+            static bool up_seen, up_said, upscale_143_said;
             if (upscale_pass) up_seen = true;
             else if (!up_seen && !up_said && renderer_present_count() >= 18000) {
                 up_said = true;
                 if (vk_ngx_sr_on())
-                    LOG("[dlss] SR / FG on, but the game's upscale pass (fs 32845c90c668fdbb or 6dc5011326ac42a2) has not drawn "
+                    LOG("[dlss] SR / FG on, but the game's upscale pass (fs 32845c90c668fdbb, 3ff709fcfa6e5343 or 6dc5011326ac42a2) has not drawn "
                         "in %llu presents: SR / FG never take it over (still in the title menu, or a mod's / another version's "
                         "upscale shader: TOTK_DLSS_HUNT=1 lists the candidates)\n", (unsigned long long)renderer_present_count());
+            }
+            if (upscale_pass && last_hash == 0x3ff709fcfa6e5343ull && !upscale_143_said) {   // (1.4.3's EASU, first draw: is its
+                // texture 0 the scene, as SR / pause take it? Read from the bound handle, no texture lookup side effects)
+                upscale_143_said = true;
+                const int sl = pr->fi->ntex >= 1 ? ((int)pr->fi->tex[0].handle_offset - 0x20) / 8 : -1;
+                const uint64_t h = sl >= 0 && sl < 32 ? st.tex[1][sl] : 0;
+                const uint32_t tic = (uint32_t)(h & 0xFFFFF);
+                const NvnTexture *t0 = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
+                LOG("[shader] fs hash 3ff709fcfa6e5343 (1.4.3 upscale, EASU): %d textures, texture 0 %ux%u f%#x into %ux%u (the scene "
+                    "size = SR / pause take it)\n", pr->fi->ntex, t0 ? t0->width : 0, t0 ? t0->height : 0, t0 ? t0->format : 0,
+                    st.rt.color[0] ? st.rt.color[0]->width : 0, st.rt.color[0] ? st.rt.color[0]->height : 0);
             }
         }
         if (ll_canvas && !upscale_pass && st.rt.color[0] == ll_canvas) late_latch_fire(false);
@@ -13715,9 +13904,9 @@ pipe_known:;
                            (dbk->format == VK_FORMAT_D32_SFLOAT || dbk->format == VK_FORMAT_D32_SFLOAT_S8_UINT);
         DYN_SET(memcmp(dyn.bias, f, sizeof f) || dyn.bias_unorm != unorm, (memcpy(dyn.bias, f, sizeof f), dyn.bias_unorm = unorm),
                 set_depth_bias(cb, f, unorm));
-        // '[d24bias]' (LEAD 04:45): once per distinct depth target kind (NVN format, size, layers) drawn with the game's polygon
-        // offset, and its bias draws every 30 s (10 lines at most): whether the sun cascades are DEPTH24 (the D24 unit reaches
-        // them) or DEPTH32F (not: the game picks the format through agl, no literal at the shadow sites)
+        // '[d24bias]': once per distinct depth target kind (NVN format, size, layers) drawn with the game's polygon offset, and its
+        // bias draws every 30 s (10 lines at most): whether the sun cascades are DEPTH24 (the D24 unit reaches them) or DEPTH32F (not:
+        // the game picks the format through agl, no literal at the shadow sites)
         static struct { uint32_t fmt, w, h, d; uint64_t n; } kinds[24];
         static int nk, cur = -1, nsum;
         static const NvnTexture *seen_t;
@@ -14163,6 +14352,9 @@ pipe_known:;
         nruns = 0;
     }
     hang_op(cb, HOP_DRAW, g_cur_fs_hash, st.program->stages[0].code_addr, use_index ? icount : count, inst, fb_bits);
+    if (nruns)
+        tdr_note(pr->vi, pr->fi, indexed, count, first, base_vertex, inst, base_inst, indexed ? r->x[3] : 0,
+                 (uint32_t)r->x[1] == 0 ? 1 : (uint32_t)r->x[1] == 1 ? 2 : 4);
     if (g_gpuprof_frame && gp_per_draw())   // (LARECOMP_GPUPROF_DRAWS=1: a timestamp before every draw; see vk_gpuprof_report)
         gp_mark(cb, "draw fs %016llx n %u inst %u", (unsigned long long)g_cur_fs_hash, use_index ? icount : count, inst);
     if (nruns && oq_scope) oq_draw(cb);   // (occlusion query scope: its query for this pass segment)
@@ -16084,17 +16276,17 @@ static void exec_list(uint64_t handle, int depth) {
             }
             static uint64_t frame_seen = ~0ull, frame_ts;
             if (frozen && vk_frame_counter() != frame_seen) { frame_seen = vk_frame_counter(); frame_ts = SDL_GetTicksNS(); }
-            // type 1 = SAMPLES_PASSED: TotK resets it (nvnCommandBufferResetCounter(1)) and reads it back as an occlusion
-            // query. Reporting 0 made every queried light / flame "occluded": Zelda's torch lit the hall only while the camera
-            // was close to it (user 2026-10-14 22:40). Until real Vulkan occlusion queries exist, report "visible": a count
-            // that grows by 4096 per report (so both "since reset" and "end - begin" reads are > 0). LARECOMP_OCCLUSION=zero =
-            // the old behaviour (A/B). (since 2026-10-30 real queries replace that value once the submission completed:
-            // oq_report) The count's low 32 bits stay within [4096, 2^31) while the 64-bit count keeps rising: it grew by 4096
-            // a report forever, so after ~1M reports (~1 h at ~250 a second) its low 32 bits wrapped through 0 and then past
-            // 2^31, and a 32-bit read (unsigned 0, or signed negative) said 'hidden' for that report: a one-frame cull in long
-            // sessions, in the default path. At the 2^31 edge it jumps to the next 2^32 block + 4096: every absolute read (32
-            // or 64 bits, signed or not) stays positive, a 64-bit 'end - begin' stays > 0; only a 32-bit 'end - begin' across
-            // that one jump (once per ~524k reports) is off, and still not equal.
+            // type 1 = SAMPLES_PASSED: TotK resets it (nvnCommandBufferResetCounter(1)) and reads it back as an occlusion query.
+            // Reporting 0 made every queried light / flame "occluded": Zelda's torch lit the hall only while the camera was close
+            // to it (user 2026-10-14 22:40). Until real Vulkan occlusion queries exist, report "visible": a count that grows by
+            // 4096 per report (so both "since reset" and "end - begin" reads are > 0). LARECOMP_OCCLUSION=zero = the old behaviour
+            // (A/B). (since 2026-10-30 real queries replace that value once the submission completed: oq_report) The count's low 32
+            // bits stay within [4096, 2^31) while the 64-bit count keeps rising: it grew by 4096 a report forever, so after ~1M
+            // reports (~1 h at ~250 a second) its low 32 bits wrapped through 0 and then past 2^31, and a 32-bit read (unsigned 0,
+            // or signed negative) said 'hidden' for that report: a one-frame cull in long sessions, in the default path. At the
+            // 2^31 edge it jumps to the next 2^32 block + 4096: every absolute read (32 or 64 bits, signed or not) stays positive,
+            // a 64-bit 'end - begin' stays > 0; only a 32-bit 'end - begin' across that one jump (once per ~524k reports) is off,
+            // and still not equal.
             static uint64_t samples;
             uint64_t v = 0;
             if (type == 1 && oq_on() != 0) {

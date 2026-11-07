@@ -494,8 +494,7 @@ extern "C" int vi_unlock_setting(void) { return unlock_mode(); }
 extern "C" void totk_frame_step_retarget(void);   // games/totk (totk_patches.h): the realtime step after a rate change
 // The engine's speed fix (hook_f_7a83e4) clamps the frame time to 1/20 s, so on a build without the realtime step patch
 // (safe mode; every package has the patch and the speed fix off) the 15 rung would run at 75 %: while Steady paces
-// under 20 its clamp is 1/15 s, the realtime step's own ceiling. Never above 1/15 (LEAD 11-03 05:31: no step size the
-// game has not had; a frame that misses the 15 rung loses one refresh of game time, accepted)
+// under 20 its clamp is 1/15 s, the realtime step's own ceiling. Never above 1/15
 static std::atomic<int> g_steady_slowest{0};
 // display.fps_cap's values (pc_settings.cpp V_FPS): "30" the game's own, "40" / "45" (a PC that cannot hold 60),
 // "60" .. "240" (the usual monitor rates), "unlocked", "steady"
@@ -1030,8 +1029,15 @@ static void vi_pace_wait(int interval) {
         // Not with fgtest / TOTK_FG_CAP=real (their own rules).
         const bool fg_max = fg_n && !fgtest && !cap_real && fps > 0 && vk_fg_max();
         if (fg_max) {
-            static bool said;
-            if (!said) printf("[pace] FG maximum: real frames paced as without FG (cap %d), %d generated each, no refresh limit (Automatic and the 30-real floor off)\n", fps, fg_n), said = true;
+            // (said again when the cap or the count changes: once only, it gave the loading screen's 120 for an unlocked
+            // game)
+            static int said_fps, said_n;
+            if (fps != said_fps || fg_n != said_n) {
+                static int nsaid;
+                if (nsaid++ < 40) printf("[pace] FG maximum: real frames paced as without FG (cap %d%s), %d generated each, no refresh limit (Automatic and the 30-real floor off)\n",
+                                         fps, g_gameplay.load() ? "" : ", outside gameplay", fg_n);
+                said_fps = fps, said_n = fg_n;
+            }
         } else if (!fgtest && !cap_real && fps >= 60 && fg_n) {
             // With VRR (the display.vrr row: FIFO) the panel shows each frame as it comes, so the whole-refresh rungs only
             // cost rate (a game holding 100 real fps fell to the 60 rung: 120 on screen against 130 without FG); there the
@@ -1183,16 +1189,16 @@ static void vi_pace_wait(int interval) {
 // an EMA of 0.08 (instant jumps crashed Astro). TOTK_SPEED_FIX=0: old behaviour (fixed step); [speedfix] logs k every
 // 300 calls.
 void f_7a83e4_orig(Ctx* __restrict c);
-// Is the game reading the realtime step? (v0.1.10, LEAD 12:52.) A slot exe generated from an UNPATCHED image ran with
-// TOTK_IMG naming the patched one: totk_engine.c's main_has_realtime read the patched image's words, TOTK_SPEED_FIX=0
-// came from the package's player.txt, and the game took its own interval step (1/60 s a frame), 2.7-3.7x speed at
-// 160-224 fps, while '[totk] game speed' said 1.00x (that line is the step the runtime writes, not the one the game
-// reads). So right after the game's frame-delta setter its ratio (this+8) is compared with the data page's: the realtime
-// patch makes them the same, the unpatched setter stores interval / 2. Decided over 60 frames whose page ratio is at least
-// 20 % away from interval / 2 (near the interval's own rate both read alike, and nothing runs fast there); not read in 9
-// of 10: a loud line, and the speed fix below goes on (it scales the interval step to measured time). A page ratio that
-// moved between the setter's read and this one (the present thread writes it) is within the 5 % tolerance or a minority.
-// TOTK_STEP_CHECK=0: neither the check nor the switch.
+// Is the game reading the realtime step? A slot exe generated from an UNPATCHED image ran with TOTK_IMG naming the patched
+// one: totk_engine.c's main_has_realtime read the patched image's words, TOTK_SPEED_FIX=0 came from the package's
+// player.txt, and the game took its own interval step (1/60 s a frame), 2.7-3.7x speed at 160-224 fps, while '[totk] game
+// speed' said 1.00x (that line is the step the runtime writes, not the one the game reads). So right after the game's
+// frame-delta setter its ratio (this+8) is compared with the data page's: the realtime patch makes them the same, the
+// unpatched setter stores interval / 2. Decided over 60 frames whose page ratio is at least 20 % away from interval / 2
+// (near the interval's own rate both read alike, and nothing runs fast there); not read in 9 of 10: a loud line, and the
+// speed fix below goes on (it scales the interval step to measured time). A page ratio that moved between the setter's read
+// and this one (the present thread writes it) is within the 5 % tolerance or a minority. TOTK_STEP_CHECK=0: neither the
+// check nor the switch.
 extern "C" void* totk_data_page_current(void);   // games/totk/runtime/totk_patches.c
 static int step_check(const float* g, u32 interval) {   // 1: the game reads the page's step, -1: it does not, 0: not yet known
     static StepCheck sc;

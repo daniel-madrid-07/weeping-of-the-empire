@@ -2670,7 +2670,7 @@ class BuilderForm : Form
                 catch (IOException e)
                 {
                     throw new IOException(L.S("Could not download the source code ({0}) from {1}. Check the internet connection; a firewall, " +
-                        "proxy or school / work network can block github.com. Then press Install again. ({2})", Release.Tag, source ?? "github.com", e.Message));
+                        "proxy or school / work network can block github.com. Then press Install again. ({2})", Release.Tag, source ?? "github.com", e.Message) + GitSaid(e));
                 }
                 string src = Source(scratch, tools);   // (from the kit's src.git, as the PC without internet will)
                 string items = Path.Combine(scratch, "setup-items.tsv");
@@ -2911,7 +2911,7 @@ class BuilderForm : Form
         catch (IOException e)   // (git's own last lines are already in the log above)
         {
             throw new IOException(L.S("Could not download the source code ({0}) from {1}. Check the internet connection; a firewall, " +
-                "proxy or school / work network can block github.com. Then press Install again. ({2})", Release.Tag, source ?? "github.com", e.Message) +
+                "proxy or school / work network can block github.com. Then press Install again. ({2})", Release.Tag, source ?? "github.com", e.Message) + GitSaid(e) +
                 (kit == null ? "" : L.S(" It is not in the download kit ({0}) either: make the kit again with Setup " +
                                         "--download-kit on a PC with internet, or connect this PC.", kit)));
         }
@@ -2953,7 +2953,8 @@ class BuilderForm : Form
         };
         if (cwd != null) psi.WorkingDirectory = cwd;
         if (env != null) foreach (var kv in env) psi.EnvironmentVariables[kv.Key] = kv.Value;
-        var tail = new List<string>();
+        var gate = new object();
+        string said = null;   // the last line the helper said that is not a progress line: what the dialog quotes
         using (var p = new Process { StartInfo = psi })
         {
             DataReceivedEventHandler h = (s, e) =>
@@ -2962,9 +2963,13 @@ class BuilderForm : Form
                 foreach (var ln in e.Data.Split('\r'))
                 {
                     if (ln.Trim().Length == 0) continue;
-                    lock (tail) { tail.Add(ln); if (tail.Count > 4) tail.RemoveAt(0); }
                     var g = GitPercent.Match(ln);
-                    if (g.Success) Append(string.Format("[Builder] {0}: {1}% (git)", g.Groups[1].Value, g.Groups[2].Value));
+                    if (g.Success) { Append(string.Format("[Builder] {0}: {1}% (git)", g.Groups[1].Value, g.Groups[2].Value)); continue; }
+                    if (Percent.IsMatch(ln)) continue;   // (remote: Counting objects: 33% (1/3) ...)
+                    // everything else git says goes to setup.log as it comes: its real reason (fatal: unable to access ...)
+                    // is what a player's report needs, not only the last few lines
+                    lock (gate) said = ln.Trim();
+                    Append("[git] " + ln.TrimEnd());
                 }
             };
             p.OutputDataReceived += h; p.ErrorDataReceived += h;
@@ -2973,10 +2978,24 @@ class BuilderForm : Form
             p.WaitForExit();
             if (p.ExitCode != 0)
             {
-                lock (tail) foreach (var ln in tail) Append(ln);
-                throw new IOException(L.S("{0} failed (exit code {1}); the last lines are below", Path.GetFileName(exe), p.ExitCode));
+                string last; lock (gate) last = said;
+                throw new HelperFailed(L.S("{0} failed (exit code {1}); the last lines are below", Path.GetFileName(exe), p.ExitCode), last);
             }
         }
+    }
+
+    // A helper that exited non-zero, with the last non-progress line it printed (git's own reason)
+    public sealed class HelperFailed : IOException
+    {
+        public readonly string Said;
+        public HelperFailed(string message, string said) : base(message) { Said = said; }
+    }
+
+    // What a download failure adds to the dialog: git's own last line, quoted (the same line is in setup.log)
+    public static string GitSaid(IOException e)
+    {
+        var f = e as HelperFailed;
+        return f == null || string.IsNullOrEmpty(f.Said) ? "" : "\ngit: " + (f.Said.Length > 300 ? f.Said.Substring(0, 300) + "..." : f.Said);
     }
 
     void RunBuilder(string src, string python, string pyArgs, Dictionary<string, string> env, string extra = "", string args = null)

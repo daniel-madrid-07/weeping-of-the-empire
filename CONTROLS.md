@@ -8,7 +8,9 @@ rumble and the back paddles of an Xbox Elite or DualSense Edge are in F10 > Cont
 [SETTINGS.md](SETTINGS.md#controls).
 
 A controller plays as on the Switch, the same button for the same action; F10 > Controls > Face buttons
-chooses whether a non-Nintendo pad's buttons follow their position or their labels.
+chooses whether a non-Nintendo pad's buttons follow their position or their labels. Menu buttons, beside
+it, sets the menus' confirm and back on their own (printed A / B, or the Switch layout) without changing
+jump or interact in the world.
 
 Keys that always work: **F10** opens the settings window, **F9** the performance overlay, **F11** or
 **Alt+Enter** switches fullscreen, **Alt+F4** closes the game (save first: as on the console, anything since

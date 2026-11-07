@@ -1,23 +1,23 @@
-// frame_snap.c: the capture half of the frame snapshot (frameguard LEAD 2026-11-03 P0, the v0.1.9 gate's one-frame rain
-// streaks / missing roof / camera-elsewhere frames, hdr the replay half in exec.c). With the async render thread the replay
-// of a submitted list reads the uniform data and CPU-written vertex / instance streams it binds from guest memory when it
-// gets to them, which can be after the game has rewritten them for its next list or frame (LARECOMP_ASYNC_EXEC=0 cut the
-// gate's glitch rate ~5x). So at each submit (backend_execute, on the game's thread, before the list's AOP_EXEC is queued)
-// the list's bound ranges are copied, and the replay of that list reads them from this copy (exec.c vk_snap_src ->
-// guest_copy, and a vertex stream it covers is copied instead of bound in place). What is taken: every
-// CMD_BIND_UNIFORM_BUFFERS range of the list and of the lists it CALLs (up to LARECOMP_FRAME_SNAP_UBO_KB, default 64: NVN's
-// largest uniform buffer), and every CMD_BIND_VERTEX_BUFFERS range up to LARECOMP_FRAME_SNAP_VTX_KB (default 0 = uniform
-// data only, hdr: the gate's COPY_VERTICES arm did not clear the glitches, so streams are not the cause; =256 takes the
-// per-frame streams, a large static mesh stays live), merged, copied once, at most LARECOMP_FRAME_SNAP_MB (default 32) per
-// submit. A range outside committed memory is left live (a stale binding the list never draws with must not fault here), and
-// so is a range in heap pages a shader has written (gdev_blk: its bytes come back on the GPU timeline). OFF by default since
-// 11-05 (LARECOMP_FRAME_SNAP=1: on): the cand-0 A/B (look 32:9 flicks, 15 min each) ran 22.9 fps with it against 72.7
-// without, '[framesnap]' 1.1-1.9 s per 2 s on the game's threads, and its target (one-frame stale scenes) turned out to be
-// the camera clipping into walls (TOTK_MOUSE_STEP_MAX). Windows only; elsewhere nothing is taken (live, as before).
-// '[framesnap]' every ~2 s: submits, ranges, MB copied and the game threads' ms, what was left live, and how the replay's
-// own writes were folded in. The replay's own guest writes: on the Switch they happen in order before a later list, so the
-// snapshot of list L must hold the writes of every list replayed between L's capture and L's replay, and not the game's
-// writes after the capture. Every replay write goes into a ticketed log (one sequence for all threads):
+// frame_snap.c: the capture half of the frame snapshot (frameguard, the v0.1.9 gate's one-frame rain streaks / missing roof /
+// camera-elsewhere frames, hdr the replay half in exec.c). With the async render thread the replay of a submitted list reads
+// the uniform data and CPU-written vertex / instance streams it binds from guest memory when it gets to them, which can be
+// after the game has rewritten them for its next list or frame (LARECOMP_ASYNC_EXEC=0 cut the gate's glitch rate ~5x). So at
+// each submit (backend_execute, on the game's thread, before the list's AOP_EXEC is queued) the list's bound ranges are
+// copied, and the replay of that list reads them from this copy (exec.c vk_snap_src -> guest_copy, and a vertex stream it
+// covers is copied instead of bound in place). What is taken: every CMD_BIND_UNIFORM_BUFFERS range of the list and of the
+// lists it CALLs (up to LARECOMP_FRAME_SNAP_UBO_KB, default 64: NVN's largest uniform buffer), and every
+// CMD_BIND_VERTEX_BUFFERS range up to LARECOMP_FRAME_SNAP_VTX_KB (default 0 = uniform data only, hdr: the gate's COPY_VERTICES
+// arm did not clear the glitches, so streams are not the cause; =256 takes the per-frame streams, a large static mesh stays
+// live), merged, copied once, at most LARECOMP_FRAME_SNAP_MB (default 32) per submit. A range outside committed memory is left
+// live (a stale binding the list never draws with must not fault here), and so is a range in heap pages a shader has written
+// (gdev_blk: its bytes come back on the GPU timeline). OFF by default since 11-05 (LARECOMP_FRAME_SNAP=1: on): the cand-0 A/B
+// (look 32:9 flicks, 15 min each) ran 22.9 fps with it against 72.7 without, '[framesnap]' 1.1-1.9 s per 2 s on the game's
+// threads, and its target (one-frame stale scenes) turned out to be the camera clipping into walls (TOTK_MOUSE_STEP_MAX).
+// Windows only; elsewhere nothing is taken (live, as before). '[framesnap]' every ~2 s: submits, ranges, MB copied and the
+// game threads' ms, what was left live, and how the replay's own writes were folded in. The replay's own guest writes: on the
+// Switch they happen in order before a later list, so the snapshot of list L must hold the writes of every list replayed
+// between L's capture and L's replay, and not the game's writes after the capture. Every replay write goes into a ticketed log
+// (one sequence for all threads):
 //  - frame_snap_write (UPDATE_UNIFORM_BUFFER, ReportCounter, COPY_BUFFER_TO_BUFFER: the bytes are in host memory at once):
 //    the current list's snapshot takes them directly; a later list's snapshot folds them in when it becomes current
 //    (frame_snap_apply): from the bytes the log kept (writes <= 4 KB), else from live memory, where the replay wrote them

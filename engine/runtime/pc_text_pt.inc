@@ -77,6 +77,16 @@ PC_TR("The button pictures in every prompt and menu, for the keys and buttons bo
       "As imagens dos botões em todos os avisos e menus, para as teclas e botões atribuídos. Automático segue o último dispositivo usado: teclado e mouse, controle Xbox (XInput), DualSense / DualShock 4, ou os do próprio jogo com controle Nintendo. A mudança aparece na hora, em todos os avisos e rótulos; com um controle em uso, os menus ocultam o ponteiro do mouse até o mouse se mover.")
 PC_TR("Automatic (the device used last)",
       "Automático (último dispositivo usado)")
+PC_TR("Menu buttons",
+      "Botões nos menus")
+PC_TR("Same as the game",
+      "Como no jogo")
+PC_TR("Printed A accepts, B goes back",
+      "O A impresso confirma, o B volta")
+PC_TR("Switch layout (right accepts, bottom goes back)",
+      "Layout do Switch (direita confirma, baixo volta)")
+PC_TR("The pad's four face buttons in menus, dialogues and the title screen. Same as the game: as Face buttons and the Pad buttons rows give them. Printed A accepts, B goes back: the button printed A (Cross) confirms and B (Circle) goes back, whatever jump and interact use in the world. Switch layout: the right button confirms, the bottom one goes back. Nothing changes in the world. A change applies at once.",
+      "Os quatro botões frontais do controle em menus, diálogos e na tela de título. Como no jogo: como Botões frontais e as linhas de Botões do controle os definem. O A impresso confirma, o B volta: o botão com A (Xis) confirma e o com B (Círculo) volta, seja qual for o botão de pular e interagir no mundo. Layout do Switch: o botão da direita confirma, o de baixo volta. Nada muda no mundo. A mudança vale na hora.")
 PC_TR("Switch (the game's)",
       "Switch (do jogo)")
 PC_TR("Keyboard and mouse",
@@ -785,6 +795,8 @@ PC_TR("The keys of the Console scheme: Classic, PC (WASD), or Custom (the key bi
       "As teclas do esquema Console: Clássico, PC (WASD) ou Personalizado (atribuições abaixo).")
 PC_TR("The button pictures in prompts and menus. Automatic follows the device you used last: keyboard and mouse, Xbox, PlayStation or Nintendo.",
       "As imagens dos botões em avisos e menus. Automático segue o último dispositivo usado: teclado e mouse, Xbox, PlayStation ou Nintendo.")
+PC_TR("The pad's face buttons in menus and dialogues: as the game, printed A accepts and B goes back, or the Switch layout (right accepts). The world keeps its layout.",
+      "Os botões frontais do controle em menus e diálogos: como no jogo, o A impresso confirma e o B volta, ou o layout do Switch (direita confirma). O mundo mantém seu layout.")
 PC_TR("In menus a mouse pointer shows and selects what it points at; left click is A, Esc goes back.",
       "Nos menus, um ponteiro do mouse aparece e seleciona o que aponta; clique esquerdo é A, Esc volta.")
 PC_TR("In the pause menu and the Purah Pad: Esc goes back, PageUp / PageDown or the wheel switch tabs, left click selects and right click goes back.",

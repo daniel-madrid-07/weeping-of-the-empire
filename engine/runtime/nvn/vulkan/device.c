@@ -43,11 +43,11 @@ static const char *pcache_file(void) {
     const char *e = getenv("LARECOMP_VK_DYN_UBO");
     return e && !strcmp(e, "0") ? "cache/vk_pipelines.bin" : "cache/vk_pipelines_dynubo.bin";
 }
-// rt_main.cpp on_crash, on the crashing thread (Windows; public #55's follow-up, LEAD v0.1.10): this thread was inside the
-// driver's pipeline cache, parsing the file (vkCreatePipelineCache with its data) or serialising it (vkGetPipelineCacheData,
-// the periodic saver and the exit's save): a cache the driver chokes on would crash every start the same way, so the file
-// is set aside as <file>.crashed (kept for a report) and the next start builds a new one. Writes what to tell the player
-// into msg; 0: not in a cache call. No locks (a crash handler); rename after removing an older aside copy.
+// rt_main.cpp on_crash, on the crashing thread: this thread was inside the driver's pipeline cache, parsing the file
+// (vkCreatePipelineCache with its data) or serialising it (vkGetPipelineCacheData, the periodic saver and the exit's save): a
+// cache the driver chokes on would crash every start the same way, so the file is set aside as <file>.crashed (kept for a
+// report) and the next start builds a new one. Writes what to tell the player into msg; 0: not in a cache call. No locks (a
+// crash handler); rename after removing an older aside copy.
 static __thread const char *tl_pcache_op;
 int vk_pcache_crashed(char *msg, int n) {
     if (!tl_pcache_op) return 0;
@@ -610,16 +610,16 @@ static bool g_queue_shared;
 static pthread_mutex_t g_queue_mu = PTHREAD_MUTEX_INITIALIZER;
 void vk_queue_lock(void) { if (g_queue_shared) pthread_mutex_lock(&g_queue_mu); }
 void vk_queue_unlock(void) { if (g_queue_shared) pthread_mutex_unlock(&g_queue_mu); }
-// Safe GPU mode (public #55's follow-up, LEAD v0.1.10): a run that ends in a crash inside the graphics driver's own files
-// (rt_main.cpp on_crash: the faulting module lives in Windows' DriverStore, where every vendor installs its Vulkan driver
-// and shader compiler) adds one to this GPU and driver's count in cache/gpu_crashes.txt ("vendor device driver crashes
-// clean"). In stages, from the third such run in a row: whole pipelines instead of pipeline libraries (GPL off) and one
-// shader build at a time (exec.c: one precompile worker, the compile gate at 1), which costs build time only; from the
-// fifth, also the driver's optimizer off for every program (exec.c noopt, engine pipelines), which can cost frame rate. A
-// clean exit before the third clears the count; once in safe mode it takes three clean runs in a row to end it (one good
-// run after three crashes is no cure), and a new driver or GPU starts clean (the file names them). The per-shader
-// quarantine (shader_quar.h) still moves single shaders on; this covers crashes it cannot place (outside a build of ours,
-// on a driver thread, a driver failing everywhere). LARECOMP_GPU_SAFE=0: never; =1: the first stage; =2: both.
+// Safe GPU mode: a run that ends in a crash inside the graphics driver's own files (rt_main.cpp on_crash: the faulting module
+// lives in Windows' DriverStore, where every vendor installs its Vulkan driver and shader compiler) adds one to this GPU and
+// driver's count in cache/gpu_crashes.txt ("vendor device driver crashes clean"). In stages, from the third such run in a row:
+// whole pipelines instead of pipeline libraries (GPL off) and one shader build at a time (exec.c: one precompile worker, the
+// compile gate at 1), which costs build time only; from the fifth, also the driver's optimizer off for every program (exec.c
+// noopt, engine pipelines), which can cost frame rate. A clean exit before the third clears the count; once in safe mode it
+// takes three clean runs in a row to end it (one good run after three crashes is no cure), and a new driver or GPU starts clean
+// (the file names them). The per-shader quarantine (shader_quar.h) still moves single shaders on; this covers crashes it cannot
+// place (outside a build of ours, on a driver thread, a driver failing everywhere). LARECOMP_GPU_SAFE=0: never; =1: the first
+// stage; =2: both.
 #define GPU_CRASH_PATH "cache/gpu_crashes.txt"
 enum { GPU_SAFE_AFTER = 3, GPU_NOOPT_AFTER = 5, GPU_SAFE_CLEAN_END = 3 };
 static int g_gpu_stage;              // (0 off, 1 GPL off + one build at a time, 2 and the optimizer off)
@@ -869,14 +869,14 @@ static void create_device(void) {
     const char *v23 = getenv("LARECOMP_2D_OF_3D");
     g_vk.view2d_of_3d = has_ext(ep, ne, VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME) && !getenv("LARECOMP_NO_2D_OF_3D") && !(v23 && !strcmp(v23, "copy"));
     if (g_vk.view2d_of_3d) ext[n_ext++] = VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME;
-    // VK_EXT_depth_bias_control (LEAD 2026-11-03): NVN's DEPTH24 / DEPTH24_STENCIL8 are D32_SFLOAT / D32_SFLOAT_S8 here
-    // (textures.c fmt_of), where Vulkan's constant depth bias unit r follows each primitive's largest depth exponent, 2^(e -
-    // 23), instead of D24's fixed 2^-24: the game's polygon offset shrank with depth, 64x at z 0.01 (decals and other
-    // coplanar draws on the scene's D24 targets). Not the sun: its cascades are DEPTH16 (0x32), native D16 with D16's unit,
-    // so this is no fix for the 32:9 grey (the wide shadow cap, textures.c shadow_wide_cap, stays its guard). FORCE_UNORM
-    // takes r = 2^-24 on a D32F attachment = D24's; exec.c uses it for draws into such targets only (a DEPTH32F guest target
-    // keeps the float unit). Without the extension or its feature, the bias stays in the float unit (said once below): no
-    // bound scale exists for a per-primitive r. LARECOMP_DEPTH_BIAS_UNORM=0: off.
+    // VK_EXT_depth_bias_control: NVN's DEPTH24 / DEPTH24_STENCIL8 are D32_SFLOAT / D32_SFLOAT_S8 here (textures.c fmt_of),
+    // where Vulkan's constant depth bias unit r follows each primitive's largest depth exponent, 2^(e - 23), instead of D24's
+    // fixed 2^-24: the game's polygon offset shrank with depth, 64x at z 0.01 (decals and other coplanar draws on the scene's
+    // D24 targets). Not the sun: its cascades are DEPTH16 (0x32), native D16 with D16's unit, so this is no fix for the 32:9
+    // grey (the wide shadow cap, textures.c shadow_wide_cap, stays its guard). FORCE_UNORM takes r = 2^-24 on a D32F
+    // attachment = D24's; exec.c uses it for draws into such targets only (a DEPTH32F guest target keeps the float unit).
+    // Without the extension or its feature, the bias stays in the float unit (said once below): no bound scale exists for a
+    // per-primitive r. LARECOMP_DEPTH_BIAS_UNORM=0: off.
     const char *dbu = getenv("LARECOMP_DEPTH_BIAS_UNORM");
     g_vk.dbias_unorm = has_ext(ep, ne, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME) && !(dbu && *dbu == '0');
     if (g_vk.dbias_unorm) ext[n_ext++] = VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME;
@@ -1402,10 +1402,9 @@ static VkPresentModeKHR present_mode(void) {
                           : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR
                           : !strcmp(e, "fifo_relaxed") ? VK_PRESENT_MODE_FIFO_RELAXED_KHR : VK_PRESENT_MODE_FIFO_KHR;
     if (atomic_load(&g_present_override) >= 0) want = (VkPresentModeKHR)atomic_load(&g_present_override);
-    // 'Maximum fps' takes MAILBOX (IMMEDIATE where the window has no mailbox) with the VRR row on too: with VRR's
-    // FIFO the frames above the refresh held up the render thread's acquire, so the real ones fell back to ~refresh /
-    // (n + 1). TOTK_FG_MAX_VRR_FIFO=1: FIFO with the VRR row on (before; mailbox can turn G-SYNC off on some
-    // drivers).
+    // 'Maximum fps' takes MAILBOX (IMMEDIATE where the window has no mailbox) with the VRR row on too: with VRR's FIFO
+    // the frames above the refresh held up the render thread's acquire, so the real ones fell back to ~refresh / (n + 1).
+    // TOTK_FG_MAX_VRR_FIFO=1: FIFO with the VRR row on (before; mailbox can turn G-SYNC off on some drivers).
     static int keep_fifo = -1;
     if (keep_fifo < 0) { const char *e = getenv("TOTK_FG_MAX_VRR_FIFO"); keep_fifo = e && *e == '1'; }
     const bool fg_free = g_sc_fg_max && !(g_sc_vrr && keep_fifo);
@@ -1435,11 +1434,13 @@ static VkPresentModeKHR present_mode(void) {
 }
 
 static VkImageUsageFlags g_sc_usage;   // what the window images allow (create_swapchain: the surface's supported bits)
-// Whether the FG present thread presented when the swapchain was made (its image count: present.c
-// vk_present_image_count, +2 for the frames the thread holds). The Frame generation row turns it on or off live:
-// vk_frame_begin makes the swapchain again on each change. That gives the thread its images when FG comes on, and
-// after FG goes off (recreate_swapchain drains the thread first) the render thread is the only one presenting again.
+// Whether the FG present thread presented when the swapchain was made (its image count: present.c vk_present_image_count, +2 for the
+// frames the thread holds; TOTK_FG_PQ=2 +n + 1). The Frame generation row turns it on or off live: vk_frame_begin makes the swapchain
+// again on each change. That gives the thread its images when FG comes on, and after FG goes off (recreate_swapchain drains the
+// thread first) the render thread is the only one presenting again. g_sc_fgn: TOTK_FG_PQ=2, the generated frames per real one then
+// (x2 -> x4 in game needs two more images)
 static bool g_sc_pq;
+static int g_sc_fgn;
 static void create_swapchain(void) {
     vk_present_queue_drain();   // (FG present thread: nothing of the old swapchain left to present)
     g_sc_fg_max = fg_max_now();   // (present_mode's; set before any return, so vk_frame_begin does not retry every frame)
@@ -1473,6 +1474,7 @@ static void create_swapchain(void) {
         if (!said++) LOG("[present] frame generation 'Maximum fps' on FIFO: the FG present thread stays off the shared render queue (presents inline)\n");
     }
     g_sc_pq = vk_present_queue_on();
+    g_sc_fgn = g_sc_pq && vk_present_fg_even() ? vk_ngx_fg_frames() : 0;
     uint32_t count = vk_present_image_count(&caps);   // (TOTK_SWAPCHAIN_IMAGES; default minImageCount + 1, at most 8)
     VkSwapchainKHR old = g_vk.swapchain;
     // (what the surface allows: every Windows driver has these, but say so where one does not instead of failing
@@ -1570,12 +1572,24 @@ static void recreate_swapchain(void) {
 }
 
 // ================================================================== frames (start screen and game)
-// Acquire semaphores rotate per frame in flight; a slot is reused once the submission that waited on it is done.
+// Acquire semaphores rotate per present; one is reused once the submission that waited on it is done. The FRAMES slots
+// are the frames in flight. With TOTK_FG_FIF=real (opt-in, present.c vk_fg_fif_real; the default in cand6 only), when a
+// frame has more passes than there are slots (x4), a generated frame's pass takes a semaphore but no slot; x2 / x3 keep a slot per pass
+// as before (fif5c, x3 old / new pair: 151 / 144 real, the gap in the CPU segment and the GPU wait equal, 0.09 / 0.10
+// ms: no gain there to take). Before, every pass took a slot: at x4 (3 generated + the real one, 4 passes a
+// frame, ring of 3) the real pass reused its own frame's first generated pass's slot and waited for it, i.e. for the
+// whole frame on the GPU, every frame (fps360 fif3 11-07, x4: GPU wait 1.6 ms a frame; x3's real pass waits one frame
+// back, 0.08 ms). Without it, x4 96 -> 128 real in a same-host pair (fif5, 1080p field), frames steadier (sd 5.6 ->
+// 3.2 ms), game -> screen 12.9 -> 11.5 ms (fps360 SHOWCASE_1105.md 11-07).
 #define FRAMES 3
-static VkSemaphore acquire_sem[FRAMES], done_sem[8];
+#define SEMS (FRAMES * 4)   // (a frame + up to 3 generated, ngx.c FG_MAX, per frame in flight)
+static VkSemaphore acquire_sem[SEMS], done_sem[8];
+static uint64_t sem_seq[SEMS];          // (the submission that waited on each acquire semaphore)
 static uint64_t slot_seq[FRAMES];
 static uint64_t slot_end_seq[FRAMES];   // (each slot's frame: its LAST submission, the present's: vk_frame_end; LARECOMP_GPU_FRAMES)
-static int slot;
+static int slot, sem;
+static bool pass_gen;                   // (TOTK_FG_FIF=real: this pass is a generated frame's at x4: no slot)
+static int g_fg_k, g_fg_n;       // (generated frame k of n; for the real one, n = how many came before it)
 
 static VkSemaphore binary_semaphore(void) {
     VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -1614,6 +1628,10 @@ bool vk_frame_begin(const float clear[4]) {
         static int nlog;
         if (nlog++ < 20) LOG("[present] FG present thread %s: the swapchain is made again\n", g_sc_pq ? "off" : "on");
         atomic_store(&g_sc_recreate, 1);
+    } else if (g_vk.swapchain && g_sc_pq && vk_present_fg_even() && vk_ngx_fg_frames() != g_sc_fgn) {   // (x2 / x3 / x4 changed: its image count)
+        static int nlog;
+        if (nlog++ < 20) LOG("[present] frame generation x%d -> x%d: the swapchain is made again\n", g_sc_fgn + 1, vk_ngx_fg_frames() + 1);
+        atomic_store(&g_sc_recreate, 1);
     }
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height ||
         atomic_exchange(&g_sc_recreate, 0) || fg_max_now() != g_sc_fg_max) recreate_swapchain();
@@ -1621,11 +1639,15 @@ bool vk_frame_begin(const float clear[4]) {
     static int trace = -1;
     if (trace < 0) trace = getenv("LARECOMP_VK_TRACE") != NULL;
     if (trace) LOG("[vk] frame begin %dx%d (swapchain %ux%u)\n", w, h, g_vk.sc_extent.width, g_vk.sc_extent.height);
-    slot = (slot + 1) % FRAMES;
-    if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
+    pass_gen = g_fg_k > 0 && g_fg_n >= FRAMES && vk_fg_fif_real();   // (g_fg_n generated + the real one > FRAMES)
+    if (!pass_gen) slot = (slot + 1) % FRAMES;
+    sem = (sem + 1) % SEMS;
+    if (!acquire_sem[sem]) acquire_sem[sem] = binary_semaphore();
     {
         const uint64_t t = SDL_GetTicksNS();
-        // LARECOMP_GPU_FRAMES=<1..3> (default 3 = FRAMES, as before): at most that many presented frames on the GPU at once;
+        vk_wait_seq(sem_seq[sem]);   // (its semaphore free again: the pass SEMS back done; a generated pass's only wait)
+        // LARECOMP_GPU_FRAMES=<1..3> (default 3 = FRAMES, as before): at most that many presented frames on the GPU at once
+        // (every pass; TOTK_FG_FIF=real: real frames, generated passes take no slot);
         // this frame starts once frame f - n's submission completed (slot_seq holds the last FRAMES frames' seqs). The v0.1.9
         // gate's one-frame foreign meshes / rain streaks come with GPU overlap (arm A: none), as if the game rewrote per-frame
         // data its own frame counting took as consumed while our GPU, up to 3 frames behind, still read it in place (the
@@ -1639,7 +1661,7 @@ bool vk_frame_begin(const float clear[4]) {
         }
         // (n < FRAMES: frame f - n wholly done, its present submission, not only its first: a frame spans several submissions
         // with chunked submits / gdev carries / FG passes)
-        vk_wait_seq(gpu_frames == FRAMES ? slot_seq[slot] : slot_end_seq[(slot + FRAMES - gpu_frames) % FRAMES]);
+        if (!pass_gen) vk_wait_seq(gpu_frames == FRAMES ? slot_seq[slot] : slot_end_seq[(slot + FRAMES - gpu_frames) % FRAMES]);
         g_pr_ns[PR_SLOT] += SDL_GetTicksNS() - t;
     }
     VkResult r;
@@ -1647,7 +1669,7 @@ bool vk_frame_begin(const float clear[4]) {
     for (uint64_t a0 = SDL_GetTicksNS();;) {   // (UINT64_MAX before: a compositor that stops releasing images = a silent hang)
         // (present.c: polled under the swapchain lock, which the FG present thread's presents take too)
         g_rt_op = "vkAcquireNextImageKHR", g_rt_op_ns = SDL_GetTicksNS();
-        r = vk_present_acquire(acquire_sem[slot], 2000000000ull, &cur_frame.image);
+        r = vk_present_acquire(acquire_sem[sem], 2000000000ull, &cur_frame.image);
         g_rt_op = NULL;
         if (r != VK_TIMEOUT && r != VK_NOT_READY) break;
         LOG("[hang] no window image from the compositor for %.0f s (vkAcquireNextImageKHR)\n", (SDL_GetTicksNS() - a0) / 1e9);
@@ -1656,12 +1678,13 @@ bool vk_frame_begin(const float clear[4]) {
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
         if (r != VK_ERROR_OUT_OF_DATE_KHR) vk_present_lost();
         recreate_swapchain();
-        r = vk_present_acquire(acquire_sem[slot], UINT64_MAX, &cur_frame.image);
+        r = vk_present_acquire(acquire_sem[sem], UINT64_MAX, &cur_frame.image);
     }
     g_pr_ns[PR_ACQ] += SDL_GetTicksNS() - t_acq;   // (a re-creation inside is counted twice: there and here)
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
-    cur_frame.acquired = acquire_sem[slot];
-    slot_seq[slot] = vk_pending_seq();
+    cur_frame.acquired = acquire_sem[sem];
+    sem_seq[sem] = vk_pending_seq();
+    if (!pass_gen) slot_seq[slot] = sem_seq[sem];
     VkCommandBuffer cb = vk_cmd();
     image_barrier(cb, g_vk.sc_images[cur_frame.image], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = g_vk.sc_views[cur_frame.image],
@@ -1742,7 +1765,6 @@ static uint64_t total_frames;   // (tentative: the frame counters are below, wit
 static bool g_game_present;     // vk_frame_end called from backend_present (a game frame; not backend_clear_window)
 static uint64_t g_note_game_ns;  // backend_present: the game present being shown (0: none, a re-present)
 static bool g_note_gen;          // and whether this window present is DLSS-G's generated frame
-static int g_fg_k, g_fg_n;       // (generated frame k of n; for the real one, n = how many came before it)
 
 // Periodic shots (TOTK_SHOT_EVERY, boot.py --shots) are converted and written on their own thread: SDL_SavePNG on the
 // render thread made the present wait for the disk (presents of 0.5 s and 3.9 s, each on the frame before a saved
@@ -1908,7 +1930,8 @@ void vk_frame_end(const char *shot_path) {
     uint64_t seq = vk_pending_seq();
     uint64_t t_submit = SDL_GetTicksNS();
     vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE);
-    slot_end_seq[slot] = seq;   // (this frame's last submission: LARECOMP_GPU_FRAMES waits on it)
+    sem_seq[sem] = seq;                       // (the submission that waits on the acquire semaphore)
+    if (!pass_gen) slot_end_seq[slot] = seq;   // (this frame's last submission: LARECOMP_GPU_FRAMES waits on it)
     g_pr_ns[PR_SUBMIT] += SDL_GetTicksNS() - t_submit;
     extern void vk_present_latency_present(int stage);   // (present.c: low latency markers of a game frame)
     if (g_game_present) vk_present_latency_present(0);
@@ -1945,7 +1968,7 @@ void vk_frame_end(const char *shot_path) {
         g_pr_ns[PR_QPRESENT] += t_qp - t_lk;
         if (g_game_present) vk_present_latency_present(2);
         g_rt_op = NULL;
-        vk_present_done(total_frames, pid, seq, r, t_submit, t_paced);   // timing; queued-frame and frames-in-flight limits
+        vk_present_done(total_frames, pid, seq, r, t_submit, t_paced, g_fg_k > 0);   // timing; queued-frame and frames-in-flight limits
         g_pr_ns[PR_LIMITS] += SDL_GetTicksNS() - t_qp;
     }
     g_pr_ns[PR_PRESENT] += SDL_GetTicksNS() - t_paced;
@@ -2123,14 +2146,13 @@ void backend_present(NvnTexture *t) {
     b->presented = true;
     vk_late_latch_present();   // (latch.c: the frame's canvas, when no HUD draw came after its upscale)
     vk_end_pass();
-    // The presented image's writes before anything here reads it. vk_end_pass issues no memory barrier by default (the
-    // next game pass's barrier comes later), and vk_frame_begin's barrier names only the swapchain image. So the game's
-    // final colour writes into this window texture, and ours (late latch, upscale), had no formal dependency before
-    // DLSS-G / post_process / vk_present_draw sample or copy it. A read racing them takes the texture's previous contents
-    // (frame N-2: TotK has 2 window textures) wherever the write had not reached. Now a barrier here, once a frame.
-    // LARECOMP_PRESENT_BARRIER: 1 (default) a full barrier, the form the gate's presentbar arm tested; 2 only an image
-    // barrier on this texture (colour / storage / transfer writes -> sampled / storage / transfer reads; narrower, needs
-    // its own arm); 0 none (old).
+    // The presented image's writes before anything here reads it. vk_end_pass issues no memory barrier by default (the next
+    // game pass's barrier comes later), and vk_frame_begin's barrier names only the swapchain image. So the game's final colour
+    // writes into this window texture, and ours (late latch, upscale), had no formal dependency before DLSS-G / post_process /
+    // vk_present_draw sample or copy it. A read racing them takes the texture's previous contents (frame N-2: TotK has 2 window
+    // textures) wherever the write had not reached. Now a barrier here, once a frame. LARECOMP_PRESENT_BARRIER: 1 (default) a
+    // full barrier, the form the gate's presentbar arm tested; 2 only an image barrier on this texture (colour / storage /
+    // transfer writes -> sampled / storage / transfer reads; narrower, needs its own arm); 0 none (old).
     {
         static int mode = -1;
         if (mode < 0) {

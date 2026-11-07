@@ -1732,11 +1732,11 @@ static int run_package(const wchar_t *pkg, const wchar_t *name, wchar_t *why, si
                                                 L" Your 1.0.0 saves were copied to this version once: what you play later "
                                                 L"in 1.0.0 will not show up here, and %ls saves do not go back to 1.0.0."), ver);
                 message(MB_ICONINFORMATION, ES_EN(
-                    /* (only gated claims, LEAD 11-04: 'runs at full frame rate' verified in the 9.1 gate's v143 line
-                       (integration 11-04 15:27), with Setup's BetaNote. The controls: 9.1 runs the placed
-                       player-state groups by default on 1.4.3 and fps360's 1.4.3 pins; the ability keys' game-data
-                       calls have no 1.4.3 match, so 4-9 are dropped there. The menu mouse cursor needs ui fields
-                       1.4.3's map does not place yet, so it is off there: menus by keyboard or pad)*/
+                    /* (only gated claims: 'runs at full frame rate' verified in the 9.1 gate's v143 line (integration
+                       11-04 15:27), with Setup's BetaNote. The controls: 9.1 runs the placed player-state groups by
+                       default on 1.4.3 and fps360's 1.4.3 pins; the ability keys' game-data calls have no 1.4.3 match, so
+                       4-9 are dropped there. The menu mouse cursor needs ui fields 1.4.3's map does not place yet, so it
+                       is off there: menus by keyboard or pad)*/
                     L"TotK %ls (beta). Esta versión va a la frecuencia de fotogramas completa, pero está menos probada "
                     L"que la 1.0.0. "
                     L"Los controles de teclado y ratón funcionan como en la 1.0.0 durante el juego, salvo las teclas "

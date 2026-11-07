@@ -76,6 +76,11 @@ static int main_has_realtime(uint64_t main_base) {
    an #ifdef that a 1.0.0 build drops, so its preprocessed code stays what it was (tools/engine/proof_totk_same.py). */
 #if defined(TOTK_GAME_VERSION) && TOTK_GAME_VERSION != 100
 #define TOTK_OTHER_VERSION 1
+/* Shadow resolution's ceiling there (public #97 / D#83, brunoanesio, 1.4.3: the inventory crashed at x2 only, x1.5 and
+   x1.75 fine; 1.0.0 clean at x2). The sun shadow map is allocated from the game's own pool, which 1.0.0's HeapDef
+   overlay can grow and 1.4.3 has none: at x2 (4x the bytes) the pool runs dry and f_1c2590 reads its null allocation
+   (+0xa0). A saved or preset 2 (High and above) is held at the ceiling, not refused: refused, the slot kept x1. */
+#define TOTK_SHADOW_RES_MAX_OTHER 1.75f
 #endif
 
 /* Default on since the all-on round (the play package runs the patched key): with the realtime step in main and
@@ -365,10 +370,24 @@ static int one_is_shipping(unsigned slot) {
            slot == TOTK_DP_ACTOR_LOD || slot == TOTK_DP_TERRAIN_LOD;
 }
 
+#ifdef TOTK_OTHER_VERSION
+static float shadow_res_ceiling(float v) {
+    if (!(v > TOTK_SHADOW_RES_MAX_OTHER)) return v;
+    static int said;
+    if (!said++)
+        fprintf(stderr, "[totk] shadow resolution x%g held at x%g: this game version cannot grow the pool the shadow map "
+                        "comes from (x2 crashes, public #97)\n", v, TOTK_SHADOW_RES_MAX_OTHER);
+    return TOTK_SHADOW_RES_MAX_OTHER;
+}
+#endif
+
 static void write_slot(int i, const char *value) {
     uint8_t *page = (uint8_t *)totk_data_page_current();
     if (!page || !value) return;
     float v = strtof(value, NULL);
+#ifdef TOTK_OTHER_VERSION
+    if (g_live_slot[i] == TOTK_DP_SHADOW_SCALE) v = shadow_res_ceiling(v);
+#endif
     if (!(v >= g_live_min[i] && v <= g_live_max[i])) return;
     if (v == 1.0f && one_is_shipping(g_live_slot[i])) v = 0.0f;
     if (g_live_slot[i] == TOTK_DP_SHADOW_SPLIT) v = totk_shadow_reach_slot(v);   /* (with Shadow distance: #69) */
@@ -400,6 +419,16 @@ static const char *fov_format(float k) {
 /* The sun shadow map size row (0 / 1): its two choices by name (a format with no conversion) */
 // (F10 shows a format through pc_tr: its Spanish is in pc_text_es.inc, PC_T marks it for check_texts)
 static const char *shadow_fixed_format(float k) { return k >= 0.5f ? PC_T("Fixed (steady)") : PC_T("The game's (changes)"); }
+#ifdef TOTK_OTHER_VERSION
+/* Shadow resolution above the ceiling: the saved value and, beside it, the one applied. No words, so nothing to
+   translate.*/
+static const char *shadow_res_format(float k) {
+    static char buf[32];
+    if (!(k > TOTK_SHADOW_RES_MAX_OTHER)) return "%.2f";
+    snprintf(buf, sizeof buf, "%%.2f (-> %.2f)", TOTK_SHADOW_RES_MAX_OTHER);
+    return buf;
+}
+#endif
 
 #define APPLY(i) static void apply_##i(const char *v) { write_slot(i, v); }
 APPLY(0) APPLY(1) APPLY(2) APPLY(3) APPLY(4) APPLY(5) APPLY(6) APPLY(7) APPLY(8) APPLY(9) APPLY(10) APPLY(11)
@@ -516,6 +545,20 @@ static void add_live_rows(void) {
     unsigned n;
     const TotkSettingRow *rows = totk_setting_rows(&n);
     int k = 0;
+#ifdef TOTK_OTHER_VERSION
+    {   /* (a TOTK_SHADOW_RES given for the run went to the slot in totk_patches_init; the row keeps max 2, so a saved or
+           preset 2 stays valid and write_slot holds it) */
+        uint8_t *page = (uint8_t *)totk_data_page_current();
+        if (page) {
+            uint32_t *slot = (uint32_t *)(page + TOTK_DP_SHADOW_SCALE), bits = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+            float v;
+            memcpy(&v, &bits, 4);
+            v = shadow_res_ceiling(v);
+            memcpy(&bits, &v, 4);
+            __atomic_store_n(slot, bits, __ATOMIC_RELEASE);
+        }
+    }
+#endif
     for (unsigned i = 0; i < n && k < MAX_LIVE_ROWS; i++) {
         const TotkSettingRow *r = &rows[i];
 #ifdef TOTK_OTHER_VERSION
@@ -532,6 +575,9 @@ static void add_live_rows(void) {
                                  (float)r->min, (float)r->max, (float)r->step, 0, NULL, NULL, k_apply[k], NULL};
         if (!strcmp(r->key, "graphics.fov")) g_live[k].format = fov_format;
         if (!strcmp(r->key, "graphics.shadow_fixed")) g_live[k].format = shadow_fixed_format;
+#ifdef TOTK_OTHER_VERSION
+        if (!strcmp(r->key, "graphics.shadow_resolution")) g_live[k].format = shadow_res_format;
+#endif
         k++;
     }
     pc_settings_add(g_live, k);
