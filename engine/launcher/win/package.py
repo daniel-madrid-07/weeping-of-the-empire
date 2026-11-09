@@ -15,7 +15,8 @@ work folder and player.txt points at them. Key: --key, else the newest built key
 
 On Linux (linux-port, 2026-11-02) the same folder holds totk (ELF) instead of totk.exe, lib/libSDL3.so.0 (the exe's
 RUNPATH is $ORIGIN/lib; from build_deps.sh's prefix, NXR_LINUX_DEPS) and the launcher: launcher_linux.py with 'TotK
-Launcher', a shell script that runs it (python3); text files with LF line ends."""
+Launcher', a shell script that runs it (python3), and savever.py with savever_data.h (the save import's converter and
+the Windows launcher's tables); text files with LF line ends."""
 import argparse, datetime, json, os, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -158,10 +159,14 @@ def dirty_of(exe):
 
 
 def linux_launcher(tmp):
-    """the Linux folder's launcher (engine/launcher/linux/launcher_linux.py and its 'TotK Launcher' script) and the
-    SDL3 library the exe loads from lib/ (build_deps.sh's prefix: NXR_LINUX_DEPS, else <work>/linux-deps)"""
+    """the Linux folder's launcher (engine/launcher/linux/launcher_linux.py and its 'TotK Launcher' script), the save
+    converter its import loads (savever.py) with the tables the Windows launcher compiles (savever_data.h, copied as it
+    is: both launchers convert with the same tables) and the SDL3 library the exe loads from lib/ (build_deps.sh's
+    prefix: NXR_LINUX_DEPS, else <work>/linux-deps)"""
     src = os.path.join(os.path.dirname(HERE), 'linux')
-    shutil.copy2(os.path.join(src, 'launcher_linux.py'), os.path.join(tmp, 'launcher_linux.py'))
+    for f in ('launcher_linux.py', 'savever.py'):
+        shutil.copy2(os.path.join(src, f), os.path.join(tmp, f))
+    shutil.copy2(os.path.join(HERE, 'savever_data.h'), os.path.join(tmp, 'savever_data.h'))
     script = os.path.join(tmp, 'TotK Launcher')
     with open(script, 'w', newline='\n') as f:
         f.write('#!/bin/sh\n# Tears of the Kingdom (nxrecomp): starts the game in this folder (launcher_linux.py)\n'
