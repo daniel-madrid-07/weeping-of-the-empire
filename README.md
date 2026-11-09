@@ -118,7 +118,8 @@ generation) are options.
 `setup.log` from the install folder and the newest `totk-*.log` from the Proton prefix's
 `drive_c/users/steamuser/AppData/Local/nxrecomp/TotK-engine/logs`, the prefix being Steam's
 `steamapps/compatdata/<number>/pfx` for the Setup entry). A native Linux build (an AppImage, no Proton) is being tested:
-the newest `linux-test` pre-release on the releases page.
+the newest `linux-test` pre-release on the releases page. Its window's **Saves** button imports a save from yuzu, Eden,
+Ryujinx (also their Flatpak versions) or a folder, converted to 1.0.0 as on Windows.
 
 Setup and the game are Windows programs; on Linux they run through Steam's Proton. Both notice Proton (or any Wine)
 by themselves and take their Linux paths.

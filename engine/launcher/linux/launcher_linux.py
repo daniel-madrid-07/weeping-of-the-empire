@@ -25,8 +25,8 @@ newest other folder beside it (lastgood); errors go to <cache>/launcher.log and,
 a desktop entry), to a desktop notice (notify-send, zenity or kdialog, whichever there is).
 Saves, as launcher.c's saves menu (Shift / --saves) and saves.c: --saves lists the current save and the saves it can
 import (player.txt's import=, our other game versions' saves, yuzu and its forks, Ryujinx, their Flatpak folders), or
-those under --look-in <folder> (a JKSV backup from the console: 5 levels down); --json is that list for a program to
-read. --import-save backs up the current save (-before-import) and, for a save of a
+those under --look-in <folder> (a JKSV backup from the console: 5 levels down); --json is that list for the AppImage's
+window, whose Saves button imports one. --import-save backs up the current save (-before-import) and, for a save of a
 later game version, the original (-original), then makes it the save, converted to 1.0.0 on the way (savever.py);
 never while the game runs.
 """
@@ -417,7 +417,8 @@ def refusal_text(rep):
         return f'{f} holds more than a 1.0.0 save has room for.'
     if rep.refused == sv.SV_PICTURE:   # (on Linux also: no Pillow for this Python, which Setup's own Python has)
         return f"The picture in {f} couldn't be converted." + ('' if sv.have_pillow() else
-                " That needs Pillow, which this Python doesn't have.")
+                " That needs Pillow, which this Python doesn't have: import the save with the Saves button in the "
+                "Setup window instead.")
     if rep.refused == sv.SV_IO:
         return f"{f} couldn't be read or written."
     return f'{f} is damaged or incomplete.'
@@ -732,9 +733,9 @@ IMPORT_NOTE = ('The game is version 1.0.0. A save from 1.1.x, 1.2.x or 1.4.x is 
 
 
 def saves_main(a):
-    """--saves / --import-save: the Windows launcher's saves menu, its import, in a terminal (and --json for a program
-    to read). The flags go anywhere: 'TotK Launcher' puts its own folder first. --look-in or --json alone mean --saves.
-    """
+    """--saves / --import-save: the Windows launcher's saves menu, its import, in a terminal (and --json for the
+    AppImage's window). The flags go anywhere: 'TotK Launcher' puts its own folder first. --look-in or --json alone
+    mean --saves."""
     global _LOG, _ECHO
     opts, rest, i = {}, [], 0
     while i < len(a):

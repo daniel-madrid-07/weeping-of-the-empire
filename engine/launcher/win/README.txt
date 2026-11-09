@@ -110,6 +110,12 @@ save, or a version after 1.4.x) is refused with the reason, and nothing changes.
 saves, in userdata-v143 next to userdata: the first time it starts it copies the 1.0.0 saves once; its saves can be
 imported back into 1.0.0 the same way ("nxrecomp v143" in the list).
 
+On Linux the save is in ~/.local/share/nxrecomp/TotK-engine/userdata/save and the backups in
+~/.local/share/nxrecomp/TotK-engine/backups. To import a save, press Saves in the Setup window (the AppImage): the same
+list and the same conversion as above, also for the Flatpak versions of the emulators; Play offers it the first time if
+you have no save. In a terminal, in this folder: ./"TotK Launcher" --saves lists the saves it finds, and
+./"TotK Launcher" --import-save <folder> imports one. The game must be closed.
+
 
 5. IF SOMETHING GOES WRONG
 --------------------------

@@ -2,12 +2,13 @@
 found, an import failing at each step, an interrupted import repaired, backups and their pruning, links not followed,
 read-only folders) in the Linux folders (XDG, Flatpak); the import with the converter (test_savever.c's test_import,
 and a conversion end to end on synthetic tables); --saves / --import-save as 'TotK Launcher' passes them; the game
-folder package.py makes, its own launcher importing. Seconds.
+folder package.py makes; and the AppImage window's Saves helpers through that folder's launcher. Seconds.
 
     python3 -I engine/launcher/linux/test_saves.py
 """
 import contextlib
 import glob
+import importlib.util
 import io
 import json
 import os
@@ -318,7 +319,7 @@ def test_import(t):
     real = sv._pil
     sv._pil = lambda: None
     try:
-        check('a picture refused without Pillow: why', 'needs Pillow' in ll.refusal_text(rep))
+        check('a picture refused without Pillow: what to do', 'Saves button in the Setup' in ll.refusal_text(rep))
     finally:
         sv._pil = real
 
@@ -403,6 +404,48 @@ def test_package(t, home, p):
     return inst
 
 
+def test_window(t, home, p, inst):
+    """the AppImage window's Saves helpers, through the game folder's launcher (run as Play runs it: there is no
+    <install>/tools/python here, so by this Python)"""
+    app = os.path.join(t, 'app')
+    os.makedirs(app)
+    shutil.copy(os.path.join(REPO, 'tools', 'linux', 'appimage', 'setup_gui.py'), app)
+    write(os.path.join(app, 'release.json'), '{"tag": "linux-test-x", "repo": "o/r", "commit": "' + '0' * 40 + '"}')
+    spec = importlib.util.spec_from_file_location('setup_gui_saves', os.path.join(app, 'setup_gui.py'))
+    sg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sg)
+    try:
+        sg.list_saves(os.path.join(t, 'no-install'))
+        check('window: no game yet', False)
+    except RuntimeError as e:
+        check('window: no game yet', 'install it first' in str(e), e)
+    with home_env(home):
+        save = os.path.join(ll.user_dirs()[0], 'userdata', 'save')
+        check('window: the data folder and the save are the launcher\'s (Play\'s offer looks there first)',
+              (sg.player_data(), sg.has_save(sg.player_data()), sg.has_save(os.path.join(t, 'none'))) ==
+              (ll.user_dirs()[0], True, False))
+        found = sg.list_saves(inst)
+        check('window: the current save and the saves found', (found['save'], found['slots'], 'eden' in
+              [c['source'] for c in found['saves']]) == (save, 1, True), found)
+        found = sg.list_saves(inst, os.path.join(t, 'sd'))
+        check('window: Look in another folder', [c['source'] for c in found['saves']] == ['folder', 'folder'], found)
+        rc, text = sg.import_save(inst, p['eden'])
+        check('window: Import the selected save', (rc, text.startswith('Done.'), slot0(save)) == (0, True, 'eden'),
+              (rc, text))
+        old = os.path.join(inst, 'game', 'TotK-PC-2')   # a newer folder made before the import existed
+        write(os.path.join(old, 'totk'), b'')
+        write(os.path.join(old, 'player.txt'), 'commit=def\n')
+        shutil.copy(os.path.join(inst, 'game', 'TotK-PC-1', 'launcher_linux.py'), old)
+        future = time.time() + 60
+        os.utime(old, (future, future))
+        try:
+            sg.import_save(inst, p['yuzu'])
+            check('window: a game folder from before the import is not asked', False)
+        except RuntimeError as e:
+            check('window: a game folder from before the import is not asked', 'press Install' in str(e) and
+                  slot0(save) == 'eden', e)
+
+
 def main():
     t = tempfile.mkdtemp(prefix='nxr_test_saves_')
     try:
@@ -410,7 +453,8 @@ def main():
         test_replace(t, home, p)
         test_import(t)
         test_cli(t, home, p, sd)
-        test_package(t, home, p)
+        inst = test_package(t, home, p)
+        test_window(t, home, p, inst)
     finally:
         check('the test folder deleted (read-only files in it too)', ll.delete_tree(t))
     print(f'test_saves: {len(fails)} FAILED' if fails else 'test_saves: all passed')
